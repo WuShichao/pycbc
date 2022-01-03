@@ -1,0 +1,1386 @@
+<!DOCTYPE html>
+<html class="writer-html4" lang="en" >
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>pycbc.population package &mdash; PyCBC 2.0.dev0 documentation</title><link rel="stylesheet" href="_static/css/theme.css" type="text/css" />
+    <link rel="stylesheet" href="_static/pygments.css" type="text/css" />
+      <link rel="stylesheet" href="_static/plot_directive.css" type="text/css" />
+      <link rel="stylesheet" href="_static/graphviz.css" type="text/css" />
+      <link rel="stylesheet" href="_static/terminal.css" type="text/css" />
+      <link rel="stylesheet" href="_static/theme_overrides.css" type="text/css" />
+  <!--[if lt IE 9]>
+    <script src="_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  <script id="documentation_options" data-url_root="./" src="_static/documentation_options.js"></script>
+        <script type="text/javascript" src="_static/jquery.js"></script>
+        <script type="text/javascript" src="_static/underscore.js"></script>
+        <script type="text/javascript" src="_static/doctools.js"></script>
+        <script type="text/javascript" src="_static/language_data.js"></script>
+        <script type="text/javascript" src="_static/typed.min.js"></script>
+        <script async="async" type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.5/latest.js?config=TeX-AMS-MML_HTMLorMML"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="pycbc.results package" href="pycbc.results.html" />
+    <link rel="prev" title="pycbc.io package" href="pycbc.io.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+            <a href="index.html" class="icon icon-home"> PyCBC
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+<li class="toctree-l1"><a class="reference internal" href="credit.html">Use of PyCBC in Scientific Publications</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="docker.html">Running PyCBC under Docker</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="install.html">Installing PyCBC</a></li>
+<li class="toctree-l1"><a class="reference internal" href="install_virtualenv.html">Setting up virtualenv</a></li>
+<li class="toctree-l1"><a class="reference internal" href="install_lalsuite.html">Installing lalsuite for PyCBC</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="inference.html">PyCBC inference documentation (<code class="docutils literal notranslate"><span class="pre">pycbc.inference</span></code>)</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="workflow/pycbc_make_psd_estimation_workflow.html"><code class="docutils literal notranslate"><span class="pre">pycbc_make_psd_estimation_workflow</span></code>: A workflow generator for noise estimation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="workflow/pycbc_make_coinc_search_workflow.html"><code class="docutils literal notranslate"><span class="pre">pycbc_make_coinc_search_workflow</span></code>: A workflow to search for gravitational waves</a></li>
+<li class="toctree-l1"><a class="reference internal" href="workflow/pygrb.html"><code class="docutils literal notranslate"><span class="pre">pycbc_make_offline_grb_workflow</span></code>: A GRB triggered CBC analysis workflow generator</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="tmpltbank.html">PyCBC template bank generation documentation (<code class="docutils literal notranslate"><span class="pre">pycbc.tmpltbank</span></code>)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="hwinj.html">Hardware injection waveform generation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="banksim.html">Calculating the Effectualness (Fitting Factor) of Template Banks</a></li>
+<li class="toctree-l1"><a class="reference internal" href="faithsim.html">Dag Generator for Doing Faithfulness Comparisons</a></li>
+<li class="toctree-l1"><a class="reference internal" href="upload_to_gracedb.html">Uploading triggers to gracedb</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="waveform_plugin.html">Making new waveform approximants available to PyCBC</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="catalog.html">Catalog of Observed Gravitational-wave Mergers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="dataquality.html">Query times of valid data, hardware injections, and more.</a></li>
+<li class="toctree-l1"><a class="reference internal" href="frame.html">Reading Gravitational-wave Frames</a></li>
+<li class="toctree-l1"><a class="reference internal" href="fft.html">Performing FFTs in PyCBC</a></li>
+<li class="toctree-l1"><a class="reference internal" href="gw150914.html">Signal Processing with GW150914</a></li>
+<li class="toctree-l1"><a class="reference internal" href="detector.html">Gravitational-wave Detectors</a></li>
+<li class="toctree-l1"><a class="reference internal" href="psd.html">Handling PSDs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="noise.html">Generating Noise</a></li>
+<li class="toctree-l1"><a class="reference internal" href="waveform.html">Waveforms</a></li>
+<li class="toctree-l1"><a class="reference internal" href="filter.html">Filtering</a></li>
+<li class="toctree-l1"><a class="reference internal" href="distributions.html">Using PyCBC Distributions from PyCBC Inference</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="building_bundled_executables.html">Building Bundled Executables</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="documentation.html">Documenting PyCBC code</a></li>
+<li class="toctree-l1"><a class="reference internal" href="release.html">Creating Releases of PyCBC</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="formats/hdf_format.html">HDF files within the PyCBC workflow</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="workflow.html">Workflow: the inspiral analysis workflow generator (<code class="docutils literal notranslate"><span class="pre">pycbc.workflow</span></code>)</a></li>
+</ul>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="modules.html">pycbc</a><ul class="current">
+<li class="toctree-l2 current"><a class="reference internal" href="pycbc.html">pycbc package</a><ul class="current">
+<li class="toctree-l3 current"><a class="reference internal" href="pycbc.html#subpackages">Subpackages</a><ul class="current">
+<li class="toctree-l4"><a class="reference internal" href="pycbc.catalog.html">pycbc.catalog package</a></li>
+<li class="toctree-l4"><a class="reference internal" href="pycbc.distributions.html">pycbc.distributions package</a></li>
+<li class="toctree-l4"><a class="reference internal" href="pycbc.events.html">pycbc.events package</a></li>
+<li class="toctree-l4"><a class="reference internal" href="pycbc.fft.html">pycbc.fft package</a></li>
+<li class="toctree-l4"><a class="reference internal" href="pycbc.filter.html">pycbc.filter package</a></li>
+<li class="toctree-l4"><a class="reference internal" href="pycbc.frame.html">pycbc.frame package</a></li>
+<li class="toctree-l4"><a class="reference internal" href="pycbc.inference.html">pycbc.inference package</a></li>
+<li class="toctree-l4"><a class="reference internal" href="pycbc.inject.html">pycbc.inject package</a></li>
+<li class="toctree-l4"><a class="reference internal" href="pycbc.io.html">pycbc.io package</a></li>
+<li class="toctree-l4"><a class="reference internal" href="pycbc.noise.html">pycbc.noise package</a></li>
+<li class="toctree-l4 current"><a class="current reference internal" href="#">pycbc.population package</a></li>
+<li class="toctree-l4"><a class="reference internal" href="pycbc.psd.html">pycbc.psd package</a></li>
+<li class="toctree-l4"><a class="reference internal" href="pycbc.results.html">pycbc.results package</a></li>
+<li class="toctree-l4"><a class="reference internal" href="pycbc.strain.html">pycbc.strain package</a></li>
+<li class="toctree-l4"><a class="reference internal" href="pycbc.tmpltbank.html">pycbc.tmpltbank package</a></li>
+<li class="toctree-l4"><a class="reference internal" href="pycbc.types.html">pycbc.types package</a></li>
+<li class="toctree-l4"><a class="reference internal" href="pycbc.vetoes.html">pycbc.vetoes package</a></li>
+<li class="toctree-l4"><a class="reference internal" href="pycbc.waveform.html">pycbc.waveform package</a></li>
+<li class="toctree-l4"><a class="reference internal" href="pycbc.workflow.html">pycbc.workflow package</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="pycbc.html#submodules">Submodules</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pycbc.html#module-pycbc.bin_utils">pycbc.bin_utils module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pycbc.html#module-pycbc.boundaries">pycbc.boundaries module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pycbc.html#module-pycbc.conversions">pycbc.conversions module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pycbc.html#module-pycbc.coordinates">pycbc.coordinates module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pycbc.html#module-pycbc.cosmology">pycbc.cosmology module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pycbc.html#module-pycbc.detector">pycbc.detector module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pycbc.html#module-pycbc.dq">pycbc.dq module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pycbc.html#module-pycbc.libutils">pycbc.libutils module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pycbc.html#module-pycbc.mchirp_area">pycbc.mchirp_area module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pycbc.html#module-pycbc.opt">pycbc.opt module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pycbc.html#module-pycbc.pnutils">pycbc.pnutils module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pycbc.html#module-pycbc.pool">pycbc.pool module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pycbc.html#module-pycbc.rate">pycbc.rate module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pycbc.html#module-pycbc.scheme">pycbc.scheme module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pycbc.html#module-pycbc.sensitivity">pycbc.sensitivity module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pycbc.html#module-pycbc.transforms">pycbc.transforms module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pycbc.html#module-pycbc.version">pycbc.version module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pycbc.html#module-pycbc">Module contents</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="build_gh_pages.html">Building Documentation for GitHub Pages</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">PyCBC</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home"></a> &raquo;</li>
+          <li><a href="modules.html">pycbc</a> &raquo;</li>
+          <li><a href="pycbc.html">pycbc package</a> &raquo;</li>
+      <li>pycbc.population package</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/pycbc.population.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <div class="section" id="pycbc-population-package">
+<h1>pycbc.population package<a class="headerlink" href="#pycbc-population-package" title="Permalink to this headline">¶</a></h1>
+<div class="section" id="submodules">
+<h2>Submodules<a class="headerlink" href="#submodules" title="Permalink to this headline">¶</a></h2>
+</div>
+<div class="section" id="module-pycbc.population.fgmc_functions">
+<span id="pycbc-population-fgmc-functions-module"></span><h2>pycbc.population.fgmc_functions module<a class="headerlink" href="#module-pycbc.population.fgmc_functions" title="Permalink to this headline">¶</a></h2>
+<p>A set of helper functions for evaluating event rates, densities etc.</p>
+<p>See <a class="reference external" href="https://dcc.ligo.org/LIGO-T2100060/public">https://dcc.ligo.org/LIGO-T2100060/public</a> for technical explanations</p>
+<dl class="function">
+<dt id="pycbc.population.fgmc_functions.filter_bin_lo_hi">
+<code class="descclassname">pycbc.population.fgmc_functions.</code><code class="descname">filter_bin_lo_hi</code><span class="sig-paren">(</span><em>values</em>, <em>lo</em>, <em>hi</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#filter_bin_lo_hi"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.filter_bin_lo_hi" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.fgmc_functions.filter_tmplt_mchirp">
+<code class="descclassname">pycbc.population.fgmc_functions.</code><code class="descname">filter_tmplt_mchirp</code><span class="sig-paren">(</span><em>bankf</em>, <em>lo_mchirp</em>, <em>hi_mchirp</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#filter_tmplt_mchirp"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.filter_tmplt_mchirp" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.fgmc_functions.read_full_data">
+<code class="descclassname">pycbc.population.fgmc_functions.</code><code class="descname">read_full_data</code><span class="sig-paren">(</span><em>fullf</em>, <em>rhomin</em>, <em>tmplt_filter=None</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#read_full_data"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.read_full_data" title="Permalink to this definition">¶</a></dt>
+<dd><p>Read the zero- and time-lagged triggers identified by a specific
+set of templates.</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><ul class="first simple">
+<li><strong>fullf</strong> – File that stores zerolag and slide triggers</li>
+<li><strong>bankf</strong> – File with template mass/spin information</li>
+<li><strong>rhomin</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)"><em>float</em></a>) – Ranking statistic threshold</li>
+<li><strong>tmplt_filter</strong> (<em>array of Booleans</em>) – Filter over the array of templates stored in bankf</li>
+</ul>
+</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><p class="first">containing foreground triggers and background information</p>
+</td>
+</tr>
+<tr class="field-odd field"><th class="field-name">Return type:</th><td class="field-body"><p class="first last">dictionary</p>
+</td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.fgmc_functions.read_full_data_mchirp">
+<code class="descclassname">pycbc.population.fgmc_functions.</code><code class="descname">read_full_data_mchirp</code><span class="sig-paren">(</span><em>fullf</em>, <em>bankf</em>, <em>rhomin</em>, <em>mc_lo</em>, <em>mc_hi</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#read_full_data_mchirp"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.read_full_data_mchirp" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.fgmc_functions.log_rho_bg">
+<code class="descclassname">pycbc.population.fgmc_functions.</code><code class="descname">log_rho_bg</code><span class="sig-paren">(</span><em>trigs</em>, <em>counts</em>, <em>bins</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#log_rho_bg"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.log_rho_bg" title="Permalink to this definition">¶</a></dt>
+<dd><p>trigs: zerolag event statistic values
+counts: background histogram
+bins: bin edges of the background histogram</p>
+<p>Returns:
+log of background PDF at the zerolag statistic values,
+fractional uncertainty due to Poisson count (set to 100% for empty bins)</p>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.fgmc_functions.log_rho_fg_analytic">
+<code class="descclassname">pycbc.population.fgmc_functions.</code><code class="descname">log_rho_fg_analytic</code><span class="sig-paren">(</span><em>trigs</em>, <em>rhomin</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#log_rho_fg_analytic"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.log_rho_fg_analytic" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.fgmc_functions.log_rho_fg">
+<code class="descclassname">pycbc.population.fgmc_functions.</code><code class="descname">log_rho_fg</code><span class="sig-paren">(</span><em>trigs</em>, <em>injstats</em>, <em>bins</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#log_rho_fg"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.log_rho_fg" title="Permalink to this definition">¶</a></dt>
+<dd><p>trigs: zerolag event statistic values
+injstats: injection event statistic values
+bins: histogram bins</p>
+<p>Returns:
+log of signal PDF at the zerolag statistic values,
+fractional uncertainty from Poisson count</p>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.fgmc_functions.get_start_dur">
+<code class="descclassname">pycbc.population.fgmc_functions.</code><code class="descname">get_start_dur</code><span class="sig-paren">(</span><em>path</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#get_start_dur"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.get_start_dur" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.fgmc_functions.in_coinc_time_incl">
+<code class="descclassname">pycbc.population.fgmc_functions.</code><code class="descname">in_coinc_time_incl</code><span class="sig-paren">(</span><em>f</em>, <em>cstring</em>, <em>test_times</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#in_coinc_time_incl"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.in_coinc_time_incl" title="Permalink to this definition">¶</a></dt>
+<dd><p>filter to all times where coincs of type given by cstring exist</p>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.fgmc_functions.alltimes">
+<code class="descclassname">pycbc.population.fgmc_functions.</code><code class="descname">alltimes</code><span class="sig-paren">(</span><em>ifos</em>, <em>mincount=1</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#alltimes"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.alltimes" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.fgmc_functions.ifos_from_combo">
+<code class="descclassname">pycbc.population.fgmc_functions.</code><code class="descname">ifos_from_combo</code><span class="sig-paren">(</span><em>ct</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#ifos_from_combo"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.ifos_from_combo" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.fgmc_functions.type_in_time">
+<code class="descclassname">pycbc.population.fgmc_functions.</code><code class="descname">type_in_time</code><span class="sig-paren">(</span><em>ct</em>, <em>cty</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#type_in_time"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.type_in_time" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="class">
+<dt id="pycbc.population.fgmc_functions.EventRate">
+<em class="property">class </em><code class="descclassname">pycbc.population.fgmc_functions.</code><code class="descname">EventRate</code><span class="sig-paren">(</span><em>args</em>, <em>coinc_times</em>, <em>coinc_types=None</em>, <em>bin_param='mchirp'</em>, <em>bin_lo=None</em>, <em>bin_hi=None</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#EventRate"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.EventRate" title="Permalink to this definition">¶</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3/library/functions.html#object" title="(in Python v3.10)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<dl class="method">
+<dt id="pycbc.population.fgmc_functions.EventRate.add_bank">
+<code class="descname">add_bank</code><span class="sig-paren">(</span><em>bank_file</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#EventRate.add_bank"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.EventRate.add_bank" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="method">
+<dt id="pycbc.population.fgmc_functions.EventRate.filter_templates">
+<code class="descname">filter_templates</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#EventRate.filter_templates"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.EventRate.filter_templates" title="Permalink to this definition">¶</a></dt>
+<dd><p>calculate array of Booleans in template id order to filter events</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="pycbc.population.fgmc_functions.EventRate.get_ctypes">
+<code class="descname">get_ctypes</code><span class="sig-paren">(</span><em>tdict</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#EventRate.get_ctypes"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.EventRate.get_ctypes" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="method">
+<dt id="pycbc.population.fgmc_functions.EventRate.get_livetimes">
+<code class="descname">get_livetimes</code><span class="sig-paren">(</span><em>fi</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#EventRate.get_livetimes"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.EventRate.get_livetimes" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="method">
+<dt id="pycbc.population.fgmc_functions.EventRate.in_coinc_time_excl">
+<code class="descname">in_coinc_time_excl</code><span class="sig-paren">(</span><em>f</em>, <em>cstring</em>, <em>test_times</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#EventRate.in_coinc_time_excl"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.EventRate.in_coinc_time_excl" title="Permalink to this definition">¶</a></dt>
+<dd><p>filter to all times where exactly the ifos in cstring are observing</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="pycbc.population.fgmc_functions.EventRate.make_bins">
+<code class="descname">make_bins</code><span class="sig-paren">(</span><em>maxval</em>, <em>choice='bg'</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#EventRate.make_bins"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.EventRate.make_bins" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="method">
+<dt id="pycbc.population.fgmc_functions.EventRate.moreifotimes">
+<code class="descname">moreifotimes</code><span class="sig-paren">(</span><em>ctstring</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#EventRate.moreifotimes"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.EventRate.moreifotimes" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="class">
+<dt id="pycbc.population.fgmc_functions.ForegroundEvents">
+<em class="property">class </em><code class="descclassname">pycbc.population.fgmc_functions.</code><code class="descname">ForegroundEvents</code><span class="sig-paren">(</span><em>args</em>, <em>coinc_times</em>, <em>coinc_types=None</em>, <em>bin_param='mchirp'</em>, <em>bin_lo=None</em>, <em>bin_hi=None</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#ForegroundEvents"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.ForegroundEvents" title="Permalink to this definition">¶</a></dt>
+<dd><p>Bases: <a class="reference internal" href="#pycbc.population.fgmc_functions.EventRate" title="pycbc.population.fgmc_functions.EventRate"><code class="xref py py-class docutils literal notranslate"><span class="pre">pycbc.population.fgmc_functions.EventRate</span></code></a></p>
+<dl class="method">
+<dt id="pycbc.population.fgmc_functions.ForegroundEvents.add_zerolag">
+<code class="descname">add_zerolag</code><span class="sig-paren">(</span><em>full_file</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#ForegroundEvents.add_zerolag"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.ForegroundEvents.add_zerolag" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="method">
+<dt id="pycbc.population.fgmc_functions.ForegroundEvents.get_bg_pdf">
+<code class="descname">get_bg_pdf</code><span class="sig-paren">(</span><em>bg_rate</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#ForegroundEvents.get_bg_pdf"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.ForegroundEvents.get_bg_pdf" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="method">
+<dt id="pycbc.population.fgmc_functions.ForegroundEvents.get_sg_pdf">
+<code class="descname">get_sg_pdf</code><span class="sig-paren">(</span><em>sg_rate</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#ForegroundEvents.get_sg_pdf"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.ForegroundEvents.get_sg_pdf" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="class">
+<dt id="pycbc.population.fgmc_functions.BackgroundEventRate">
+<em class="property">class </em><code class="descclassname">pycbc.population.fgmc_functions.</code><code class="descname">BackgroundEventRate</code><span class="sig-paren">(</span><em>args</em>, <em>coinc_times</em>, <em>coinc_types=None</em>, <em>bin_param='mchirp'</em>, <em>bin_lo=None</em>, <em>bin_hi=None</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#BackgroundEventRate"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.BackgroundEventRate" title="Permalink to this definition">¶</a></dt>
+<dd><p>Bases: <a class="reference internal" href="#pycbc.population.fgmc_functions.EventRate" title="pycbc.population.fgmc_functions.EventRate"><code class="xref py py-class docutils literal notranslate"><span class="pre">pycbc.population.fgmc_functions.EventRate</span></code></a></p>
+<dl class="method">
+<dt id="pycbc.population.fgmc_functions.BackgroundEventRate.add_background">
+<code class="descname">add_background</code><span class="sig-paren">(</span><em>full_file</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#BackgroundEventRate.add_background"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.BackgroundEventRate.add_background" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="method">
+<dt id="pycbc.population.fgmc_functions.BackgroundEventRate.eval_pdf">
+<code class="descname">eval_pdf</code><span class="sig-paren">(</span><em>chunk</em>, <em>ctime</em>, <em>ctype</em>, <em>statvals</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#BackgroundEventRate.eval_pdf"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.BackgroundEventRate.eval_pdf" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="method">
+<dt id="pycbc.population.fgmc_functions.BackgroundEventRate.get_norms">
+<code class="descname">get_norms</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#BackgroundEventRate.get_norms"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.BackgroundEventRate.get_norms" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="method">
+<dt id="pycbc.population.fgmc_functions.BackgroundEventRate.plot_bg">
+<code class="descname">plot_bg</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#BackgroundEventRate.plot_bg"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.BackgroundEventRate.plot_bg" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="class">
+<dt id="pycbc.population.fgmc_functions.SignalEventRate">
+<em class="property">class </em><code class="descclassname">pycbc.population.fgmc_functions.</code><code class="descname">SignalEventRate</code><span class="sig-paren">(</span><em>args</em>, <em>coinc_times</em>, <em>coinc_types=None</em>, <em>bin_param='mchirp'</em>, <em>bin_lo=None</em>, <em>bin_hi=None</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#SignalEventRate"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.SignalEventRate" title="Permalink to this definition">¶</a></dt>
+<dd><p>Bases: <a class="reference internal" href="#pycbc.population.fgmc_functions.EventRate" title="pycbc.population.fgmc_functions.EventRate"><code class="xref py py-class docutils literal notranslate"><span class="pre">pycbc.population.fgmc_functions.EventRate</span></code></a></p>
+<dl class="method">
+<dt id="pycbc.population.fgmc_functions.SignalEventRate.add_injections">
+<code class="descname">add_injections</code><span class="sig-paren">(</span><em>inj_file</em>, <em>fg_file</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#SignalEventRate.add_injections"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.SignalEventRate.add_injections" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="method">
+<dt id="pycbc.population.fgmc_functions.SignalEventRate.eval_pdf">
+<code class="descname">eval_pdf</code><span class="sig-paren">(</span><em>chunk</em>, <em>ctime</em>, <em>ctype</em>, <em>statvals</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#SignalEventRate.eval_pdf"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.SignalEventRate.eval_pdf" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="method">
+<dt id="pycbc.population.fgmc_functions.SignalEventRate.get_norms">
+<code class="descname">get_norms</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#SignalEventRate.get_norms"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.SignalEventRate.get_norms" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="method">
+<dt id="pycbc.population.fgmc_functions.SignalEventRate.make_all_bins">
+<code class="descname">make_all_bins</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#SignalEventRate.make_all_bins"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.SignalEventRate.make_all_bins" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="method">
+<dt id="pycbc.population.fgmc_functions.SignalEventRate.plot_inj">
+<code class="descname">plot_inj</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_functions.html#SignalEventRate.plot_inj"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_functions.SignalEventRate.plot_inj" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+</div>
+<div class="section" id="module-pycbc.population.fgmc_laguerre">
+<span id="pycbc-population-fgmc-laguerre-module"></span><h2>pycbc.population.fgmc_laguerre module<a class="headerlink" href="#module-pycbc.population.fgmc_laguerre" title="Permalink to this headline">¶</a></h2>
+<p>Based ultimately on code used for O1 rate calculations, see
+<a class="reference external" href="https://git.ligo.org/RatesAndPopulations/lvc-rates-and-pop/-/blob/master/bin/O1_scripts/lvc_rates_calc_posterior">https://git.ligo.org/RatesAndPopulations/lvc-rates-and-pop/-/blob/master/bin/O1_scripts/lvc_rates_calc_posterior</a>
+and technical documentation at <a class="reference external" href="https://dcc.ligo.org/LIGO-T1700029/public">https://dcc.ligo.org/LIGO-T1700029/public</a></p>
+<dl class="class">
+<dt id="pycbc.population.fgmc_laguerre.augmented_rv_continuous">
+<em class="property">class </em><code class="descclassname">pycbc.population.fgmc_laguerre.</code><code class="descname">augmented_rv_continuous</code><span class="sig-paren">(</span><em>unit='dimensionless'</em>, <em>texunit='\mbox{dimensionless}'</em>, <em>texsymb='x'</em>, <em>**kwargs</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_laguerre.html#augmented_rv_continuous"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_laguerre.augmented_rv_continuous" title="Permalink to this definition">¶</a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">scipy.stats._distn_infrastructure.rv_continuous</span></code></p>
+<dl class="method">
+<dt id="pycbc.population.fgmc_laguerre.augmented_rv_continuous.hpd_interval">
+<code class="descname">hpd_interval</code><span class="sig-paren">(</span><em>alpha</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_laguerre.html#augmented_rv_continuous.hpd_interval"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_laguerre.augmented_rv_continuous.hpd_interval" title="Permalink to this definition">¶</a></dt>
+<dd><p>Confidence interval of highest probability density.</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><strong>alpha</strong> (<em>array_like of float</em>) – Probability that an rv will be drawn from the returned range.
+Each value should be in the range [0, 1].</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><strong>a, b</strong> – end-points of range that contain <code class="docutils literal notranslate"><span class="pre">100</span> <span class="pre">*</span> <span class="pre">alpha</span> <span class="pre">%</span></code> of the rv’s
+possible values.</td>
+</tr>
+<tr class="field-odd field"><th class="field-name">Return type:</th><td class="field-body">ndarray of float</td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="class">
+<dt id="pycbc.population.fgmc_laguerre.count_posterior">
+<em class="property">class </em><code class="descclassname">pycbc.population.fgmc_laguerre.</code><code class="descname">count_posterior</code><span class="sig-paren">(</span><em>logbf</em>, <em>laguerre_n</em>, <em>Lambda0</em>, <em>prior=-0.5</em>, <em>name='count posterior'</em>, <em>unit='signals/experiment'</em>, <em>texunit='\mathrm{signals}/\mathrm{experiment}'</em>, <em>texsymb='\Lambda_1'</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_laguerre.html#count_posterior"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_laguerre.count_posterior" title="Permalink to this definition">¶</a></dt>
+<dd><p>Bases: <a class="reference internal" href="#pycbc.population.fgmc_laguerre.augmented_rv_continuous" title="pycbc.population.fgmc_laguerre.augmented_rv_continuous"><code class="xref py py-class docutils literal notranslate"><span class="pre">pycbc.population.fgmc_laguerre.augmented_rv_continuous</span></code></a></p>
+<p>Count posterior distribution.</p>
+<dl class="method">
+<dt id="pycbc.population.fgmc_laguerre.count_posterior.expect">
+<code class="descname">expect</code><span class="sig-paren">(</span><em>func</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_laguerre.html#count_posterior.expect"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_laguerre.count_posterior.expect" title="Permalink to this definition">¶</a></dt>
+<dd><dl class="docutils">
+<dt>Calculate expected value of a function with respect to the</dt>
+<dd>distribution.</dd>
+</dl>
+<p>The expected value of a function <code class="docutils literal notranslate"><span class="pre">f(x)</span></code> with respect to a
+distribution <code class="docutils literal notranslate"><span class="pre">dist</span></code> is defined as:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">E</span><span class="p">[</span><span class="n">x</span><span class="p">]</span> <span class="o">=</span> <span class="n">Integral</span><span class="p">(</span><span class="n">f</span><span class="p">(</span><span class="n">x</span><span class="p">)</span> <span class="o">*</span> <span class="n">dist</span><span class="o">.</span><span class="n">pdf</span><span class="p">(</span><span class="n">x</span><span class="p">))</span>
+</pre></div>
+</div>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><strong>func</strong> (<em>callable</em>) – Function for which integral is calculated. Takes only one argument.</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><strong>expect</strong> – The calculated expected value.</td>
+</tr>
+<tr class="field-odd field"><th class="field-name">Return type:</th><td class="field-body"><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)">float</a></td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+<dl class="method">
+<dt id="pycbc.population.fgmc_laguerre.count_posterior.p_bg">
+<code class="descname">p_bg</code><span class="sig-paren">(</span><em>logbf</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_laguerre.html#count_posterior.p_bg"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_laguerre.count_posterior.p_bg" title="Permalink to this definition">¶</a></dt>
+<dd><p>Calculate the false alarm probabilities of the events.</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><strong>logbf</strong> (<em>array_like</em>) – Logs of foreground over background probability ratios of events.</td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+</dd></dl>
+
+</div>
+<div class="section" id="module-pycbc.population.fgmc_plots">
+<span id="pycbc-population-fgmc-plots-module"></span><h2>pycbc.population.fgmc_plots module<a class="headerlink" href="#module-pycbc.population.fgmc_plots" title="Permalink to this headline">¶</a></h2>
+<dl class="function">
+<dt id="pycbc.population.fgmc_plots.plotdist">
+<code class="descclassname">pycbc.population.fgmc_plots.</code><code class="descname">plotdist</code><span class="sig-paren">(</span><em>rv</em>, <em>plot_lim=None</em>, <em>middle=None</em>, <em>credible_intervals=None</em>, <em>style='linear'</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_plots.html#plotdist"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_plots.plotdist" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.fgmc_plots.odds_summary">
+<code class="descclassname">pycbc.population.fgmc_plots.</code><code class="descname">odds_summary</code><span class="sig-paren">(</span><em>args</em>, <em>rankstats</em>, <em>ifars</em>, <em>p_b</em>, <em>ntop</em>, <em>times=None</em>, <em>mchirps=None</em>, <em>name='events'</em>, <em>plot_extensions=None</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_plots.html#odds_summary"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_plots.odds_summary" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.fgmc_plots.dist_summary">
+<code class="descclassname">pycbc.population.fgmc_plots.</code><code class="descname">dist_summary</code><span class="sig-paren">(</span><em>args</em>, <em>rv</em>, <em>plot_styles=('linear'</em>, <em>'loglog'</em>, <em>'semilogx')</em>, <em>plot_extensions=None</em>, <em>middle=None</em>, <em>credible_intervals=None</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/fgmc_plots.html#dist_summary"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.fgmc_plots.dist_summary" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+</div>
+<div class="section" id="module-pycbc.population.population_models">
+<span id="pycbc-population-population-models-module"></span><h2>pycbc.population.population_models module<a class="headerlink" href="#module-pycbc.population.population_models" title="Permalink to this headline">¶</a></h2>
+<p>This module provides functions for star formation rate models, time delay
+models, merger rate density, and population models of BBH/BNS/NSBH.</p>
+<dl class="function">
+<dt id="pycbc.population.population_models.sfr_grb_2008">
+<code class="descclassname">pycbc.population.population_models.</code><code class="descname">sfr_grb_2008</code><span class="sig-paren">(</span><em>z</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/population_models.html#sfr_grb_2008"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.population_models.sfr_grb_2008" title="Permalink to this definition">¶</a></dt>
+<dd><p>The star formation rate (SFR) calibrated by high-z GRBs data.</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><strong>z</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)"><em>float</em></a>) – The redshift.</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><strong>rho_z</strong> – The SFR at redshift z, in unit of “Msolar/Mpc^3/yr”.</td>
+</tr>
+<tr class="field-odd field"><th class="field-name">Return type:</th><td class="field-body"><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)">float</a></td>
+</tr>
+</tbody>
+</table>
+<div class="admonition note">
+<p class="first admonition-title">Note</p>
+<p class="last">Please see Eq.(5) in &lt;arXiv:0804.4008&gt; for more details.</p>
+</div>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.population_models.sfr_madau_dickinson_2014">
+<code class="descclassname">pycbc.population.population_models.</code><code class="descname">sfr_madau_dickinson_2014</code><span class="sig-paren">(</span><em>z</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/population_models.html#sfr_madau_dickinson_2014"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.population_models.sfr_madau_dickinson_2014" title="Permalink to this definition">¶</a></dt>
+<dd><p>The madau-dickinson 2014 star formation rate (SFR).</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><strong>z</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)"><em>float</em></a>) – The redshift.</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><strong>rho_z</strong> – The SFR at redshift z, in unit of “Msolar/Mpc^3/yr”.</td>
+</tr>
+<tr class="field-odd field"><th class="field-name">Return type:</th><td class="field-body"><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)">float</a></td>
+</tr>
+</tbody>
+</table>
+<p class="rubric">Notes</p>
+<p>Pease see Eq.(15) in &lt;arXiv:1403.0007&gt; for more details.</p>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.population_models.sfr_madau_fragos_2017">
+<code class="descclassname">pycbc.population.population_models.</code><code class="descname">sfr_madau_fragos_2017</code><span class="sig-paren">(</span><em>z</em>, <em>k_imf=0.66</em>, <em>mode='high'</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/population_models.html#sfr_madau_fragos_2017"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.population_models.sfr_madau_fragos_2017" title="Permalink to this definition">¶</a></dt>
+<dd><dl class="docutils">
+<dt>The madau-fragos 2017 star formation rate (SFR),</dt>
+<dd>which updates madau-dickinson 2014 SFR by better reproducing
+a number of recent 4 &lt; z &lt; 10 results.</dd>
+</dl>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><ul class="first simple">
+<li><strong>z</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)"><em>float</em></a>) – The redshift.</li>
+<li><strong>k_imf</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)"><em>float</em></a>) – The correction factor KIMF adjusts the SFR for the assumed IMF,
+for the Salpeter IMF, k_imf=1.0, for the  three component broken
+power-law Kroupa IMF, k_imf=0.66, here we choose Kroupa IMF as default.</li>
+<li><strong>model</strong> (<em>string</em>) – The model of SFR, choose from ‘high’ and ‘low’. Default to ‘high’.</li>
+</ul>
+</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><p class="first"><strong>rho_z</strong> – The SFR at redshift z, in unit of “Msolar/Mpc^3/yr”.</p>
+</td>
+</tr>
+<tr class="field-odd field"><th class="field-name">Return type:</th><td class="field-body"><p class="first last"><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)">float</a></p>
+</td>
+</tr>
+</tbody>
+</table>
+<p class="rubric">Notes</p>
+<p>Pease see &lt;arXiv:1606.07887&gt; and &lt;arXiv:1706.07053&gt; for more details.</p>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.population_models.diff_lookback_time">
+<code class="descclassname">pycbc.population.population_models.</code><code class="descname">diff_lookback_time</code><span class="sig-paren">(</span><em>z</em>, <em>**kwargs</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/population_models.html#diff_lookback_time"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.population_models.diff_lookback_time" title="Permalink to this definition">¶</a></dt>
+<dd><dl class="docutils">
+<dt>The derivative of lookback time t(z)</dt>
+<dd>with respect to redshit z.</dd>
+</dl>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><strong>z</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)"><em>float</em></a>) – The redshift.</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><ul class="simple">
+<li><strong>dt_dz</strong> (<em>float</em>) – The value of dt/dz at the redshift z.</li>
+<li><em>**kwargs</em> – All other keyword args are passed to <code class="xref py py-func docutils literal notranslate"><span class="pre">get_cosmology()</span></code> to
+select a cosmology. If none provided, will use
+<code class="xref py py-attr docutils literal notranslate"><span class="pre">DEFAULT_COSMOLOGY</span></code>.</li>
+</ul>
+</td>
+</tr>
+</tbody>
+</table>
+<p class="rubric">Notes</p>
+<p>Pease see Eq.(A3) in &lt;arXiv:2011.02717v3&gt; for more details.</p>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.population_models.p_tau">
+<code class="descclassname">pycbc.population.population_models.</code><code class="descname">p_tau</code><span class="sig-paren">(</span><em>tau</em>, <em>td_model='inverse'</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/population_models.html#p_tau"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.population_models.p_tau" title="Permalink to this definition">¶</a></dt>
+<dd><p>The probability distribution of the time delay.</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><ul class="first simple">
+<li><strong>tau</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)"><em>float</em></a>) – The merger delay time from the
+formation of the binary system and the orbital
+decay timescale through gravitational wave radiation.</li>
+<li><strong>td_model</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.10)"><em>str</em></a>) – The time delay model.</li>
+</ul>
+</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><p class="first"><strong>p_t</strong> – The probability at time delay tau.</p>
+</td>
+</tr>
+<tr class="field-odd field"><th class="field-name">Return type:</th><td class="field-body"><p class="first last"><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)">float</a></p>
+</td>
+</tr>
+</tbody>
+</table>
+<p class="rubric">Notes</p>
+<p>Pease see the Appendix in &lt;arXiv:2011.02717v3&gt; for more details.</p>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.population_models.merger_rate_density">
+<code class="descclassname">pycbc.population.population_models.</code><code class="descname">merger_rate_density</code><span class="sig-paren">(</span><em>sfr_func</em>, <em>td_model</em>, <em>rho_local</em>, <em>maxz=10.0</em>, <em>npoints=10000</em>, <em>z_array=None</em>, <em>**kwargs</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/population_models.html#merger_rate_density"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.population_models.merger_rate_density" title="Permalink to this definition">¶</a></dt>
+<dd><dl class="docutils">
+<dt>This function uses the symbolic integral to calculate</dt>
+<dd>the merger rate density of CBC sources. This function converts the
+convolution of the star formation rate SFR(tau) and the time delay
+probability P(tau) on the time delay ‘tau’ into the convolution on
+the redshift ‘z’. This function relies on <cite>convolution_trans</cite>.</dd>
+</dl>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><ul class="first simple">
+<li><strong>sfr_func</strong> (<em>function</em>) – The star formation rate function used in the convolution.</li>
+<li><strong>td_model</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.10)"><em>str</em></a>) – The name of time delay model.</li>
+<li><strong>rho_local</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)"><em>float</em></a>) – The local merger rate of a certain type of CBC source.
+In the unit of “Mpc^-3yr^-1”.</li>
+<li><strong>maxz</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)"><em>float</em></a>) – The max redshift. The default value is 10.</li>
+<li><strong>npoints</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.10)"><em>int</em></a>) – The number of points used in the interpolation. The default
+value is 10000.</li>
+<li><strong>z_array</strong> (<em>numpy.array</em>) – The array of redshift. The default value is None.</li>
+<li><strong>**kwargs</strong> – All other keyword args are passed to <code class="xref py py-func docutils literal notranslate"><span class="pre">get_cosmology()</span></code> to
+select a cosmology. If none provided, will use
+<code class="xref py py-attr docutils literal notranslate"><span class="pre">DEFAULT_COSMOLOGY</span></code>.</li>
+</ul>
+</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><p class="first"><strong>rho_z</strong> – The merger rate density.</p>
+</td>
+</tr>
+<tr class="field-odd field"><th class="field-name">Return type:</th><td class="field-body"><p class="first last">scipy.interpolate.interp1d</p>
+</td>
+</tr>
+</tbody>
+</table>
+<p class="rubric">Notes</p>
+<p>Pease see Eq.(A1), Eq.(A2) in &lt;arXiv:2011.02717v3&gt; for more details.</p>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.population_models.coalescence_rate">
+<code class="descclassname">pycbc.population.population_models.</code><code class="descname">coalescence_rate</code><span class="sig-paren">(</span><em>rate_den</em>, <em>maxz=10.0</em>, <em>npoints=10000</em>, <em>z_array=None</em>, <em>**kwargs</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/population_models.html#coalescence_rate"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.population_models.coalescence_rate" title="Permalink to this definition">¶</a></dt>
+<dd><p>This function calculates the coalescence(merger) rate at the redshift z.</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><ul class="first simple">
+<li><strong>rate_den</strong> (<em>function</em><em> or </em><em>scipy.interpolate.interp1d</em>) – The merger rate density as a function of redshift. In the unit of
+“Mpc^-3yr^-1”. Use <cite>merger_rate_density</cite> function to calculate.</li>
+<li><strong>maxz</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)"><em>float</em></a>) – The max redshift. The default value is 10.</li>
+<li><strong>npoints</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.10)"><em>int</em></a>) – The number of points used in the interpolation. The default
+value is 10000.</li>
+<li><strong>z_array</strong> (<em>numpy.array</em><em> or </em><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#list" title="(in Python v3.10)"><em>list</em></a>) – The redshift range. The default value is None.</li>
+<li><strong>**kwargs</strong> – All other keyword args are passed to <code class="xref py py-func docutils literal notranslate"><span class="pre">get_cosmology()</span></code> to
+select a cosmology. If none provided, will use
+<code class="xref py py-attr docutils literal notranslate"><span class="pre">DEFAULT_COSMOLOGY</span></code>.</li>
+</ul>
+</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><p class="first"><strong>coalescence_rate_interp</strong> – The coalescence rate.</p>
+</td>
+</tr>
+<tr class="field-odd field"><th class="field-name">Return type:</th><td class="field-body"><p class="first last">scipy.interpolate.interp1d</p>
+</td>
+</tr>
+</tbody>
+</table>
+<p class="rubric">Notes</p>
+<p>Pease see Eq.(1) in &lt;arXiv:2011.02717v3&gt; for more details.</p>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.population_models.norm_redshift_distribution">
+<code class="descclassname">pycbc.population.population_models.</code><code class="descname">norm_redshift_distribution</code><span class="sig-paren">(</span><em>z_array</em>, <em>merger_rate</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/population_models.html#norm_redshift_distribution"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.population_models.norm_redshift_distribution" title="Permalink to this definition">¶</a></dt>
+<dd><dl class="docutils">
+<dt>This function calculates the normalized redshift distribution</dt>
+<dd>of a certain type of CBC source.</dd>
+</dl>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><ul class="first simple">
+<li><strong>z_array</strong> (<em>numpy.array</em>) – The array of redshift.</li>
+<li><strong>merger_rate</strong> (<em>scipy.interpolate.interp1d</em><em> or </em><em>function</em>) – The coalescence rate. Provided by users or calculated by
+the <cite>coalescence_rate</cite> function.</li>
+</ul>
+</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><p class="first"><strong>norm_coalescence_rate</strong> – The normalized redshift distribution.</p>
+</td>
+</tr>
+<tr class="field-odd field"><th class="field-name">Return type:</th><td class="field-body"><p class="first last">numpy.array</p>
+</td>
+</tr>
+</tbody>
+</table>
+<p class="rubric">Notes</p>
+<p>The can be used as a population-informed prior for redshift
+and luminosity distance of CBC sources.</p>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.population_models.total_rate_upto_redshift">
+<code class="descclassname">pycbc.population.population_models.</code><code class="descname">total_rate_upto_redshift</code><span class="sig-paren">(</span><em>z</em>, <em>merger_rate</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/population_models.html#total_rate_upto_redshift"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.population_models.total_rate_upto_redshift" title="Permalink to this definition">¶</a></dt>
+<dd><p>Total rate of occurrences out to some redshift.</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><ul class="first simple">
+<li><strong>z</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.10)"><em>int</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)"><em>float</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#tuple" title="(in Python v3.10)"><em>tuple</em></a><em>, </em><em>numpy.ndarray</em><em> or </em><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#list" title="(in Python v3.10)"><em>list</em></a>) – The redshift.</li>
+<li><strong>merger_rate</strong> (<em>scipy.interpolate.interp1d</em><em> or </em><em>function</em>) – The merger or coalescence rate. Function should take the
+redshift as a single argument. Provided by users or
+calculated by the <cite>coalescence_rate</cite> function.</li>
+</ul>
+</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><p class="first"><strong>rate</strong> – The total rate of occurrences out to some redshift. In the
+unit of “yr^-1”.</p>
+</td>
+</tr>
+<tr class="field-odd field"><th class="field-name">Return type:</th><td class="field-body"><p class="first last"><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)">float</a> or <a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#list" title="(in Python v3.10)">list</a></p>
+</td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.population_models.distance_from_rate">
+<code class="descclassname">pycbc.population.population_models.</code><code class="descname">distance_from_rate</code><span class="sig-paren">(</span><em>total_rate</em>, <em>merger_rate</em>, <em>maxz=10</em>, <em>npoints=10000</em>, <em>**kwargs</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/population_models.html#distance_from_rate"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.population_models.distance_from_rate" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns the luminosity distance from the given total rate value.</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><ul class="first simple">
+<li><strong>total_rate</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)"><em>float</em></a>) – The total rate.</li>
+<li><strong>merger_rate</strong> (<em>scipy.interpolate.interp1d</em><em> or </em><em>function</em>) – The coalescence rate. Provided by users or calculated by
+the <cite>coalescence_rate</cite> function.</li>
+<li><strong>maxz</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)"><em>float</em></a>) – The max redshift in the interpolation, the default value is 10.
+Please use the same <cite>maxz</cite> as in <cite>merger_rate</cite>.</li>
+<li><strong>npoints</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.10)"><em>int</em></a>) – The number of points used in the interpolation, the default value
+is 10000.</li>
+<li><strong>**kwargs</strong> – All other keyword args are passed to <code class="xref py py-func docutils literal notranslate"><span class="pre">get_cosmology()</span></code> to
+select a cosmology. If none provided, will use
+<code class="xref py py-attr docutils literal notranslate"><span class="pre">DEFAULT_COSMOLOGY</span></code>.</li>
+</ul>
+</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><p class="first"><strong>dl</strong> – The luminosity distance at the given total rate value.
+In the unit of “Mpc”.</p>
+</td>
+</tr>
+<tr class="field-odd field"><th class="field-name">Return type:</th><td class="field-body"><p class="first last"><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)">float</a></p>
+</td>
+</tr>
+</tbody>
+</table>
+<p class="rubric">Notes</p>
+<p>This can be used in a population-informed prior for redshift
+and luminosity distance of CBC sources. When this used in
+high redshift range, please first use the <cite>total_rate_upto_redshift</cite>
+function to plot the curve and find the point where the curve
+starts to stay almost horizontal, then set <cite>maxz</cite> to the
+corresponding value and change <cite>npoints</cite> to a reasonable value.</p>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.population_models.average_time_between_signals">
+<code class="descclassname">pycbc.population.population_models.</code><code class="descname">average_time_between_signals</code><span class="sig-paren">(</span><em>z_array</em>, <em>merger_rate</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/population_models.html#average_time_between_signals"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.population_models.average_time_between_signals" title="Permalink to this definition">¶</a></dt>
+<dd><dl class="docutils">
+<dt>This function calculates the average time interval</dt>
+<dd>of a certain type of CBC source.</dd>
+</dl>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><ul class="first simple">
+<li><strong>z_array</strong> (<em>numpy.array</em>) – The array of redshift.</li>
+<li><strong>merger_rate</strong> (<em>scipy.interpolate.interp1d</em><em> or </em><em>function</em>) – The coalescence rate. Provided by users or calculated by
+the <cite>coalescence_rate</cite> function.</li>
+</ul>
+</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><p class="first"><strong>average_time</strong> – The average time interval (s).</p>
+</td>
+</tr>
+<tr class="field-odd field"><th class="field-name">Return type:</th><td class="field-body"><p class="first last"><a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)">float</a></p>
+</td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+</div>
+<div class="section" id="module-pycbc.population.rates_functions">
+<span id="pycbc-population-rates-functions-module"></span><h2>pycbc.population.rates_functions module<a class="headerlink" href="#module-pycbc.population.rates_functions" title="Permalink to this headline">¶</a></h2>
+<p>A set of helper functions for evaluating rates.</p>
+<dl class="function">
+<dt id="pycbc.population.rates_functions.draw_flat_samples">
+<code class="descclassname">pycbc.population.rates_functions.</code><code class="descname">draw_flat_samples</code><span class="sig-paren">(</span><em>**kwargs</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/rates_functions.html#draw_flat_samples"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.rates_functions.draw_flat_samples" title="Permalink to this definition">¶</a></dt>
+<dd><p>Draw samples for uniform in mass</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><strong>**kwargs</strong> (<em>string</em>) – Keyword arguments as model parameters and number of samples</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><ul class="simple">
+<li><em>array</em> – The first mass</li>
+<li><em>array</em> – The second mass</li>
+</ul>
+</td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.rates_functions.draw_imf_samples">
+<code class="descclassname">pycbc.population.rates_functions.</code><code class="descname">draw_imf_samples</code><span class="sig-paren">(</span><em>**kwargs</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/rates_functions.html#draw_imf_samples"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.rates_functions.draw_imf_samples" title="Permalink to this definition">¶</a></dt>
+<dd><p>Draw samples for power-law model</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><strong>**kwargs</strong> (<em>string</em>) – Keyword arguments as model parameters and number of samples</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><ul class="simple">
+<li><em>array</em> – The first mass</li>
+<li><em>array</em> – The second mass</li>
+</ul>
+</td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.rates_functions.draw_lnm_samples">
+<code class="descclassname">pycbc.population.rates_functions.</code><code class="descname">draw_lnm_samples</code><span class="sig-paren">(</span><em>**kwargs</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/rates_functions.html#draw_lnm_samples"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.rates_functions.draw_lnm_samples" title="Permalink to this definition">¶</a></dt>
+<dd><p>Draw samples for uniform-in-log model</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><strong>**kwargs</strong> (<em>string</em>) – Keyword arguments as model parameters and number of samples</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><ul class="simple">
+<li><em>array</em> – The first mass</li>
+<li><em>array</em> – The second mass</li>
+</ul>
+</td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.rates_functions.fgmc">
+<code class="descclassname">pycbc.population.rates_functions.</code><code class="descname">fgmc</code><span class="sig-paren">(</span><em>log_fg_ratios</em>, <em>mu_log_vt</em>, <em>sigma_log_vt</em>, <em>Rf</em>, <em>maxfg</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/rates_functions.html#fgmc"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.rates_functions.fgmc" title="Permalink to this definition">¶</a></dt>
+<dd><p>Function to fit the likelihood Fixme</p>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.rates_functions.fit">
+<code class="descclassname">pycbc.population.rates_functions.</code><code class="descname">fit</code><span class="sig-paren">(</span><em>R</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/rates_functions.html#fit"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.rates_functions.fit" title="Permalink to this definition">¶</a></dt>
+<dd><p>Fit skew - lognormal to the rate samples achived from a prior analysis
+:param R: Rate samples
+:type R: array</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Returns:</th><td class="field-body"><ul class="simple">
+<li><strong>ff[0]</strong> (<em>float</em>) – The skewness</li>
+<li><strong>ff[1]</strong> (<em>float</em>) – The mean</li>
+<li><strong>ff[2]</strong> (<em>float</em>) – The standard deviation</li>
+</ul>
+</td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.rates_functions.log_rho_fgmc">
+<code class="descclassname">pycbc.population.rates_functions.</code><code class="descname">log_rho_fgmc</code><span class="sig-paren">(</span><em>t</em>, <em>injstats</em>, <em>bins</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/rates_functions.html#log_rho_fgmc"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.rates_functions.log_rho_fgmc" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.rates_functions.mchirp_sampler_flat">
+<code class="descclassname">pycbc.population.rates_functions.</code><code class="descname">mchirp_sampler_flat</code><span class="sig-paren">(</span><em>**kwargs</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/rates_functions.html#mchirp_sampler_flat"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.rates_functions.mchirp_sampler_flat" title="Permalink to this definition">¶</a></dt>
+<dd><p>Draw chirp mass samples for flat in mass model</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><strong>**kwargs</strong> (<em>string</em>) – Keyword arguments as model parameters and number of samples</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><strong>mchirp-astro</strong> – The chirp mass samples for the population</td>
+</tr>
+<tr class="field-odd field"><th class="field-name">Return type:</th><td class="field-body">array</td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.rates_functions.mchirp_sampler_imf">
+<code class="descclassname">pycbc.population.rates_functions.</code><code class="descname">mchirp_sampler_imf</code><span class="sig-paren">(</span><em>**kwargs</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/rates_functions.html#mchirp_sampler_imf"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.rates_functions.mchirp_sampler_imf" title="Permalink to this definition">¶</a></dt>
+<dd><p>Draw chirp mass samples for power-law model</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><strong>**kwargs</strong> (<em>string</em>) – Keyword arguments as model parameters and number of samples</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><strong>mchirp-astro</strong> – The chirp mass samples for the population</td>
+</tr>
+<tr class="field-odd field"><th class="field-name">Return type:</th><td class="field-body">array</td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.rates_functions.mchirp_sampler_lnm">
+<code class="descclassname">pycbc.population.rates_functions.</code><code class="descname">mchirp_sampler_lnm</code><span class="sig-paren">(</span><em>**kwargs</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/rates_functions.html#mchirp_sampler_lnm"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.rates_functions.mchirp_sampler_lnm" title="Permalink to this definition">¶</a></dt>
+<dd><p>Draw chirp mass samples for uniform-in-log model</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><strong>**kwargs</strong> (<em>string</em>) – Keyword arguments as model parameters and number of samples</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><strong>mchirp-astro</strong> – The chirp mass samples for the population</td>
+</tr>
+<tr class="field-odd field"><th class="field-name">Return type:</th><td class="field-body">array</td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.rates_functions.prob_flat">
+<code class="descclassname">pycbc.population.rates_functions.</code><code class="descname">prob_flat</code><span class="sig-paren">(</span><em>m1</em>, <em>m2</em>, <em>s1z</em>, <em>s2z</em>, <em>**kwargs</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/rates_functions.html#prob_flat"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.rates_functions.prob_flat" title="Permalink to this definition">¶</a></dt>
+<dd><p>Return probability density for uniform in component mass
+:param m1: Component masses 1
+:type m1: array
+:param m2: Component masses 2
+:type m2: array
+:param s1z: Aligned spin 1 (not in use currently)
+:type s1z: array
+:param s2z: Aligned spin 2 (not in use currently)
+:param **kwargs: Keyword arguments as model parameters
+:type **kwargs: string</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Returns:</th><td class="field-body"><strong>p_m1_m2</strong> – the probability density for m1, m2 pair</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Return type:</th><td class="field-body">array</td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.rates_functions.prob_imf">
+<code class="descclassname">pycbc.population.rates_functions.</code><code class="descname">prob_imf</code><span class="sig-paren">(</span><em>m1</em>, <em>m2</em>, <em>s1z</em>, <em>s2z</em>, <em>**kwargs</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/rates_functions.html#prob_imf"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.rates_functions.prob_imf" title="Permalink to this definition">¶</a></dt>
+<dd><p>Return probability density for power-law
+:param m1: Component masses 1
+:type m1: array
+:param m2: Component masses 2
+:type m2: array
+:param s1z: Aligned spin 1(Not in use currently)
+:type s1z: array
+:param s2z: Aligned spin 2(Not in use currently)
+:param **kwargs: Keyword arguments as model parameters
+:type **kwargs: string</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Returns:</th><td class="field-body"><strong>p_m1_m2</strong> – the probability density for m1, m2 pair</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Return type:</th><td class="field-body">array</td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.rates_functions.prob_lnm">
+<code class="descclassname">pycbc.population.rates_functions.</code><code class="descname">prob_lnm</code><span class="sig-paren">(</span><em>m1</em>, <em>m2</em>, <em>s1z</em>, <em>s2z</em>, <em>**kwargs</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/rates_functions.html#prob_lnm"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.rates_functions.prob_lnm" title="Permalink to this definition">¶</a></dt>
+<dd><p>Return probability density for uniform in log
+:param m1: Component masses 1
+:type m1: array
+:param m2: Component masses 2
+:type m2: array
+:param s1z: Aligned spin 1(Not in use currently)
+:type s1z: array
+:param s2z: Aligned spin 2(Not in use currently)
+:param **kwargs: Keyword arguments as model parameters
+:type **kwargs: string</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Returns:</th><td class="field-body"><strong>p_m1_m2</strong> – The probability density for m1, m2 pair</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Return type:</th><td class="field-body">array</td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.rates_functions.process_full_data">
+<code class="descclassname">pycbc.population.rates_functions.</code><code class="descname">process_full_data</code><span class="sig-paren">(</span><em>fname</em>, <em>rhomin</em>, <em>mass1</em>, <em>mass2</em>, <em>lo_mchirp</em>, <em>hi_mchirp</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/rates_functions.html#process_full_data"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.rates_functions.process_full_data" title="Permalink to this definition">¶</a></dt>
+<dd><p>Read the zero-lag and time-lag triggers identified by templates in
+a specified range of chirp mass.</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><ul class="first simple">
+<li><strong>hdfile</strong> – File that stores all the triggers</li>
+<li><strong>rhomin</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)"><em>float</em></a>) – Minimum value of SNR threhold (will need including ifar)</li>
+<li><strong>mass1</strong> (<em>array</em>) – First mass of the waveform in the template bank</li>
+<li><strong>mass2</strong> (<em>array</em>) – Second mass of the waveform in the template bank</li>
+<li><strong>lo_mchirp</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)"><em>float</em></a>) – Minimum chirp mass for the template</li>
+<li><strong>hi_mchirp</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)"><em>float</em></a>) – Maximum chirp mass for the template</li>
+</ul>
+</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><p class="first">containing foreground triggers and background information</p>
+</td>
+</tr>
+<tr class="field-odd field"><th class="field-name">Return type:</th><td class="field-body"><p class="first last">dictionary</p>
+</td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.rates_functions.save_bkg_falloff">
+<code class="descclassname">pycbc.population.rates_functions.</code><code class="descname">save_bkg_falloff</code><span class="sig-paren">(</span><em>fname_statmap</em>, <em>fname_bank</em>, <em>path</em>, <em>rhomin</em>, <em>lo_mchirp</em>, <em>hi_mchirp</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/rates_functions.html#save_bkg_falloff"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.rates_functions.save_bkg_falloff" title="Permalink to this definition">¶</a></dt>
+<dd><p>Read the STATMAP files to derive snr falloff for the background events.
+Save the output to a txt file
+Bank file is also provided to restrict triggers to BBH templates.</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><ul class="first last simple">
+<li><strong>fname_statmap</strong> (<em>string</em>) – STATMAP file containing trigger information</li>
+<li><strong>fname_bank</strong> (<em>string</em>) – File name of the template bank</li>
+<li><strong>path</strong> (<em>string</em>) – Destination where txt file is saved</li>
+<li><strong>rhomin</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)"><em>float</em></a>) – Minimum value of SNR threhold (will need including ifar)</li>
+<li><strong>lo_mchirp</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)"><em>float</em></a>) – Minimum chirp mass for the template</li>
+<li><strong>hi_mchirp</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)"><em>float</em></a>) – Maximum chirp mass for template</li>
+</ul>
+</td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.rates_functions.skew_lognormal_samples">
+<code class="descclassname">pycbc.population.rates_functions.</code><code class="descname">skew_lognormal_samples</code><span class="sig-paren">(</span><em>alpha</em>, <em>mu</em>, <em>sigma</em>, <em>minrp</em>, <em>maxrp</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/rates_functions.html#skew_lognormal_samples"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.rates_functions.skew_lognormal_samples" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns a large number of Skew lognormal samples
+:param alpha: Skewness of the distribution
+:type alpha: float
+:param mu: Mean of the distribution
+:type mu: float
+:param sigma: Scale of the distribution
+:type sigma: float
+:param minrp: Minimum value for the samples
+:type minrp: float
+:param maxrp: Maximum value for the samples
+:type maxrp: float</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Returns:</th><td class="field-body"><strong>Rfs</strong> – Large number of samples (may need fixing)</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Return type:</th><td class="field-body">array</td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+</div>
+<div class="section" id="module-pycbc.population.scale_injections">
+<span id="pycbc-population-scale-injections-module"></span><h2>pycbc.population.scale_injections module<a class="headerlink" href="#module-pycbc.population.scale_injections" title="Permalink to this headline">¶</a></h2>
+<dl class="function">
+<dt id="pycbc.population.scale_injections.astro_redshifts">
+<code class="descclassname">pycbc.population.scale_injections.</code><code class="descname">astro_redshifts</code><span class="sig-paren">(</span><em>min_z</em>, <em>max_z</em>, <em>nsamples</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/scale_injections.html#astro_redshifts"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.scale_injections.astro_redshifts" title="Permalink to this definition">¶</a></dt>
+<dd><dl class="docutils">
+<dt>Sample the redshifts for sources, with redshift</dt>
+<dd>independent rate, using standard cosmology</dd>
+</dl>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><ul class="first simple">
+<li><strong>min_z</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)"><em>float</em></a>) – Minimum redshift</li>
+<li><strong>max_z</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)"><em>float</em></a>) – Maximum redshift</li>
+<li><strong>nsamples</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.10)"><em>int</em></a>) – Number of samples</li>
+</ul>
+</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><p class="first"><strong>z_astro</strong> – nsamples of redshift, between min_z, max_z, by standard cosmology</p>
+</td>
+</tr>
+<tr class="field-odd field"><th class="field-name">Return type:</th><td class="field-body"><p class="first last">array</p>
+</td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.scale_injections.contracted_dVdc">
+<code class="descclassname">pycbc.population.scale_injections.</code><code class="descname">contracted_dVdc</code><span class="sig-paren">(</span><em>z</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/scale_injections.html#contracted_dVdc"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.scale_injections.contracted_dVdc" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.scale_injections.dlum_to_z">
+<code class="descclassname">pycbc.population.scale_injections.</code><code class="descname">dlum_to_z</code><span class="sig-paren">(</span><em>dl</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/scale_injections.html#dlum_to_z"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.scale_injections.dlum_to_z" title="Permalink to this definition">¶</a></dt>
+<dd><p>Get the redshift for a luminosity distance</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><strong>dl</strong> (<em>array</em>) – The array of luminosity distances</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body">The redshift values corresponding to the luminosity distances</td>
+</tr>
+<tr class="field-odd field"><th class="field-name">Return type:</th><td class="field-body">array</td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.scale_injections.estimate_vt">
+<code class="descclassname">pycbc.population.scale_injections.</code><code class="descname">estimate_vt</code><span class="sig-paren">(</span><em>injections</em>, <em>mchirp_sampler</em>, <em>model_pdf</em>, <em>**kwargs</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/scale_injections.html#estimate_vt"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.scale_injections.estimate_vt" title="Permalink to this definition">¶</a></dt>
+<dd><p>Based on injection strategy and the desired astro model estimate the injected volume.
+Scale injections and estimate sensitive volume.</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><ul class="first simple">
+<li><strong>injections</strong> (<em>dictionary</em>) – Dictionary obtained after reading injections from read_injections</li>
+<li><strong>mchirp_sampler</strong> (<em>function</em>) – Sampler for producing chirp mass samples for the astro model.</li>
+<li><strong>model_pdf</strong> (<em>function</em>) – The PDF for astro model in mass1-mass2-spin1z-spin2z space.
+This is easily extendible to include precession</li>
+<li><strong>kwargs</strong> (<em>key words</em>) – Inputs for thresholds and astrophysical models</li>
+</ul>
+</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><p class="first"><strong>injection_chunks</strong> – The input dictionary with VT and VT error included with the injections</p>
+</td>
+</tr>
+<tr class="field-odd field"><th class="field-name">Return type:</th><td class="field-body"><p class="first last">dictionary</p>
+</td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.scale_injections.inj_distance_pdf">
+<code class="descclassname">pycbc.population.scale_injections.</code><code class="descname">inj_distance_pdf</code><span class="sig-paren">(</span><em>key</em>, <em>distance</em>, <em>low_dist</em>, <em>high_dist</em>, <em>mchirp=1</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/scale_injections.html#inj_distance_pdf"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.scale_injections.inj_distance_pdf" title="Permalink to this definition">¶</a></dt>
+<dd><p>Estimate the probability density of the
+injections for the distance distribution.</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><ul class="first last simple">
+<li><strong>key</strong> (<em>string</em>) – Injections strategy</li>
+<li><strong>distance</strong> (<em>array</em>) – Array of distances</li>
+<li><strong>low_dist</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)"><em>float</em></a>) – Lower value of distance used in the injection strategy</li>
+<li><strong>high_dist</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)"><em>float</em></a>) – Higher value of distance used in the injection strategy</li>
+</ul>
+</td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.scale_injections.inj_mass_pdf">
+<code class="descclassname">pycbc.population.scale_injections.</code><code class="descname">inj_mass_pdf</code><span class="sig-paren">(</span><em>key</em>, <em>mass1</em>, <em>mass2</em>, <em>lomass</em>, <em>himass</em>, <em>lomass_2=0</em>, <em>himass_2=0</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/scale_injections.html#inj_mass_pdf"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.scale_injections.inj_mass_pdf" title="Permalink to this definition">¶</a></dt>
+<dd><p>Estimate the probability density based on the injection strategy</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><ul class="first simple">
+<li><strong>key</strong> (<em>string</em>) – Injection strategy</li>
+<li><strong>mass1</strong> (<em>array</em>) – First mass of the injections</li>
+<li><strong>mass2</strong> (<em>array</em>) – Second mass of the injections</li>
+<li><strong>lomass</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)"><em>float</em></a>) – Lower value of the mass distributions</li>
+<li><strong>himass</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)"><em>float</em></a>) – higher value of the mass distribution</li>
+</ul>
+</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><p class="first"><strong>pdf</strong> – Probability density of the injections</p>
+</td>
+</tr>
+<tr class="field-odd field"><th class="field-name">Return type:</th><td class="field-body"><p class="first last">array</p>
+</td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.scale_injections.inj_spin_pdf">
+<code class="descclassname">pycbc.population.scale_injections.</code><code class="descname">inj_spin_pdf</code><span class="sig-paren">(</span><em>key</em>, <em>high_spin</em>, <em>spinz</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/scale_injections.html#inj_spin_pdf"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.scale_injections.inj_spin_pdf" title="Permalink to this definition">¶</a></dt>
+<dd><dl class="docutils">
+<dt>Estimate the probability density of the</dt>
+<dd>injections for the spin distribution.</dd>
+</dl>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><ul class="first last simple">
+<li><strong>key</strong> (<em>string</em>) – Injections strategy</li>
+<li><strong>high_spin</strong> (<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.10)"><em>float</em></a>) – Maximum spin used in the strategy</li>
+<li><strong>spinz</strong> (<em>array</em>) – Spin of the injections (for one component)</li>
+</ul>
+</td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.scale_injections.pdf_z_astro">
+<code class="descclassname">pycbc.population.scale_injections.</code><code class="descname">pdf_z_astro</code><span class="sig-paren">(</span><em>z</em>, <em>V_min</em>, <em>V_max</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/scale_injections.html#pdf_z_astro"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.scale_injections.pdf_z_astro" title="Permalink to this definition">¶</a></dt>
+<dd><p>Get the probability density for the rate of events
+at a redshift assuming standard cosmology</p>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.scale_injections.process_injections">
+<code class="descclassname">pycbc.population.scale_injections.</code><code class="descname">process_injections</code><span class="sig-paren">(</span><em>hdffile</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/scale_injections.html#process_injections"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.scale_injections.process_injections" title="Permalink to this definition">¶</a></dt>
+<dd><p>Function to read in the injection file and
+extract the found injections and all injections</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><strong>hdffile</strong> (<em>hdf file</em>) – File for which injections are to be processed</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><strong>data</strong> – Dictionary containing injection read from the input file</td>
+</tr>
+<tr class="field-odd field"><th class="field-name">Return type:</th><td class="field-body">dictionary</td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+<dl class="function">
+<dt id="pycbc.population.scale_injections.read_injections">
+<code class="descclassname">pycbc.population.scale_injections.</code><code class="descname">read_injections</code><span class="sig-paren">(</span><em>sim_files</em>, <em>m_dist</em>, <em>s_dist</em>, <em>d_dist</em><span class="sig-paren">)</span><a class="reference internal" href="_modules/pycbc/population/scale_injections.html#read_injections"><span class="viewcode-link">[source]</span></a><a class="headerlink" href="#pycbc.population.scale_injections.read_injections" title="Permalink to this definition">¶</a></dt>
+<dd><p>Read all the injections from the files in the provided folder.
+The files must belong to individual set i.e. no files that combine
+all the injections in a run.
+Identify injection strategies and finds parameter boundaries.
+Collect injection according to GPS.</p>
+<table class="docutils field-list" frame="void" rules="none">
+<col class="field-name" />
+<col class="field-body" />
+<tbody valign="top">
+<tr class="field-odd field"><th class="field-name">Parameters:</th><td class="field-body"><ul class="first simple">
+<li><strong>sim_files</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#list" title="(in Python v3.10)"><em>list</em></a>) – List containign names of the simulation files</li>
+<li><strong>m_dist</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#list" title="(in Python v3.10)"><em>list</em></a>) – The mass distribution used in the simulation runs</li>
+<li><strong>s_dist</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#list" title="(in Python v3.10)"><em>list</em></a>) – The spin distribution used in the simulation runs</li>
+<li><strong>d_dist</strong> (<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#list" title="(in Python v3.10)"><em>list</em></a>) – The distance distribution used in the simulation runs</li>
+</ul>
+</td>
+</tr>
+<tr class="field-even field"><th class="field-name">Returns:</th><td class="field-body"><p class="first"><strong>injections</strong> – Contains the organized information about the injections</p>
+</td>
+</tr>
+<tr class="field-odd field"><th class="field-name">Return type:</th><td class="field-body"><p class="first last">dictionary</p>
+</td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+</div>
+<div class="section" id="module-pycbc.population">
+<span id="module-contents"></span><h2>Module contents<a class="headerlink" href="#module-pycbc.population" title="Permalink to this headline">¶</a></h2>
+</div>
+</div>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="pycbc.io.html" class="btn btn-neutral float-left" title="pycbc.io package" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="pycbc.results.html" class="btn btn-neutral float-right" title="pycbc.results package" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2015, 2016, 2017, Alexander Nitz, Ian Harry, Christopher M. Biwer, Duncan A.  Brown, Josh Willis, and Tito Dal Canton.
+      <span class="lastupdated">Last updated on Jan 03, 2022.
+      </span></p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

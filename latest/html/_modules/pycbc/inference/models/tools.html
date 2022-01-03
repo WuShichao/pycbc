@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html class="writer-html4" lang="en" >
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>pycbc.inference.models.tools &mdash; PyCBC 2.0.dev0 documentation</title><link rel="stylesheet" href="../../../../_static/css/theme.css" type="text/css" />
+    <link rel="stylesheet" href="../../../../_static/pygments.css" type="text/css" />
+      <link rel="stylesheet" href="../../../../_static/plot_directive.css" type="text/css" />
+      <link rel="stylesheet" href="../../../../_static/graphviz.css" type="text/css" />
+      <link rel="stylesheet" href="../../../../_static/terminal.css" type="text/css" />
+      <link rel="stylesheet" href="../../../../_static/theme_overrides.css" type="text/css" />
+  <!--[if lt IE 9]>
+    <script src="../../../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  <script id="documentation_options" data-url_root="../../../../" src="../../../../_static/documentation_options.js"></script>
+        <script type="text/javascript" src="../../../../_static/jquery.js"></script>
+        <script type="text/javascript" src="../../../../_static/underscore.js"></script>
+        <script type="text/javascript" src="../../../../_static/doctools.js"></script>
+        <script type="text/javascript" src="../../../../_static/language_data.js"></script>
+        <script type="text/javascript" src="../../../../_static/typed.min.js"></script>
+        <script async="async" type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.5/latest.js?config=TeX-AMS-MML_HTMLorMML"></script>
+    <script src="../../../../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../../../../genindex.html" />
+    <link rel="search" title="Search" href="../../../../search.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+            <a href="../../../../index.html" class="icon icon-home"> PyCBC
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../credit.html">Use of PyCBC in Scientific Publications</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../docker.html">Running PyCBC under Docker</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../install.html">Installing PyCBC</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../install_virtualenv.html">Setting up virtualenv</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../install_lalsuite.html">Installing lalsuite for PyCBC</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../inference.html">PyCBC inference documentation (<code class="docutils literal notranslate"><span class="pre">pycbc.inference</span></code>)</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../workflow/pycbc_make_psd_estimation_workflow.html"><code class="docutils literal notranslate"><span class="pre">pycbc_make_psd_estimation_workflow</span></code>: A workflow generator for noise estimation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../workflow/pycbc_make_coinc_search_workflow.html"><code class="docutils literal notranslate"><span class="pre">pycbc_make_coinc_search_workflow</span></code>: A workflow to search for gravitational waves</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../workflow/pygrb.html"><code class="docutils literal notranslate"><span class="pre">pycbc_make_offline_grb_workflow</span></code>: A GRB triggered CBC analysis workflow generator</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../tmpltbank.html">PyCBC template bank generation documentation (<code class="docutils literal notranslate"><span class="pre">pycbc.tmpltbank</span></code>)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../hwinj.html">Hardware injection waveform generation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../banksim.html">Calculating the Effectualness (Fitting Factor) of Template Banks</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../faithsim.html">Dag Generator for Doing Faithfulness Comparisons</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../upload_to_gracedb.html">Uploading triggers to gracedb</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../waveform_plugin.html">Making new waveform approximants available to PyCBC</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../catalog.html">Catalog of Observed Gravitational-wave Mergers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../dataquality.html">Query times of valid data, hardware injections, and more.</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../frame.html">Reading Gravitational-wave Frames</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../fft.html">Performing FFTs in PyCBC</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../gw150914.html">Signal Processing with GW150914</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../detector.html">Gravitational-wave Detectors</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../psd.html">Handling PSDs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../noise.html">Generating Noise</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../waveform.html">Waveforms</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../filter.html">Filtering</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../distributions.html">Using PyCBC Distributions from PyCBC Inference</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../building_bundled_executables.html">Building Bundled Executables</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../documentation.html">Documenting PyCBC code</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../release.html">Creating Releases of PyCBC</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../formats/hdf_format.html">HDF files within the PyCBC workflow</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../workflow.html">Workflow: the inspiral analysis workflow generator (<code class="docutils literal notranslate"><span class="pre">pycbc.workflow</span></code>)</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../modules.html">pycbc</a></li>
+</ul>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../build_gh_pages.html">Building Documentation for GitHub Pages</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../../index.html">PyCBC</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../../index.html" class="icon icon-home"></a> &raquo;</li>
+          <li><a href="../../../index.html">Module code</a> &raquo;</li>
+          <li><a href="../../../pycbc.html">pycbc</a> &raquo;</li>
+          <li><a href="../models.html">pycbc.inference.models</a> &raquo;</li>
+      <li>pycbc.inference.models.tools</li>
+      <li class="wy-breadcrumbs-aside">
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <h1>Source code for pycbc.inference.models.tools</h1><div class="highlight"><pre>
+<span></span><span class="sd">&quot;&quot;&quot; Common utility functions for calculation of likelihoods</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">import</span> <span class="nn">logging</span>
+<span class="kn">import</span> <span class="nn">numpy</span>
+<span class="kn">import</span> <span class="nn">tqdm</span>
+
+<span class="kn">from</span> <span class="nn">scipy.special</span> <span class="kn">import</span> <span class="n">logsumexp</span><span class="p">,</span> <span class="n">i0e</span>
+<span class="kn">from</span> <span class="nn">scipy.interpolate</span> <span class="kn">import</span> <span class="n">RectBivariateSpline</span><span class="p">,</span> <span class="n">interp1d</span>
+<span class="kn">from</span> <span class="nn">pycbc.distributions</span> <span class="kn">import</span> <span class="n">JointDistribution</span>
+
+
+<div class="viewcode-block" id="str_to_tuple"><a class="viewcode-back" href="../../../../pycbc.inference.models.html#pycbc.inference.models.tools.str_to_tuple">[docs]</a><span class="k">def</span> <span class="nf">str_to_tuple</span><span class="p">(</span><span class="n">sval</span><span class="p">,</span> <span class="n">ftype</span><span class="p">):</span>
+    <span class="sd">&quot;&quot;&quot; Convenience parsing to convert str to tuple&quot;&quot;&quot;</span>
+    <span class="k">return</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">ftype</span><span class="p">(</span><span class="n">x</span><span class="p">)</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">sval</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s1">&#39;,&#39;</span><span class="p">))</span></div>
+
+
+<div class="viewcode-block" id="DistMarg"><a class="viewcode-back" href="../../../../pycbc.inference.models.html#pycbc.inference.models.tools.DistMarg">[docs]</a><span class="k">class</span> <span class="nc">DistMarg</span><span class="p">():</span>
+    <span class="sd">&quot;&quot;&quot;Help class to add bookkeeping for distance marginalization&quot;&quot;&quot;</span>
+
+    <span class="n">marginalize_phase</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">distance_marginalization</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">distance_interpolator</span> <span class="o">=</span> <span class="kc">None</span>
+
+<div class="viewcode-block" id="DistMarg.setup_distance_marginalization"><a class="viewcode-back" href="../../../../pycbc.inference.models.html#pycbc.inference.models.tools.DistMarg.setup_distance_marginalization">[docs]</a>    <span class="k">def</span> <span class="nf">setup_distance_marginalization</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                                       <span class="n">variable_params</span><span class="p">,</span>
+                                       <span class="n">marginalize_phase</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                                       <span class="n">marginalize_distance</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                                       <span class="n">marginalize_distance_param</span><span class="o">=</span><span class="s1">&#39;distance&#39;</span><span class="p">,</span>
+                                       <span class="n">marginalize_distance_samples</span><span class="o">=</span><span class="nb">int</span><span class="p">(</span><span class="mf">1e4</span><span class="p">),</span>
+                                       <span class="n">marginalize_distance_interpolator</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                                       <span class="n">marginalize_distance_snr_range</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                                       <span class="n">marginalize_distance_density</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                                       <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+        <span class="sd">&quot;&quot;&quot; Setup the model for use with distance marginalization</span>
+
+<span class="sd">        This function sets up precalculations for distance / phase</span>
+<span class="sd">        marginalization. For distance margininalization it modifies the</span>
+<span class="sd">        model to internally remove distance as a parameter.</span>
+
+<span class="sd">        Parameters</span>
+<span class="sd">        ----------</span>
+<span class="sd">        variable_params: list of strings</span>
+<span class="sd">            The set of variable parameters</span>
+<span class="sd">        marginalize_phase: bool, False</span>
+<span class="sd">            Do analytic marginalization (appopriate only for 22 mode waveforms)</span>
+<span class="sd">        marginalize_distance: bool, False</span>
+<span class="sd">            Marginalize over distance</span>
+<span class="sd">        marginalize_distance_param: str</span>
+<span class="sd">            Name of the parameter that is used to determine the distance.</span>
+<span class="sd">            This might be &#39;distance&#39; or a parameter which can be converted</span>
+<span class="sd">            to distance by a provided univariate transformation.</span>
+<span class="sd">        marginalize_distance_interpolator: bool</span>
+<span class="sd">            Use a pre-calculated interpolating function for the distance</span>
+<span class="sd">            marginalized likelihood.</span>
+<span class="sd">        marginalize_distance_snr_range: tuple of floats, (1, 50)</span>
+<span class="sd">            The SNR range for the interpolating function to be defined in.</span>
+<span class="sd">            If a sampler goes outside this range, the logl will be returned</span>
+<span class="sd">            as -numpy.inf.</span>
+<span class="sd">        marginalize_distance_density: tuple of intes, (1000, 1000)</span>
+<span class="sd">            The dimensions of the interpolation grid over (sh, hh).</span>
+
+<span class="sd">        Returns</span>
+<span class="sd">        -------</span>
+<span class="sd">        variable_params: list of strings</span>
+<span class="sd">            Set of variable params (missing distance-related parameter).</span>
+<span class="sd">        kwags: dict</span>
+<span class="sd">            The keyword arguments to the model initialization, may be modified</span>
+<span class="sd">            from the original set by this function.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">marginalize_phase</span> <span class="o">=</span> <span class="n">marginalize_phase</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">distance_marginalization</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">distance_interpolator</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">marginalize_distance</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">variable_params</span><span class="p">,</span> <span class="n">kwargs</span>
+
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">marginalize_distance_snr_range</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
+            <span class="n">marginalize_distance_snr_range</span> <span class="o">=</span> \
+                <span class="n">str_to_tuple</span><span class="p">(</span><span class="n">marginalize_distance_snr_range</span><span class="p">,</span> <span class="nb">float</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">marginalize_distance_density</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
+            <span class="n">marginalize_distance_density</span> <span class="o">=</span> \
+                <span class="n">str_to_tuple</span><span class="p">(</span><span class="n">marginalize_distance_density</span><span class="p">,</span> <span class="nb">int</span><span class="p">)</span>
+
+        <span class="n">logging</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s1">&#39;Marginalizing over distance&#39;</span><span class="p">)</span>
+
+        <span class="c1"># Take distance out of the variable params since we&#39;ll handle it</span>
+        <span class="c1"># manually now</span>
+        <span class="n">variable_params</span><span class="o">.</span><span class="n">remove</span><span class="p">(</span><span class="n">marginalize_distance_param</span><span class="p">)</span>
+        <span class="n">old_prior</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;prior&#39;</span><span class="p">]</span>
+        <span class="n">dists</span> <span class="o">=</span> <span class="p">[</span><span class="n">d</span> <span class="k">for</span> <span class="n">d</span> <span class="ow">in</span> <span class="n">old_prior</span><span class="o">.</span><span class="n">distributions</span>
+                 <span class="k">if</span> <span class="n">marginalize_distance_param</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">d</span><span class="o">.</span><span class="n">params</span><span class="p">]</span>
+        <span class="n">dprior</span> <span class="o">=</span> <span class="p">[</span><span class="n">d</span> <span class="k">for</span> <span class="n">d</span> <span class="ow">in</span> <span class="n">old_prior</span><span class="o">.</span><span class="n">distributions</span>
+                  <span class="k">if</span> <span class="n">marginalize_distance_param</span> <span class="ow">in</span> <span class="n">d</span><span class="o">.</span><span class="n">params</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span>
+        <span class="n">prior</span> <span class="o">=</span> <span class="n">JointDistribution</span><span class="p">(</span><span class="n">variable_params</span><span class="p">,</span> <span class="o">*</span><span class="n">dists</span><span class="p">,</span>
+                                  <span class="o">**</span><span class="n">old_prior</span><span class="o">.</span><span class="n">kwargs</span><span class="p">)</span>
+        <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;prior&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">prior</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">dprior</span><span class="o">.</span><span class="n">params</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">1</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">dprior</span><span class="p">,</span> <span class="s1">&#39;bounds&#39;</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s1">&#39;Distance Marginalization requires a &#39;</span>
+                             <span class="s1">&#39;univariate and bounded prior&#39;</span><span class="p">)</span>
+
+        <span class="c1"># Set up distance prior vector and samples</span>
+
+        <span class="c1"># (1) prior is using distance</span>
+        <span class="k">if</span> <span class="n">dprior</span><span class="o">.</span><span class="n">params</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="s1">&#39;distance&#39;</span><span class="p">:</span>
+            <span class="n">logging</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">&quot;Prior is directly on distance, setting up &quot;</span>
+                         <span class="s2">&quot;</span><span class="si">%s</span><span class="s2"> grid weights&quot;</span><span class="p">,</span> <span class="n">marginalize_distance_samples</span><span class="p">)</span>
+            <span class="n">dmin</span><span class="p">,</span> <span class="n">dmax</span> <span class="o">=</span> <span class="n">dprior</span><span class="o">.</span><span class="n">bounds</span><span class="p">[</span><span class="s1">&#39;distance&#39;</span><span class="p">]</span>
+            <span class="n">dist_locs</span> <span class="o">=</span> <span class="n">numpy</span><span class="o">.</span><span class="n">linspace</span><span class="p">(</span><span class="n">dmin</span><span class="p">,</span> <span class="n">dmax</span><span class="p">,</span>
+                                       <span class="nb">int</span><span class="p">(</span><span class="n">marginalize_distance_samples</span><span class="p">))</span>
+            <span class="n">dist_weights</span> <span class="o">=</span> <span class="p">[</span><span class="n">dprior</span><span class="o">.</span><span class="n">pdf</span><span class="p">(</span><span class="n">distance</span><span class="o">=</span><span class="n">l</span><span class="p">)</span> <span class="k">for</span> <span class="n">l</span> <span class="ow">in</span> <span class="n">dist_locs</span><span class="p">]</span>
+            <span class="n">dist_weights</span> <span class="o">=</span> <span class="n">numpy</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">dist_weights</span><span class="p">)</span>
+
+        <span class="c1"># (2) prior is univariate and can be converted to distance</span>
+        <span class="k">elif</span> <span class="n">marginalize_distance_param</span> <span class="o">!=</span> <span class="s1">&#39;distance&#39;</span><span class="p">:</span>
+            <span class="n">waveform_transforms</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;waveform_transforms&#39;</span><span class="p">]</span>
+            <span class="n">pname</span> <span class="o">=</span> <span class="n">dprior</span><span class="o">.</span><span class="n">params</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+            <span class="n">logging</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">&quot;Settings up transform,  prior is in terms of&quot;</span>
+                         <span class="s2">&quot; </span><span class="si">%s</span><span class="s2">&quot;</span><span class="p">,</span> <span class="n">pname</span><span class="p">)</span>
+            <span class="n">wtrans</span> <span class="o">=</span> <span class="p">[</span><span class="n">d</span> <span class="k">for</span> <span class="n">d</span> <span class="ow">in</span> <span class="n">waveform_transforms</span>
+                      <span class="k">if</span> <span class="s1">&#39;distance&#39;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">d</span><span class="o">.</span><span class="n">outputs</span><span class="p">]</span>
+            <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">wtrans</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="n">wtrans</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;waveform_transforms&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">wtrans</span>
+            <span class="n">dtrans</span> <span class="o">=</span> <span class="p">[</span><span class="n">d</span> <span class="k">for</span> <span class="n">d</span> <span class="ow">in</span> <span class="n">waveform_transforms</span>
+                      <span class="k">if</span> <span class="s1">&#39;distance&#39;</span> <span class="ow">in</span> <span class="n">d</span><span class="o">.</span><span class="n">outputs</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span>
+            <span class="n">v</span> <span class="o">=</span> <span class="n">dprior</span><span class="o">.</span><span class="n">rvs</span><span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="mf">1e8</span><span class="p">))</span>
+            <span class="n">d</span> <span class="o">=</span> <span class="n">dtrans</span><span class="o">.</span><span class="n">transform</span><span class="p">({</span><span class="n">pname</span><span class="p">:</span> <span class="n">v</span><span class="p">[</span><span class="n">pname</span><span class="p">]})[</span><span class="s1">&#39;distance&#39;</span><span class="p">]</span>
+            <span class="n">d</span><span class="o">.</span><span class="n">sort</span><span class="p">()</span>
+            <span class="n">cdf</span> <span class="o">=</span> <span class="n">numpy</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">d</span><span class="p">)</span><span class="o">+</span><span class="mi">1</span><span class="p">)</span> <span class="o">/</span> <span class="nb">len</span><span class="p">(</span><span class="n">d</span><span class="p">)</span>
+            <span class="n">i</span> <span class="o">=</span> <span class="n">interp1d</span><span class="p">(</span><span class="n">d</span><span class="p">,</span> <span class="n">cdf</span><span class="p">)</span>
+            <span class="n">dmin</span><span class="p">,</span> <span class="n">dmax</span> <span class="o">=</span> <span class="n">d</span><span class="o">.</span><span class="n">min</span><span class="p">(),</span> <span class="n">d</span><span class="o">.</span><span class="n">max</span><span class="p">()</span>
+            <span class="n">logging</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s1">&#39;Distance range </span><span class="si">%s</span><span class="s1">-</span><span class="si">%s</span><span class="s1">&#39;</span><span class="p">,</span> <span class="n">dmin</span><span class="p">,</span> <span class="n">dmax</span><span class="p">)</span>
+            <span class="n">x</span> <span class="o">=</span> <span class="n">numpy</span><span class="o">.</span><span class="n">linspace</span><span class="p">(</span><span class="n">dmin</span><span class="p">,</span> <span class="n">dmax</span><span class="p">,</span>
+                               <span class="nb">int</span><span class="p">(</span><span class="n">marginalize_distance_samples</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span>
+            <span class="n">xl</span><span class="p">,</span> <span class="n">xr</span> <span class="o">=</span> <span class="n">x</span><span class="p">[:</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span> <span class="n">x</span><span class="p">[</span><span class="mi">1</span><span class="p">:]</span>
+            <span class="n">dist_locs</span> <span class="o">=</span> <span class="mf">0.5</span> <span class="o">*</span> <span class="p">(</span><span class="n">xr</span> <span class="o">+</span> <span class="n">xl</span><span class="p">)</span>
+            <span class="n">dist_weights</span> <span class="o">=</span> <span class="n">i</span><span class="p">(</span><span class="n">xr</span><span class="p">)</span> <span class="o">-</span> <span class="n">i</span><span class="p">(</span><span class="n">xl</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;No prior seems to determine the distance&quot;</span><span class="p">)</span>
+
+        <span class="n">dist_weights</span> <span class="o">/=</span> <span class="n">dist_weights</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+        <span class="n">dist_ref</span> <span class="o">=</span> <span class="mf">0.5</span> <span class="o">*</span> <span class="p">(</span><span class="n">dmax</span> <span class="o">+</span> <span class="n">dmin</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">distance_marginalization</span> <span class="o">=</span> <span class="n">dist_ref</span> <span class="o">/</span> <span class="n">dist_locs</span><span class="p">,</span> <span class="n">dist_weights</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">distance_interpolator</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">marginalize_distance_interpolator</span><span class="p">:</span>
+            <span class="n">setup_args</span> <span class="o">=</span> <span class="p">{}</span>
+            <span class="k">if</span> <span class="n">marginalize_distance_snr_range</span><span class="p">:</span>
+                <span class="n">setup_args</span><span class="p">[</span><span class="s1">&#39;snr_range&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">marginalize_distance_snr_range</span>
+            <span class="k">if</span> <span class="n">marginalize_distance_density</span><span class="p">:</span>
+                <span class="n">setup_args</span><span class="p">[</span><span class="s1">&#39;density&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">marginalize_distance_density</span>
+            <span class="n">i</span> <span class="o">=</span> <span class="n">setup_distance_marg_interpolant</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">distance_marginalization</span><span class="p">,</span>
+                                                <span class="n">phase</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">marginalize_phase</span><span class="p">,</span>
+                                                <span class="o">**</span><span class="n">setup_args</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">distance_interpolator</span> <span class="o">=</span> <span class="n">i</span>
+        <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;static_params&#39;</span><span class="p">][</span><span class="s1">&#39;distance&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">dist_ref</span>
+        <span class="k">return</span> <span class="n">variable_params</span><span class="p">,</span> <span class="n">kwargs</span></div>
+
+<div class="viewcode-block" id="DistMarg.marginalize_loglr"><a class="viewcode-back" href="../../../../pycbc.inference.models.html#pycbc.inference.models.tools.DistMarg.marginalize_loglr">[docs]</a>    <span class="k">def</span> <span class="nf">marginalize_loglr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">sh_total</span><span class="p">,</span> <span class="n">hh_total</span><span class="p">,</span> <span class="n">skip_vector</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+        <span class="sd">&quot;&quot;&quot; Return the marginal likelihood</span>
+
+<span class="sd">        Parameters</span>
+<span class="sd">        -----------</span>
+<span class="sd">        sh_total: float or ndarray</span>
+<span class="sd">            The total &lt;s|h&gt; inner product summed over detectors</span>
+<span class="sd">        hh_total: float or ndarray</span>
+<span class="sd">            The total &lt;h|h&gt; inner product summed over detectors</span>
+<span class="sd">        skip_vector: bool, False</span>
+<span class="sd">            If true, and input is a vector, do not marginalize over that</span>
+<span class="sd">            vector, instead return the likelihood values as a vector.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="n">marginalize_likelihood</span><span class="p">(</span><span class="n">sh_total</span><span class="p">,</span> <span class="n">hh_total</span><span class="p">,</span>
+                                      <span class="n">phase</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">marginalize_phase</span><span class="p">,</span>
+                                      <span class="n">interpolator</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">distance_interpolator</span><span class="p">,</span>
+                                      <span class="n">distance</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">distance_marginalization</span><span class="p">,</span>
+                                      <span class="n">skip_vector</span><span class="o">=</span><span class="n">skip_vector</span><span class="p">)</span></div></div>
+
+
+<div class="viewcode-block" id="setup_distance_marg_interpolant"><a class="viewcode-back" href="../../../../pycbc.inference.models.html#pycbc.inference.models.tools.setup_distance_marg_interpolant">[docs]</a><span class="k">def</span> <span class="nf">setup_distance_marg_interpolant</span><span class="p">(</span><span class="n">dist_marg</span><span class="p">,</span>
+                                    <span class="n">phase</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                                    <span class="n">snr_range</span><span class="o">=</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">50</span><span class="p">),</span>
+                                    <span class="n">density</span><span class="o">=</span><span class="p">(</span><span class="mi">1000</span><span class="p">,</span> <span class="mi">1000</span><span class="p">)):</span>
+    <span class="sd">&quot;&quot;&quot; Create the interpolant for distance marginalization</span>
+
+<span class="sd">    Parameters</span>
+<span class="sd">    ----------</span>
+<span class="sd">    dist_marg: tuple of two arrays</span>
+<span class="sd">        The (dist_loc, dist_weight) tuple which defines the grid</span>
+<span class="sd">        for integrating over distance</span>
+<span class="sd">    snr_range: tuple of (float, float)</span>
+<span class="sd">        Tuple of min, max SNR that the interpolant is expected to work</span>
+<span class="sd">        for.</span>
+<span class="sd">    density: tuple of (float, float)</span>
+<span class="sd">        The number of samples in either dimension of the 2d interpolant</span>
+
+<span class="sd">    Returns</span>
+<span class="sd">    -------</span>
+<span class="sd">    interp: function</span>
+<span class="sd">        Function which returns the precalculated likelihood for a given</span>
+<span class="sd">        inner product sh/hh.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">dist_rescale</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">dist_marg</span>
+    <span class="n">logging</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">&quot;Interpolator valid for SNRs in </span><span class="si">%s</span><span class="s2">&quot;</span><span class="p">,</span> <span class="n">snr_range</span><span class="p">)</span>
+    <span class="n">logging</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">&quot;Interpolator using grid </span><span class="si">%s</span><span class="s2">&quot;</span><span class="p">,</span> <span class="n">density</span><span class="p">)</span>
+    <span class="c1"># approximate maximum shr and hhr values, assuming the true SNR is</span>
+    <span class="c1"># within the indicated range (and neglecting noise fluctuations)</span>
+    <span class="n">snr_min</span><span class="p">,</span> <span class="n">snr_max</span> <span class="o">=</span> <span class="n">snr_range</span>
+    <span class="n">smax</span> <span class="o">=</span> <span class="n">dist_rescale</span><span class="o">.</span><span class="n">max</span><span class="p">()</span>
+    <span class="n">smin</span> <span class="o">=</span> <span class="n">dist_rescale</span><span class="o">.</span><span class="n">min</span><span class="p">()</span>
+    <span class="n">shr_max</span> <span class="o">=</span> <span class="n">snr_max</span> <span class="o">**</span> <span class="mf">2.0</span> <span class="o">/</span> <span class="n">smin</span>
+    <span class="n">hhr_max</span> <span class="o">=</span> <span class="n">snr_max</span> <span class="o">**</span> <span class="mf">2.0</span> <span class="o">/</span> <span class="n">smin</span> <span class="o">/</span> <span class="n">smin</span>
+
+    <span class="n">shr_min</span> <span class="o">=</span> <span class="n">snr_min</span> <span class="o">**</span> <span class="mf">2.0</span> <span class="o">/</span> <span class="n">smax</span>
+    <span class="n">hhr_min</span> <span class="o">=</span> <span class="n">snr_min</span> <span class="o">**</span> <span class="mf">2.0</span> <span class="o">/</span> <span class="n">smax</span> <span class="o">/</span> <span class="n">smax</span>
+
+    <span class="n">shr</span> <span class="o">=</span> <span class="n">numpy</span><span class="o">.</span><span class="n">geomspace</span><span class="p">(</span><span class="n">shr_min</span><span class="p">,</span> <span class="n">shr_max</span><span class="p">,</span> <span class="n">density</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
+    <span class="n">hhr</span> <span class="o">=</span> <span class="n">numpy</span><span class="o">.</span><span class="n">geomspace</span><span class="p">(</span><span class="n">hhr_min</span><span class="p">,</span> <span class="n">hhr_max</span><span class="p">,</span> <span class="n">density</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span>
+    <span class="n">lvals</span> <span class="o">=</span> <span class="n">numpy</span><span class="o">.</span><span class="n">zeros</span><span class="p">((</span><span class="nb">len</span><span class="p">(</span><span class="n">shr</span><span class="p">),</span> <span class="nb">len</span><span class="p">(</span><span class="n">hhr</span><span class="p">)))</span>
+    <span class="n">logging</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s1">&#39;Setup up likelihood interpolator&#39;</span><span class="p">)</span>
+    <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">sh</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">tqdm</span><span class="o">.</span><span class="n">tqdm</span><span class="p">(</span><span class="n">shr</span><span class="p">)):</span>
+        <span class="k">for</span> <span class="n">j</span><span class="p">,</span> <span class="n">hh</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">hhr</span><span class="p">):</span>
+            <span class="n">lvals</span><span class="p">[</span><span class="n">i</span><span class="p">,</span> <span class="n">j</span><span class="p">]</span> <span class="o">=</span> <span class="n">marginalize_likelihood</span><span class="p">(</span><span class="n">sh</span><span class="p">,</span> <span class="n">hh</span><span class="p">,</span>
+                                                 <span class="n">distance</span><span class="o">=</span><span class="n">dist_marg</span><span class="p">,</span>
+                                                 <span class="n">phase</span><span class="o">=</span><span class="n">phase</span><span class="p">)</span>
+    <span class="n">interp</span> <span class="o">=</span> <span class="n">RectBivariateSpline</span><span class="p">(</span><span class="n">shr</span><span class="p">,</span> <span class="n">hhr</span><span class="p">,</span> <span class="n">lvals</span><span class="p">)</span>
+
+    <span class="k">def</span> <span class="nf">interp_wrapper</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">y</span><span class="p">,</span> <span class="n">bounds_check</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
+        <span class="n">k</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">bounds_check</span><span class="p">:</span>
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="nb">float</span><span class="p">):</span>
+                <span class="k">if</span> <span class="n">x</span> <span class="o">&gt;</span> <span class="n">shr_max</span> <span class="ow">or</span> <span class="n">x</span> <span class="o">&lt;</span> <span class="n">shr_min</span> <span class="ow">or</span> <span class="n">y</span> <span class="o">&gt;</span> <span class="n">hhr_max</span> <span class="ow">or</span> <span class="n">y</span> <span class="o">&lt;</span> <span class="n">hhr_min</span><span class="p">:</span>
+                    <span class="k">return</span> <span class="o">-</span><span class="n">numpy</span><span class="o">.</span><span class="n">inf</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">k</span> <span class="o">=</span> <span class="p">(</span><span class="n">x</span> <span class="o">&gt;</span> <span class="n">shr_max</span><span class="p">)</span> <span class="o">|</span> <span class="p">(</span><span class="n">x</span> <span class="o">&lt;</span> <span class="n">shr_min</span><span class="p">)</span>
+                <span class="n">k</span> <span class="o">=</span> <span class="n">k</span> <span class="o">|</span> <span class="p">(</span><span class="n">y</span> <span class="o">&gt;</span> <span class="n">hhr_max</span><span class="p">)</span> <span class="o">|</span> <span class="p">(</span><span class="n">y</span> <span class="o">&lt;</span> <span class="n">hhr_min</span><span class="p">)</span>
+
+        <span class="n">v</span> <span class="o">=</span> <span class="n">interp</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">y</span><span class="p">,</span> <span class="n">grid</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">k</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">v</span><span class="p">[</span><span class="n">k</span><span class="p">]</span> <span class="o">=</span> <span class="o">-</span><span class="n">numpy</span><span class="o">.</span><span class="n">inf</span>
+        <span class="k">return</span> <span class="n">v</span>
+    <span class="k">return</span> <span class="n">interp_wrapper</span></div>
+
+
+<div class="viewcode-block" id="marginalize_likelihood"><a class="viewcode-back" href="../../../../pycbc.inference.models.html#pycbc.inference.models.tools.marginalize_likelihood">[docs]</a><span class="k">def</span> <span class="nf">marginalize_likelihood</span><span class="p">(</span><span class="n">sh</span><span class="p">,</span> <span class="n">hh</span><span class="p">,</span>
+                           <span class="n">phase</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                           <span class="n">distance</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                           <span class="n">skip_vector</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                           <span class="n">interpolator</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+    <span class="sd">&quot;&quot;&quot; Return the marginalized likelihood</span>
+
+<span class="sd">    Parameters</span>
+<span class="sd">    ----------</span>
+<span class="sd">    sh: complex float or numpy.ndarray</span>
+<span class="sd">        The data-template inner product</span>
+<span class="sd">    hh: complex float or numpy.ndarray</span>
+<span class="sd">        The template-template inner product</span>
+<span class="sd">    phase: bool, False</span>
+<span class="sd">        Enable phase marginalization. Only use if orbital phase can be related</span>
+<span class="sd">        to just a single overall phase (e.g. not true for waveform with</span>
+<span class="sd">        sub-dominant modes)</span>
+<span class="sd">    skip_vector: bool, False</span>
+<span class="sd">        Don&#39;t apply marginalization of vector component of input (i.e. leave</span>
+<span class="sd">        as vector).</span>
+<span class="sd">    interpolator: function, None</span>
+<span class="sd">        If provided, internal calculation is skipped in favor of a</span>
+<span class="sd">        precalculated interpolating function which takes in sh/hh</span>
+<span class="sd">        and returns the likelihood.</span>
+
+<span class="sd">    Returns</span>
+<span class="sd">    -------</span>
+<span class="sd">    loglr: float</span>
+<span class="sd">        The marginalized loglikehood ratio</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">sh</span><span class="p">,</span> <span class="nb">float</span><span class="p">):</span>
+        <span class="n">clogweights</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">sh</span> <span class="o">=</span> <span class="n">sh</span><span class="o">.</span><span class="n">flatten</span><span class="p">()</span>
+        <span class="n">hh</span> <span class="o">=</span> <span class="n">hh</span><span class="o">.</span><span class="n">flatten</span><span class="p">()</span>
+        <span class="n">clogweights</span> <span class="o">=</span> <span class="n">numpy</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">sh</span><span class="p">))</span>
+
+    <span class="k">if</span> <span class="n">phase</span><span class="p">:</span>
+        <span class="n">sh</span> <span class="o">=</span> <span class="nb">abs</span><span class="p">(</span><span class="n">sh</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">sh</span> <span class="o">=</span> <span class="n">sh</span><span class="o">.</span><span class="n">real</span>
+
+    <span class="n">vweights</span> <span class="o">=</span> <span class="mi">1</span>
+    <span class="k">if</span> <span class="n">interpolator</span><span class="p">:</span>
+        <span class="c1"># pre-calculated result for this function</span>
+        <span class="n">vloglr</span> <span class="o">=</span> <span class="n">interpolator</span><span class="p">(</span><span class="n">sh</span><span class="p">,</span> <span class="n">hh</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">skip_vector</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">vloglr</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="c1"># explicit calculation</span>
+        <span class="k">if</span> <span class="n">distance</span><span class="p">:</span>
+            <span class="c1"># brute force distance path</span>
+            <span class="n">dist_rescale</span><span class="p">,</span> <span class="n">dist_weights</span> <span class="o">=</span> <span class="n">distance</span>
+
+            <span class="n">sh</span> <span class="o">=</span> <span class="n">numpy</span><span class="o">.</span><span class="n">multiply</span><span class="o">.</span><span class="n">outer</span><span class="p">(</span><span class="n">sh</span><span class="p">,</span> <span class="n">dist_rescale</span><span class="p">)</span>
+            <span class="n">hh</span> <span class="o">=</span> <span class="n">numpy</span><span class="o">.</span><span class="n">multiply</span><span class="o">.</span><span class="n">outer</span><span class="p">(</span><span class="n">hh</span><span class="p">,</span> <span class="n">dist_rescale</span> <span class="o">**</span> <span class="mf">2.0</span><span class="p">)</span>
+            <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">sh</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span> <span class="o">==</span> <span class="mi">2</span><span class="p">:</span>
+                <span class="n">vweights</span> <span class="o">=</span> <span class="n">numpy</span><span class="o">.</span><span class="n">resize</span><span class="p">(</span><span class="n">dist_weights</span><span class="p">,</span>
+                                        <span class="p">(</span><span class="n">sh</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="n">sh</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]))</span><span class="o">.</span><span class="n">T</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">vweights</span> <span class="o">=</span> <span class="n">dist_weights</span>
+
+        <span class="k">if</span> <span class="n">phase</span><span class="p">:</span>
+            <span class="n">sh</span> <span class="o">=</span> <span class="n">numpy</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">i0e</span><span class="p">(</span><span class="n">sh</span><span class="p">))</span> <span class="o">+</span> <span class="n">sh</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">sh</span> <span class="o">=</span> <span class="n">sh</span><span class="o">.</span><span class="n">real</span>
+
+        <span class="c1"># Calculate loglikelihood ratio</span>
+        <span class="n">vloglr</span> <span class="o">=</span> <span class="n">sh</span> <span class="o">-</span> <span class="mf">0.5</span> <span class="o">*</span> <span class="n">hh</span>
+
+    <span class="c1"># Do brute-force marginalization if loglr is a vector</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">vloglr</span><span class="p">,</span> <span class="nb">float</span><span class="p">):</span>
+        <span class="n">vloglr</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">vloglr</span><span class="p">)</span>
+    <span class="k">elif</span> <span class="n">skip_vector</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">vloglr</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">vloglr</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">logsumexp</span><span class="p">(</span><span class="n">vloglr</span><span class="p">,</span> <span class="n">b</span><span class="o">=</span><span class="n">vweights</span><span class="p">))</span> <span class="o">-</span> <span class="n">clogweights</span>
+
+    <span class="k">return</span> <span class="n">vloglr</span></div>
+</pre></div>
+
+           </div>
+          </div>
+          <footer>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2015, 2016, 2017, Alexander Nitz, Ian Harry, Christopher M. Biwer, Duncan A.  Brown, Josh Willis, and Tito Dal Canton.
+      <span class="lastupdated">Last updated on Jan 03, 2022.
+      </span></p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>
