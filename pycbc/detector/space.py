@@ -203,12 +203,11 @@ _space_detectors = {'LISA': {'armlength': 2.5e9,
                     # lunar-surface instrument, not a multi-spacecraft
                     # constellation like the three above -- 'armlength' is
                     # not a meaningful concept for it and is left as None.
-                    # Registered here purely for discovery via
-                    # `get_available_space_detectors`; see
-                    # `_Generic_detector` below and
-                    # `pycbc.coordinates.moon` for the coordinate/arrival-
-                    # time machinery this response will eventually build on.
-                    'LGWA': {'armlength': None, 'aliases': []},
+                    # The two aliases are its two horizontal sensing axes
+                    # (see `_LGWA_detector`), not TDI channels -- LGWA, as
+                    # a single station, has no TDI combination.
+                    'LGWA': {'armlength': None,
+                             'aliases': ['LGWA_X', 'LGWA_Y']},
                    }
 
 class AbsSpaceDet(ABC):
@@ -925,6 +924,266 @@ class _FLR_detector(AbsSpaceDet):
         return tdi_dict
 
 
+class _LGWA_detector(AbsSpaceDet):
+    """
+    LGWA (Lunar Gravitational Wave Antenna) detector modeled using the
+    `lgwa_response` package (https://github.com/jacopok/lgwa-response,
+    Tissino et al. 2026, arXiv:2606.04918) for its antenna-pattern
+    geometry only -- not its built-in waveform/likelihood machinery
+    (`lgwa_response.likelihood`/`bilby_interface`, which hard-import
+    `bilby` at module level). Only the bilby-free
+    `lgwa_response.lunar_coordinates` submodule is used, which wraps
+    `lunarsky` to compute the detector's real, libration-aware
+    orientation on the Moon.
+
+    LGWA is modeled as a single lunar-surface station with two
+    orthogonal horizontal sensing axes (not a multi-spacecraft
+    interferometer constellation), so there is no TDI combination here
+    -- `project_wave` returns the two horizontal-axis channels directly.
+
+    Not installable from PyPI (GPLv3, no tagged releases yet); install
+    with `pip install git+https://github.com/jacopok/lgwa-response.git`.
+
+    Parameters
+    ----------
+    detector_name : str
+        The name of the detector. Accepts any output from
+        `get_available_space_detectors`.
+
+    reference_time : float (optional)
+        The reference time in seconds of the signal in the SSB frame. This is
+        defined such that the detector mission start time corresponds to 0.
+        Default None.
+
+    longitude_site, latitude_site : float
+        Selenodetic longitude/latitude (radians) of the specific LGWA
+        surface site, in the same convention as
+        `pycbc.coordinates.moon.moon_site_position_ssb`. Required:
+        unlike arrival time (which can fall back to the Moon's
+        barycenter), antenna-pattern geometry needs an actual oriented
+        site.
+
+    cadence : float (optional)
+        Spacing, in seconds, of the coarse time grid on which the
+        detector's orientation is evaluated via `lunarsky` (slow) before
+        being linearly interpolated onto the input waveform's sample
+        times (fast). Lunar libration evolves on a timescale of days, so
+        the default of 3600s (1 hour) is generously fine; increase it to
+        speed up long-duration signals at the cost of interpolation
+        accuracy.
+    """
+    def __init__(self, detector_name, reference_time=None,
+                 longitude_site=None, latitude_site=None,
+                 cadence=3600.0, **kwargs):
+        super().__init__(detector_name, reference_time, **kwargs)
+        assert self.det == 'LGWA', (
+            'LGWAResponse backend only works with the LGWA detector')
+        if longitude_site is None or latitude_site is None:
+            raise ValueError(
+                'longitude_site and latitude_site (radians) are required: '
+                'antenna-pattern geometry needs an actual oriented site on '
+                "the Moon, unlike arrival time (which can default to the "
+                "Moon's barycenter, see "
+                'coordinates.moon.moon_site_position_ssb).')
+        self.longitude_site = longitude_site
+        self.latitude_site = latitude_site
+        self.cadence = cadence
+        # Cache of the coarse lunarsky/astropy orientation grid, keyed by
+        # nothing but the last-built [t_start, t_end] span (site position
+        # and cadence are fixed for the lifetime of this instance): a
+        # single instance is expected to be reused across many
+        # project_wave/_detector_frame calls covering overlapping time
+        # ranges (e.g. repeated relbin likelihood evaluations for the
+        # same analysis segment), and rebuilding this grid from scratch
+        # every call is by far the dominant cost of both (~85-90% of a
+        # project_wave call, measured directly -- the lunarsky/astropy
+        # calls in generate_data_response, not the cheap numpy
+        # interpolation/combination that follows).
+        self._frame_cache = None  # (t_start, t_end, times, data) or None
+
+    @property
+    def sky_coords(self):
+        return 'eclipticlongitude', 'eclipticlatitude'
+
+    def _detector_frame(self, t_start, t_end, query_times):
+        """
+        Detector-orientation unit vectors (n, x, y), each shape (M, 3) in
+        the ICRS frame, at the given `query_times` (an array of length
+        M, not necessarily uniformly spaced or sorted), obtained by
+        evaluating `lunar_coordinates.generate_data_response` on a coarse
+        `self.cadence`-spaced grid spanning [t_start, t_end] (lazy, slow
+        -- real `lunarsky`/astropy calls) and linearly interpolating each
+        of its 6 unwrapped angle columns onto `query_times` (fast),
+        mirroring the interpolation approach `lgwa_response` itself uses
+        internally (see
+        `lunar_coordinates.test_interpolation_error_response`).
+
+        The coarse grid is cached on `self` (see `__init__`): if
+        [t_start, t_end] falls entirely within a previously-built grid's
+        span, that grid is reused as-is; otherwise a new grid spanning
+        the union of the requested range and any existing cached range
+        is built (so a sequence of calls with growing-but-overlapping
+        ranges only ever extends the cache, it doesn't rebuild the parts
+        already covered).
+
+        Only `lgwa_response.lunar_coordinates` is imported here -- this
+        submodule does not import `bilby`.
+        """
+        try:
+            from lgwa_response import lunar_coordinates
+        except ImportError as exc:
+            raise ImportError(
+                'lgwa_response is required for the LGWAResponse backend '
+                '(only its bilby-free lunar_coordinates submodule is '
+                'used); install with `pip install git+'
+                'https://github.com/jacopok/lgwa-response.git`.') from exc
+
+        if self._frame_cache is not None:
+            cached_start, cached_end, times, data = self._frame_cache
+            if t_start >= cached_start and t_end <= cached_end:
+                return self._interpolate_frame(
+                    lunar_coordinates, times, data, query_times)
+            t_start = min(t_start, cached_start)
+            t_end = max(t_end, cached_end)
+
+        n_points = max(2, int(numpy.ceil((t_end - t_start) / self.cadence))
+                        + 1)
+        lgwa_position = {
+            'longitude': float(numpy.degrees(self.longitude_site)),
+            'latitude': float(numpy.degrees(self.latitude_site))}
+        times, data = lunar_coordinates.generate_data_response(
+            n_points, lgwa_position, gps_time_start=t_start,
+            gps_time_end=t_end)
+        self._frame_cache = (t_start, t_end, times, data)
+
+        return self._interpolate_frame(
+            lunar_coordinates, times, data, query_times)
+
+    @staticmethod
+    def _interpolate_frame(lunar_coordinates, times, data, query_times):
+        """Linear-interpolate a `generate_data_response` grid's 6
+        unwrapped angle columns onto `query_times`, and convert the
+        interpolated (n, x, y) angle pairs to ICRS Cartesian unit
+        vectors. Split out of `_detector_frame` so both the cache-hit
+        and cache-miss paths share the same interpolation code.
+        """
+        interp = numpy.empty((len(query_times), 6))
+        for j in range(6):
+            interp[:, j] = numpy.interp(query_times, times, data[:, j])
+
+        n = lunar_coordinates.spherical_to_cartesian(
+            interp[:, 0], interp[:, 1])
+        x = lunar_coordinates.spherical_to_cartesian(
+            interp[:, 2], interp[:, 3])
+        y = lunar_coordinates.spherical_to_cartesian(
+            interp[:, 4], interp[:, 5])
+        return n, x, y
+
+    @staticmethod
+    def _antenna_pattern_factors(n, x, y, ra, dec, psi):
+        """
+        Antenna-pattern combination, replicated from
+        `lgwa_response.likelihood.LunarLikelihood.get_antenna_response`
+        (pure numpy, no bilby import needed) -- shared by `project_wave`
+        (time domain) and the frequency-domain SPA response in
+        `pycbc.waveform.lgwa` (each evaluates it at different query
+        times, but the formula itself is identical).
+
+        Parameters
+        ----------
+        n, x, y : numpy.array
+            Detector-orientation unit vectors (ICRS Cartesian), each
+            shape (M, 3), as returned by `_detector_frame`.
+        ra, dec, psi : float
+            The source's ICRS right ascension/declination and
+            `lgwa_response`-convention polarization angle (radians), as
+            returned by `coordinates.moon.moon_to_geo(...,
+            lal_convention=False)`.
+
+        Returns
+        -------
+        (hpx, hcx, hpy, hcy) : tuple of numpy.array
+            Each shape (M,): the F+/Fx antenna-pattern factors for the
+            X and Y horizontal sensing axes.
+        """
+        from lgwa_response import lunar_coordinates
+        u, v = lunar_coordinates.wave_frame_basis_cartesian(ra, dec, -psi)
+
+        un, ux, uy = n @ u, x @ u, y @ u
+        vn, vx, vy = n @ v, x @ v, y @ v
+        hpx = un * ux - vn * vx
+        hcx = un * vx + vn * ux
+        hpy = un * uy - vn * vy
+        hcy = un * vy + vn * uy
+        return hpx, hcx, hpy, hcy
+
+    def project_wave(self, hp, hc, lamb, beta, polarization=0, **kwargs):
+        """
+        Project the plus/cross polarizations onto LGWA's two horizontal
+        sensing axes.
+
+        `hp`/`hc` are assumed to already be in the SSB frame (as for
+        `_LDC_detector`/`_FLR_detector`); `lamb`/`beta`/`polarization`
+        are the SSB-frame `eclipticlongitude`/`eclipticlatitude`/
+        polarization of the source.
+
+        NOTE: this does NOT call `apply_polarization(hp, hc,
+        polarization)` the way `_LDC_detector`/`_FLR_detector` do.
+        Those backends' external packages (`lisagwresponse`/
+        `fastlisaresponse`) don't accept a polarization angle, so PyCBC
+        pre-rotates hp/hc instead. `lgwa_response`'s antenna-pattern
+        formula folds the polarization angle directly into the F+/Fx
+        combination (via `wave_frame_basis_cartesian(ra, dec, -psi)`),
+        so pre-rotating hp/hc here as well would double-count the
+        polarization angle.
+
+        Returns
+        -------
+        dict of pycbc.types.TimeSeries
+            Keyed 'LGWA_X'/'LGWA_Y' for the two horizontal sensing axes.
+        """
+        from pycbc.coordinates import moon as coord_moon
+
+        # SSB-frame ecliptic lon/lat/pol -> ICRS ra/dec/psi (no LDC/LAL
+        # flip -- lgwa_response has its own, unrelated polarization
+        # convention). `t_geo` (discarded, `_`) is meaningless here:
+        # arrival time at the actual LGWA site is computed separately
+        # below via t_moon_from_ssb, not via the geocenter.
+        _, ra, dec, psi = coord_moon.moon_to_geo(
+            t_moon=0.0, longitude_moon=lamb, latitude_moon=beta,
+            polarization_moon=polarization, lal_convention=False)
+
+        # Light-travel-time offset (SSB -> LGWA site), evaluated once at
+        # a single reference time and applied as a near-constant shift
+        # to the whole waveform -- lunar libration/orbital geometry
+        # changes on a timescale of days, far slower than the offset
+        # would vary across a single signal's duration. This mirrors
+        # _LDC_detector's use of a single constant `offset` (though
+        # there the offset is a fixed mission-phase constant; here it is
+        # computed per-source from the already-built t_moon_from_ssb).
+        t_ref = float(hp.start_time)
+        delta_t = coord_moon.t_moon_from_ssb(
+            t_ref, lamb, beta, self.longitude_site,
+            self.latitude_site) - t_ref
+
+        hp = hp.copy()
+        hc = hc.copy()
+        hp.start_time += delta_t
+        hc.start_time += delta_t
+
+        pad = self.cadence
+        n, x, y = self._detector_frame(
+            hp.start_time - pad, hp.end_time + pad, hp.sample_times.numpy())
+
+        hpx, hcx, hpy, hcy = self._antenna_pattern_factors(
+            n, x, y, ra, dec, psi)
+
+        h_x = hp * hpx + hc * hcx
+        h_y = hp * hpy + hc * hcy
+
+        return {'LGWA_X': h_x, 'LGWA_Y': h_y}
+
+
 class _Generic_detector(AbsSpaceDet):
     """
     Placeholder backend for space-borne detectors that do not yet have a
@@ -967,7 +1226,8 @@ _backends = {'LISA': {'LDC': _LDC_detector,
                      },
              'Taiji': {'Generic': _Generic_detector},
              'TianQin': {'Generic': _Generic_detector},
-             'LGWA': {'Generic': _Generic_detector},
+             'LGWA': {'Generic': _Generic_detector,
+                      'LGWAResponse': _LGWA_detector},
             }
 
 class SpaceDetector(AbsSpaceDet):
