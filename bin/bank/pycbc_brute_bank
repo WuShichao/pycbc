@@ -22,6 +22,7 @@
 import numpy
 import logging
 import signal
+import sys
 import tqdm
 import os
 import argparse
@@ -75,7 +76,22 @@ parser.add_argument('--nprocesses', type=int, default=1,
     help='Number of processes to use for waveform generation parallelization. If not given then only a single core will be used.')
 parser.add_argument('--parallel-check', action='store_true', help="Do bank checking parallel, note that this means that proposals WILL NOT be checked against each other.")
 parser.add_argument('--max-connections', type=int, help="Maximum number of matches to store with each template", default=numpy.inf)
-pycbc.psd.insert_psd_option_group(parser)
+parser.add_argument('--channels', nargs='*', default=None,
+    help='List of detector-frame data channels to use for multi-channel '
+         '(e.g. LISA TDI A/E/T) matched filtering. When given, the '
+         '--approximant must be one registered for detector-response '
+         '(fd_det/fd_det_sequence) waveform generation, and each of the PSD '
+         'options below must be given once per channel using the '
+         'IFO:VALUE syntax, e.g. '
+         '--psd-file LISA_A:psdA.txt LISA_E:psdE.txt LISA_T:psdT.txt')
+
+# --psd-file/--psd-model need IFO:VALUE form under --channels (each TDI
+# channel standing in for an "ifo"); pre-scan since this must be decided
+# before argparse runs.
+if '--channels' in sys.argv:
+    pycbc.psd.insert_psd_option_group_multi_ifo(parser)
+else:
+    pycbc.psd.insert_psd_option_group(parser)
 parser.add_argument('--use-trimmed-buffer', action='store_true',
     help=('When specified, the match calculation will use only the first and last 100 samples '
         'of the waveform instead of the full buffer. Enabling this option makes match computation faster.'))
@@ -85,6 +101,19 @@ args = parser.parse_args()
 
 pycbc.init_logging(args.verbose)
 numpy.random.seed(args.seed)
+
+if args.channels is not None and args.use_td_waveform:
+    parser.error("--channels (multi-channel detector-response mode) is not "
+                 "supported together with --use-td-waveform.")
+if args.channels is not None and args.full_resolution_buffer_length is not None:
+    parser.error("--channels (multi-channel detector-response mode) is not "
+                 "supported together with --full-resolution-buffer-length.")
+if args.channels is not None and args.nprocesses != 1:
+    # BroadcastPool forks; BBHx's import-time state deadlocks forked
+    # workers on first waveform call. Needs spawn + a __main__ guard this
+    # script doesn't have yet. MPI path untested.
+    parser.error("--channels currently requires --nprocesses 1 (fork "
+                 "deadlocks with BBHx, see comment above).")
 
 config_parser = pycbc.types.config.InterpolatingConfigParser([args.input_config])
 variable_args, static_args = read_params_from_config(
@@ -109,7 +138,9 @@ def get_stable_match(p_inj, p_tmplt):
     # We loop until convergence or a safety cap (e.g., 64s)
     while (last_match == -1.0) or (current_buflen <= 64):
         # Create a transient generator for this specific resolution
-        tmp_gen = GenUniformWaveform(current_buflen, args.sample_rate, args.low_frequency_cutoff)
+        tmp_gen = GenUniformWaveform(current_buflen, args.sample_rate,
+                                     args.low_frequency_cutoff,
+                                     channels=args.channels)
         h_inj = tmp_gen.generate(**p_inj)
         h_tmplt = tmp_gen.generate(**p_tmplt)
         current_match = tmp_gen.match(h_inj, h_tmplt)
@@ -367,25 +398,55 @@ def save_bank(): # Use a local name
     logging.info("Save complete.")
 
 class GenUniformWaveform(object):
-    def __init__(self, buffer_length, sample_rate, f_lower):
+    def __init__(self, buffer_length, sample_rate, f_lower, channels=None):
         self.f_lower = f_lower
         self.delta_f = 1.0 / buffer_length
         tlen = int(buffer_length * sample_rate)
         self.flen = tlen // 2 + 1
-        psd = pycbc.psd.from_cli(args, self.flen, self.delta_f, self.f_lower)
         self.kmin = int(f_lower * buffer_length)
-        self.w = ((1.0 / psd[self.kmin:-1]) ** 0.5).astype(numpy.float32)
-        qtilde = pycbc.types.zeros(tlen, numpy.complex64)
-        q = pycbc.types.zeros(tlen, numpy.complex64)
-        self.qtilde_view = qtilde[self.kmin:self.flen - 1]
-        self.ifft = pycbc.fft.IFFT(qtilde, q)
+        self.channels = channels
 
-        self.md = q
-        self.md2 = numpy.zeros(20)
+        if self.channels is None:
+            psd = pycbc.psd.from_cli(args, self.flen, self.delta_f, self.f_lower)
+            self.w = ((1.0 / psd[self.kmin:-1]) ** 0.5).astype(numpy.float32)
+            qtilde = pycbc.types.zeros(tlen, numpy.complex64)
+            q = pycbc.types.zeros(tlen, numpy.complex64)
+            self.qtilde_view = qtilde[self.kmin:self.flen - 1]
+            self.ifft = pycbc.fft.IFFT(qtilde, q)
 
-        if args.use_trimmed_buffer:
-            self.md = q._data[-100:]
-            self.md2 = q._data[0:100]
+            self.md = q
+            self.md2 = numpy.zeros(20)
+
+            if args.use_trimmed_buffer:
+                self.md = q._data[-100:]
+                self.md2 = q._data[0:100]
+        else:
+            # per-channel whitening weight + correlate/IFFT buffer; match()
+            # combines them into one network statistic
+            length_dict = {ch: self.flen for ch in self.channels}
+            delta_f_dict = {ch: self.delta_f for ch in self.channels}
+            flow_dict = {ch: self.f_lower for ch in self.channels}
+            psds = pycbc.psd.from_cli_multi_ifos(args, length_dict, delta_f_dict,
+                                                  flow_dict, self.channels)
+            self.w = {ch: ((1.0 / psds[ch][self.kmin:-1]) ** 0.5).astype(numpy.float32)
+                      for ch in self.channels}
+
+            self.qtilde_view = {}
+            self.ifft = {}
+            self.md = {}
+            self.md2 = {}
+            for ch in self.channels:
+                qtilde = pycbc.types.zeros(tlen, numpy.complex64)
+                q = pycbc.types.zeros(tlen, numpy.complex64)
+                self.qtilde_view[ch] = qtilde[self.kmin:self.flen - 1]
+                self.ifft[ch] = pycbc.fft.IFFT(qtilde, q)
+
+                self.md[ch] = q
+                self.md2[ch] = numpy.zeros(20)
+
+                if args.use_trimmed_buffer:
+                    self.md[ch] = q._data[-100:]
+                    self.md2[ch] = q._data[0:100]
 
     def generate(self, **kwds):
         if args.max_signal_length is not None:
@@ -404,10 +465,50 @@ class GenUniformWaveform(object):
         if hasattr(kwds['approximant'], 'decode'):
             kwds['approximant'] = kwds['approximant'].decode()
 
-        if args.full_resolution_buffer_length is not None: 
+        if args.full_resolution_buffer_length is not None:
             buff_len =  args.full_resolution_buffer_length
         else:
             buff_len = 1.0 / self.delta_f
+
+        if self.channels is not None:
+            # Request an explicit sample_points grid, starting at f_lower:
+            # BBHX_Phenom's delta_f-only path has a shape bug and breaks at
+            # f=0. Zero-pad below f_lower ourselves, same as a resize()'d
+            # single-channel template.
+            n_active = self.flen - 1 - self.kmin
+            freqs_active = self.f_lower + numpy.arange(n_active) * self.delta_f
+            # delta_f is required by pycbc's generic arg check even though
+            # the sample_points path ignores it.
+            wavs_active = pycbc.waveform.get_fd_det_waveform(
+                sample_points=freqs_active, delta_f=self.delta_f,
+                ifos=self.channels, **kwds)
+
+            # whiten per channel, then scale all channels by one factor
+            # from the combined network sigmasq
+            total_sigmasq = 0.0
+            wavs = {}
+            for ch in self.channels:
+                wavs[ch] = pycbc.types.FrequencySeries(
+                    numpy.zeros(self.flen, dtype=numpy.complex64),
+                    delta_f=self.delta_f)
+                wavs[ch][self.kmin:self.flen - 1] = pycbc.types.Array(
+                    numpy.asarray(wavs_active[ch]).astype(numpy.complex64))
+                wavs[ch][self.kmin:-1] *= self.w[ch]
+                total_sigmasq += pycbc.filter.sigmasq(wavs[ch],
+                                                       low_frequency_cutoff=f)
+
+            s = float(1.0 / total_sigmasq ** 0.5)
+            channel_views = {}
+            for ch in self.channels:
+                wavs[ch] *= s
+                channel_views[ch] = wavs[ch][self.kmin:-1]
+
+            hp = wavs[self.channels[0]]
+            hp.channels = channel_views
+            hp.params = kwds
+            hp.view = channel_views[self.channels[0]]
+            hp.s = (1.0 / s) ** 2.0
+            return hp
 
         if args.use_td_waveform and kwds['approximant'] in pycbc.waveform.td_approximants():
 
@@ -453,6 +554,22 @@ class GenUniformWaveform(object):
         return hp
 
     def match(self, hp, hc):
+        if self.channels is not None:
+            # network match: sum per-channel |overlap(t)|^2, then maximize
+            # over time
+            total_md = None
+            total_md2 = None
+            for ch in self.channels:
+                pycbc.filter.correlate(hp.channels[ch], hc.channels[ch],
+                                        self.qtilde_view[ch])
+                self.ifft[ch].execute()
+                power_md = abs(self.md[ch]) ** 2
+                power_md2 = abs(self.md2[ch]) ** 2
+                total_md = power_md if total_md is None else total_md + power_md
+                total_md2 = power_md2 if total_md2 is None else total_md2 + power_md2
+            m = max(total_md.max(), total_md2.max()) ** 0.5
+            return m * 4.0 * self.delta_f
+
         pycbc.filter.correlate(hp.view, hc.view, self.qtilde_view)
         self.ifft.execute()
         m = max(abs(self.md).max(), abs(self.md2).max())
@@ -467,7 +584,7 @@ else:
 size = int(1.0 / tolerance)
 
 gen = GenUniformWaveform(args.buffer_length,
-    args.sample_rate, args.low_frequency_cutoff)
+    args.sample_rate, args.low_frequency_cutoff, channels=args.channels)
 bank = TriangleBank()
 
 def silent_child_exit(signum, frame):
