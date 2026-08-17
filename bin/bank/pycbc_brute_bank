@@ -135,6 +135,16 @@ if args.channels is not None and args.use_td_waveform:
 if args.channels is not None and args.full_resolution_buffer_length is not None:
     parser.error("--channels (multi-channel detector-response mode) is not "
                  "supported together with --full-resolution-buffer-length.")
+# All four are used without defaults by the crawl below, so they are required
+# in practice; without this the run dies later inside insert() on a missing
+# .tbin, or on None arithmetic.
+_missing = [name for name in ('tau0_start', 'tau0_end', 'tau0_crawl',
+                              'tau0_threshold')
+            if getattr(args, name) is None]
+if _missing:
+    parser.error("missing required option(s): "
+                 + ", ".join('--' + m.replace('_', '-') for m in _missing))
+
 if _OMP_OVERRIDDEN_FROM not in (None, '1'):
     logging.warning("OMP_NUM_THREADS was %s, forced to 1: forked workers "
                     "deadlock otherwise. Templates are already parallelised "
