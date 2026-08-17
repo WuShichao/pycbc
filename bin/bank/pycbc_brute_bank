@@ -19,12 +19,39 @@
 
 """Generate a bank of templates using a brute force stochastic method.
 """
+import os
+import sys
+
+
+def _pin_openmp_before_import():
+    """Pin OpenMP to one thread when the pool will fork, before numpy loads.
+
+    The parent enters an OpenMP region via numpy/BLAS while building PSDs, so
+    forked workers inherit a runtime referring to threads that did not survive
+    the fork and block forever in their first waveform. Must run before any
+    import: the runtime reads OMP_NUM_THREADS once, on first use.
+    """
+    if '--channels' not in sys.argv:
+        return None
+    nprocesses = 1
+    for i, a in enumerate(sys.argv):
+        if a == '--nprocesses' and i + 1 < len(sys.argv):
+            nprocesses = int(sys.argv[i + 1])
+        elif a.startswith('--nprocesses='):
+            nprocesses = int(a.split('=', 1)[1])
+    if nprocesses == 1:
+        return None
+    previous = os.environ.get('OMP_NUM_THREADS')
+    os.environ['OMP_NUM_THREADS'] = '1'
+    return previous
+
+
+_OMP_OVERRIDDEN_FROM = _pin_openmp_before_import()
+
 import numpy
 import logging
 import signal
-import sys
 import tqdm
-import os
 import argparse
 import numpy.random
 from scipy.stats import gaussian_kde
@@ -108,12 +135,10 @@ if args.channels is not None and args.use_td_waveform:
 if args.channels is not None and args.full_resolution_buffer_length is not None:
     parser.error("--channels (multi-channel detector-response mode) is not "
                  "supported together with --full-resolution-buffer-length.")
-if args.channels is not None and args.nprocesses != 1:
-    # BroadcastPool forks; BBHx's import-time state deadlocks forked
-    # workers on first waveform call. Needs spawn + a __main__ guard this
-    # script doesn't have yet. MPI path untested.
-    parser.error("--channels currently requires --nprocesses 1 (fork "
-                 "deadlocks with BBHx, see comment above).")
+if _OMP_OVERRIDDEN_FROM not in (None, '1'):
+    logging.warning("OMP_NUM_THREADS was %s, forced to 1: forked workers "
+                    "deadlock otherwise. Templates are already parallelised "
+                    "across processes.", _OMP_OVERRIDDEN_FROM)
 
 config_parser = pycbc.types.config.InterpolatingConfigParser([args.input_config])
 variable_args, static_args = read_params_from_config(
