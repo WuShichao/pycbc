@@ -53,32 +53,73 @@ class HarmonicSource:
 
 
 def adaptive_time_grid(source, harmonic, t_start, t_end, delta_phi=0.5,
-                       growth=1.1, dt_max=None, t_ref=None,
-                       max_step_scale=4096.0):
-    """Cornish & Littenberg Sec. III.B grid: dense at merger, growing outward.
+                       dt_max=None, n_probe=4096, growth=1.0,
+                       max_step_scale=np.inf):
+    """Grid on which the carrier advances by ``delta_phi`` per step.
 
-    The step is set by the carrier, ``dt = delta_phi / omega``, then allowed to
-    grow geometrically once far from the reference time. ``dt_max`` caps it;
-    the cap that matters is the constellation's own timescale, not the
-    waveform's, so it defaults to a day.
+    The definition is exactly that -- points where Phi increases by delta_phi --
+    so instead of stepping through time and asking for omega at each point, the
+    carrier phase is evaluated ONCE on a probe grid and inverted. Because omega
+    rises toward merger, the result densifies there automatically.
+
+    Two bugs this replaces, both found on a real pyEFPEHM harmonic:
+
+    * the first version grew the step geometrically from ``t_start``, which put
+      the dense region at the start of the segment and the coarse region at the
+      merger -- backwards for a chirp. It survived testing only because the
+      test source's merger lay beyond the segment, where omega barely moves.
+    * the second called ``source.angular_frequency`` once per grid point inside
+      a Python loop. For an analytic source that is free; for pyEFPEHM every
+      call re-evaluates the inspiral solution, and building one grid took
+      longer than the dense path it was meant to replace.
+
+    ``dt_max`` still caps the step, for the stretches where the carrier is so
+    slow that the constellation's own motion becomes the limit.
     """
     if dt_max is None:
         dt_max = 86400.0
-    t_ref = t_end if t_ref is None else t_ref
-    times, t, step_scale = [t_start], t_start, delta_phi
-    while t < t_end:
-        omega = float(np.abs(source.angular_frequency(harmonic, np.array([t]))[0]))
-        dt = step_scale / omega if omega > 0 else dt_max
-        dt = min(max(dt, 1e-3), dt_max)
-        t = t + dt
-        # The step is allowed to grow far past a GW period: once the carrier
-        # is factored out, what is being sampled varies on the ORBITAL
-        # timescale. Capping the growth at a few GW periods, as a first version
-        # of this did, throws away most of the available speedup.
-        step_scale = min(step_scale * growth, max_step_scale * delta_phi)
-        times.append(min(t, t_end))
-    grid = np.unique(np.asarray(times))
-    return grid[grid <= t_end]
+    support = getattr(source, 'support', None)
+    if support is not None:
+        low, high = support(harmonic)
+        t_start, t_end = max(t_start, low), min(t_end, high)
+        if not t_end > t_start:
+            return np.array([])
+    probe = np.linspace(t_start, t_end, int(n_probe))
+    phase = np.asarray(source.carrier_phase(harmonic, probe), dtype=float)
+    # A harmonic pyEFPEHM defines over only part of the mission returns
+    # phase = 0 outside its window. Inverting a phase that is flat at zero for
+    # most of the probe piles every grid point into the flat stretch and
+    # produces a grid that resolves nothing -- which is what a `support` method
+    # on the source exists to prevent.
+    if not np.all(np.diff(phase) > 0):          # phase must be monotone to invert
+        phase = np.maximum.accumulate(phase)
+    total = phase[-1] - phase[0]
+    if not np.isfinite(total) or total <= 0:
+        return np.linspace(t_start, t_end, 2)
+
+    # Walk the carrier phase BACKWARDS from the merger, letting the step grow
+    # away from it. Cornish & Littenberg's own optimisation, and the direction
+    # matters: growing forwards from t_start puts the dense region where the
+    # signal is slowest and the coarse region at the merger.
+    if growth <= 1.0:
+        wanted = np.arange(phase[0], phase[-1], float(delta_phi))
+    else:
+        wanted, value, step = [], phase[-1], float(delta_phi)
+        limit = float(max_step_scale) * float(delta_phi)
+        while value > phase[0]:
+            wanted.append(value)
+            value -= step
+            step = min(step * growth, limit)
+        wanted = np.asarray(wanted[::-1])
+    grid = np.interp(wanted, phase, probe)
+    grid = np.unique(np.concatenate(([t_start], grid, [t_end])))
+
+    gaps = np.diff(grid)
+    if np.any(gaps > dt_max):                   # refill where the carrier is slow
+        extra = [np.arange(a, b, dt_max)
+                 for a, b in zip(grid[:-1], grid[1:]) if b - a > dt_max]
+        grid = np.unique(np.concatenate([grid] + extra))
+    return grid[(grid >= t_start) & (grid <= t_end)]
 
 
 def _link_factors(sample, lamb, beta, velocity_order=1):
@@ -189,15 +230,33 @@ def sparse_channel(source, harmonic, grid, terms, orbit, lamb, beta,
     return bracket
 
 
-def reconstruct(source, harmonic, grid, bracket, times):
-    """Spline the slow bracket onto ``times`` and reattach the carrier."""
+def reconstruct(source, harmonic, grid, bracket, times, support=None):
+    """Spline the slow bracket onto ``times`` and reattach the carrier.
+
+    The real and imaginary parts are splined SEPARATELY rather than the
+    amplitude and phase. Cornish & Littenberg spline amplitude and phase and
+    then need explicit zero-crossing handling, because ``unwrap(angle(B))``
+    jumps wherever ``|B|`` passes through zero -- measured here at over a
+    radian between adjacent grid points for a real waveform's strongest
+    harmonic, which a cubic spline then turns into garbage. The bracket is
+    slowly varying by construction, so its real and imaginary parts are too,
+    and splining them needs no unwrapping and no sign bookkeeping.
+
+    ``support`` optionally restricts the output to a harmonic's validity
+    window. A harmonic that pyEFPEHM only defines over part of the mission has
+    ``carrier_phase = 0`` outside it, so ``exp(i*0) = 1`` would otherwise
+    multiply a splined amplitude into a signal that is not there.
+    """
     from scipy.interpolate import CubicSpline
-    amplitude = np.abs(bracket)
-    phase = np.unwrap(np.angle(bracket))
-    amp = CubicSpline(grid, amplitude)(times)
-    ang = CubicSpline(grid, phase)(times)
-    return np.real(amp * np.exp(1j * (ang + source.carrier_phase(harmonic,
-                                                                 times))))
+    real = CubicSpline(grid, np.real(bracket))(times)
+    imaginary = CubicSpline(grid, np.imag(bracket))(times)
+    out = np.real((real + 1j * imaginary)
+                  * np.exp(1j * source.carrier_phase(harmonic, times)))
+    if support is not None:
+        low, high = support
+        out = np.where((times >= low) & (times <= high), out, 0.0)
+    return out
+
 
 
 class SparseGeometry:

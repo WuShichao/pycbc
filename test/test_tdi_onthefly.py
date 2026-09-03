@@ -75,7 +75,7 @@ def test_sparse_matches_dense():
         generation=2, interpolation_order=31, delay_order=5)["X"])
 
     grid = adaptive_time_grid(source, 2, times[0], times[-1],
-                              delta_phi=0.5, growth=1.15, dt_max=1e9,
+                              delta_phi=0.5, dt_max=1e9, growth=1.15,
                               max_step_scale=64)
     sparse = reconstruct(source, 2, grid,
                          sparse_channel(source, 2, grid, _terms(), orbit,
@@ -88,7 +88,11 @@ def test_sparse_matches_dense():
 
 
 def test_sparse_grid_shrinks_and_error_grows_monotonically():
-    """Guards the accuracy/speed knob: a looser grid must cost accuracy."""
+    """Guards the accuracy/speed knob: a looser grid must cost accuracy.
+
+    delta_phi is now the only knob -- the geometric step growth it replaced put
+    the dense region at the segment start rather than at the merger.
+    """
     orbit = LisaEqualArmOrbit()
     delta_t, n = 5.0, 120000
     times = np.arange(n) * delta_t + 1e5
@@ -105,7 +109,7 @@ def test_sparse_grid_shrinks_and_error_grows_monotonically():
     sizes, errors = [], []
     for cap in (64, 512, 4096):
         grid = adaptive_time_grid(source, 2, times[0], times[-1],
-                                  delta_phi=0.5, growth=1.15, dt_max=1e9,
+                                  delta_phi=0.5, dt_max=1e9, growth=1.15,
                                   max_step_scale=cap)
         sparse = reconstruct(source, 2, grid,
                              sparse_channel(source, 2, grid, _terms(), orbit,
@@ -127,7 +131,7 @@ def test_cached_geometries_agree_with_the_direct_path():
     source = NewtonianChirp(3.0e4, times[-1] + 4e5)
     terms = _terms()
     grid = adaptive_time_grid(source, 2, times[0], times[-1],
-                              delta_phi=0.5, growth=1.15, dt_max=1e9,
+                              delta_phi=0.5, dt_max=1e9, growth=1.15,
                               max_step_scale=512)
     direct = sparse_channel(source, 2, grid, terms, orbit, 0.9, -0.25)
     scale = np.max(np.abs(direct))
