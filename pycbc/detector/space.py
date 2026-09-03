@@ -959,11 +959,126 @@ class _Generic_detector(AbsSpaceDet):
             'orbit/coordinate machinery this response will build on.')
 
 
+class _Native_detector(AbsSpaceDet):
+    """
+    PyCBC's own response and TDI backend, built on
+    `pycbc.coordinates.space_orbit` and `pycbc.tdi`.
+
+    Works for any constellation the orbit module can describe, so unlike the
+    LISA-only LDC and FLR backends it also serves Taiji and TianQin. The
+    single-link response is light-cone consistent: the arm direction and the
+    emission event both come from solving c L_ij = |r_i(t) - r_j(t - L_ij)|,
+    and the Speri Eq. (13) Doppler weights are built on that same direction.
+
+    Parameters
+    ----------
+    detector_name : str
+        The name of the detector. Accepts any output from
+        `get_available_space_detectors`.
+
+    reference_time : float (optional)
+        The reference time in seconds of the signal in the SSB frame,
+        defined so that the detector mission start time is 0. Default None.
+
+    orbits : object (optional)
+        Any `pycbc.coordinates.space_orbit` orbit instance. Default is the
+        equal-arm analytic orbit for this detector.
+    """
+
+    _default_orbits = {
+        'LISA': 'LisaEqualArmOrbit',
+        'Taiji': 'TaijiEqualArmOrbit',
+        'TianQin': 'TianQinAnalyticOrbit',
+    }
+
+    def __init__(self, detector_name, reference_time=None, orbits=None,
+                 **kwargs):
+        super().__init__(detector_name, reference_time, **kwargs)
+        if orbits is None:
+            from pycbc.coordinates import space_orbit
+            orbits = getattr(space_orbit, self._default_orbits[self.det])()
+        self.orbits = orbits
+        self._sample = None
+
+    @property
+    def sky_coords(self):
+        return 'eclipticlongitude', 'eclipticlatitude'
+
+    def _constellation(self, times):
+        """Cache the sky-independent orbit sample across likelihood calls."""
+        key = (len(times), float(times[0]), float(times[-1]))
+        if self._sample is None or self._sample[0] != key:
+            from pycbc.tdi.response import sample_constellation
+            self._sample = (key, sample_constellation(times, self.orbits))
+        return self._sample[1]
+
+    def get_links(self, hp, hc, lamb, beta, polarization=0,
+                  velocity_order=1, **kwargs):
+        """
+        Evaluate the six directed single-link responses.
+
+        Returns
+        -------
+        numpy.ndarray
+            Shape (N, 6) fractional-frequency response, in
+            `pycbc.tdi.response.LINK_ORDER`.
+        """
+        from pycbc.tdi.response import link_geometry, link_response
+        from pycbc.tdi.sources import ArrayWaveformSource
+        hp_ssb, hc_ssb = apply_polarization(hp, hc, polarization)
+        times = numpy.asarray(hp.sample_times, dtype=float)
+        sample = self._constellation(times)
+        geometry = link_geometry(sample, lamb, beta,
+                                 velocity_order=velocity_order)
+        # NOTE ArrayWaveformSource interpolates linearly, so the retarded
+        # samples carry an O((pi f dt)^2 / 2) error -- about 1% for f = 10 mHz
+        # at dt = 5 s. Pass a source with an analytic `polarizations` to
+        # get_links, or use the sparse evaluator, when that matters.
+        source = ArrayWaveformSource(times, numpy.asarray(hp_ssb),
+                                     numpy.asarray(hc_ssb))
+        return link_response(source, sample, geometry)
+
+    def project_wave(self, hp, hc, lamb, beta, polarization=0, tdi=1.5,
+                     tdi_chan='AET', velocity_order=1, pad_data=False,
+                     remove_garbage=False, t0=1e4, **kwargs):
+        """
+        Evaluate the TDI observables.
+
+        Parameters match `_FLR_detector.project_wave`; `tdi` accepts 1.5 or 2,
+        `tdi_chan` accepts 'XYZ', 'AET' or 'AE'. `velocity_order=0` drops the
+        Speri Doppler weights but keeps the light-cone geometry.
+
+        Returns
+        -------
+        dict ({str: pycbc.types.TimeSeries})
+            The TDI observables keyed by channel name.
+        """
+        from pycbc.tdi.backends.pytdi_backend import combine_links
+        if tdi not in (1.5, 2):
+            raise ValueError("tdi must be 1.5 or 2")
+        if tdi_chan not in ('XYZ', 'AET', 'AE'):
+            raise ValueError("tdi_chan must be 'XYZ', 'AET' or 'AE'")
+        links = self.get_links(hp, hc, lamb, beta, polarization=polarization,
+                               velocity_order=velocity_order, **kwargs)
+        sample = self._constellation(
+            numpy.asarray(hp.sample_times, dtype=float))
+        channels = combine_links(
+            links, sample, channels='XYZ' if tdi_chan == 'XYZ' else 'AET',
+            generation=1 if tdi == 1.5 else 2,
+        )
+        if tdi_chan == 'AE':
+            channels = {k: v for k, v in channels.items() if k in 'AE'}
+        return cut_channels(channels, remove_garbage=remove_garbage, t0=t0)
+
+
 _backends = {'LISA': {'LDC': _LDC_detector,
                       'FLR': _FLR_detector,
+                      'pycbc': _Native_detector,
                      },
-             'Taiji': {'Generic': _Generic_detector},
-             'TianQin': {'Generic': _Generic_detector},
+             'Taiji': {'pycbc': _Native_detector,
+                       'Generic': _Generic_detector},
+             'TianQin': {'pycbc': _Native_detector,
+                         'Generic': _Generic_detector},
             }
 
 class SpaceDetector(AbsSpaceDet):

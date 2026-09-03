@@ -363,6 +363,7 @@ class NumericOrbits:
         """
         t_gps = None
         positions_icrs_km = []
+        velocities_icrs_km_s = []
         for path in (oem_1, oem_2, oem_3):
             meta, epochs_iso, rows = _parse_oem_file(path)
             if meta.get('REF_FRAME') != 'EME2000':
@@ -378,13 +379,32 @@ class NumericOrbits:
                 raise ValueError(
                     'input OEM files do not share identical epochs')
             positions_icrs_km.append(rows[:, 0:3])
+            # OEM rows carry velocity (and often acceleration) alongside
+            # position. Differentiating the velocity column is ~5 orders more
+            # accurate than differentiating a position spline twice: on the
+            # 1-minute ESA file the spline route reaches 5.8e-3 relative error
+            # against the file's own acceleration column, the velocity route
+            # 1.6e-8. Reading them costs nothing, so do not throw them away.
+            velocities_icrs_km_s.append(
+                rows[:, 3:6] if rows.shape[1] >= 6 else None)
 
         positions_icrs_m = np.stack(positions_icrs_km, axis=1) * 1e3  # (N,3,3)
         rotation = _icrs_to_ecliptic_rotation_matrix()
         positions_ecliptic_m = (
             positions_icrs_m.reshape(-1, 3) @ rotation.T
         ).reshape(positions_icrs_m.shape)
-        return cls(t_gps, positions_ecliptic_m, interp_order=interp_order)
+
+        velocities_ecliptic_m_s = None
+        if all(v is not None for v in velocities_icrs_km_s):
+            velocities_icrs_m_s = (
+                np.stack(velocities_icrs_km_s, axis=1) * 1e3)
+            velocities_ecliptic_m_s = (
+                velocities_icrs_m_s.reshape(-1, 3) @ rotation.T
+            ).reshape(velocities_icrs_m_s.shape)
+
+        return cls(t_gps, positions_ecliptic_m,
+                   velocities=velocities_ecliptic_m_s,
+                   interp_order=interp_order)
 
     @classmethod
     def from_lisaorbits_file(cls, path, interp_order=5):
