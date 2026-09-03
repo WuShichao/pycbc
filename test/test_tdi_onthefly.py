@@ -114,3 +114,39 @@ def test_sparse_grid_shrinks_and_error_grows_monotonically():
         errors.append(np.max(np.abs(sparse[interior] - dense[interior])) / scale)
     assert sizes[0] > sizes[1] > sizes[2]
     assert errors[0] < errors[1] < errors[2]
+
+
+def test_cached_geometries_agree_with_the_direct_path():
+    """The three cached forms are optimisations, not different calculations."""
+    from pycbc.tdi.onthefly import (SparseGeometry, StackedGeometry,
+                                    TermGeometry, sparse_channel_cached,
+                                    sparse_channel_stacked,
+                                    sparse_channel_terms)
+    orbit = LisaEqualArmOrbit()
+    times = np.arange(120000) * 5.0 + 1e5
+    source = NewtonianChirp(3.0e4, times[-1] + 4e5)
+    terms = _terms()
+    grid = adaptive_time_grid(source, 2, times[0], times[-1],
+                              delta_phi=0.5, growth=1.15, dt_max=1e9,
+                              max_step_scale=512)
+    direct = sparse_channel(source, 2, grid, terms, orbit, 0.9, -0.25)
+    scale = np.max(np.abs(direct))
+    for builder, evaluate, tolerance in (
+            (SparseGeometry, sparse_channel_cached, 0.0),
+            (StackedGeometry, sparse_channel_stacked, 1e-12),
+            (TermGeometry, sparse_channel_terms, 1e-12)):
+        got = evaluate(source, 2, builder(orbit, grid, terms), 0.9, -0.25)
+        assert np.max(np.abs(got - direct)) / scale <= tolerance
+
+
+def test_term_geometry_keeps_only_the_pairs_the_channel_uses():
+    """The optimisation that mattered: gather (chain, link), do not index."""
+    from pycbc.tdi.onthefly import StackedGeometry, TermGeometry
+    orbit = LisaEqualArmOrbit()
+    grid = np.linspace(1e5, 3e6, 64)
+    terms = _terms()
+    stacked = StackedGeometry(orbit, grid, terms)
+    gathered = TermGeometry(orbit, grid, terms)
+    assert gathered.shape == (len(terms), len(grid))
+    # the stacked form carries every link of every chain
+    assert stacked.n_chain * stacked.n_link > 3 * len(terms)
