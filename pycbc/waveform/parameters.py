@@ -200,6 +200,44 @@ eccentricity = Parameter("eccentricity",
                 dtype=float, default=0., label=r"$e$",
                 description="Eccentricity.")
 
+# Environmental-effect parameters used by waveform plugins.
+environmental_model = Parameter("environmental_model",
+                        dtype=str, default=None, label=None,
+                        description=("Environmental phase-correction model. Supported pyEFPEHM "
+                                    "values are 'roemer', 'bhl', and 'supersonic'. A value of "
+                                    "None disables environmental corrections."))
+
+environmental_redshift = Parameter("environmental_redshift",
+                            dtype=float, default=0., label=r"$z_{\rm env}$",
+                            description=("Redshift used to convert detector-frame masses and frequencies "
+                                        "to source-frame quantities in environmental corrections."))
+
+environmental_phase_sign = Parameter("environmental_phase_sign",
+                            dtype=float, default=1.0, label=None,
+                            description=("Overall sign of the environmental Fourier-phase correction. "
+                                        "Must be either +1 or -1."))
+
+tertiary_mass = Parameter("tertiary_mass",
+                dtype=float, default=0.0, label=r"$m_3~(\mathrm{M}_\odot)$",
+                description=("Source-frame tertiary mass in solar masses, used by the "
+                            "pyEFPEHM Roemer-delay correction."))
+
+tertiary_distance = Parameter("tertiary_distance",
+                    dtype=float, default=0.0, label=r"$R~(\mathrm{m})$",
+                    description=("Separation between the tertiary object and inner binary "
+                                "center of mass in metres, used by the pyEFPEHM "
+                                "Roemer-delay correction."))
+
+gas_density = Parameter("gas_density",
+                dtype=float, default=0.0, label=r"$\rho~(\mathrm{kg\,m^{-3}})$",
+                description=("Environmental gas rest-mass density in kg m^-3, used by "
+                            "the pyEFPEHM BHL and supersonic-drag corrections."))
+
+sound_speed = Parameter("sound_speed",
+                dtype=float, default=0.0, label=r"$c_s~(\mathrm{m\,s^{-1}})$",
+                description=("Environmental sound speed in m s^-1, used by the "
+                            "pyEFPEHM BHL-drag correction."))
+
 # derived parameters (these are not used for waveform generation)
 mchirp = Parameter("mchirp",
                 dtype=float, label=r"$\mathcal{M}~(\mathrm{M}_\odot)$",
@@ -585,13 +623,18 @@ testingGR_params = ParameterList\
       dchi7, dalpha1, dalpha2, dalpha3, dalpha4, dalpha5,
       dbeta1, dbeta2, dbeta3])
 
+# parameters of environmental effects
+environmental_params = ParameterList\
+    ([environmental_model, environmental_redshift, environmental_phase_sign,
+      tertiary_mass, tertiary_distance, gas_density, sound_speed,])
+
 # intrinsic parameters of a CBC waveform. Some of these are not recognized
 # by every waveform model
 cbc_intrinsic_params = ParameterList\
     ([mass1, mass2, spin1x, spin1y, spin1z, spin2x, spin2y, spin2z,
       eccentricity, lambda1, lambda2, dquad_mon1, dquad_mon2, lambda_octu1,
       lambda_octu2, quadfmode1, quadfmode2, octufmode1, octufmode2]) + \
-    testingGR_params
+    testingGR_params + environmental_params
 
 # the parameters of a cbc in the radiation frame
 cbc_rframe_params = cbc_intrinsic_params + orientation_params
