@@ -1275,14 +1275,27 @@ class _LILA_detector(AbsSpaceDet):
         propagation delay. Pass None to disable interpolation and
         evaluate every sample exactly (much slower).
     """
-    # Orthogonal recombination of the three vertex channels. T is the
-    # triangle's null stream: the three vertices' response tensors sum to
-    # zero identically (an exact geometric identity for any three sites
-    # whose arms lie along the connecting great circles, not a
+    # Orthogonal recombination of the three vertex channels, in the same
+    # convention `_LDC_detector` uses for LISA's TDI variables (see its
+    # `project_wave`), with the vertex channels 1/2/3 playing the role of
+    # X/Y/Z there:
+    #     A = (Z - X)/sqrt(2), E = (X - 2Y + Z)/sqrt(6),
+    #     T = (X + Y + Z)/sqrt(3).
+    # Any orthonormal basis of the two-dimensional signal subspace would
+    # do -- these three rows are one particular choice among a rotation's
+    # worth -- but matching LISA's keeps 'LILA_A' meaning the same
+    # combination as 'LISA_A' for anyone reading across the two backends.
+    #
+    # T is the triangle's null stream: the three vertices' response
+    # tensors sum to zero identically (an exact geometric identity for any
+    # three sites whose arms lie along the connecting great circles, not a
     # small-triangle approximation), so T carries no GW signal in the
-    # long-wavelength limit and is an instrumental/glitch monitor.
-    _AET = numpy.array([[1.0, -1.0, 0.0],
-                        [1.0, 1.0, -2.0],
+    # long-wavelength limit and is an instrumental/glitch monitor. Under
+    # the usual symmetry assumption -- equal noise at each vertex, equal
+    # correlation between each pair -- this basis also diagonalizes the
+    # noise covariance, as it does for LISA.
+    _AET = numpy.array([[-1.0, 0.0, 1.0],
+                        [1.0, -2.0, 1.0],
                         [1.0, 1.0, 1.0]]) / numpy.array([[numpy.sqrt(2.0)],
                                                          [numpy.sqrt(6.0)],
                                                          [numpy.sqrt(3.0)]])

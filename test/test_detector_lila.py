@@ -256,6 +256,25 @@ class TestLILAProjection(unittest.TestCase):
         self.assertEqual(len(epochs), 1)
         self.assertEqual(len(deltas), 1)
 
+    def test_aet_matches_the_lisa_tdi_convention(self):
+        """A/E/T must be built the same way `_LDC_detector` builds LISA's
+        TDI variables, with vertex channels 1/2/3 in the role of X/Y/Z.
+        Any orthonormal basis of the signal subspace would be physically
+        valid, so nothing but an explicit test keeps the two backends
+        from drifting apart."""
+        from pycbc.detector.space import _LILA_detector
+
+        matrix = _LILA_detector._AET
+        # orthonormal, hence power-preserving
+        self.assertTrue(numpy.allclose(matrix @ matrix.T, numpy.eye(3)))
+
+        rng = numpy.random.default_rng(20260903)
+        x, y, z = rng.normal(size=(3, 8))
+        a, e, t = matrix @ numpy.vstack([x, y, z])
+        self.assertTrue(numpy.allclose(a, (z - x) / numpy.sqrt(2)))
+        self.assertTrue(numpy.allclose(e, (x - 2 * y + z) / numpy.sqrt(6)))
+        self.assertTrue(numpy.allclose(t, (x + y + z) / numpy.sqrt(3)))
+
     def test_aet_channels_present_on_request(self):
         out = self.det.project_wave(self.hp, self.hc, include_aet=True,
                                     **self.sky)
