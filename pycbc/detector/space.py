@@ -1447,41 +1447,105 @@ class _LILA_detector(AbsSpaceDet):
             out[chan] = (fplus, fcross)
         return out
 
-    def _vertex_delays(self, t_ref, lamb, beta):
-        """Propagation delay from the SSB to each vertex at `t_ref`.
+    def _vertex_positions(self, times):
+        """Barycentric-ecliptic positions of the three vertices at the given
+        GPS `times`, shape (3 vertices, 3 components, M), in metres.
 
-        Returned split into the delay at the triangle centroid (hundreds
-        of seconds) and each vertex's differential offset from it (at
-        most L/sqrt(3)/c = 77 us). The split matters numerically: the
-        differential is computed directly as k.(p_i - p_c)/c rather than
-        by subtracting two ~1.4e9 absolute GPS times, whose float64 ulp
-        (0.24 us) and `fsolve` tolerance would both eat into a 130 us
-        signal.
+        A vectorised counterpart to
+        `pycbc.coordinates.moon.moon_site_position_ssb`, which is
+        scalar-only (it reshapes its result to (3, 1)). The frame matches
+        that function's, so these positions may be contracted directly
+        with a propagation vector from
+        `coordinates.space.localization_to_propagation_vector`.
+        """
+        from astropy import units as apy_units
+        from astropy.coordinates import ICRS
+        from astropy.time import Time
+        from lunarsky import MoonLocation
+
+        from pycbc.coordinates.space_orbit import (
+            _icrs_to_ecliptic_rotation_matrix)
+
+        obstimes = Time(numpy.atleast_1d(times), format='gps')
+        rotation = _icrs_to_ecliptic_rotation_matrix()
+
+        out = numpy.empty((3, 3, len(obstimes)))
+        for j, site in enumerate(self.sites):
+            loc = MoonLocation.from_selenodetic(
+                lon=site['longitude'] * apy_units.rad,
+                lat=site['latitude'] * apy_units.rad,
+                height=site['height'] * apy_units.m)
+            icrs = loc.get_mcmf(obstimes).transform_to(ICRS())
+            xyz = numpy.vstack([
+                icrs.cartesian.x.to_value(apy_units.m),
+                icrs.cartesian.y.to_value(apy_units.m),
+                icrs.cartesian.z.to_value(apy_units.m)])
+            out[j] = rotation @ xyz
+        return out
+
+    def vertex_delays(self, lamb, beta, times):
+        """Light-travel delay from the SSB to each vertex, in seconds, at the
+        given *detector* GPS `times`.
+
+        This is the explicit, detector-time form
+        .. math::
+            \Delta t_i(t) = \hat{k}\cdot\bm{r}_i(t)/c ,
+        in which the position is evaluated at the known detector time, so
+        no root-finding is involved. It is the direction in which the
+        mapping is explicit: going the other way, from a known SSB time to
+        the unknown arrival time, puts the unknown inside
+        :math:`\bm{r}(\cdot)` and requires the implicit solve performed by
+        `coordinates.moon.t_moon_from_ssb` (which `_LGWA_detector` uses).
+
+        The delay is evaluated on the coarse `self.cadence` grid and cubic
+        interpolated, as the antenna patterns are; it varies on orbital
+        timescales, and a 3600 s grid reproduces it to well under a
+        nanosecond.
 
         Returns
         -------
-        (delay_center, offsets) : (float, list of float)
+        dict
+            Channel name -> delay array of len(times), in seconds.
         """
-        from pycbc.coordinates.moon import moon_site_position_ssb
-        from pycbc.coordinates.space import localization_to_propagation_vector
-        from pycbc.coordinates.moon import t_moon_from_ssb
+        from scipy.interpolate import CubicSpline
+
         from astropy.constants import c as speed_of_light
+        from pycbc.coordinates.space import (
+            localization_to_propagation_vector)
 
-        delay_center = t_moon_from_ssb(
-            t_ref, lamb, beta,
-            self.longitude_site, self.latitude_site) - t_ref
+        times = numpy.asarray(times, dtype=numpy.float64)
+        grid = self._grid(float(times[0]), float(times[-1]))
+        eval_times = times if grid is None else grid
 
-        k = localization_to_propagation_vector(lamb, beta, use_astropy=False)
-        t_center = t_ref + delay_center
-        p_center = moon_site_position_ssb(
-            t_center, self.longitude_site, self.latitude_site)
-        offsets = []
-        for site in self.sites:
-            p_site = moon_site_position_ssb(
-                t_center, site['longitude'], site['latitude'])
-            offsets.append(
-                float(numpy.vdot(k, p_site - p_center)) / speed_of_light.value)
-        return delay_center, offsets
+        k = numpy.asarray(
+            localization_to_propagation_vector(lamb, beta, use_astropy=False),
+            dtype=numpy.float64).reshape(3)
+        positions = self._vertex_positions(eval_times)
+
+        out = {}
+        for j, chan in enumerate(self.channels):
+            delay = (k @ positions[j]) / speed_of_light.value
+            if grid is not None:
+                delay = CubicSpline(grid, delay)(times)
+            out[chan] = delay
+        return out
+
+    def _window_epoch(self, lamb, beta, t_ref):
+        """Detector time at which to start the output series.
+
+        This only selects *which window* of detector time is emitted; the
+        delays applied within it are exact at every sample, so an error
+        here costs a sliver of signal at the segment edges and nothing
+        else. Two explicit evaluations are therefore ample, and no
+        implicit solve is needed: the first uses the Moon's position at
+        the SSB epoch, the second corrects it for the Moon's motion during
+        the light-travel time (about 11 ms of the 475 s total).
+        """
+        delay = self.vertex_delays(lamb, beta, numpy.array([t_ref, t_ref]))
+        guess = float(numpy.mean([delay[c][0] for c in self.channels]))
+        refined = self.vertex_delays(
+            lamb, beta, numpy.array([t_ref + guess, t_ref + guess]))
+        return float(numpy.mean([refined[c][0] for c in self.channels]))
 
     def project_wave(self, hp, hc, lamb, beta, polarization=0,
                      include_aet=False, **kwargs):
@@ -1494,21 +1558,29 @@ class _LILA_detector(AbsSpaceDet):
         the SSB-frame `eclipticlongitude`/`eclipticlatitude`/polarization
         of the source.
 
-        All three channels are returned on a *common* sample grid, that
-        of the triangle centroid. Only the bulk SSB -> Moon delay is
-        applied as an epoch shift, in the manner of `_LDC_detector` and
-        `_LGWA_detector`; each vertex's differential delay (at most
-        77 us, and always a fraction of a sample) is applied by
-        interpolating hp/hc, because it is sub-sample and because a
-        common grid is what a coherent three-channel analysis -- and the
-        A/E/T recombination in particular -- requires. Relabelling three
-        epochs instead would leave the channels mutually unaligned and
-        make the null stream cancel spuriously.
+        The output grid is a *detector*-time grid, which is what makes the
+        propagation delay explicit (see `vertex_delays`). For each vertex,
+        .. math::
+            h_i(t) = F^{(i)}_+(t)\,h_+(t - \Delta t_i(t))
+                   + F^{(i)}_\times(t)\,h_\times(t - \Delta t_i(t)),
+        the minus sign following from the plane-wave form
+        :math:`h(t,\bm{x}) = f(t - \hat{k}\cdot\bm{x}/c)`: a vertex
+        further along the propagation direction receives later, so at a
+        given detector time it displays an earlier barycentric sample.
 
-        As for `_LGWA_detector`, `apply_polarization` is NOT called: the
-        polarization angle is folded directly into the F+/Fx combination
-        via the rotated source basis, so pre-rotating hp/hc the way the
-        LISA-family backends do would double-count it.
+        Unlike `_LDC_detector`/`_LGWA_detector`, which apply a single
+        constant epoch shift, :math:`\Delta t_i` is evaluated at every
+        sample. That is not a refinement but a requirement here: the
+        Moon's barycentric motion is dominated by the Earth's ~30 km/s
+        orbit, not by libration, so the delay drifts by ~44 ms across an
+        hour of signal and ~1 s across a day -- 10 cycles at 10 Hz, which
+        would destroy phase coherence for exactly the long mid-band
+        signals LILA is built to see.
+
+        All three channels share one grid. Per-vertex delays differ by at
+        most L/c = 133 us and are applied by interpolation, never by
+        relabelling epochs, since a coherent three-channel analysis -- and
+        the A/E/T recombination above all -- requires a common grid.
 
         Parameters
         ----------
@@ -1528,39 +1600,41 @@ class _LILA_detector(AbsSpaceDet):
         from pycbc.coordinates import moon as coord_moon
 
         # SSB-frame ecliptic lon/lat/pol -> LAL-convention ICRS
-        # ra/dec/psi, which is what the response tensors below expect.
-        # `t_geo` is discarded: arrival time at each vertex is computed
-        # separately via _vertex_delays, not via the geocenter.
+        # ra/dec/psi, which is what the response tensors expect. `t_geo`
+        # is discarded: arrival times come from vertex_delays, not via the
+        # geocenter.
         _, ra, dec, psi = coord_moon.moon_to_geo(
             t_moon=0.0, longitude_moon=lamb, latitude_moon=beta,
             polarization_moon=polarization, lal_convention=True)
 
         t_ref = float(hp.start_time)
-        delay_center, offsets = self._vertex_delays(t_ref, lamb, beta)
+        delta_t = float(hp.delta_t)
+        n_sample = len(hp)
 
-        # Common output grid: the SSB waveform, bulk-shifted to the
-        # centroid's arrival time.
-        hp_c, hc_c = hp.copy(), hc.copy()
-        hp_c.start_time += delay_center
-        hc_c.start_time += delay_center
-        times = hp_c.sample_times.numpy()
+        epoch_delay = self._window_epoch(lamb, beta, t_ref)
+        times = t_ref + epoch_delay + numpy.arange(n_sample) * delta_t
 
-        # A vertex whose arrival is later by `offset` sees, at common time
-        # t, the wavefront the centroid saw at t - offset.
-        hp_spline = CubicSpline(times, hp_c.numpy(), extrapolate=False)
-        hc_spline = CubicSpline(times, hc_c.numpy(), extrapolate=False)
-
+        delays = self.vertex_delays(lamb, beta, times)
         patterns = self.antenna_pattern(ra, dec, psi, times)
 
+        # All time arithmetic below is done in seconds *relative to
+        # t_ref*, never on absolute GPS times. At t ~ 1.4e9 s the spacing
+        # between doubles is 0.24 us, which would quantise the 133 us
+        # inter-vertex structure to 0.2%; the delays themselves are only
+        # ~475 s, where the spacing is 6e-14 s.
+        tau = numpy.arange(n_sample) * delta_t
+        hp_spline = CubicSpline(tau, hp.numpy(), extrapolate=False)
+        hc_spline = CubicSpline(tau, hc.numpy(), extrapolate=False)
+
         out = {}
-        for chan, offset in zip(self.channels, offsets):
-            shifted = times - offset
-            hp_v = numpy.nan_to_num(hp_spline(shifted))
-            hc_v = numpy.nan_to_num(hc_spline(shifted))
+        for chan in self.channels:
+            query = tau + (epoch_delay - delays[chan])
+            hp_v = numpy.nan_to_num(hp_spline(query))
+            hc_v = numpy.nan_to_num(hc_spline(query))
             fplus, fcross = patterns[chan]
             out['LILA_' + chan] = TimeSeries(
-                fplus * hp_v + fcross * hc_v, delta_t=hp_c.delta_t,
-                epoch=hp_c.start_time, copy=False)
+                fplus * hp_v + fcross * hc_v, delta_t=delta_t,
+                epoch=times[0], copy=False)
 
         if include_aet:
             stack = numpy.vstack([out['LILA_' + c].numpy()
@@ -1568,8 +1642,7 @@ class _LILA_detector(AbsSpaceDet):
             aet = self._AET @ stack
             for name, row in zip(['A', 'E', 'T'], aet):
                 out['LILA_' + name] = TimeSeries(
-                    row, delta_t=hp_c.delta_t, epoch=hp_c.start_time,
-                    copy=False)
+                    row, delta_t=delta_t, epoch=times[0], copy=False)
         return out
 
 

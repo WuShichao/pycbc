@@ -285,11 +285,45 @@ class TestLILAProjection(unittest.TestCase):
     def test_vertex_delays_respect_the_geometric_bound(self):
         """No two vertices can differ by more than one side's light time,
         L/c = 133.4 us."""
-        _, offsets = self.det.backend._vertex_delays(
-            float(self.hp.start_time), self.sky['lamb'], self.sky['beta'])
-        spread = max(offsets) - min(offsets)
+        times = float(self.hp.start_time) + numpy.array([0.0, 100.0])
+        delays = self.det.backend.vertex_delays(
+            self.sky['lamb'], self.sky['beta'], times)
+        stack = numpy.array([delays[c] for c in self.det.backend.channels])
+        spread = (stack.max(axis=0) - stack.min(axis=0)).max()
         self.assertLess(spread, ARM / 299792458.0)
         self.assertGreater(spread, 0.0)
+
+    def test_delay_is_explicit_and_time_varying(self):
+        """The delay is evaluated at each detector time, so it must drift
+        across a long segment. A constant delay -- the approximation the
+        LGWA backend makes -- would be flat, and would cost ~10 cycles of
+        phase at 10 Hz across a day of signal."""
+        t0 = float(self.hp.start_time)
+        times = t0 + numpy.array([0.0, 3600.0])
+        delays = self.det.backend.vertex_delays(
+            self.sky['lamb'], self.sky['beta'], times)
+        drift = abs(delays['1'][1] - delays['1'][0])
+        self.assertGreater(drift, 1e-3)   # tens of ms across an hour
+
+    def test_explicit_delay_matches_the_implicit_solve(self):
+        """Cross-check against `t_moon_from_ssb`, which solves the implicit
+        equation for the same quantity. Agreement to well under the 133 us
+        inter-vertex scale confirms the two formulations describe the same
+        geometry, and that the explicit path has not flipped a sign."""
+        from pycbc.coordinates.moon import t_moon_from_ssb
+
+        backend = self.det.backend
+        t_ref = float(self.hp.start_time)
+        site = backend.sites[0]
+        implicit = t_moon_from_ssb(
+            t_ref, self.sky['lamb'], self.sky['beta'],
+            site['longitude'], site['latitude']) - t_ref
+        # The implicit solve returns the delay for a wavefront leaving the
+        # SSB at t_ref; evaluate the explicit form at that arrival time.
+        explicit = backend.vertex_delays(
+            self.sky['lamb'], self.sky['beta'],
+            numpy.array([t_ref + implicit, t_ref + implicit]))['1'][0]
+        self.assertLess(abs(explicit - implicit), 1e-5)
 
     def test_null_stream_is_suppressed_but_not_zero(self):
         """T must be far below the vertex channels (the tensors cancel)
