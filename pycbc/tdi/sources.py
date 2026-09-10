@@ -145,6 +145,45 @@ class NewtonianChirp:
         return np.real(amp_p * carrier), np.real(amp_c * carrier)
 
 
+def _windowed_derivative(x, y, window=256, degree=6):
+    """``(y_smooth, dy/dx)`` from overlapping polynomial windows.
+
+    Differentiating a spline through ``y`` fails here for a reason that has
+    nothing to do with the physics: the measured stationary times carry a
+    little roundoff, and once the grid is fine enough that the true change
+    between knots drops below it, the derivative goes negative.  A window
+    wide enough to average the noise away and short enough to follow the
+    curve fixes both ends of that, and unlike one global fit it costs the
+    same per knot at any bandwidth.
+    """
+    count = len(x)
+    window = int(min(max(window, degree + 2), count))
+    step = max(window // 2, 1)
+    derivative = np.zeros(count)
+    smoothed = np.zeros(count)
+    weight = np.zeros(count)
+    for start in range(0, count, step):
+        stop = min(start + window, count)
+        if stop - start < degree + 2:
+            start = max(0, stop - window)
+        piece = slice(start, stop)
+        centre = 0.5 * (x[start] + x[stop - 1])
+        scale = 0.5 * (x[stop - 1] - x[start]) or 1.0
+        local = (x[piece] - centre) / scale
+        fit = np.polynomial.polynomial.Polynomial.fit(
+            local, y[piece], min(degree, stop - start - 1), domain=[-1, 1],
+            window=[-1, 1])
+        # a raised cosine so neighbouring windows blend instead of stepping
+        taper = 0.5 * (1 - np.cos(
+            2 * np.pi * (np.arange(stop - start) + 0.5) / (stop - start)))
+        derivative[piece] += taper * fit.deriv()(local) / scale
+        smoothed[piece] += taper * fit(local)
+        weight[piece] += taper
+        if stop == count:
+            break
+    return smoothed / weight, derivative / weight
+
+
 class LALFDSource:
     r"""Any dominant-mode frequency-domain LAL waveform, for sparse LISA.
 
@@ -189,7 +228,10 @@ class LALFDSource:
     f_upper : float, optional
         End frequency in Hz.
     n_frequency : int, optional
-        Number of frequency knots used for the inverse-SPA splines.
+        Number of frequency knots, spaced geometrically.  It sets accuracy
+        only: the phase is unwrapped against the measured stationary time, so
+        the knot count no longer has to scale with duration times bandwidth.
+        ``unwrap_margin`` reports how much of the half-cycle budget was used.
     polarization : float, optional
         Polarization rotation in radians.  Sky position belongs to the LISA
         response and is deliberately not part of this source.
@@ -238,50 +280,63 @@ class LALFDSource:
             raise ValueError("f_upper must exceed f_lower")
         self.f_upper = float(f_upper)
 
-        # After the decades-long linear phase is removed, the largest phase
-        # step is about 2*pi*duration*df.  Keep it below pi/2 so unwrap cannot
-        # alias even for the full two-year Yorsh band.
-        if duration is not None:
-            requested_duration = float(duration)
-        else:
-            end_time = self._stationary_time([f_upper])[0]
-            start_time = self._stationary_time([f_lower])[0]
-            requested_duration = end_time - start_time
-        unwrap_knots = int(np.ceil(
-            4 * requested_duration * (self.f_upper - self.f_lower))) + 1
-        n_frequency = max(int(n_frequency), unwrap_knots)
-        frequency = np.linspace(self.f_lower, self.f_upper, n_frequency)
+        frequency = np.geomspace(self.f_lower, self.f_upper,
+                                 int(n_frequency))
         h_plus, h_cross = self._fd_waveform(frequency)
-        stationary_start = self._stationary_time([self.f_lower])[0]
+        stationary = self._stationary_time(frequency)
+        # dt/df comes from the MAIN grid, not from the local windows.  Those
+        # span about 1e-10 Hz, over which the curvature contributes
+        # (1/2) phi'' eps^2 ~ 2e-8 rad -- far below the roundoff of a phase
+        # that is itself ~1e8 rad, so a second derivative measured there is
+        # pure noise (it scatters over 1.2e12 to 4.2e12 around a true
+        # 9.9e11).  Across the main grid it is smooth, but only if the grid
+        # is read in windows: a plain spline derivative turns negative once
+        # n_frequency is large enough for roundoff to dominate a single knot
+        # spacing, which happened at 2048 knots over a three-day band.
+        # The same windows also smooth t(f).  The measured times are not
+        # strictly increasing once the grid is fine -- roundoff, not physics
+        # -- and CubicSpline demands strictly increasing knots, so the
+        # smoothed times are what the splines are built on.
+        stationary, dt_df = _windowed_derivative(frequency, stationary)
+        stationary_start = stationary[0]
+        relative_time = stationary - stationary_start
 
-        # Remove the large linear phase before unwrapping.  Differentiating a
-        # spline of the resulting native LAL phase is markedly more stable
-        # than storing a finite-difference time at every knot.
+        if np.any(~np.isfinite(dt_df)) or np.any(dt_df <= 0):
+            raise ValueError("LAL stationary-time map is not monotone")
+        if np.any(np.diff(relative_time) <= 0):
+            raise ValueError(
+                "the smoothed stationary times are still not increasing; "
+                "the window is too narrow for this grid")
+
+        # Unwrap against the measured t(f) rather than against a removed
+        # global linear phase.  The old route needed the phase step to stay
+        # under pi/2 after removing 2*pi*f*t_start, which costs
+        # 4 * duration * bandwidth knots: fine for a narrowband LISA binary
+        # (1.7e4 for a two-year 5.9 mHz source) and impossible for a
+        # broadband one (1.5e7 for a stellar-mass binary that merges in
+        # band, whose degree-32 Chebyshev design matrix alone is 3.8 GiB).
+        # Subtracting the PREDICTED increment first leaves only the
+        # prediction error to wrap, so the grid is set by the accuracy wanted
+        # and not by the bandwidth.
+        # The big linear term is still removed first, modulo 2*pi so that a
+        # multi-decade t0 costs no precision, which keeps `phase` on the
+        # contract the callers already use.  What is new is that the leftover
+        # is unwrapped against the MEASURED time rather than assumed small.
         time_shift_phase = np.remainder(
             2 * np.pi * frequency * stationary_start, 2 * np.pi)
-        shifted_fd_phase = np.unwrap(np.angle(
-            h_plus * np.exp(1j * time_shift_phase)))
-        # ``exp(i 2*pi*f*t0)`` itself loses a few ulps when t0 is decades.
-        # A local Chebyshev representation removes that harmless point noise
-        # before differentiation; a cubic interpolant would amplify it into
-        # spurious structure in delayed phases.  A LISA stellar-origin band
-        # spans about one percent in frequency, where degree 32 is ample; a
-        # band wide enough to need more shows up as the monotonicity failure
-        # below rather than silently.
-        degree = min(32, n_frequency - 1)
-        fd_phase = np.polynomial.Chebyshev.fit(
-            frequency, shifted_fd_phase, degree)
-        smooth_fd_phase = fd_phase(frequency)
-        relative_time = -fd_phase.deriv(1)(frequency) / (2 * np.pi)
-        relative_time -= relative_time[0]
-        dt_df = -fd_phase.deriv(2)(frequency) / (2 * np.pi)
-        invalid_time = np.any(np.diff(relative_time) <= 0)
-        invalid_slope = np.any(~np.isfinite(dt_df)) or np.any(dt_df <= 0)
-        if invalid_time or invalid_slope:
-            raise ValueError("LAL stationary-time map is not monotone")
-        stationary = stationary_start + relative_time
-        time = relative_time + self.t_start
-
+        measured = np.angle(h_plus * np.exp(1j * time_shift_phase))
+        predicted = -np.pi * (relative_time[:-1] + relative_time[1:]) \
+            * np.diff(frequency)
+        residual = np.remainder(
+            np.diff(measured) - predicted + np.pi, 2 * np.pi) - np.pi
+        margin = np.max(np.abs(residual))
+        if margin > 0.5 * np.pi:
+            raise ValueError(
+                f"the phase prediction is off by {margin:.2f} rad between "
+                "knots, more than half a cycle; raise n_frequency")
+        self.unwrap_margin = float(margin)
+        fd_phase = np.concatenate(
+            ([measured[0]], measured[0] + np.cumsum(predicted + residual)))
         # H(f) = A(t_f)/2 sqrt(dt/df)
         amplitude_plus = 2 * np.abs(h_plus) / np.sqrt(dt_df)
         ratio = np.divide(h_cross, h_plus, out=np.zeros_like(h_cross),
@@ -294,9 +349,10 @@ class LALFDSource:
             spsi * amplitude_plus + cpsi * amplitude_cross,
         )
 
-        phase = smooth_fd_phase + 2 * np.pi * frequency * relative_time
+        phase = fd_phase + 2 * np.pi * frequency * relative_time
         phase += np.pi / 4
 
+        time = relative_time + self.t_start
         self.t_end = float(time[-1])
         self.sample_frequencies = frequency
         self.stationary_times = stationary
@@ -325,12 +381,23 @@ class LALFDSource:
         scale = 5 / 256 * (chirp_mass * self.TAU_SUN) ** (-5 / 3)
         return scale * (np.pi * np.asarray(frequency)) ** (-8 / 3)
 
-    def _stationary_time(self, frequency):
-        """Measure ``-d arg(H)/2pi df`` without global phase unwrapping."""
+    def _local_phase_derivatives(self, frequency):
+        """``(t, dt/df)`` from local fits, with no global phase unwrapping.
+
+        Nine nearby NATIVE phase values are fitted rather than two nearly
+        equal complex numbers differenced.  The local span is about 2.4 rad:
+        safely unwrap-able, and large enough to suppress roundoff.  Because
+        every window uses the same nine offsets, rescaling to
+        ``x = (f - f_i)/epsilon_i`` makes the design matrix common to all of
+        them, so the whole set is one least-squares solve instead of a Python
+        loop over knots.
+
+        The second derivative it also returns is NOT usable as ``dt/df``: the
+        window is far too narrow to see curvature above roundoff.  It is
+        returned for diagnosis only, and the caller takes ``dt/df`` from the
+        main grid instead.
+        """
         frequency = np.atleast_1d(np.asarray(frequency, dtype=float))
-        # Fit nine nearby native phase values instead of differencing only two
-        # nearly equal complex numbers.  The full local phase span is about
-        # 2.4 rad: safely unwrap-able, but large enough to suppress roundoff.
         epsilon = 1.2 / (2 * np.pi * self._newtonian_time(frequency))
         epsilon = np.minimum(epsilon, frequency * 1e-7)
         offsets = np.linspace(-1.0, 1.0, 9)
@@ -338,12 +405,19 @@ class LALFDSource:
         h_plus, _ = self._fd_waveform(local_frequency.reshape(-1))
         local_phase = np.unwrap(
             np.angle(h_plus.reshape(len(frequency), -1)), axis=1)
-        derivative = np.empty(len(frequency))
-        for index in range(len(frequency)):
-            fit = np.polynomial.Chebyshev.fit(
-                local_frequency[index], local_phase[index], 4)
-            derivative[index] = fit.deriv()(frequency[index])
-        return -derivative / (2 * np.pi)
+        design = np.polynomial.polynomial.polyvander(offsets, 4)
+        coefficients = np.linalg.lstsq(design, local_phase.T, rcond=None)[0]
+        first = coefficients[1] / epsilon
+        second = 2 * coefficients[2] / epsilon ** 2
+        return -first / (2 * np.pi), -second / (2 * np.pi)
+
+    def _stationary_time(self, frequency):
+        """``-d arg(H)/2pi df``; see `_local_phase_derivatives`."""
+        return self._local_phase_derivatives(frequency)[0]
+
+    def _local_curvature(self, frequency):
+        """Diagnostic only -- see `_local_phase_derivatives`."""
+        return self._local_phase_derivatives(frequency)[1]
 
     def _solve_upper_frequency(self, duration):
         from scipy.optimize import brentq
