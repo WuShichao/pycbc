@@ -13,7 +13,7 @@ from pycbc.tdi.onthefly import (adaptive_time_grid, chain_delay,
 from pycbc.tdi.response import (link_geometry, link_response,
                                 sample_constellation)
 from pycbc.tdi.sources import (LALFDSource, LALIMRPhenomDSource,
-                               NewtonianChirp)
+                               LALTDSource, NewtonianChirp)
 
 
 def _lal_waveforms_available():
@@ -316,3 +316,98 @@ def test_lal_source_rejects_what_it_cannot_represent():
     assert source.approximant == "IMRPhenomD"
     with pytest.raises(ValueError, match="carrier"):
         source.amplitude(3, np.zeros(2))
+
+
+@pytest.mark.skipif(_NO_LAL is not None, reason=str(_NO_LAL))
+def test_lal_td_source_reaches_merger_and_reproduces_lal():
+    """The point of the time-domain route is the part inverse SPA cannot see.
+
+    LALFDSource stops where the stationary-time map does; for a LISA-mass
+    binary that is well before the ringdown.  This one must run past it and
+    must still be the LAL waveform, not an approximation of it.
+    """
+    from pycbc.waveform import get_td_waveform
+
+    parameters = dict(mass1=60.0, mass2=25.0, spin1z=0.4, spin2z=0.1,
+                      distance=500.0, coa_phase=0.0, f_lower=20.0)
+    delta_t = 1.0 / 4096
+    source = LALTDSource(delta_t=delta_t, inclination=1.0, approximant="IMRPhenomD",
+                         **parameters)
+    total_mass = (parameters["mass1"] + parameters["mass2"]) * 4.925490947e-6
+    probe = np.linspace(source.t_start, source.t_end, 20000)
+    frequency = source.angular_frequency(2, probe) / (2 * np.pi)
+    # the phase is monotone by construction, but the frequency is not: it
+    # falls away again in the decaying ringdown tail
+    assert np.all(frequency > 0)
+    assert frequency.max() * total_mass > 0.08     # past the ringdown
+    assert frequency[0] * total_mass < 0.01        # and starting in inspiral
+
+    plus, cross = get_td_waveform(approximant="IMRPhenomD", delta_t=delta_t,
+                                  inclination=1.0, **parameters)
+    times = np.asarray(plus.sample_times)
+    inside = (times >= source.t_start) & (times <= source.t_end)
+    got_plus, got_cross = source.polarizations(times[inside])
+    want_plus = np.asarray(plus)[inside]
+    want_cross = np.asarray(cross)[inside]
+    scale = max(np.max(np.abs(want_plus)), np.max(np.abs(want_cross)))
+    assert np.max(np.abs(got_plus - want_plus)) / scale < 1e-7
+    assert np.max(np.abs(got_cross - want_cross)) / scale < 1e-7
+
+
+@pytest.mark.skipif(_NO_LAL is not None, reason=str(_NO_LAL))
+def test_lal_td_source_refuses_more_than_one_carrier():
+    """Generated on axis, a higher-mode model looks single-carrier.
+
+    The spin-weighted harmonics leave only m = +/-2 at zero inclination, so
+    smoothness there proves nothing; what breaks is the angular dependence.
+    The check has to go off-axis, and it has to maximise over time and phase,
+    because two generations of the same model need not be sample-aligned --
+    IMRPhenomXAS puts its two inclinations 0.98 ms apart.
+    """
+    parameters = dict(mass1=60.0, mass2=25.0, spin1z=0.4, spin2z=0.1,
+                      distance=500.0, coa_phase=0.0, f_lower=20.0)
+    for approximant in ("IMRPhenomD", "IMRPhenomXAS", "TaylorF2"):
+        LALTDSource(delta_t=1.0 / 4096, inclination=1.0,
+                    approximant=approximant, **parameters)
+    # named by the registry, which knows these families by citation
+    for approximant in ("IMRPhenomXHM", "IMRPhenomXPHM", "IMRPhenomHM"):
+        with pytest.raises(ValueError, match="besides the .2, 2. carrier"):
+            LALTDSource(delta_t=1.0 / 4096, inclination=1.0,
+                        approximant=approximant, **parameters)
+    # and caught by measurement, which the registry does not cover
+    for approximant in ("SEOBNRv4HM", "SEOBNRv4PHM", "IMRPhenomTPHM"):
+        with pytest.raises(ValueError, match="single .2, ..-2. carrier"):
+            LALTDSource(delta_t=1.0 / 4096, inclination=1.0,
+                        approximant=approximant, **parameters)
+    # and accepted deliberately, as the dominant-mode approximation it is
+    LALTDSource(delta_t=1.0 / 4096, inclination=1.0,
+                approximant="IMRPhenomXHM", check_inclination=None,
+                **parameters)
+
+
+@pytest.mark.skipif(_NO_LAL is not None, reason=str(_NO_LAL))
+def test_lal_td_source_is_bandlimited_not_aliased_by_a_coarse_step():
+    """A coarse step costs the merger, and it costs it visibly.
+
+    The constructor guards against a carrier advancing more than pi per
+    sample, but LAL never lets that happen: it band-limits to the Nyquist of
+    the requested delta_t instead of folding. So the failure mode to document
+    is a silently SHORTER waveform, not a corrupt one -- which is why the
+    merger test above checks how far in Mf the source actually reaches.
+    """
+    parameters = dict(mass1=60.0, mass2=25.0, spin1z=0.4, spin2z=0.1,
+                      distance=500.0, coa_phase=0.0, f_lower=20.0)
+    total_mass = (parameters["mass1"] + parameters["mass2"]) * 4.925490947e-6
+    reach = {}
+    for delta_t in (1.0 / 4096, 1.0 / 256):
+        source = LALTDSource(delta_t=delta_t, inclination=1.0,
+                             approximant="IMRPhenomD", **parameters)
+        probe = np.linspace(source.t_start, source.t_end, 4000)
+        frequency = source.angular_frequency(2, probe) / (2 * np.pi)
+        assert np.all(frequency > 0)
+        # filled right up to Nyquist -- measured 130.0 Hz against 128.0 at
+        # delta_t = 1/256, the excess being the spline derivative at the edge
+        assert frequency.max() < 1.05 * 0.5 / delta_t
+        reach[delta_t] = frequency.max() * total_mass
+    assert reach[1.0 / 4096] > 0.08                     # keeps the ringdown
+    assert reach[1.0 / 256] < reach[1.0 / 4096] / 2     # loses it

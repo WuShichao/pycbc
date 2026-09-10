@@ -19,14 +19,16 @@ from pycbc.tdi.response import (
     sample_constellation,
 )
 from pycbc.tdi.sources import (ArrayWaveformSource, LALFDSource,
-                               LALIMRPhenomDSource, NewtonianChirp,
-                               PyEFPEHMSource, WaveformSource)
+                               LALIMRPhenomDSource, LALTDSource,
+                               NewtonianChirp, PyEFPEHMSource,
+                               WaveformSource)
 
 __all__ = [
     "LINK_ORDER",
     "ArrayWaveformSource",
     "LALFDSource",
     "LALIMRPhenomDSource",
+    "LALTDSource",
     "PyEFPEHMSource",
     "adaptive_time_grid",
     "chain_delay",

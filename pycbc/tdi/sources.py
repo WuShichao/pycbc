@@ -409,6 +409,263 @@ class LALFDSource:
                 np.real(amplitude_cross * carrier))
 
 
+def _longest_increasing_run(values):
+    """``(start, length)`` of the longest strictly increasing stretch.
+
+    ``-inf`` marks a sample as unusable: no run can cross one, because
+    ``diff`` across it is not positive on at least one side.
+    """
+    with np.errstate(invalid='ignore'):
+        rising = np.diff(values) > 0
+    if not rising.any():
+        return 0, 0
+    edges = np.flatnonzero(np.diff(np.concatenate(
+        ([False], rising, [False]))))
+    starts, stops = edges[::2], edges[1::2]
+    best = int(np.argmax(stops - starts))
+    return int(starts[best]), int(stops[best] - starts[best] + 1)
+
+
+class LALTDSource:
+    r"""A dominant-mode LAL waveform through merger, from its analytic signal.
+
+    `LALFDSource` inverts the stationary-phase map, which needs a monotone
+    t(f) and therefore stops before the merger: for a 1.8e6 Msun LISA binary
+    it reaches Mf = 0.0017, about ten days early, and only 26% of rho^2 lies
+    below that -- half the signal-to-noise.  Merger-ringdown has no stationary
+    phase to invert, so no amount of care fixes that route.
+
+    This one takes the amplitude and phase from the time domain instead, where
+    they exist throughout.  Generated at zero inclination the two polarizations
+    are exactly in quadrature,
+
+    .. math:: h_+ - i h_\times = A(t)\,e^{-i\Phi(t)},
+
+    so A and Phi come straight from the modulus and argument, and inclination
+    and polarization re-enter afterwards as the constants they are.  Any
+    approximant `pycbc.waveform.get_td_waveform` accepts will do, including
+    the frequency-domain ones, which it conditions into the time domain
+    itself.
+
+    The cost is that the sparse evaluator's premise -- an amplitude varying on
+    the ORBITAL timescale -- fails near merger, so the grid has to densify
+    there.  That is a real cost paid where the physics demands it, not an
+    approximation.
+
+    Parameters
+    ----------
+    delta_t : float
+        Sampling of the generated waveform in seconds.  It must resolve the
+        carrier: the constructor rejects a step that leaves the phase
+        advancing by more than pi per sample, since the unwrap would then
+        alias silently.
+    t_coalescence : float, optional
+        Where to place the waveform's own t = 0 (its amplitude peak, by LAL's
+        convention) on the mission clock.
+    polarization : float, optional
+        Polarization rotation in radians.  Sky position belongs to the LISA
+        response and is deliberately not part of this source.
+    amplitude_floor : float, optional
+        Fraction of the peak amplitude below which the waveform is treated as
+        absent at either end.  ``get_td_waveform`` pads a frequency-domain
+        model out to a power of two and tapers into it, so for a LISA-band
+        binary most of the returned array can be padding: a 1.8e6 Msun system
+        started at 5e-5 Hz has 332 days of real inspiral inside 971 days of
+        array, and the padding sits at 1e-6 of the peak where an inspiral
+        would be at (f_start/f_peak)^(2/3) ~ 3e-2.  The default is chosen to
+        cut the former and keep the latter.
+    approximant : str, optional
+        Default ``IMRPhenomD``.
+    check_inclination : float or None, optional
+        Test inclination in radians at which the dominant-mode projection is
+        verified against a real generation, or None to skip.  This is not
+        optional book-keeping: generated at zero inclination a higher-mode
+        model looks perfectly single-carrier, because the spin-weighted
+        harmonics leave only m = +/-2 there, so smoothness proves nothing.
+        What fails for such a model is the ANGULAR dependence, and the only
+        way to catch it is to go off-axis and look.  Measured mismatches at
+        1.0 rad: IMRPhenomD 3e-16, IMRPhenomXAS 3e-16, against IMRPhenomXHM
+        2e-03 and SEOBNRv4PHM 1e-01.
+    waveform_options : keyword arguments
+        Passed to :func:`pycbc.waveform.get_td_waveform`; ``inclination`` is
+        used for the projection and is not passed through.
+    """
+
+    def __init__(self, delta_t, inclination=0.0, t_coalescence=0.0,
+                 polarization=0.0, amplitude_floor=1e-3,
+                 approximant="IMRPhenomD", check_inclination=1.0,
+                 tolerance=1e-6, **waveform_options):
+        from scipy.interpolate import CubicSpline, PchipInterpolator
+        from pycbc.waveform import get_td_waveform
+
+        for name in ("delta_t", "approximant", "inclination"):
+            if name in waveform_options:
+                raise ValueError(f"{name} is a named argument here")
+        self.approximant = str(approximant)
+        self.harmonics = (2,)
+        self.delta_t = float(delta_t)
+
+        plus, cross = get_td_waveform(
+            approximant=self.approximant, delta_t=self.delta_t,
+            inclination=0.0, **waveform_options)
+        analytic = np.asarray(plus) - 1j * np.asarray(cross)
+        magnitude = np.abs(analytic)
+        peak = magnitude.max()
+        if peak <= 0:
+            raise ValueError("the generated waveform is identically zero")
+        phase = -np.unwrap(np.angle(analytic))
+
+        # Keep the longest stretch that is both loud enough to be signal and
+        # strictly monotone in phase.  Either test alone is too weak: the
+        # padded head is monotone in a slowly drifting numerical phase, and
+        # amplitude alone would keep whatever noise sits above the floor.
+        loud = magnitude > float(amplitude_floor) * peak
+        first, span = _longest_increasing_run(
+            np.where(loud, phase, -np.inf))
+        if span < 16:
+            raise ValueError(
+                "no usable stretch of monotone carrier phase; this source is "
+                "for a single (2, +/-2) carrier, and a higher-mode or "
+                "precessing model has several")
+        analytic = analytic[first:first + span]
+        magnitude = magnitude[first:first + span]
+        phase = phase[first:first + span]
+        times = np.asarray(plus.sample_times)[first:first + span]
+
+        step = np.abs(np.diff(np.angle(analytic)))
+        step = np.minimum(step, 2 * np.pi - step)
+        if step.max() >= np.pi:
+            raise ValueError(
+                f"delta_t = {self.delta_t} leaves the carrier advancing "
+                f"{step.max():.2f} rad per sample; the unwrap would alias")
+
+        cos_inclination = np.cos(float(inclination))
+        plus_factor = 0.5 * (1 + cos_inclination ** 2)
+        cross_factor = -1j * cos_inclination
+        angle = 2 * float(polarization)
+        cos_psi, sin_psi = np.cos(angle), np.sin(angle)
+        amplitude_plus = plus_factor * cos_psi - cross_factor * sin_psi
+        amplitude_cross = plus_factor * sin_psi + cross_factor * cos_psi
+
+        clock = times + float(t_coalescence)
+        self.t_start, self.t_end = float(clock[0]), float(clock[-1])
+        self._times, self._magnitude_samples = times, magnitude
+        self._phase_samples = phase
+        self._magnitude = CubicSpline(clock, magnitude, extrapolate=False)
+        self._phase = CubicSpline(clock, phase, extrapolate=True)
+        # Read the frequency off a monotonicity-preserving interpolant of the
+        # measured samples rather than differentiating the cubic spline.  The
+        # phase is monotone at the samples, but a cubic through it need not be
+        # between them, and its derivative dips below zero in the faint tails
+        # where the amplitude sits at the floor -- at delta_t = 1/256 that is
+        # enough to hand `adaptive_time_grid` a negative frequency.  The two
+        # therefore differ at interpolation order; angular_frequency is used
+        # to size grids, never to build the waveform.
+        self._omega = PchipInterpolator(clock, np.gradient(phase, times),
+                                        extrapolate=True)
+        self._amplitude_plus = amplitude_plus
+        self._amplitude_cross = amplitude_cross
+        if check_inclination is not None:
+            self._verify_projection(float(check_inclination), float(tolerance),
+                                    waveform_options)
+
+    def _verify_projection(self, inclination, tolerance, waveform_options):
+        """Is this model really one (2, +/-2) carrier off-axis as well?
+
+        Ask first, measure second.  ``pycbc.waveform.waveform_modes`` knows
+        the mode content of a few model families by citation -- and only
+        those: it raises for everything else, and its own source carries a
+        FIXME asking for a lalsimulation call that does not exist yet.  So
+        the registry settles the cases it covers, and the measurement below
+        covers the rest, including sources that are not LAL models at all.
+        """
+        from pycbc.waveform import get_td_waveform
+        from pycbc.waveform.waveform_modes import default_modes
+
+        try:
+            modes = default_modes(self.approximant)
+        except (ValueError, KeyError):
+            modes = None
+        if modes is not None:
+            extra = sorted({(l, abs(m)) for l, m in modes} - {(2, 2)})
+            if extra:
+                raise ValueError(
+                    f"{self.approximant} carries {extra} besides the (2, 2) "
+                    "carrier, per pycbc.waveform.waveform_modes.default_modes."
+                    " Higher modes and precession need a source with one "
+                    "harmonic each; pass check_inclination=None only to "
+                    "accept the dominant-mode approximation deliberately")
+
+        plus, cross = get_td_waveform(
+            approximant=self.approximant, delta_t=self.delta_t,
+            inclination=inclination, **waveform_options)
+        times = np.asarray(plus.sample_times)
+        inside = (times >= self._times[0]) & (times <= self._times[-1])
+        magnitude = np.interp(times[inside], self._times,
+                              self._magnitude_samples)
+        phase = np.interp(times[inside], self._times, self._phase_samples)
+        cosine = np.cos(inclination)
+        model = magnitude * (0.5 * (1 + cosine ** 2) * np.cos(phase)
+                             - 1j * cosine * np.sin(phase))
+        reference = np.asarray(plus)[inside] - 1j * np.asarray(cross)[inside]
+        # Maximise over time and phase.  The two generations need not be
+        # aligned to the sample: IMRPhenomXAS puts its two inclinations 0.98 ms
+        # apart, which reads as mismatch 6e-02 unaligned and 3e-09 aligned,
+        # and would otherwise be rejected as a higher-mode model. Modes shift
+        # the SHAPE, so they survive the maximisation -- IMRPhenomXHM stays at
+        # 1.4e-02 -- and the two cases separate by seven orders.
+        count = len(model)
+        norm = np.sqrt(np.sum(np.abs(model) ** 2)
+                       * np.sum(np.abs(reference) ** 2))
+        correlation = np.fft.ifft(np.fft.fft(model)
+                                  * np.conj(np.fft.fft(reference)))
+        mismatch = 1 - np.max(np.abs(correlation)) * count / norm / count
+        if not mismatch < tolerance:
+            raise ValueError(
+                f"{self.approximant} is not a single (2, +/-2) carrier: its "
+                f"own waveform at inclination {inclination} differs from the "
+                f"dominant-mode projection by mismatch {mismatch:.3e}. Higher "
+                "modes and precession need a source with one harmonic each; "
+                "pass check_inclination=None only to accept the "
+                "dominant-mode approximation deliberately")
+
+    def _check_harmonic(self, harmonic):
+        if harmonic != 2:
+            raise ValueError(
+                f"{self.approximant} is used here as a single (2, +/-2) "
+                "carrier; there is no other harmonic to ask for")
+
+    def support(self, harmonic):
+        self._check_harmonic(harmonic)
+        return self.t_start, self.t_end
+
+    def amplitude(self, harmonic, t):
+        self._check_harmonic(harmonic)
+        query = np.asarray(t, dtype=float)
+        inside = (query >= self.t_start) & (query <= self.t_end)
+        magnitude = np.where(
+            inside, self._magnitude(np.clip(query, self.t_start, self.t_end)),
+            0.0)
+        return (magnitude * self._amplitude_plus,
+                magnitude * self._amplitude_cross)
+
+    def carrier_phase(self, harmonic, t):
+        self._check_harmonic(harmonic)
+        return self._phase(np.clip(np.asarray(t, dtype=float),
+                                   self.t_start, self.t_end))
+
+    def angular_frequency(self, harmonic, t):
+        self._check_harmonic(harmonic)
+        return self._omega(np.clip(np.asarray(t, dtype=float),
+                                   self.t_start, self.t_end))
+
+    def polarizations(self, t):
+        amplitude_plus, amplitude_cross = self.amplitude(2, t)
+        carrier = np.exp(1j * self.carrier_phase(2, t))
+        return (np.real(amplitude_plus * carrier),
+                np.real(amplitude_cross * carrier))
+
+
 class LALIMRPhenomDSource(LALFDSource):
     """`LALFDSource` with the approximant fixed to IMRPhenomD."""
 
