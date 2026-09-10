@@ -13,7 +13,8 @@ from pycbc.tdi.onthefly import (adaptive_time_grid, chain_delay,
 from pycbc.tdi.response import (link_geometry, link_response,
                                 sample_constellation)
 from pycbc.tdi.sources import (LALFDSource, LALIMRPhenomDSource,
-                               LALTDSource, NewtonianChirp)
+                               LALModesSource, LALTDSource,
+                               NewtonianChirp)
 
 
 def _lal_waveforms_available():
@@ -414,3 +415,110 @@ def test_lal_td_source_is_bandlimited_not_aliased_by_a_coarse_step():
         reach[delta_t] = frequency.max() * total_mass
     assert reach[1.0 / 4096] > 0.08                     # keeps the ringdown
     assert reach[1.0 / 256] < reach[1.0 / 4096] / 2     # loses it
+
+
+@pytest.mark.skipif(_NO_LAL is not None, reason=str(_NO_LAL))
+def test_lal_modes_source_is_lals_own_mode_sum():
+    """One harmonic per (l, m), reconstructing LAL's own decomposition.
+
+    The comparison is against pycbc's `sum_modes` over the SAME modes, not
+    against get_td_waveform, so that what is tested is the representation and
+    not the mode content.  The azimuth is not coa_phase: `sum_modes` takes an
+    azimuth, and pi/2 - coa_phase is what reproduces get_td_waveform (0.0e+00
+    against 6e-02 to 2.0 for coa_phase itself, depending on inclination).
+    """
+    from pycbc.waveform import get_td_waveform_modes
+    from pycbc.waveform.waveform_modes import sum_modes
+
+    parameters = dict(mass1=60.0, mass2=25.0, spin1z=0.4, spin2z=0.1,
+                      distance=500.0, f_lower=20.0)
+    delta_t, inclination, coa_phase = 1.0 / 4096, 1.0, 0.7
+    source = LALModesSource(delta_t=delta_t, inclination=inclination,
+                            coa_phase=coa_phase, approximant="SEOBNRv4PHM",
+                            **parameters)
+    assert source.harmonics
+    assert all(mode[1] != 0 for mode in source.harmonics)
+    assert any("m = 0" in reason for reason in source.skipped.values())
+
+    modes = get_td_waveform_modes(
+        approximant="SEOBNRv4PHM", delta_t=delta_t, inclination=inclination,
+        coa_phase=coa_phase, **parameters)
+    kept = {mode: np.asarray(modes[mode][0]) + 1j * np.asarray(modes[mode][1])
+            for mode in source.harmonics}
+    summed = sum_modes(kept, inclination, 0.5 * np.pi - coa_phase)
+    times = np.asarray(modes[source.harmonics[0]][0].sample_times)
+    inside = ((times >= source.t_start + 0.02)
+              & (times <= source.t_end - 0.02))
+    got_plus, got_cross = source.polarizations(times[inside])
+    want_plus = np.real(summed)[inside]
+    want_cross = -np.imag(summed)[inside]
+    overlap = (np.sum(got_plus * want_plus) + np.sum(got_cross * want_cross)) \
+        / np.sqrt((np.sum(got_plus ** 2) + np.sum(got_cross ** 2))
+                  * (np.sum(want_plus ** 2) + np.sum(want_cross ** 2)))
+    assert abs(1 - overlap) < 1e-10
+
+    for harmonic in source.harmonics:
+        low, high = source.support(harmonic)
+        assert high > low
+        probe = np.linspace(low, high, 500)
+        assert np.all(source.angular_frequency(harmonic, probe) > 0)
+        plus, cross = source.amplitude(harmonic, np.array([low - 1.0]))
+        assert plus[0] == 0 and cross[0] == 0
+
+
+@pytest.mark.skipif(_NO_LAL is not None, reason=str(_NO_LAL))
+def test_lal_modes_source_carries_a_precessing_waveform():
+    """The point of the class: a model LALTDSource has to refuse.
+
+    Against the full get_td_waveform the residual is the m = 0 content it
+    cannot carry -- non-oscillatory, no carrier to factor out, the same reason
+    GW memory goes down the dense path.  Measured here that is 7e-03 for a
+    precessing 60+25, and the assertion pins it to the dropped modes rather
+    than to the representation.
+    """
+    from pycbc.waveform import get_td_waveform, get_td_waveform_modes
+    from pycbc.waveform.waveform_modes import sum_modes
+
+    parameters = dict(mass1=60.0, mass2=25.0, spin1x=0.6, spin1y=0.2,
+                      spin1z=0.3, spin2x=-0.3, spin2y=0.4, spin2z=0.1,
+                      distance=500.0, f_lower=20.0)
+    delta_t, inclination, coa_phase = 1.0 / 4096, 1.0, 0.7
+    with pytest.raises(ValueError):
+        LALTDSource(delta_t=delta_t, inclination=inclination,
+                    coa_phase=coa_phase, approximant="SEOBNRv4PHM",
+                    **parameters)
+    source = LALModesSource(delta_t=delta_t, inclination=inclination,
+                            coa_phase=coa_phase, approximant="SEOBNRv4PHM",
+                            **parameters)
+    assert len(source.harmonics) > 20
+
+    modes = get_td_waveform_modes(
+        approximant="SEOBNRv4PHM", delta_t=delta_t, inclination=inclination,
+        coa_phase=coa_phase, **parameters)
+    every = {mode: np.asarray(value[0]) + 1j * np.asarray(value[1])
+             for mode, value in modes.items()}
+    kept = {mode: every[mode] for mode in source.harmonics}
+    azimuth = 0.5 * np.pi - coa_phase
+    times = np.asarray(modes[source.harmonics[0]][0].sample_times)
+    inside = ((times >= source.t_start + 0.02)
+              & (times <= source.t_end - 0.02))
+    got_plus, got_cross = source.polarizations(times[inside])
+
+    def mismatch(a, b, c, d):
+        return 1 - (np.sum(a * c) + np.sum(b * d)) / np.sqrt(
+            (np.sum(a * a) + np.sum(b * b)) * (np.sum(c * c) + np.sum(d * d)))
+
+    partial = sum_modes(kept, inclination, azimuth)
+    whole = sum_modes(every, inclination, azimuth)
+    plus, cross = get_td_waveform(
+        approximant="SEOBNRv4PHM", delta_t=delta_t, inclination=inclination,
+        coa_phase=coa_phase, **parameters)
+    against_kept = mismatch(got_plus, got_cross, np.real(partial)[inside],
+                            -np.imag(partial)[inside])
+    against_all = mismatch(got_plus, got_cross, np.asarray(plus)[inside],
+                           np.asarray(cross)[inside])
+    dropped = mismatch(np.real(partial)[inside], -np.imag(partial)[inside],
+                       np.real(whole)[inside], -np.imag(whole)[inside])
+    assert abs(against_kept) < 1e-9                  # the representation
+    assert abs(against_all - dropped) < 0.2 * abs(dropped)   # all of the rest
+    assert 1e-4 < abs(dropped) < 5e-2                # and it is the m = 0 part

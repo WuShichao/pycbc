@@ -740,6 +740,196 @@ class LALTDSource:
                 np.real(amplitude_cross * carrier))
 
 
+class LALModesSource:
+    r"""A higher-mode or precessing LAL waveform, one harmonic per ``(l, m)``.
+
+    `LALTDSource` carries a single carrier and refuses anything else, which
+    rules out exactly the models LISA analyses are moving to.  The sparse
+    evaluator does not need a single carrier, though -- it needs each piece to
+    be a slowly varying amplitude times its own carrier, which is what a mode
+    is.  So each ``(l, m)`` becomes its own harmonic, and the response is
+    applied to each and summed, as it already is for pyEFPEHM's ``(l, m, n)``.
+
+    The decomposition is LAL's own, through
+    :func:`pycbc.waveform.get_td_waveform_modes`, and the reconstruction is
+    LAL's own contract: ``h = sum_lm Y_lm h_lm`` with the plus polarization
+    the real part and the cross the negative imaginary part.  Writing
+    ``h_lm = A_lm exp(i arg h_lm)`` and using ``Re[z] = Re[conj(z)]``, each
+    mode contributes ``Re[(A_lm conj(Y_lm)) exp(i Phi_lm)]`` to the plus with
+    ``Phi_lm = -arg h_lm``, and the same amplitude times ``-i`` to the cross.
+    Whichever sign of ``Phi`` rises is the one kept, so ``m < 0`` modes are
+    carried as readily as ``m > 0``.
+
+    ``m = 0`` modes are dropped, and reported in `skipped`.  They are not
+    oscillatory, so they have no carrier to factor out and no sparse grid can
+    represent them; that is the same reason the plan sends GW memory down the
+    dense path.
+
+    Which approximants can be decomposed at all is a separate question from
+    which have higher modes, and PyCBC answers only the first:
+    ``td_waveform_mode_approximants()`` lists SEOBNRv4PHM, IMRPhenomTPHM,
+    NRHybSur3dq8, NRSur7dq2/4 and the Taylor families, while IMRPhenomXPHM --
+    which LDC is beginning to use -- is in neither mode list even though
+    ``default_modes`` knows its content. Wiring that up belongs upstream in
+    ``pycbc.waveform.waveform_modes``, not here.
+
+    Parameters
+    ----------
+    delta_t : float
+        Sampling of the generated modes in seconds.
+    inclination, coa_phase : float
+        Viewing angles for the spin-weighted harmonics.
+    t_coalescence : float, optional
+        Where the modes' own t = 0 sits on the mission clock.
+    polarization : float, optional
+        Polarization rotation in radians.
+    mode_array : sequence of (l, m), optional
+        Restrict to these modes.  Default: everything the model returns.
+    amplitude_floor : float, optional
+        Fraction of a MODE's own peak below which it is treated as absent.
+    approximant : str, optional
+        Default ``SEOBNRv4PHM``.
+    """
+
+    def __init__(self, delta_t, inclination, coa_phase, t_coalescence=0.0,
+                 polarization=0.0, mode_array=None, amplitude_floor=1e-3,
+                 approximant="SEOBNRv4PHM", **waveform_options):
+        import lal
+        from scipy.interpolate import CubicSpline, PchipInterpolator
+        from pycbc.waveform import get_td_waveform_modes
+
+        for name in ("delta_t", "approximant", "inclination", "coa_phase"):
+            if name in waveform_options:
+                raise ValueError(f"{name} is a named argument here")
+        self.approximant = str(approximant)
+        self.delta_t = float(delta_t)
+        # one dict, (l, m) -> (real TimeSeries, imaginary TimeSeries)
+        modes = get_td_waveform_modes(
+            approximant=self.approximant, delta_t=self.delta_t,
+            inclination=float(inclination), coa_phase=float(coa_phase),
+            **waveform_options)
+
+        wanted = (None if mode_array is None
+                  else {tuple(mode) for mode in mode_array})
+        # The spherical harmonic wants an AZIMUTH, and it is not coa_phase.
+        # pycbc.waveform.waveform_modes.sum_modes takes the azimuth as its
+        # `phi`; measured against get_td_waveform on the same modes,
+        # azimuth = pi/2 - coa_phase reproduces it to 0.0e+00 while coa_phase
+        # itself gives mismatch 6e-02 to 2.0 depending on the inclination.
+        azimuth = 0.5 * np.pi - float(coa_phase)
+        angle = 2 * float(polarization)
+        cos_psi, sin_psi = np.cos(angle), np.sin(angle)
+        self._modes, self.skipped = {}, {}
+        for mode in sorted(modes):
+            if wanted is not None and tuple(mode) not in wanted:
+                continue
+            harmonic = (int(mode[0]), int(mode[1]))
+            if harmonic[1] == 0:
+                self.skipped[harmonic] = "m = 0 has no carrier to factor out"
+                continue
+            real, imaginary = modes[mode]
+            series = np.asarray(real) + 1j * np.asarray(imaginary)
+            magnitude = np.abs(series)
+            peak = magnitude.max()
+            if peak <= 0:
+                self.skipped[harmonic] = "identically zero"
+                continue
+            loud = magnitude > float(amplitude_floor) * peak
+            phase = np.unwrap(np.angle(series))
+            sign = 1.0
+            first, span = _longest_increasing_run(
+                np.where(loud, phase, -np.inf))
+            back, back_span = _longest_increasing_run(
+                np.where(loud, -phase, -np.inf))
+            if back_span > span:
+                sign, first, span = -1.0, back, back_span
+            if span < 16:
+                self.skipped[harmonic] = "no usable stretch of monotone phase"
+                continue
+            piece = slice(first, first + span)
+            spherical = lal.SpinWeightedSphericalHarmonic(
+                float(inclination), azimuth, -2, *harmonic)
+            # h_lm Y_lm contributes Re[.] to plus and -Im[.] = Re[i .] to
+            # cross.  With Phi = +arg(h_lm) that is Re[(A Y) exp(i Phi)] and
+            # Re[(i A Y) exp(i Phi)]; with Phi = -arg(h_lm), conjugating
+            # inside the real part gives A conj(Y) and -i A conj(Y).
+            if sign > 0:
+                amplitude_plus = magnitude[piece] * spherical
+                amplitude_cross = 1j * amplitude_plus
+            else:
+                amplitude_plus = magnitude[piece] * np.conj(spherical)
+                amplitude_cross = -1j * amplitude_plus
+            amplitude_plus, amplitude_cross = (
+                cos_psi * amplitude_plus - sin_psi * amplitude_cross,
+                sin_psi * amplitude_plus + cos_psi * amplitude_cross)
+            clock = (np.asarray(real.sample_times)[piece]
+                     + float(t_coalescence))
+            carrier = sign * phase[piece]
+            self._modes[harmonic] = dict(
+                start=float(clock[0]), end=float(clock[-1]),
+                plus=CubicSpline(clock, amplitude_plus.real,
+                                 extrapolate=False),
+                plus_imag=CubicSpline(clock, amplitude_plus.imag,
+                                      extrapolate=False),
+                cross=CubicSpline(clock, amplitude_cross.real,
+                                  extrapolate=False),
+                cross_imag=CubicSpline(clock, amplitude_cross.imag,
+                                       extrapolate=False),
+                phase=CubicSpline(clock, carrier, extrapolate=True),
+                omega=PchipInterpolator(clock, np.gradient(carrier, clock),
+                                        extrapolate=True))
+        if not self._modes:
+            raise ValueError(
+                f"{self.approximant} yielded no usable mode; skipped "
+                f"{self.skipped}")
+        self.harmonics = tuple(sorted(self._modes))
+        self.t_start = min(m["start"] for m in self._modes.values())
+        self.t_end = max(m["end"] for m in self._modes.values())
+
+    def _mode(self, harmonic):
+        try:
+            return self._modes[tuple(harmonic)]
+        except KeyError:
+            raise ValueError(
+                f"{tuple(harmonic)} is not carried; available "
+                f"{self.harmonics}, skipped {self.skipped}") from None
+
+    def support(self, harmonic):
+        mode = self._mode(harmonic)
+        return mode["start"], mode["end"]
+
+    def amplitude(self, harmonic, t):
+        mode = self._mode(harmonic)
+        query = np.asarray(t, dtype=float)
+        inside = (query >= mode["start"]) & (query <= mode["end"])
+        clipped = np.clip(query, mode["start"], mode["end"])
+
+        def value(real_key, imaginary_key):
+            return np.where(inside, mode[real_key](clipped), 0.0) \
+                + 1j * np.where(inside, mode[imaginary_key](clipped), 0.0)
+        return value("plus", "plus_imag"), value("cross", "cross_imag")
+
+    def carrier_phase(self, harmonic, t):
+        mode = self._mode(harmonic)
+        return mode["phase"](np.clip(np.asarray(t, dtype=float),
+                                     mode["start"], mode["end"]))
+
+    def angular_frequency(self, harmonic, t):
+        mode = self._mode(harmonic)
+        return mode["omega"](np.clip(np.asarray(t, dtype=float),
+                                     mode["start"], mode["end"]))
+
+    def polarizations(self, t):
+        total_plus = np.zeros(np.shape(t))
+        total_cross = np.zeros(np.shape(t))
+        for harmonic in self.harmonics:
+            amplitude_plus, amplitude_cross = self.amplitude(harmonic, t)
+            carrier = np.exp(1j * self.carrier_phase(harmonic, t))
+            total_plus += np.real(amplitude_plus * carrier)
+            total_cross += np.real(amplitude_cross * carrier)
+        return total_plus, total_cross
+
+
 class LALIMRPhenomDSource(LALFDSource):
     """`LALFDSource` with the approximant fixed to IMRPhenomD."""
 
