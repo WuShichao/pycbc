@@ -145,6 +145,279 @@ class NewtonianChirp:
         return np.real(amp_p * carrier), np.real(amp_c * carrier)
 
 
+class LALFDSource:
+    r"""Any dominant-mode frequency-domain LAL waveform, for sparse LISA.
+
+    The LISA response code needs a slowly varying complex amplitude and a
+    carrier phase that can be evaluated at arbitrary retarded times.  LAL's
+    IMRPhenomD interface instead returns frequency-domain polarizations.  This
+    adapter connects the two with the stationary-phase map
+
+    .. math::
+
+        t(f) = -\frac{1}{2\pi}\frac{d\arg \tilde h}{df},\qquad
+        \Phi(f) = \arg \tilde h + 2\pi f t + \frac{\pi}{4}.
+
+    Importantly, the derivative is measured from close pairs of *native LAL*
+    frequency-sequence evaluations.  It is not obtained by unwrapping a
+    mission-resolution Fourier grid: for a stellar-mass LISA binary tens of
+    years from merger, adjacent mission bins can differ by many phase cycles.
+
+    This is an inverse-SPA representation of the LAL waveform, not a new
+    waveform approximant.  It is appropriate for the slowly evolving inspiral
+    portion of any such model -- the regime a LISA stellar-origin binary
+    spends its whole observation in.
+
+    Applicability is narrower than "a LAL waveform".  The model must be
+    available through ``get_fd_waveform_sequence``, must carry the (2, 2)
+    carrier alone, and must have a monotone stationary-time map over the
+    requested band; the constructor raises when the last fails, which is what
+    a higher-mode or precessing model does, since ``arg h_plus`` is then a sum
+    of carriers rather than one. Verified against IMRPhenomD, IMRPhenomXAS and
+    TaylorF2.
+
+    Parameters
+    ----------
+    mass1, mass2 : float
+        Detector-frame component masses in solar masses.
+    f_lower : float
+        GW frequency at ``t_start`` in Hz.
+    duration : float, optional
+        Requested time support in seconds.  The upper frequency is solved
+        from the LAL phase derivative.  Exactly one of ``duration`` and
+        ``f_upper`` must be supplied.
+    f_upper : float, optional
+        End frequency in Hz.
+    n_frequency : int, optional
+        Number of frequency knots used for the inverse-SPA splines.
+    polarization : float, optional
+        Polarization rotation in radians.  Sky position belongs to the LISA
+        response and is deliberately not part of this source.
+    approximant : str, optional
+        Any dominant-mode frequency-domain LAL approximant registered in
+        ``pycbc.waveform.fd_sequence``.  Default ``IMRPhenomD``.
+    waveform_options : keyword arguments
+        Passed to :func:`pycbc.waveform.get_fd_waveform_sequence`;
+        ``sample_points`` is supplied by the adapter and must not appear.
+    """
+
+    TAU_SUN = 4.925490947e-6
+
+    def __init__(self, mass1, mass2, f_lower, duration=None, f_upper=None,
+                 n_frequency=4096, t_start=0.0, polarization=0.0,
+                 approximant="IMRPhenomD", **waveform_options):
+        from scipy.interpolate import CubicSpline, PchipInterpolator
+
+        if (duration is None) == (f_upper is None):
+            raise ValueError("supply exactly one of duration and f_upper")
+        if mass1 <= 0 or mass2 <= 0 or f_lower <= 0:
+            raise ValueError("masses and f_lower must be positive")
+        if duration is not None and duration <= 0:
+            raise ValueError("duration must be positive")
+        if n_frequency < 16:
+            raise ValueError("n_frequency must be at least 16")
+
+        if "sample_points" in waveform_options:
+            raise ValueError("the adapter supplies sample_points")
+        from pycbc.waveform import fd_sequence
+        if approximant not in fd_sequence:
+            raise ValueError(
+                f"{approximant} has no frequency-sequence generator; the "
+                "adapter needs one to place its own knots")
+        self._parameters = dict(waveform_options)
+        self._parameters.update(approximant=str(approximant),
+                                mass1=float(mass1), mass2=float(mass2))
+        self.approximant = str(approximant)
+        self.f_lower = float(f_lower)
+        self.t_start = float(t_start)
+        self.harmonics = (2,)
+
+        if f_upper is None:
+            f_upper = self._solve_upper_frequency(float(duration))
+        if f_upper <= f_lower:
+            raise ValueError("f_upper must exceed f_lower")
+        self.f_upper = float(f_upper)
+
+        # After the decades-long linear phase is removed, the largest phase
+        # step is about 2*pi*duration*df.  Keep it below pi/2 so unwrap cannot
+        # alias even for the full two-year Yorsh band.
+        if duration is not None:
+            requested_duration = float(duration)
+        else:
+            end_time = self._stationary_time([f_upper])[0]
+            start_time = self._stationary_time([f_lower])[0]
+            requested_duration = end_time - start_time
+        unwrap_knots = int(np.ceil(
+            4 * requested_duration * (self.f_upper - self.f_lower))) + 1
+        n_frequency = max(int(n_frequency), unwrap_knots)
+        frequency = np.linspace(self.f_lower, self.f_upper, n_frequency)
+        h_plus, h_cross = self._fd_waveform(frequency)
+        stationary_start = self._stationary_time([self.f_lower])[0]
+
+        # Remove the large linear phase before unwrapping.  Differentiating a
+        # spline of the resulting native LAL phase is markedly more stable
+        # than storing a finite-difference time at every knot.
+        time_shift_phase = np.remainder(
+            2 * np.pi * frequency * stationary_start, 2 * np.pi)
+        shifted_fd_phase = np.unwrap(np.angle(
+            h_plus * np.exp(1j * time_shift_phase)))
+        # ``exp(i 2*pi*f*t0)`` itself loses a few ulps when t0 is decades.
+        # A local Chebyshev representation removes that harmless point noise
+        # before differentiation; a cubic interpolant would amplify it into
+        # spurious structure in delayed phases.  A LISA stellar-origin band
+        # spans about one percent in frequency, where degree 32 is ample; a
+        # band wide enough to need more shows up as the monotonicity failure
+        # below rather than silently.
+        degree = min(32, n_frequency - 1)
+        fd_phase = np.polynomial.Chebyshev.fit(
+            frequency, shifted_fd_phase, degree)
+        smooth_fd_phase = fd_phase(frequency)
+        relative_time = -fd_phase.deriv(1)(frequency) / (2 * np.pi)
+        relative_time -= relative_time[0]
+        dt_df = -fd_phase.deriv(2)(frequency) / (2 * np.pi)
+        invalid_time = np.any(np.diff(relative_time) <= 0)
+        invalid_slope = np.any(~np.isfinite(dt_df)) or np.any(dt_df <= 0)
+        if invalid_time or invalid_slope:
+            raise ValueError("LAL stationary-time map is not monotone")
+        stationary = stationary_start + relative_time
+        time = relative_time + self.t_start
+
+        # H(f) = A(t_f)/2 sqrt(dt/df)
+        amplitude_plus = 2 * np.abs(h_plus) / np.sqrt(dt_df)
+        ratio = np.divide(h_cross, h_plus, out=np.zeros_like(h_cross),
+                          where=np.abs(h_plus) > 0)
+        amplitude_cross = amplitude_plus * ratio
+        angle = 2 * float(polarization)
+        cpsi, spsi = np.cos(angle), np.sin(angle)
+        amplitude_plus, amplitude_cross = (
+            cpsi * amplitude_plus - spsi * amplitude_cross,
+            spsi * amplitude_plus + cpsi * amplitude_cross,
+        )
+
+        phase = smooth_fd_phase + 2 * np.pi * frequency * relative_time
+        phase += np.pi / 4
+
+        self.t_end = float(time[-1])
+        self.sample_frequencies = frequency
+        self.stationary_times = stationary
+        self._dt_df = dt_df
+        self._amplitude_plus = CubicSpline(time, amplitude_plus,
+                                           extrapolate=False)
+        self._amplitude_cross_real = CubicSpline(
+            time, amplitude_cross.real, extrapolate=False)
+        self._amplitude_cross_imag = CubicSpline(
+            time, amplitude_cross.imag, extrapolate=False)
+        self._phase = CubicSpline(time, phase, extrapolate=True)
+        self._omega = PchipInterpolator(
+            time, 2 * np.pi * frequency, extrapolate=True)
+
+    def _fd_waveform(self, frequency):
+        from pycbc.waveform import get_fd_waveform_sequence
+        h_plus, h_cross = get_fd_waveform_sequence(
+            sample_points=np.asarray(frequency), **self._parameters)
+        return np.asarray(h_plus), np.asarray(h_cross)
+
+    def _newtonian_time(self, frequency):
+        m1, m2 = self._parameters["mass1"], self._parameters["mass2"]
+        total = m1 + m2
+        eta = m1 * m2 / total ** 2
+        chirp_mass = total * eta ** 0.6
+        scale = 5 / 256 * (chirp_mass * self.TAU_SUN) ** (-5 / 3)
+        return scale * (np.pi * np.asarray(frequency)) ** (-8 / 3)
+
+    def _stationary_time(self, frequency):
+        """Measure ``-d arg(H)/2pi df`` without global phase unwrapping."""
+        frequency = np.atleast_1d(np.asarray(frequency, dtype=float))
+        # Fit nine nearby native phase values instead of differencing only two
+        # nearly equal complex numbers.  The full local phase span is about
+        # 2.4 rad: safely unwrap-able, but large enough to suppress roundoff.
+        epsilon = 1.2 / (2 * np.pi * self._newtonian_time(frequency))
+        epsilon = np.minimum(epsilon, frequency * 1e-7)
+        offsets = np.linspace(-1.0, 1.0, 9)
+        local_frequency = frequency[:, None] + epsilon[:, None] * offsets
+        h_plus, _ = self._fd_waveform(local_frequency.reshape(-1))
+        local_phase = np.unwrap(
+            np.angle(h_plus.reshape(len(frequency), -1)), axis=1)
+        derivative = np.empty(len(frequency))
+        for index in range(len(frequency)):
+            fit = np.polynomial.Chebyshev.fit(
+                local_frequency[index], local_phase[index], 4)
+            derivative[index] = fit.deriv()(frequency[index])
+        return -derivative / (2 * np.pi)
+
+    def _solve_upper_frequency(self, duration):
+        from scipy.optimize import brentq
+
+        start = self._stationary_time([self.f_lower])[0]
+        chirp_time = self._newtonian_time(self.f_lower)
+        if duration >= chirp_time:
+            raise ValueError("requested duration reaches the Newtonian merger")
+        upper = self.f_lower * (chirp_time / (chirp_time - duration)) ** 0.375
+
+        def residual(frequency):
+            return self._stationary_time([frequency])[0] - start - duration
+
+        value = residual(upper)
+        while value < 0:
+            upper *= 1.25
+            value = residual(upper)
+        return brentq(residual, self.f_lower * (1 + 1e-12), upper,
+                      xtol=np.finfo(float).eps * upper * 8, rtol=1e-12)
+
+    def _check_harmonic(self, harmonic):
+        if harmonic != 2:
+            raise ValueError(
+                f"{self.approximant} is used here as a single (2, +/-2) "
+                "carrier; there is no other harmonic to ask for")
+
+    def support(self, harmonic):
+        self._check_harmonic(harmonic)
+        return self.t_start, self.t_end
+
+    def amplitude(self, harmonic, t):
+        self._check_harmonic(harmonic)
+        query = np.asarray(t, dtype=float)
+        # Clip for endpoint roundoff, then restore exact zero outside support.
+        # Subtracting the multi-decade stationary time to form this source's
+        # local clock loses about 1e-7 s, even though the local times are only
+        # days long.
+        tolerance = max(1e-6, 32 * np.spacing(max(
+            1.0, abs(self.t_start), abs(self.t_end))))
+        inside = np.logical_and(query >= self.t_start - tolerance,
+                                query <= self.t_end + tolerance)
+        sample = np.clip(query, self.t_start, self.t_end)
+        plus = np.where(inside, self._amplitude_plus(sample), 0.0)
+        cross = np.where(inside, self._amplitude_cross_real(sample), 0.0)
+        cross = cross + 1j * np.where(
+            inside, self._amplitude_cross_imag(sample), 0.0)
+        return plus, cross
+
+    def carrier_phase(self, harmonic, t):
+        self._check_harmonic(harmonic)
+        query = np.clip(np.asarray(t, dtype=float), self.t_start, self.t_end)
+        return self._phase(query)
+
+    def angular_frequency(self, harmonic, t):
+        self._check_harmonic(harmonic)
+        query = np.clip(np.asarray(t, dtype=float), self.t_start, self.t_end)
+        return self._omega(query)
+
+    def polarizations(self, t):
+        amplitude_plus, amplitude_cross = self.amplitude(2, t)
+        carrier = np.exp(1j * self.carrier_phase(2, t))
+        return (np.real(amplitude_plus * carrier),
+                np.real(amplitude_cross * carrier))
+
+
+class LALIMRPhenomDSource(LALFDSource):
+    """`LALFDSource` with the approximant fixed to IMRPhenomD."""
+
+    def __init__(self, *args, **kwargs):
+        if "approximant" in kwargs:
+            raise ValueError("this subclass fixes approximant=IMRPhenomD")
+        super().__init__(*args, approximant="IMRPhenomD", **kwargs)
+
+
 class PyEFPEHMSource:
     """`HarmonicSource` over pyEFPEHM's co-precessing (l, m, n) harmonics.
 

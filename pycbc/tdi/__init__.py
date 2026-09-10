@@ -3,6 +3,7 @@
 from pycbc.tdi.onthefly import (SparseGeometry, StackedGeometry, TermGeometry,
                                 adaptive_time_grid, chain_delay,
                                 delay_padding, harmonic_windows, reconstruct,
+                                reconstruct_complex,
                                 sparse_channel, sparse_channel_cached,
                                 sparse_channel_stacked, sparse_channel_terms)
 from pycbc.tdi.combination import TDICombination, Term, orthogonal_channels
@@ -17,17 +18,22 @@ from pycbc.tdi.response import (
     polarization_basis,
     sample_constellation,
 )
-from pycbc.tdi.sources import (ArrayWaveformSource, NewtonianChirp,
-                               WaveformSource)
+from pycbc.tdi.sources import (ArrayWaveformSource, LALFDSource,
+                               LALIMRPhenomDSource, NewtonianChirp,
+                               PyEFPEHMSource, WaveformSource)
 
 __all__ = [
     "LINK_ORDER",
     "ArrayWaveformSource",
+    "LALFDSource",
+    "LALIMRPhenomDSource",
+    "PyEFPEHMSource",
     "adaptive_time_grid",
     "chain_delay",
     "delay_padding",
     "harmonic_windows",
     "reconstruct",
+    "reconstruct_complex",
     "SparseGeometry",
     "StackedGeometry",
     "TermGeometry",

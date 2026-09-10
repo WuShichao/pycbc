@@ -295,17 +295,24 @@ def sparse_channel(source, harmonic, grid, terms, orbit, lamb, beta,
     return bracket
 
 
-def reconstruct(source, harmonic, grid, bracket, times, support=None):
+def reconstruct_complex(source, harmonic, grid, bracket, times,
+                        support=None):
     """Spline the slow bracket onto ``times`` and reattach the carrier.
 
-    The real and imaginary parts are splined SEPARATELY rather than the
-    amplitude and phase. Cornish & Littenberg spline amplitude and phase and
-    then need explicit zero-crossing handling, because ``unwrap(angle(B))``
-    jumps wherever ``|B|`` passes through zero -- measured here at over a
-    radian between adjacent grid points for a real waveform's strongest
-    harmonic, which a cubic spline then turns into garbage. The bracket is
-    slowly varying by construction, so its real and imaginary parts are too,
-    and splining them needs no unwrapping and no sign bookkeeping.
+    Returns the complex analytic signal; `reconstruct` is its real part. The
+    analytic form is what a narrow-band search wants: it can be heterodyned
+    and sampled at the envelope's bandwidth rather than at the cadence needed
+    to resolve the GW carrier.
+
+    The real and imaginary parts of the bracket are splined SEPARATELY rather
+    than its amplitude and phase. Cornish & Littenberg spline amplitude and
+    phase and then need explicit zero-crossing handling, because
+    ``unwrap(angle(B))`` jumps wherever ``|B|`` passes through zero --
+    measured here at over a radian between adjacent grid points for a real
+    waveform's strongest harmonic, which a cubic spline then turns into
+    garbage. The bracket is slowly varying by construction, so its real and
+    imaginary parts are too, and splining them needs no unwrapping and no sign
+    bookkeeping.
 
     ``support`` restricts the output to where the harmonic can contribute at
     all, so that the spline is never read outside the grid it was built on. It
@@ -319,7 +326,7 @@ def reconstruct(source, harmonic, grid, bracket, times, support=None):
     if support is None:
         value = (CubicSpline(grid, np.real(bracket))(times)
                  + 1j * CubicSpline(grid, np.imag(bracket))(times))
-        return np.real(value * carrier)
+        return value * carrier
 
     # One spline per window, not one across all of them: a harmonic with a
     # dead gap has no grid points in it, and a single spline would then join
@@ -327,7 +334,7 @@ def reconstruct(source, harmonic, grid, bracket, times, support=None):
     # conditions leak back into the block edges, which is exactly where the
     # error lives. Measured on the 16-harmonic case, splining per window
     # instead of once takes the mismatch from 5.69e-04 to 4.83e-04.
-    out = np.zeros(times.shape)
+    out = np.zeros(times.shape, dtype=complex)
     for low, high in ([support] if np.ndim(support) == 1 else support):
         nodes = (grid >= low) & (grid <= high)
         want = (times >= low) & (times <= high)
@@ -336,8 +343,18 @@ def reconstruct(source, harmonic, grid, bracket, times, support=None):
         piece = grid[nodes]
         value = (CubicSpline(piece, np.real(bracket)[nodes])(times[want])
                  + 1j * CubicSpline(piece, np.imag(bracket)[nodes])(times[want]))
-        out[want] = np.real(value * carrier[want])
+        out[want] = value * carrier[want]
     return out
+
+
+def reconstruct(source, harmonic, grid, bracket, times, support=None):
+    """The real TDI channel: the real part of `reconstruct_complex`.
+
+    Defined this way rather than duplicating the spline, so the two cannot
+    drift apart.
+    """
+    return np.real(reconstruct_complex(source, harmonic, grid, bracket, times,
+                                       support))
 
 
 class SparseGeometry:
