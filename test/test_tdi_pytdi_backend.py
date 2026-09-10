@@ -134,7 +134,7 @@ def test_wangs_arrow_notation_transcribes_to_pytdi():
     This is what makes his PD4L strings usable: his ``<-beam`` is an
     unprefixed beam and his ``->beam`` is a '-'-prefixed one, and the only
     way to be sure of that mapping is to transcribe a combination he shares
-    with pytdi and compare the monomials.  Getting it backwards would leave
+    with pytdi and compare the monomials. Getting it backwards would leave
     PD4L quietly wrong with no other symptom, since D3 symmetry holds either
     way.
     """

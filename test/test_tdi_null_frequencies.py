@@ -1,19 +1,17 @@
 """Do the response approximations get amplified where a channel nearly nulls?
 
 A TDI combination has frequencies where its transfer function collapses, and
-the worry is that an approximation dropped from the single-link response gets
-divided by that collapsing signal.  Measured here, it does not: the error is
-filtered by the same combination that makes the null, so it collapses with
-the signal rather than against it.
+the worry is that an approximation dropped from the single-link response then
+gets divided by a vanishing signal. It does not: the error passes through the
+same combination that makes the null, so the two collapse together.
 
-The scope is narrow and deliberate, and matches how the number was first
-obtained.  The single-link geometry is one FROZEN epoch of the analytic,
-nearly equal-arm LISA orbit; only the six TDI delays carry an unequal-arm
-snapshot (dL/L = 4.6e-3).  The 'null' is the minimum of |R| AVERAGED over sky
-directions, not a per-direction null and not one found by root-finding.  This
-is evidence that the off-null ordering is not overturned at a null -- it is
-not a proof that single-link errors are immune to null amplification, and an
-earlier version of the plan claimed the latter.
+The scope matches how the number was first obtained. The single-link geometry
+is one frozen epoch of the analytic, nearly equal-arm LISA orbit; only the six
+TDI delays carry an unequal-arm snapshot (dL/L = 4.6e-3). The 'null' is the
+minimum of |R| averaged over sky directions, not a per-direction null and not
+one found by root-finding. So this shows the off-null ordering surviving at a
+null; it does not show single-link errors immune to null amplification, which
+an earlier version of the plan claimed.
 """
 
 import numpy as np
@@ -56,10 +54,10 @@ def _chain_delay(chain, delays):
 def _transfer(terms, sample, index, delays, frequency, sky, emitter='exact'):
     """|R_c(f)| for a unit plus-polarised wave, per sky direction.
 
-    Built here rather than taken from the library: pycbc.tdi is a
-    time-domain path, and a null is a statement about the frequency-domain
-    transfer.  Each term contributes its coefficient times the chain's phase
-    times the link's own two sampling phases.
+    Built here because pycbc.tdi is a time-domain path while a null is a
+    statement about the frequency-domain transfer. Each term contributes its
+    coefficient times the chain's phase times the link's own two sampling
+    phases.
     """
     out = np.zeros(len(sky), dtype=complex)
     link_index = {link: position for position, link in enumerate(sample.links)}
@@ -112,18 +110,15 @@ def test_the_error_is_not_amplified_by_the_null(name, null_at,
                                                 expected_depth):
     """Across the whole scan, not between two chosen points.
 
-    Measured on this configuration: for X2 the averaged transfer drops by
-    2.5e4 while the relative error of dropping the acceleration term runs
-    7.1e-11 to 1.5e-10 across the scan, and of dropping the retardation
-    9.8e-05 to 2.7e-04.  Both are LARGEST at the null -- so the errors are
-    not immune -- but by a factor under two, not by the 2.5e4 the signal
-    itself falls.
+    On this configuration the X2 averaged transfer drops by 2.5e4, while
+    dropping the acceleration term costs 7.1e-11 to 1.5e-10 across the scan
+    and dropping the retardation costs 9.8e-05 to 2.7e-04. Both errors peak
+    at the null, by a factor under two against the 2.5e4 the signal falls.
 
-    This refines the plan, which compared one off-null point with one
-    near-null point and reported the relative error moving by under 25%.  It
-    moves by up to a factor two once the whole scan is looked at, and the
-    null is where it peaks; the conclusion that the off-null ORDERING is not
-    overturned survives, which is all it was ever used for.
+    The plan compared one off-null point with one near-null point and put the
+    movement under 25%. Over the whole scan it reaches a factor of two, at the
+    null; the off-null ordering, which is what the number was used for, still
+    holds.
     """
     orbit = LisaEqualArmOrbit()
     sample, index, delays = _frozen(orbit)
@@ -137,8 +132,8 @@ def test_the_error_is_not_amplified_by_the_null(name, null_at,
                                            sky))
                          for f in scan])
     deepest = int(np.argmin(strength))
-    # how deep the null is depends on the arm snapshot, so this is a floor
-    # rather than the particular figure one draw produces
+    # how deep the null is depends on the arm snapshot, so assert a floor and
+    # not the figure one draw produces
     assert np.median(strength) / strength[deepest] > expected_depth
 
     for emitter, ceiling in (('velocity', 1e-8), ('simultaneous', 1e-2)):
@@ -150,9 +145,8 @@ def test_the_error_is_not_amplified_by_the_null(name, null_at,
             relative.append(np.mean(np.abs(other - exact)) / np.mean(exact))
         relative = np.array(relative)
         assert relative.max() < ceiling
-        # the whole scan sits inside a factor of three, and the null inside
-        # a factor of three of the median -- against a signal that falls by
-        # orders across the same scan
+        # the whole scan sits inside a factor of three, and so does the null
+        # against the median, while the signal falls by orders
         assert relative.max() / relative.min() < 3.0
         assert relative[deepest] / np.median(relative) < 3.0
 

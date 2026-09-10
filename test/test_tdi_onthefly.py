@@ -20,12 +20,11 @@ from pycbc.tdi.sources import (LALFDSource, LALIMRPhenomDSource,
 def _lal_waveforms_available():
     """Is ``pycbc.waveform`` importable at all in this environment?
 
-    The LAL-backed source needs it, and the plugin scan at import time will
-    raise if any INSTALLED package registers a pycbc.waveform entry point
-    whose module is absent from the checked-out PyCBC -- which is what a
-    sibling feature branch's plugin looks like from here. That is an
-    environment defect rather than a missing optional dependency, so the
-    reason is reported instead of being swallowed.
+    The LAL-backed source needs it, and the plugin scan at import time raises
+    if an installed package registers a pycbc.waveform entry point whose
+    module is absent from the checked-out PyCBC, which is how a sibling
+    feature branch's plugin looks from here. That is an environment defect,
+    not a missing optional dependency, so the reason is reported.
     """
     try:
         import pycbc.waveform                                  # noqa: F401
@@ -114,8 +113,8 @@ def test_sparse_matches_dense():
 def test_sparse_grid_shrinks_and_error_grows_monotonically():
     """Guards the accuracy/speed knob: a looser grid must cost accuracy.
 
-    delta_phi is now the only knob -- the geometric step growth it replaced put
-    the dense region at the segment start rather than at the merger.
+    delta_phi is the only knob. The geometric step growth it replaced put the
+    dense region at the segment start instead of at the merger.
     """
     orbit = LisaEqualArmOrbit()
     delta_t, n = 5.0, 120000
@@ -227,7 +226,7 @@ def test_lal_imrphenomd_inverse_spa_reproduces_native_fd_waveform():
     # stationary-time measurement carries an rms of 38 s here (max 127 s),
     # unchanged whether it is smoothed with a degree 6, 12 or 24 fit, so a
     # difference of two of them scatters by tens of seconds on a three-day
-    # duration.  Anything much tighter would be fitting one draw.
+    # duration. Anything much tighter would be fitting one draw.
     assert abs(source.t_end - 3 * 86400.0) < 200.0
 
 
@@ -269,8 +268,8 @@ def test_lal_source_generalises_beyond_imrphenomd():
 
     Every dominant-mode frequency-domain model must round-trip back to its own
     native LAL waveform; the adapter must not quietly become a surrogate.
-    ROM models are skipped when their data files are absent, which is an
-    environment property rather than a code one.
+    ROM models are skipped when their data files are absent, an environment
+    property and not a code one.
     """
     from pycbc.waveform import get_fd_waveform_sequence
 
@@ -327,7 +326,7 @@ def test_lal_td_source_reaches_merger_and_reproduces_lal():
     """The point of the time-domain route is the part inverse SPA cannot see.
 
     LALFDSource stops where the stationary-time map does; for a LISA-mass
-    binary that is well before the ringdown.  This one must run past it and
+    binary that is well before the ringdown. This one must run past it and
     must still be the LAL waveform, not an approximation of it.
     """
     from pycbc.waveform import get_td_waveform
@@ -383,7 +382,7 @@ def test_lal_td_source_refuses_more_than_one_carrier():
         with pytest.raises(ValueError, match="single .2, ..-2. carrier"):
             LALTDSource(delta_t=1.0 / 4096, inclination=1.0,
                         approximant=approximant, **parameters)
-    # and accepted deliberately, as the dominant-mode approximation it is
+    # and accepted as the dominant-mode approximation it is
     LALTDSource(delta_t=1.0 / 4096, inclination=1.0,
                 approximant="IMRPhenomXHM", check_inclination=None,
                 **parameters)
@@ -395,9 +394,9 @@ def test_lal_td_source_is_bandlimited_not_aliased_by_a_coarse_step():
 
     The constructor guards against a carrier advancing more than pi per
     sample, but LAL never lets that happen: it band-limits to the Nyquist of
-    the requested delta_t instead of folding. So the failure mode to document
-    is a silently SHORTER waveform, not a corrupt one -- which is why the
-    merger test above checks how far in Mf the source actually reaches.
+    the requested delta_t instead of folding. The failure mode is a silently
+    shorter waveform, not a corrupt one, which is why the merger test above
+    checks how far in Mf the source reaches.
     """
     parameters = dict(mass1=60.0, mass2=25.0, spin1z=0.4, spin2z=0.1,
                       distance=500.0, coa_phase=0.0, f_lower=20.0)
@@ -409,8 +408,8 @@ def test_lal_td_source_is_bandlimited_not_aliased_by_a_coarse_step():
         probe = np.linspace(source.t_start, source.t_end, 4000)
         frequency = source.angular_frequency(2, probe) / (2 * np.pi)
         assert np.all(frequency > 0)
-        # filled right up to Nyquist -- measured 130.0 Hz against 128.0 at
-        # delta_t = 1/256, the excess being the spline derivative at the edge
+        # filled right up to Nyquist: 130.0 Hz against 128.0 at
+        # delta_t = 1/256, the excess coming from the edge of the spline
         assert frequency.max() < 1.05 * 0.5 / delta_t
         reach[delta_t] = frequency.max() * total_mass
     assert reach[1.0 / 4096] > 0.08                     # keeps the ringdown
@@ -421,9 +420,9 @@ def test_lal_td_source_is_bandlimited_not_aliased_by_a_coarse_step():
 def test_lal_modes_source_is_lals_own_mode_sum():
     """One harmonic per (l, m), reconstructing LAL's own decomposition.
 
-    The comparison is against pycbc's `sum_modes` over the SAME modes, not
-    against get_td_waveform, so that what is tested is the representation and
-    not the mode content.  The azimuth is not coa_phase: `sum_modes` takes an
+    The comparison is against pycbc's `sum_modes` over the same modes, not
+    against get_td_waveform, so what is tested is the representation and not
+    the mode content. The azimuth is not coa_phase: `sum_modes` takes an
     azimuth, and pi/2 - coa_phase is what reproduces get_td_waveform (0.0e+00
     against 6e-02 to 2.0 for coa_phase itself, depending on inclination).
     """
@@ -471,10 +470,10 @@ def test_lal_modes_source_carries_a_precessing_waveform():
     """The point of the class: a model LALTDSource has to refuse.
 
     Against the full get_td_waveform the residual is the m = 0 content it
-    cannot carry -- non-oscillatory, no carrier to factor out, the same reason
-    GW memory goes down the dense path.  Measured here that is 7e-03 for a
-    precessing 60+25, and the assertion pins it to the dropped modes rather
-    than to the representation.
+    cannot carry: non-oscillatory, no carrier to factor out, which is also why
+    GW memory goes down the dense path. That is 7e-03 for a precessing 60+25,
+    and the assertion pins it to the dropped modes, not to the
+    representation.
     """
     from pycbc.waveform import get_td_waveform, get_td_waveform_modes
     from pycbc.waveform.waveform_modes import sum_modes

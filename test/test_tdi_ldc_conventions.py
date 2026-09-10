@@ -1,10 +1,10 @@
 """pycbc.tdi against the LISA Data Challenge, with no challenge data.
 
 The LDC orbit and single-link response are closed form, so they can be
-transcribed and compared term by term.  That makes an EXTERNAL check of the
-two response choices the plan quantified only from this project's own
-scripts -- the light-cone arm direction and the retarded emitter -- and it
-costs nothing to run: no 3 GB download, no LDC install, no network.
+transcribed and compared term by term. That gives an outside check on the
+light-cone arm direction and the retarded emitter, the two response choices
+the plan quantified from this project's own scripts, and it costs no 3 GB
+download, no LDC install and no network.
 
 Everything below is taken from the LDC v1.2.0 source, not from the manual:
 pdftotext mangles the parentheses of the velocity equations, and reading the
@@ -82,7 +82,7 @@ def ldc_position(t, spacecraft):
 
 
 def ldc_velocity(t, spacecraft):
-    """orbits.cc velocity_x/y/z.  Note the PLUS on the y eccentric term."""
+    """orbits.cc velocity_x/y/z, with a plus on the y eccentric term."""
     t = np.atleast_1d(np.asarray(t, dtype=float))
     eccentricity = ARM / (2 * np.sqrt(3) * LDC_AU)
     alpha = LDC_OMEGA * t
@@ -105,7 +105,7 @@ def ldc_velocity(t, spacecraft):
 def ldc_link(times, receiver, emitter):
     """common.cc travel_time at order 1.
 
-    Both spacecraft at the RECEPTION time and the velocity correction taken
+    Both spacecraft at the reception time, and the velocity correction taken
     from the RECEIVER: LDC does not solve the light cone, which is the whole
     point of comparing against it.
     """
@@ -149,9 +149,9 @@ class LdcGalacticBinary(object):
 def ldc_polarization_basis(lamb, beta):
     """hphc.py's projection basis, transcribed.
 
-    Transcribed rather than imported from pycbc: a reference that shares the
-    code under test cancels its own errors.  Flipping the sign of v_hat in
-    pycbc goes unnoticed if this function is the same object.
+    Transcribed, not imported from pycbc: a reference that shares the code
+    under test cancels its own errors, and flipping the sign of v_hat in
+    pycbc would go unnoticed.
     """
     sin_beta, cos_beta = np.sin(beta), np.cos(beta)
     sin_lamb, cos_lamb = np.sin(lamb), np.cos(lamb)
@@ -186,9 +186,9 @@ def ldc_arm_response(source, times, links=LDC_LINKS):
 def ldc_convention_sample(times, orbit, links=LDC_LINKS):
     """A `ConstellationSample` carrying LDC's simultaneous arm geometry.
 
-    pycbc.tdi keeps the light cone: `velocity_order` and `retard_emitter`
-    exist, but there is deliberately no switch for a simultaneous arm
-    direction, so LDC's convention is built here rather than in the library.
+    pycbc.tdi keeps the light cone. `velocity_order` and `retard_emitter`
+    exist, but no switch selects a simultaneous arm direction, so LDC's
+    convention is built here instead of in the library.
     """
     position = np.asarray(orbit.compute_position(times, (1, 2, 3)))
     velocity = np.asarray(orbit.compute_velocity(times, (1, 2, 3)))
@@ -206,7 +206,7 @@ def ldc_convention_sample(times, orbit, links=LDC_LINKS):
 def retarded_emitter_sample(times, orbit, links=LDC_LINKS):
     """LDC's arm direction with the emitter at the true emission event.
 
-    Isolates the retardation on its own.  Toggling `retard_emitter` against
+    Isolates the retardation on its own. Toggling `retard_emitter` against
     `ldc_convention_sample` is a NO-OP, because that sample holds the
     un-retarded position in both of its slots.
     """
@@ -221,8 +221,8 @@ def retarded_emitter_sample(times, orbit, links=LDC_LINKS):
 
 
 def test_polarization_basis_matches_ldc():
-    """The frame convention, checked against a transcription rather than
-    against itself."""
+    """The frame convention, against a transcription and not against
+    itself."""
     for row in VERIFICATION_BINARIES:
         got = polarization_basis(row['lamb'], row['beta'])
         want = ldc_polarization_basis(row['lamb'], row['beta'])
@@ -289,11 +289,11 @@ def test_light_cone_costs_the_aberration_angle():
 
 
 def test_single_link_reproduces_ldcs_own_response():
-    """In LDC's convention pycbc IS LDC, to twelve digits.
+    """In LDC's convention pycbc is LDC, to twelve digits.
 
     The three ways they differ are each switched on alone afterwards, which
-    turns the plan's own numbers -- measured until now only from this
-    project's scripts -- into a comparison against an outside implementation.
+    puts the plan's numbers, so far measured only from this project's own
+    scripts, against an outside implementation.
     """
     times = np.arange(0.0, 3 * 86400.0, 5.0)
     orbit = LisaEqualArmOrbit(armlength=ARM, t0=0.0)
@@ -330,7 +330,7 @@ def test_single_link_reproduces_ldcs_own_response():
     # velocity_order=0 with a simultaneous arm and no retardation IS LDC
     assert same.max() < 1e-8
 
-    # the arm direction costs ~1.15e-4 and is FLAT in frequency, so across an
+    # the arm direction costs ~1.15e-4 and is flat in frequency, so across an
     # 18x band it may only move by these sources' sky-position scatter
     assert 5e-5 < direction.min() and direction.max() < 2e-4
     assert direction.max() / direction.min() < 4.0
@@ -348,8 +348,8 @@ def test_single_link_reproduces_ldcs_own_response():
 if __name__ == '__main__':
     import unittest
 
-    # imported here rather than at module scope: `utils` lives in test/ and is
-    # only on the path when this file is run the way pycbc's own suite is
+    # `utils` lives in test/ and is on the path only when this file is run
+    # the way pycbc's own suite runs it
     from utils import simple_exit
 
     class LDCConventions(unittest.TestCase):

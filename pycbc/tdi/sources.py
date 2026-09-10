@@ -23,10 +23,9 @@ class WaveformSource(Protocol):
 class ArrayWaveformSource:
     """Linearly interpolate sampled polarizations onto arbitrary times.
 
-    Values requested outside the supplied time range are zero. This makes the
-    required waveform padding explicit: callers that need physical data at a
-    retarded time must include it in ``times`` rather than relying on spline
-    extrapolation.
+    Values requested outside the supplied time range are zero, so a caller
+    that needs physical data at a retarded time has to include that time in
+    ``times``.
 
     Parameters
     ----------
@@ -51,7 +50,7 @@ class ArrayWaveformSource:
 
     @classmethod
     def from_timeseries(cls, h_plus, h_cross):
-        """Construct from two uniformly sampled PyCBC ``TimeSeries`` objects."""
+        """Construct from two uniformly sampled PyCBC ``TimeSeries``."""
         if len(h_plus) != len(h_cross):
             raise ValueError("h_plus and h_cross must have the same length")
         if h_plus.delta_t != h_cross.delta_t:
@@ -78,7 +77,7 @@ class ArrayWaveformSource:
         return out.reshape(shape)
 
     def polarizations(self, t):
-        """Return linearly interpolated polarizations with the shape of ``t``."""
+        """Linearly interpolated polarizations, with the shape of ``t``."""
         return (
             self._interpolate(self.times, self.h_plus, t),
             self._interpolate(self.times, self.h_cross, t),
@@ -88,14 +87,13 @@ class ArrayWaveformSource:
 class NewtonianChirp:
     """Reference `HarmonicSource`: a Newtonian point-particle inspiral.
 
-    Exists so the sparse evaluator can be exercised and benchmarked without
-    pulling in a full waveform model. The phase is the closed-form
+    For exercising the sparse evaluator without a full waveform model. The
+    phase is closed form,
 
         Phi(t) = Phi_c - 2 [ (t_c - t) / (5 tau_c) ]^(5/8),  tau_c = G Mc / c^3
 
-    so amplitude and phase are available at ARBITRARY times, which is what the
-    sparse path needs -- it queries the waveform at retarded times that are not
-    on any grid.
+    so amplitude and phase are available at the arbitrary retarded times the
+    sparse path queries.
 
     Parameters
     ----------
@@ -148,13 +146,10 @@ class NewtonianChirp:
 def _windowed_derivative(x, y, window=256, degree=6):
     """``(y_smooth, dy/dx)`` from overlapping polynomial windows.
 
-    Differentiating a spline through ``y`` fails here for a reason that has
-    nothing to do with the physics: the measured stationary times carry a
-    little roundoff, and once the grid is fine enough that the true change
-    between knots drops below it, the derivative goes negative.  A window
-    wide enough to average the noise away and short enough to follow the
-    curve fixes both ends of that, and unlike one global fit it costs the
-    same per knot at any bandwidth.
+    A spline derivative goes negative once the grid is fine enough that the
+    change between knots drops below the roundoff in ``y``. A window wide
+    enough to average that away and short enough to follow the curve avoids
+    it, at a cost per knot independent of bandwidth.
     """
     count = len(x)
     window = int(min(max(window, degree + 2), count))
@@ -185,35 +180,28 @@ def _windowed_derivative(x, y, window=256, degree=6):
 
 
 class LALFDSource:
-    r"""Any dominant-mode frequency-domain LAL waveform, for sparse LISA.
+    r"""A dominant-mode frequency-domain LAL waveform as amplitude and carrier.
 
-    The LISA response code needs a slowly varying complex amplitude and a
-    carrier phase that can be evaluated at arbitrary retarded times.  LAL's
-    IMRPhenomD interface instead returns frequency-domain polarizations.  This
-    adapter connects the two with the stationary-phase map
+    The sparse response wants a slowly varying complex amplitude and a phase
+    it can evaluate at arbitrary retarded times; LAL returns frequency-domain
+    polarizations. The two are connected by the stationary-phase map
 
     .. math::
 
         t(f) = -\frac{1}{2\pi}\frac{d\arg \tilde h}{df},\qquad
         \Phi(f) = \arg \tilde h + 2\pi f t + \frac{\pi}{4}.
 
-    Importantly, the derivative is measured from close pairs of *native LAL*
-    frequency-sequence evaluations.  It is not obtained by unwrapping a
-    mission-resolution Fourier grid: for a stellar-mass LISA binary tens of
-    years from merger, adjacent mission bins can differ by many phase cycles.
+    The derivative comes from close pairs of native LAL frequency-sequence
+    evaluations. Unwrapping a mission-resolution Fourier grid would not do:
+    for a stellar-mass LISA binary decades from merger, adjacent mission bins
+    differ by many cycles.
 
-    This is an inverse-SPA representation of the LAL waveform, not a new
-    waveform approximant.  It is appropriate for the slowly evolving inspiral
-    portion of any such model -- the regime a LISA stellar-origin binary
-    spends its whole observation in.
-
-    Applicability is narrower than "a LAL waveform".  The model must be
-    available through ``get_fd_waveform_sequence``, must carry the (2, 2)
-    carrier alone, and must have a monotone stationary-time map over the
-    requested band; the constructor raises when the last fails, which is what
-    a higher-mode or precessing model does, since ``arg h_plus`` is then a sum
-    of carriers rather than one. Verified against IMRPhenomD, IMRPhenomXAS and
-    TaylorF2.
+    This is an inverse-SPA representation of the LAL waveform, valid over the
+    slowly evolving inspiral. Requirements, all checked in the constructor:
+    the model must be in ``pycbc.waveform.fd_sequence``, must carry the (2, 2)
+    carrier alone, and must have a monotone stationary-time map over the band.
+    A higher-mode or precessing model fails the last, ``arg h_plus`` being a
+    sum of carriers; use `LALModesSource` for those.
 
     Parameters
     ----------
@@ -222,22 +210,22 @@ class LALFDSource:
     f_lower : float
         GW frequency at ``t_start`` in Hz.
     duration : float, optional
-        Requested time support in seconds.  The upper frequency is solved
-        from the LAL phase derivative.  Exactly one of ``duration`` and
+        Requested time support in seconds. The upper frequency is solved
+        from the LAL phase derivative. Exactly one of ``duration`` and
         ``f_upper`` must be supplied.
     f_upper : float, optional
         End frequency in Hz.
     n_frequency : int, optional
-        Number of frequency knots, spaced geometrically.  It sets accuracy
-        only: the phase is unwrapped against the measured stationary time, so
-        the knot count no longer has to scale with duration times bandwidth.
+        Number of frequency knots, spaced geometrically. Sets accuracy only;
+        the phase is unwrapped against the measured stationary time, so the
+        count does not scale with duration times bandwidth.
         ``unwrap_margin`` reports how much of the half-cycle budget was used.
     polarization : float, optional
-        Polarization rotation in radians.  Sky position belongs to the LISA
-        response and is deliberately not part of this source.
+        Polarization rotation in radians. Sky position belongs to the LISA
+        response, not to the source.
     approximant : str, optional
-        Any dominant-mode frequency-domain LAL approximant registered in
-        ``pycbc.waveform.fd_sequence``.  Default ``IMRPhenomD``.
+        Any dominant-mode frequency-domain LAL approximant in
+        ``pycbc.waveform.fd_sequence``. Default ``IMRPhenomD``.
     waveform_options : keyword arguments
         Passed to :func:`pycbc.waveform.get_fd_waveform_sequence`;
         ``sample_points`` is supplied by the adapter and must not appear.
@@ -284,19 +272,12 @@ class LALFDSource:
                                  int(n_frequency))
         h_plus, h_cross = self._fd_waveform(frequency)
         stationary = self._stationary_time(frequency)
-        # dt/df comes from the MAIN grid, not from the local windows.  Those
-        # span about 1e-10 Hz, over which the curvature contributes
-        # (1/2) phi'' eps^2 ~ 2e-8 rad -- far below the roundoff of a phase
-        # that is itself ~1e8 rad, so a second derivative measured there is
-        # pure noise (it scatters over 1.2e12 to 4.2e12 around a true
-        # 9.9e11).  Across the main grid it is smooth, but only if the grid
-        # is read in windows: a plain spline derivative turns negative once
-        # n_frequency is large enough for roundoff to dominate a single knot
-        # spacing, which happened at 2048 knots over a three-day band.
-        # The same windows also smooth t(f).  The measured times are not
-        # strictly increasing once the grid is fine -- roundoff, not physics
-        # -- and CubicSpline demands strictly increasing knots, so the
-        # smoothed times are what the splines are built on.
+        # dt/df comes from the main grid. The local windows of
+        # _local_phase_derivatives span ~1e-10 Hz, over which the curvature
+        # contributes (1/2) phi'' eps^2 ~ 2e-8 rad against a phase of ~1e8
+        # rad, so a second derivative read there is roundoff. The same
+        # windows also smooth t(f), whose measured values stop being strictly
+        # increasing on a fine grid while CubicSpline needs knots that are.
         stationary, dt_df = _windowed_derivative(frequency, stationary)
         stationary_start = stationary[0]
         relative_time = stationary - stationary_start
@@ -308,20 +289,14 @@ class LALFDSource:
                 "the smoothed stationary times are still not increasing; "
                 "the window is too narrow for this grid")
 
-        # Unwrap against the measured t(f) rather than against a removed
-        # global linear phase.  The old route needed the phase step to stay
-        # under pi/2 after removing 2*pi*f*t_start, which costs
-        # 4 * duration * bandwidth knots: fine for a narrowband LISA binary
-        # (1.7e4 for a two-year 5.9 mHz source) and impossible for a
-        # broadband one (1.5e7 for a stellar-mass binary that merges in
-        # band, whose degree-32 Chebyshev design matrix alone is 3.8 GiB).
-        # Subtracting the PREDICTED increment first leaves only the
-        # prediction error to wrap, so the grid is set by the accuracy wanted
-        # and not by the bandwidth.
-        # The big linear term is still removed first, modulo 2*pi so that a
-        # multi-decade t0 costs no precision, which keeps `phase` on the
-        # contract the callers already use.  What is new is that the leftover
-        # is unwrapped against the MEASURED time rather than assumed small.
+        # Unwrap against the measured t(f). Requiring the raw phase step to
+        # stay under pi/2 instead would cost 4 * duration * bandwidth knots,
+        # which reaches 1.5e7 for a stellar-mass binary that merges in band.
+        # Subtracting the predicted increment first leaves only the
+        # prediction error to wrap, so n_frequency follows the accuracy
+        # wanted. The big linear term is still removed, modulo 2*pi so a
+        # multi-decade t0 costs no precision and `phase` keeps the contract
+        # its callers already use.
         time_shift_phase = np.remainder(
             2 * np.pi * frequency * stationary_start, 2 * np.pi)
         measured = np.angle(h_plus * np.exp(1j * time_shift_phase))
@@ -384,18 +359,15 @@ class LALFDSource:
     def _local_phase_derivatives(self, frequency):
         """``(t, dt/df)`` from local fits, with no global phase unwrapping.
 
-        Nine nearby NATIVE phase values are fitted rather than two nearly
-        equal complex numbers differenced.  The local span is about 2.4 rad:
-        safely unwrap-able, and large enough to suppress roundoff.  Because
-        every window uses the same nine offsets, rescaling to
-        ``x = (f - f_i)/epsilon_i`` makes the design matrix common to all of
-        them, so the whole set is one least-squares solve instead of a Python
-        loop over knots.
+        Fits nine nearby native phase values, spanning about 2.4 rad: wide
+        enough to suppress roundoff, narrow enough to unwrap safely. Every
+        window uses the same nine offsets, so rescaling to
+        ``x = (f - f_i)/epsilon_i`` gives them all one design matrix and the
+        whole set becomes a single least-squares solve.
 
-        The second derivative it also returns is NOT usable as ``dt/df``: the
-        window is far too narrow to see curvature above roundoff.  It is
-        returned for diagnosis only, and the caller takes ``dt/df`` from the
-        main grid instead.
+        The second derivative also returned is diagnostic. The window is too
+        narrow to see curvature above roundoff; the caller takes ``dt/df``
+        from the main grid.
         """
         frequency = np.atleast_1d(np.asarray(frequency, dtype=float))
         epsilon = 1.2 / (2 * np.pi * self._newtonian_time(frequency))
@@ -416,7 +388,7 @@ class LALFDSource:
         return self._local_phase_derivatives(frequency)[0]
 
     def _local_curvature(self, frequency):
-        """Diagnostic only -- see `_local_phase_derivatives`."""
+        """Diagnostic; see `_local_phase_derivatives`."""
         return self._local_phase_derivatives(frequency)[1]
 
     def _solve_upper_frequency(self, duration):
@@ -451,10 +423,9 @@ class LALFDSource:
     def amplitude(self, harmonic, t):
         self._check_harmonic(harmonic)
         query = np.asarray(t, dtype=float)
-        # Clip for endpoint roundoff, then restore exact zero outside support.
-        # Subtracting the multi-decade stationary time to form this source's
-        # local clock loses about 1e-7 s, even though the local times are only
-        # days long.
+        # Clip for endpoint roundoff, then restore exact zero outside support:
+        # forming the local clock subtracts a multi-decade stationary time and
+        # loses about 1e-7 s even though the local times are only days long.
         tolerance = max(1e-6, 32 * np.spacing(max(
             1.0, abs(self.t_start), abs(self.t_end))))
         inside = np.logical_and(query >= self.t_start - tolerance,
@@ -503,63 +474,47 @@ def _longest_increasing_run(values):
 class LALTDSource:
     r"""A dominant-mode LAL waveform through merger, from its analytic signal.
 
-    `LALFDSource` inverts the stationary-phase map, which needs a monotone
-    t(f) and therefore stops before the merger: for a 1.8e6 Msun LISA binary
-    it reaches Mf = 0.0017, about ten days early, and only 26% of rho^2 lies
-    below that -- half the signal-to-noise.  Merger-ringdown has no stationary
-    phase to invert, so no amount of care fixes that route.
+    Merger-ringdown has no stationary phase to invert, so `LALFDSource` stops
+    short of it. For a 1.8e6 Msun LISA binary that leaves 26% of rho^2, half
+    the signal-to-noise.
 
-    This one takes the amplitude and phase from the time domain instead, where
-    they exist throughout.  Generated at zero inclination the two polarizations
-    are exactly in quadrature,
+    Here the amplitude and phase come from the time domain, where they exist
+    throughout. At zero inclination the polarizations are in quadrature,
 
     .. math:: h_+ - i h_\times = A(t)\,e^{-i\Phi(t)},
 
-    so A and Phi come straight from the modulus and argument, and inclination
-    and polarization re-enter afterwards as the constants they are.  Any
-    approximant `pycbc.waveform.get_td_waveform` accepts will do, including
-    the frequency-domain ones, which it conditions into the time domain
-    itself.
+    so A and Phi are the modulus and argument, and inclination and
+    polarization enter afterwards as constants. Any approximant
+    `pycbc.waveform.get_td_waveform` accepts will do, frequency-domain ones
+    included.
 
-    The cost is that the sparse evaluator's premise -- an amplitude varying on
-    the ORBITAL timescale -- fails near merger, so the grid has to densify
-    there.  That is a real cost paid where the physics demands it, not an
-    approximation.
+    Near merger the amplitude varies on the carrier timescale, so a sparse
+    grid has to densify there.
 
     Parameters
     ----------
     delta_t : float
-        Sampling of the generated waveform in seconds.  It must resolve the
-        carrier: the constructor rejects a step that leaves the phase
-        advancing by more than pi per sample, since the unwrap would then
-        alias silently.
+        Sampling of the generated waveform in seconds. A step that leaves the
+        phase advancing by more than pi per sample is rejected.
     t_coalescence : float, optional
-        Where to place the waveform's own t = 0 (its amplitude peak, by LAL's
-        convention) on the mission clock.
+        Where the waveform's own t = 0 sits on the mission clock.
     polarization : float, optional
-        Polarization rotation in radians.  Sky position belongs to the LISA
-        response and is deliberately not part of this source.
+        Polarization rotation in radians. Sky position belongs to the LISA
+        response, not to the source.
     amplitude_floor : float, optional
         Fraction of the peak amplitude below which the waveform is treated as
-        absent at either end.  ``get_td_waveform`` pads a frequency-domain
-        model out to a power of two and tapers into it, so for a LISA-band
-        binary most of the returned array can be padding: a 1.8e6 Msun system
-        started at 5e-5 Hz has 332 days of real inspiral inside 971 days of
-        array, and the padding sits at 1e-6 of the peak where an inspiral
-        would be at (f_start/f_peak)^(2/3) ~ 3e-2.  The default is chosen to
-        cut the former and keep the latter.
+        absent at either end. ``get_td_waveform`` pads a frequency-domain
+        model to a power of two and tapers into it, and for a LISA-band binary
+        most of the returned array is that padding, sitting at ~1e-6 of the
+        peak where an inspiral would be at (f_start/f_peak)^(2/3).
     approximant : str, optional
         Default ``IMRPhenomD``.
     check_inclination : float or None, optional
-        Test inclination in radians at which the dominant-mode projection is
-        verified against a real generation, or None to skip.  This is not
-        optional book-keeping: generated at zero inclination a higher-mode
-        model looks perfectly single-carrier, because the spin-weighted
-        harmonics leave only m = +/-2 there, so smoothness proves nothing.
-        What fails for such a model is the ANGULAR dependence, and the only
-        way to catch it is to go off-axis and look.  Measured mismatches at
-        1.0 rad: IMRPhenomD 3e-16, IMRPhenomXAS 3e-16, against IMRPhenomXHM
-        2e-03 and SEOBNRv4PHM 1e-01.
+        Inclination in radians at which the dominant-mode projection is
+        checked against a real generation, or None to skip. At zero
+        inclination the spin-weighted harmonics leave only m = +/-2, so a
+        higher-mode model looks single-carrier there; what it breaks is the
+        angular dependence, which only an off-axis comparison sees.
     waveform_options : keyword arguments
         Passed to :func:`pycbc.waveform.get_td_waveform`; ``inclination`` is
         used for the projection and is not passed through.
@@ -590,9 +545,9 @@ class LALTDSource:
         phase = -np.unwrap(np.angle(analytic))
 
         # Keep the longest stretch that is both loud enough to be signal and
-        # strictly monotone in phase.  Either test alone is too weak: the
-        # padded head is monotone in a slowly drifting numerical phase, and
-        # amplitude alone would keep whatever noise sits above the floor.
+        # strictly monotone in phase. Either test alone is too weak: the padded
+        # head is monotone in a slowly drifting numerical phase, and amplitude
+        # alone keeps whatever noise sits above the floor.
         loud = magnitude > float(amplitude_floor) * peak
         first, span = _longest_increasing_run(
             np.where(loud, phase, -np.inf))
@@ -627,14 +582,13 @@ class LALTDSource:
         self._phase_samples = phase
         self._magnitude = CubicSpline(clock, magnitude, extrapolate=False)
         self._phase = CubicSpline(clock, phase, extrapolate=True)
-        # Read the frequency off a monotonicity-preserving interpolant of the
-        # measured samples rather than differentiating the cubic spline.  The
-        # phase is monotone at the samples, but a cubic through it need not be
-        # between them, and its derivative dips below zero in the faint tails
-        # where the amplitude sits at the floor -- at delta_t = 1/256 that is
-        # enough to hand `adaptive_time_grid` a negative frequency.  The two
-        # therefore differ at interpolation order; angular_frequency is used
-        # to size grids, never to build the waveform.
+        # A monotonicity-preserving interpolant of the sampled frequency, not
+        # the derivative of the phase spline: the phase is monotone at the
+        # samples but a cubic through them need not be, and its derivative
+        # dips below zero in the faint tails where the amplitude sits at the
+        # floor, which hands `adaptive_time_grid` a negative frequency. The
+        # two differ at interpolation order; angular_frequency sizes grids and
+        # never builds the waveform.
         self._omega = PchipInterpolator(clock, np.gradient(phase, times),
                                         extrapolate=True)
         self._amplitude_plus = amplitude_plus
@@ -646,12 +600,10 @@ class LALTDSource:
     def _verify_projection(self, inclination, tolerance, waveform_options):
         """Is this model really one (2, +/-2) carrier off-axis as well?
 
-        Ask first, measure second.  ``pycbc.waveform.waveform_modes`` knows
-        the mode content of a few model families by citation -- and only
-        those: it raises for everything else, and its own source carries a
-        FIXME asking for a lalsimulation call that does not exist yet.  So
-        the registry settles the cases it covers, and the measurement below
-        covers the rest, including sources that are not LAL models at all.
+        ``pycbc.waveform.waveform_modes.default_modes`` knows the mode content
+        of a few model families and raises for the rest, so it settles the
+        cases it covers and the measurement below handles everything else,
+        non-LAL sources included.
         """
         from pycbc.waveform import get_td_waveform
         from pycbc.waveform.waveform_modes import default_modes
@@ -668,8 +620,8 @@ class LALTDSource:
                     f"{self.approximant} carries {extra} besides the (2, 2) "
                     "carrier, per pycbc.waveform.waveform_modes.default_modes."
                     " Higher modes and precession need a source with one "
-                    "harmonic each; pass check_inclination=None only to "
-                    "accept the dominant-mode approximation deliberately")
+                    "harmonic each; pass check_inclination=None to accept "
+                    "the dominant-mode approximation")
 
         plus, cross = get_td_waveform(
             approximant=self.approximant, delta_t=self.delta_t,
@@ -683,12 +635,11 @@ class LALTDSource:
         model = magnitude * (0.5 * (1 + cosine ** 2) * np.cos(phase)
                              - 1j * cosine * np.sin(phase))
         reference = np.asarray(plus)[inside] - 1j * np.asarray(cross)[inside]
-        # Maximise over time and phase.  The two generations need not be
+        # Maximise over time and phase. The two generations need not be
         # aligned to the sample: IMRPhenomXAS puts its two inclinations 0.98 ms
-        # apart, which reads as mismatch 6e-02 unaligned and 3e-09 aligned,
-        # and would otherwise be rejected as a higher-mode model. Modes shift
-        # the SHAPE, so they survive the maximisation -- IMRPhenomXHM stays at
-        # 1.4e-02 -- and the two cases separate by seven orders.
+        # apart, reading as mismatch 6e-02 unaligned and 3e-09 aligned. Higher
+        # modes change the shape, so they survive the maximisation and the two
+        # cases separate by seven orders.
         count = len(model)
         norm = np.sqrt(np.sum(np.abs(model) ** 2)
                        * np.sum(np.abs(reference) ** 2))
@@ -701,8 +652,8 @@ class LALTDSource:
                 f"own waveform at inclination {inclination} differs from the "
                 f"dominant-mode projection by mismatch {mismatch:.3e}. Higher "
                 "modes and precession need a source with one harmonic each; "
-                "pass check_inclination=None only to accept the "
-                "dominant-mode approximation deliberately")
+                "pass check_inclination=None to accept the dominant-mode "
+                "approximation")
 
     def _check_harmonic(self, harmonic):
         if harmonic != 2:
@@ -744,35 +695,30 @@ class LALTDSource:
 class LALModesSource:
     r"""A higher-mode or precessing LAL waveform, one harmonic per ``(l, m)``.
 
-    `LALTDSource` carries a single carrier and refuses anything else, which
-    rules out exactly the models LISA analyses are moving to.  The sparse
-    evaluator does not need a single carrier, though -- it needs each piece to
-    be a slowly varying amplitude times its own carrier, which is what a mode
-    is.  So each ``(l, m)`` becomes its own harmonic, and the response is
-    applied to each and summed, as it already is for pyEFPEHM's ``(l, m, n)``.
+    The sparse evaluator needs each piece to be a slowly varying amplitude
+    times its own carrier, which is what a mode is, so each ``(l, m)``
+    becomes a harmonic and the response is applied to each and summed. Same
+    arrangement as pyEFPEHM's ``(l, m, n)``.
 
-    The decomposition is LAL's own, through
-    :func:`pycbc.waveform.get_td_waveform_modes`, and the reconstruction is
-    LAL's own contract: ``h = sum_lm Y_lm h_lm`` with the plus polarization
-    the real part and the cross the negative imaginary part.  Writing
-    ``h_lm = A_lm exp(i arg h_lm)`` and using ``Re[z] = Re[conj(z)]``, each
-    mode contributes ``Re[(A_lm conj(Y_lm)) exp(i Phi_lm)]`` to the plus with
+    The decomposition and the reconstruction are LAL's, through
+    :func:`pycbc.waveform.get_td_waveform_modes`:
+    ``h = sum_lm Y_lm h_lm``, plus polarization the real part, cross the
+    negative imaginary part. Writing ``h_lm = A_lm exp(i arg h_lm)`` and using
+    ``Re[z] = Re[conj(z)]``, a mode contributes
+    ``Re[(A_lm conj(Y_lm)) exp(i Phi_lm)]`` to the plus with
     ``Phi_lm = -arg h_lm``, and the same amplitude times ``-i`` to the cross.
-    Whichever sign of ``Phi`` rises is the one kept, so ``m < 0`` modes are
-    carried as readily as ``m > 0``.
+    Whichever sign of ``Phi`` rises is kept, so ``m < 0`` modes carry as
+    readily as ``m > 0``.
 
-    ``m = 0`` modes are dropped, and reported in `skipped`.  They are not
-    oscillatory, so they have no carrier to factor out and no sparse grid can
-    represent them; that is the same reason the plan sends GW memory down the
-    dense path.
+    ``m = 0`` modes are dropped and listed in `skipped`. They do not
+    oscillate, so there is no carrier to factor out; they belong on the dense
+    path, as GW memory does.
 
-    Which approximants can be decomposed at all is a separate question from
-    which have higher modes, and PyCBC answers only the first:
-    ``td_waveform_mode_approximants()`` lists SEOBNRv4PHM, IMRPhenomTPHM,
-    NRHybSur3dq8, NRSur7dq2/4 and the Taylor families, while IMRPhenomXPHM --
-    which LDC is beginning to use -- is in neither mode list even though
-    ``default_modes`` knows its content. Wiring that up belongs upstream in
-    ``pycbc.waveform.waveform_modes``, not here.
+    Only some approximants can be decomposed at all. PyCBC's
+    ``td_waveform_mode_approximants()`` covers SEOBNRv4PHM, IMRPhenomTPHM,
+    NRHybSur3dq8, NRSur7dq2/4 and the Taylor families. IMRPhenomXPHM is in
+    neither mode list, though ``default_modes`` knows its content; wiring it
+    up belongs in ``pycbc.waveform.waveform_modes``.
 
     Parameters
     ----------
@@ -785,9 +731,9 @@ class LALModesSource:
     polarization : float, optional
         Polarization rotation in radians.
     mode_array : sequence of (l, m), optional
-        Restrict to these modes.  Default: everything the model returns.
+        Restrict to these modes. Default: everything the model returns.
     amplitude_floor : float, optional
-        Fraction of a MODE's own peak below which it is treated as absent.
+        Fraction of a mode's own peak below which it is treated as absent.
     approximant : str, optional
         Default ``SEOBNRv4PHM``.
     """
@@ -812,11 +758,10 @@ class LALModesSource:
 
         wanted = (None if mode_array is None
                   else {tuple(mode) for mode in mode_array})
-        # The spherical harmonic wants an AZIMUTH, and it is not coa_phase.
-        # pycbc.waveform.waveform_modes.sum_modes takes the azimuth as its
-        # `phi`; measured against get_td_waveform on the same modes,
-        # azimuth = pi/2 - coa_phase reproduces it to 0.0e+00 while coa_phase
-        # itself gives mismatch 6e-02 to 2.0 depending on the inclination.
+        # sum_modes takes an azimuth as its `phi`, and the azimuth is
+        # pi/2 - coa_phase: against get_td_waveform on the same modes that
+        # reproduces to 0.0e+00, while passing coa_phase gives mismatch 6e-02
+        # to 2.0 depending on the inclination.
         azimuth = 0.5 * np.pi - float(coa_phase)
         angle = 2 * float(polarization)
         cos_psi, sin_psi = np.cos(angle), np.sin(angle)
@@ -851,7 +796,7 @@ class LALModesSource:
             spherical = lal.SpinWeightedSphericalHarmonic(
                 float(inclination), azimuth, -2, *harmonic)
             # h_lm Y_lm contributes Re[.] to plus and -Im[.] = Re[i .] to
-            # cross.  With Phi = +arg(h_lm) that is Re[(A Y) exp(i Phi)] and
+            # cross. With Phi = +arg(h_lm) that is Re[(A Y) exp(i Phi)] and
             # Re[(i A Y) exp(i Phi)]; with Phi = -arg(h_lm), conjugating
             # inside the real part gives A conj(Y) and -i A conj(Y).
             if sign > 0:
@@ -943,29 +888,27 @@ class LALIMRPhenomDSource(LALFDSource):
 class PyEFPEHMSource:
     """`HarmonicSource` over pyEFPEHM's co-precessing (l, m, n) harmonics.
 
-    pyEFPEHM fits the sparse evaluator unusually well: ``generate_tdomain_hlm_modes``
-    takes an arbitrary time array, which is what the retarded queries need, and
-    ``return_waveform_pieces=True`` hands back ``phase``, ``omega`` and
-    ``DomegaDt`` directly, so nothing has to be recovered by unwrapping
-    ``arg(hlm)``.
+    ``generate_tdomain_hlm_modes`` takes an arbitrary time array, which suits
+    the retarded queries, and ``return_waveform_pieces=True`` returns
+    ``phase``, ``omega`` and ``DomegaDt``, so nothing has to be recovered by
+    unwrapping ``arg(hlm)``.
 
-    Grouping. Each co-precessing ``(l, m, n)`` harmonic contributes to every
-    inertial ``mp = -l..l``, so a precessing, eccentric configuration reaches
-    ~100 pieces. But the ``mp`` projector is a constant at fixed viewing
-    angles, and all of a harmonic's ``mp`` columns share one carrier phase, so
-    summing over ``mp`` first collapses those to ~16 harmonics -- a 6x saving
-    on the sparse cost, with no approximation.
+    Grouping. Each co-precessing ``(l, m, n)`` contributes to every inertial
+    ``mp = -l..l``, reaching ~100 pieces for a precessing eccentric system.
+    The ``mp`` projector is constant at fixed viewing angles and the columns
+    share one carrier phase, so summing over ``mp`` first collapses them to
+    ~16 harmonics with no approximation.
 
-    Convention. This uses the time-domain contract only: ``h = Re[hlm . Proj]``
-    with the projector NOT conjugated. The frequency-domain contract conjugates
-    it, and pyEFPEHM's own docstrings are explicit that the two must not be
-    mixed. The slowly varying amplitude handed to the evaluator is therefore
+    Convention. The time-domain contract only: ``h = Re[hlm . Proj]`` with the
+    projector unconjugated. The frequency-domain contract conjugates it, and
+    pyEFPEHM's docstrings are explicit that the two must not be mixed. So the
+    amplitude handed to the evaluator is
 
         A = (hlm . Proj) exp(-i phase),      h = Re[A exp(i phase)]
 
-    Validity windows. Harmonics do not all cover the same times -- pyEFPEHM
-    returns ``time_idxs`` per mode -- so queries outside a harmonic's window
-    return zero amplitude rather than an extrapolation.
+    Validity windows. pyEFPEHM returns ``time_idxs`` per mode, and harmonics
+    do not all cover the same times; a query outside a window returns zero
+    amplitude.
 
     Parameters
     ----------
@@ -1009,15 +952,11 @@ class PyEFPEHMSource:
     def _evaluate(self, harmonic, t):
         """(A_plus, A_cross, phase, omega) at arbitrary, possibly 2-D ``t``.
 
-        Deliberately uncached.  An earlier version memoised on
-        ``(harmonic, shape, query.ctypes.data, first, last)``, which is not a
-        key: a freed buffer's address is handed straight back to the next
-        array of the same size, so two different query arrays that agree at
-        their endpoints can collide and one gets the other's amplitudes.
-        Instrumented against a fresh recomputation it never once hit -- since
-        `carrier_phase` stopped going through here it has no repeat callers --
-        so it was pure risk.  If a cache is wanted again it has to be keyed on
-        the times themselves, not on where they happen to live.
+        Uncached. A cache keyed on ``query.ctypes.data`` collides whenever a
+        freed buffer's address is reused by an array of the same size, and
+        instrumentation showed it never hitting: since `carrier_phase` stopped
+        coming through here there are no repeat callers. A future cache has to
+        be keyed on the times themselves.
         """
         query = np.asarray(t, dtype=float)
         flat = query.reshape(-1)
@@ -1065,16 +1004,13 @@ class PyEFPEHMSource:
         """Every contiguous stretch over which this harmonic has amplitude.
 
         pyEFPEHM keeps a harmonic only while it carries more than
-        ``Amplitude_tol`` of the total, so a harmonic is live over part of the
-        trajectory -- and NOT necessarily over one interval. Measured on a
-        precessing, eccentric configuration, (2, 1, 2) is live over
-        [0.000, 0.009] and again over [0.174, 0.619] of the span, with a dead
-        gap of 16% in between. Reporting only the outer hull, as an earlier
-        version did, spends grid points on the gap.
+        ``Amplitude_tol`` of the total, and the live set can be several
+        intervals: on one precessing, eccentric configuration (2, 1, 2) is
+        live over [0.000, 0.009] and [0.174, 0.619] of the span. The outer
+        hull would spend grid points on the 16% gap between them.
 
-        Liveness is read off the amplitude, not the phase: `carrier_phase` is
-        now defined everywhere, and even before that a mode's phase passes
-        through zero at an interior point.
+        Liveness comes from the amplitude, not the phase, which is defined
+        everywhere and passes through zero at interior points.
         """
         key = ('blocks', harmonic)
         if key not in self._cache:
@@ -1094,7 +1030,7 @@ class PyEFPEHMSource:
         return self._cache[key]
 
     def support(self, harmonic):
-        """Outer hull of `support_blocks`; empty harmonics give a null window."""
+        """Outer hull of `support_blocks`; an empty harmonic gives a null."""
         blocks = self.support_blocks(harmonic)
         if not blocks:
             return (self.t_start, self.t_start)
@@ -1112,7 +1048,7 @@ class PyEFPEHMSource:
         return first.reshape(query.shape), second.reshape(query.shape)
 
     def carrier_phase(self, harmonic, t):
-        """Phi(t) = n lambda + (m - n) delta_lambda, defined EVERYWHERE.
+        """Phi(t) = n lambda + (m - n) delta_lambda, defined everywhere.
 
         Not ``_evaluate``'s phase array, which is zero wherever the harmonic
         is not in pyEFPEHM's selected set. The factorisation

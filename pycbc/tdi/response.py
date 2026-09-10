@@ -85,12 +85,11 @@ def sample_constellation(t, orbit, *, ltt_order=1, links=LINK_ORDER,
             "ltt_order=2 requires a specified solar-Shapiro convention"
         )
     links = _validate_links(links)
-    # The light-cone iteration evaluates the emitter at t - delay, so the
-    # achievable precision is set by the spacing of t itself, not by the
-    # delay. At a two-year mission time t ~ 6.3e7 s the float64 spacing is
-    # 7.5e-9 s, which a fixed 1e-12 s tolerance can never reach -- the solve
-    # then exhausts max_iterations and raises on a converged answer. Floor the
-    # tolerance at the representable resolution.
+    # The light-cone iteration evaluates the emitter at t - delay, so its
+    # precision follows the spacing of t. At a two-year mission time
+    # t ~ 6.3e7 s that spacing is 7.5e-9 s, so a fixed 1e-12 s tolerance
+    # exhausts max_iterations and raises on an answer that has converged.
+    # Floor the tolerance at the representable resolution.
     tolerance = max(float(tolerance),
                     4 * float(np.spacing(np.max(np.abs(t)))))
     position = np.asarray(orbit.compute_position(t, (1, 2, 3)), dtype=float)

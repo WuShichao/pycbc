@@ -1,23 +1,22 @@
 """How far the emitter-retardation expansion has to be carried, and why.
 
 `sample_constellation` solves the light cone exactly, so nothing here changes
-what the code does.  What these tests protect is the reasoning that let
-`link_geometry` ship with no ``acceleration_order`` knob: the acceleration
-term of ``r_j(t - L)`` is negligible, and it is negligible for a reason that
-survives a longer-armed or faster-orbiting constellation being added later.
+what the code does. These tests protect the reasoning that let `link_geometry`
+ship with no ``acceleration_order`` knob: the acceleration term of
+``r_j(t - L)`` is negligible, on grounds that survive a longer-armed or
+faster-orbiting constellation being added later.
 
 Expanding the emission event,
 
     r_j(t - L) = r_j - v L + a L^2 / 2 - adot L^3 / 6,
 
-successive orders do NOT share one factor.  The consecutive ratios are
+successive orders have different denominators,
 
     acc / vel  = |k.a| L / (2 |k.v|),      jerk / acc = |k.adot| L / (3 |k.a|)
 
-with different denominators, so a single "cost per order" would hide the case
-where they disagree -- and TianQin is that case: its jerk/acc is eight times
-its acc/vel, because its velocity is dominated by Earth's heliocentric motion
-while its acceleration is dominated by the geocentric orbit.
+so a single "cost per order" hides the case where the two disagree. TianQin is
+that case: its jerk/acc is eight times its acc/vel, its velocity coming from
+Earth's heliocentric motion and its acceleration from the geocentric orbit.
 """
 
 import numpy as np
@@ -36,9 +35,9 @@ ORBITS = (("LISA", LisaEqualArmOrbit), ("Taiji", TaijiEqualArmOrbit),
 def _terms(orbit):
     """Largest sampling-time contribution of each Taylor order, in seconds.
 
-    Maximised over time and over sky direction independently, which is what
-    makes these ENVELOPES: |k.x| <= |x|, and the maxima of different orders
-    fall at different points.
+    Maximised over time and over sky direction independently, so these are
+    envelopes: |k.x| <= |x|, and the maxima of different orders fall at
+    different points.
     """
     times = np.linspace(0.0, YEAR, 733)
     arm = orbit.armlength / C_SI
@@ -87,11 +86,10 @@ def test_each_taylor_order_matches_its_own_envelope(name, factory):
 def test_omega_l_over_two_is_not_the_expansion_parameter():
     """It happens to work for LISA and Taiji, and fails for TianQin.
 
-    Recording this because the wrong parameter is the tempting one: for a
-    heliocentric constellation the guiding centre supplies both the speed and
-    the acceleration, so |a| L / (2 |v|) collapses to omega L / 2.  TianQin's
-    do not come from the same motion -- Earth's orbit sets its speed, its own
-    geocentric orbit sets its acceleration -- and the two part company.
+    For a heliocentric constellation the guiding centre supplies both the
+    speed and the acceleration, so |a| L / (2 |v|) collapses to omega L / 2.
+    TianQin takes its speed from Earth's orbit and its acceleration from its
+    own geocentric orbit, and the two part company.
     """
     earth_rate = 2 * np.pi / YEAR
     ratios = {}

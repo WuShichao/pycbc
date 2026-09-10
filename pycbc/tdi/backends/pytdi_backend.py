@@ -133,8 +133,8 @@ def get_pytdi_michelson(generation=2):
 def get_pytdi_combination(name):
     """Resolve one verified ETA-only combination from the plan registry.
 
-    ``C12_3`` is deliberately absent: its path transcription has not yet been
-    validated by a laser-noise-cancellation test.
+    ``C12_3`` is absent until its path transcription passes a laser-noise
+    cancellation test.
     """
     core, michelson = _require_pytdi()
     standard = {

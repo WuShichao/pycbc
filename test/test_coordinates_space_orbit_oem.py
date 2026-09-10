@@ -2,16 +2,15 @@
 
 ESA's OEM rows carry epoch, position, velocity and often acceleration, and
 the reader used to keep only the position and differentiate a spline through
-it.  Measured on the 1-minute ESA file, that route reaches 5.8e-3 relative
-error against the file's own acceleration column while differentiating the
-velocity column reaches 1.6e-8, so the columns are worth reading.
+it. On the 1-minute ESA file that route reaches 5.8e-3 relative error against
+the file's own acceleration column, against 1.6e-8 for differentiating the
+velocity column.
 
-The fixtures here are synthetic on purpose.  A test that needs a real orbit
-file can only skip, and skipping is what an untested behaviour change looks
-like from the outside; a written-out file that carries a velocity which is
-DELIBERATELY not the derivative of its own position column settles the
-question in three lines -- if the reader still differentiates, it cannot
-return what the file says.
+The fixtures are synthetic. A test needing a real orbit file can only skip,
+and from the outside a skip looks the same as an untested behaviour change; a
+written-out file whose velocity is not the derivative of its own position
+column settles it in three lines, since a reader that still differentiates
+cannot return what the file says.
 """
 
 import os
@@ -66,8 +65,8 @@ def _write_oem(path, radius_km, phase, velocity_scale=1.0, columns=6,
 
 
 def _epoch_gps():
-    """The GPS times the fixtures are written at, computed here rather than
-    read off the object, so the test does not depend on its internals."""
+    """The GPS times the fixtures are written at, recomputed here so the test
+    does not lean on the object's internals."""
     from astropy.time import Time
     base = Time(EPOCH, format='isot', scale='tcb')
     return np.asarray([(base + index * CADENCE / 86400.0).gps

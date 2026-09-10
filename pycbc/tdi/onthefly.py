@@ -7,29 +7,19 @@
 
 """Sparse "TDI on the fly" evaluation of TDI channels.
 
-The dense path costs ~25-38 us per output sample and is dominated (85-90%) by
-PyTDI's Lagrange interpolation, not by the response: a two-year LISA channel at
-dt = 5 s takes about eight minutes, which is five to six orders too slow for
-parameter estimation.
+Cornish & Littenberg, PRD 112, 102007. For a harmonic
+h(t) = Re[A(t) exp(i Phi(t))],
 
-Cornish & Littenberg (PRD 112, 102007) remove that cost rather than optimise
-it. For a quasi-monochromatic harmonic h(t) = Re[A(t) exp(i Phi(t))], every
-delayed copy the combination needs can be written as
+    h(t - D) = Re[ exp(i Phi(t)) * A(t - D) exp(i (Phi(t - D) - Phi(t))) ]
 
-    h(t - D) = Re[ A(t - D) exp(i Phi(t - D)) ]
-             = Re[ exp(i Phi(t)) * A(t - D) exp(i (Phi(t - D) - Phi(t))) ]
+so factoring exp(i Phi(t)) out of the whole combination leaves a bracket
+varying on the orbital timescale. The bracket is sampled on a few hundred
+points per year and splined; the carrier is reattached at full cadence.
 
-so pulling exp(i Phi(t)) out of the whole sum leaves a bracket that varies on
-the orbital timescale rather than the GW period. That bracket is sampled on a
-grid of a few hundred points per year and splined; the carrier is reattached at
-full cadence at the end. No intermediate eta series is ever built and
-`dsp.timeshift` is never called -- which is why Layer 2 has to expose
-(coefficient, net shift) pairs rather than only "give me eta, take channels".
-
-The delays go on the WAVEFORM's time argument, and the orbit quantities are
-evaluated at the shifted times too, so this is not a frozen-constellation
-approximation: it is exact up to the interpolation of a slowly varying complex
-amplitude.
+Delays are applied to the waveform's time argument and the orbit quantities
+are evaluated at the shifted times, so the constellation is not frozen. No
+intermediate eta series is built and `dsp.timeshift` is never called, which
+is why the combination layer exposes (coefficient, net shift) pairs.
 """
 
 import numpy as np
@@ -55,23 +45,13 @@ class HarmonicSource:
 def delay_padding(orbit, times, terms, links=LINK_ORDER):
     """How far outside its own window a harmonic still reaches in a channel.
 
-    The channel at output time ``t`` queries the waveform at
-    ``t - net_shift - tau`` with ``tau = L + k.r_emit/c`` for the emission term
-    and ``k.r_recv/c`` for the reception term. So a harmonic that pyEFPEHM
-    switches off at ``t_off`` still contributes to the channel for another
-    ``max|tau|`` afterwards, and starts contributing that much before it
-    switches on. Bounding ``|k.r| <= |r|`` makes the result sky-independent,
-    which is what a grid held fixed across a likelihood run needs.
+    The channel at ``t`` queries the waveform at ``t - net_shift - tau``,
+    tau being ``L + k.r_emit/c`` for the emission term and ``k.r_recv/c`` for
+    the reception term. Bounding ``|k.r| <= |r|`` drops the sky dependence, so
+    one grid serves a whole likelihood run. About 570 s for LISA.
 
-    For LISA this is about 570 s: 500 s of light time across the orbit, one
-    arm, and the combination's own chain delay (58 s for X2).
-
-    Widening the grid by this much is correct but measured NOT to help: with
-    pyEFPEHM at ``Amplitude_tol = 1e-4`` it moves the 16-harmonic mismatch from
-    4.83e-04 to 5.34e-04, and at 1e-5 it changes nothing. The reach is real;
-    what limits the reconstruction there is the amplitude step itself, and
-    extra nodes just past the step buy ringing rather than accuracy. Hence
-    ``padding`` defaults to zero.
+    Padding the grid by this much does not improve the reconstruction, so
+    callers default to zero; see test_tdi_onthefly.
     """
     probe = np.linspace(times[0], times[-1], 32)
     cache = {}
@@ -88,30 +68,12 @@ def adaptive_time_grid(source, harmonic, t_start, t_end, delta_phi=0.5,
                        max_step_scale=np.inf, padding=0.0):
     """Grid on which the carrier advances by ``delta_phi`` per step.
 
-    The definition is exactly that -- points where Phi increases by delta_phi --
-    so instead of stepping through time and asking for omega at each point, the
-    carrier phase is evaluated ONCE on a probe grid and inverted. Because omega
-    rises toward merger, the result densifies there automatically.
+    The carrier phase is evaluated once on a probe grid and inverted, so the
+    grid densifies wherever omega rises. ``dt_max`` caps the step where the
+    carrier is slow enough that the constellation's motion sets the scale.
 
-    Two bugs this replaces, both found on a real pyEFPEHM harmonic:
-
-    * the first version grew the step geometrically from ``t_start``, which put
-      the dense region at the start of the segment and the coarse region at the
-      merger -- backwards for a chirp. It survived testing only because the
-      test source's merger lay beyond the segment, where omega barely moves.
-    * the second called ``source.angular_frequency`` once per grid point inside
-      a Python loop. For an analytic source that is free; for pyEFPEHM every
-      call re-evaluates the inspiral solution, and building one grid took
-      longer than the dense path it was meant to replace.
-
-    ``dt_max`` still caps the step, for the stretches where the carrier is so
-    slow that the constellation's own motion becomes the limit.
-
-    The grid covers `harmonic_windows`, one sub-grid per window, so a harmonic
-    with a dead gap in the middle of its span gets no points there. Pass the
-    SAME ``padding`` and windows to `reconstruct`: the spline is only valid
-    inside them, and across a gap it interpolates between two blocks with a
-    single cubic.
+    One sub-grid per window of `harmonic_windows`. Pass the same ``padding``
+    to `reconstruct`; the spline is valid only inside the windows.
     """
     if dt_max is None:
         dt_max = 86400.0
@@ -129,9 +91,9 @@ def adaptive_time_grid(source, harmonic, t_start, t_end, delta_phi=0.5,
 def harmonic_windows(source, harmonic, t_start, t_end, padding=0.0):
     """The stretches of [t_start, t_end] a harmonic can contribute to.
 
-    Prefers ``support_blocks`` over ``support``: a harmonic's live set is not
-    always one interval, and the outer hull then spans a dead gap. ``padding``
-    widens each block by the channel's delay spread -- see `delay_padding`.
+    Uses ``support_blocks`` where the source has it. A live set spanning two
+    intervals with a dead gap between them would otherwise be covered by its
+    outer hull. ``padding`` widens each block by `delay_padding`.
     """
     blocks = getattr(source, 'support_blocks', None)
     if blocks is not None:
@@ -156,13 +118,13 @@ def _grid_over_window(source, harmonic, t_start, t_end, delta_phi, dt_max,
                       n_probe, growth, max_step_scale):
     probe = np.linspace(t_start, t_end, int(n_probe))
     phase = np.asarray(source.carrier_phase(harmonic, probe), dtype=float)
-    if not np.all(np.diff(phase) > 0):          # phase must be monotone to invert
+    if not np.all(np.diff(phase) > 0):          # must be monotone to invert
         phase = np.maximum.accumulate(phase)
     total = phase[-1] - phase[0]
     if not np.isfinite(total) or total <= 0:
         return np.linspace(t_start, t_end, 2)
 
-    # Walk the carrier phase BACKWARDS from the merger, letting the step grow
+    # Walk the carrier phase backwards from the merger, letting the step grow
     # away from it. Cornish & Littenberg's own optimisation, and the direction
     # matters: growing forwards from t_start puts the dense region where the
     # signal is slowest and the coarse region at the merger.
@@ -180,7 +142,7 @@ def _grid_over_window(source, harmonic, t_start, t_end, delta_phi, dt_max,
     grid = np.unique(np.concatenate(([t_start], grid, [t_end])))
 
     gaps = np.diff(grid)
-    if np.any(gaps > dt_max):                   # refill where the carrier is slow
+    if np.any(gaps > dt_max):                   # refill where the carrier lags
         extra = [np.arange(a, b, dt_max)
                  for a, b in zip(grid[:-1], grid[1:]) if b - a > dt_max]
         grid = np.unique(np.concatenate([grid] + extra))
@@ -213,27 +175,17 @@ def chain_delay(orbit, times, chain, links=LINK_ORDER, iterations=3,
                 cache=None):
     """Net delay of one operator chain, summed from retarded light times.
 
-    ``D_ij`` delays by the light travel time of the link received at i from j,
+    ``D_ij`` delays by the travel time of the link received at i from j,
     evaluated at the time the chain has already reached:
 
         (D_ab D_cd) x (t) = x(t - L_ab(t) - L_cd(t - L_ab(t)))
 
-    This deliberately does not call ``build_shifts``: it needs the delay at a
-    few hundred sparse times, not a full-cadence array, and PyTDI's composition
-    goes through ``dsp.timeshift``, which requires one delay sample per output
-    sample. Summing retarded light times directly is the alternative the plan
-    calls for, and Speri does the same thing for response purposes.
+    ``build_shifts`` is unusable here: PyTDI composes through
+    ``dsp.timeshift``, which wants one delay sample per output sample, while
+    this needs a few hundred sparse times.
 
-    Two things make this cheap enough to sit inside a likelihood:
-
-    * only the single link being traversed is solved, not all six -- a naive
-      version asked ``sample_constellation`` for the whole constellation and
-      threw five sixths of it away;
-    * ``cache`` memoises on the chain PREFIX. A Michelson combination's chains
-      are nested (``D_12``, ``D_12 D_21``, ``D_12 D_21 D_13``, ...), so
-      recomputing each from scratch repeats almost all of the work. With the
-      cache the cost is the number of distinct prefixes, not the sum of the
-      chain lengths.
+    Only the link being traversed is solved. ``cache`` memoises on the chain
+    prefix, so nested Michelson chains cost one solve per distinct prefix.
     """
     if cache is None:
         cache = {}
@@ -260,9 +212,8 @@ def sparse_channel(source, harmonic, grid, terms, orbit, lamb, beta,
                    velocity_order=1, links=LINK_ORDER):
     """Evaluate one harmonic's contribution to one channel on ``grid``.
 
-    Returns the complex bracket B(t) with the carrier factored out, so the
-    channel is ``Re[B(t) exp(i Phi(t))]``. B varies on the orbital timescale,
-    which is what makes the sparse grid legitimate.
+    Returns the bracket B(t) with the carrier factored out, so the channel is
+    ``Re[B(t) exp(i Phi(t))]``.
     """
     link_index = {tuple(link): i for i, link in enumerate(links)}
     chains = sorted({term.operators for term in terms}, key=len)
@@ -299,26 +250,18 @@ def reconstruct_complex(source, harmonic, grid, bracket, times,
                         support=None):
     """Spline the slow bracket onto ``times`` and reattach the carrier.
 
-    Returns the complex analytic signal; `reconstruct` is its real part. The
-    analytic form is what a narrow-band search wants: it can be heterodyned
-    and sampled at the envelope's bandwidth rather than at the cadence needed
-    to resolve the GW carrier.
+    Returns the analytic signal, of which `reconstruct` is the real part. A
+    narrow-band search can heterodyne it and sample at the envelope's
+    bandwidth instead of the carrier's.
 
-    The real and imaginary parts of the bracket are splined SEPARATELY rather
-    than its amplitude and phase. Cornish & Littenberg spline amplitude and
-    phase and then need explicit zero-crossing handling, because
-    ``unwrap(angle(B))`` jumps wherever ``|B|`` passes through zero --
-    measured here at over a radian between adjacent grid points for a real
-    waveform's strongest harmonic, which a cubic spline then turns into
-    garbage. The bracket is slowly varying by construction, so its real and
-    imaginary parts are too, and splining them needs no unwrapping and no sign
-    bookkeeping.
+    Real and imaginary parts are splined separately. Cornish & Littenberg
+    spline amplitude and phase, which needs explicit handling wherever |B|
+    crosses zero and ``unwrap(angle(B))`` jumps; on a real waveform those
+    jumps exceed a radian between adjacent grid points.
 
-    ``support`` restricts the output to where the harmonic can contribute at
-    all, so that the spline is never read outside the grid it was built on. It
-    takes one ``(low, high)`` pair or a sequence of them, since a harmonic's
-    live set need not be one interval. Pass the windows `harmonic_windows`
-    returns for the same ``padding`` the grid was built with.
+    ``support`` takes one ``(low, high)`` pair or a sequence of them, since a
+    harmonic's live set need not be one interval. Pass what
+    `harmonic_windows` returned for the padding the grid was built with.
     """
     from scipy.interpolate import CubicSpline
     times = np.asarray(times, dtype=float)
@@ -328,12 +271,9 @@ def reconstruct_complex(source, harmonic, grid, bracket, times,
                  + 1j * CubicSpline(grid, np.imag(bracket))(times))
         return value * carrier
 
-    # One spline per window, not one across all of them: a harmonic with a
-    # dead gap has no grid points in it, and a single spline would then join
-    # the two blocks with one cubic reaching across the gap. Its end
-    # conditions leak back into the block edges, which is exactly where the
-    # error lives. Measured on the 16-harmonic case, splining per window
-    # instead of once takes the mismatch from 5.69e-04 to 4.83e-04.
+    # A dead gap holds no grid points, so one spline across all the windows
+    # joins the blocks with a single cubic whose end conditions leak back into
+    # the block edges. One spline per window instead.
     out = np.zeros(times.shape, dtype=complex)
     for low, high in ([support] if np.ndim(support) == 1 else support):
         nodes = (grid >= low) & (grid <= high)
@@ -348,11 +288,7 @@ def reconstruct_complex(source, harmonic, grid, bracket, times,
 
 
 def reconstruct(source, harmonic, grid, bracket, times, support=None):
-    """The real TDI channel: the real part of `reconstruct_complex`.
-
-    Defined this way rather than duplicating the spline, so the two cannot
-    drift apart.
-    """
+    """The real TDI channel: the real part of `reconstruct_complex`."""
     return np.real(reconstruct_complex(source, harmonic, grid, bracket, times,
                                        support))
 
@@ -360,16 +296,9 @@ def reconstruct(source, harmonic, grid, bracket, times, support=None):
 class SparseGeometry:
     """Everything on the sparse grid that does not depend on sky or waveform.
 
-    Profiling the first working version showed ~90% of its time inside the
-    orbit: light-cone solves, position and velocity splines. None of that
-    depends on the source. In parameter estimation the orbit is fixed and the
-    grid can be held fixed too, so all of it belongs outside the likelihood.
-
-    What is left inside the likelihood is one einsum per sky direction and the
-    waveform evaluations themselves.
-
-    Build once per (orbit, grid, combination); reuse across every likelihood
-    call.
+    The light-cone solves and orbit splines are ~90% of a channel evaluation
+    and none of it depends on the source, so it is lifted out of the
+    likelihood. Build once per (orbit, grid, combination) and reuse.
     """
 
     def __init__(self, orbit, grid, terms, links=LINK_ORDER,
@@ -451,12 +380,10 @@ def sparse_channel_cached(source, harmonic, geometry, lamb, beta):
 class StackedGeometry:
     """`SparseGeometry` with every operator chain stacked into one array.
 
-    Profiling the per-chain version showed half its remaining time inside
-    `numpy.einsum` -- 135 calls per channel, each contracting a (n_grid, 6, 3)
-    array against a 3-vector. At that size the dispatch costs more than the
-    arithmetic. Stacking the chains turns those into a handful of large
-    matrix products, and lets the waveform be queried once per channel instead
-    of twice per term.
+    The per-chain form spends half its time in `numpy.einsum` dispatch: 135
+    calls per channel, each contracting a (n_grid, 6, 3) array against a
+    3-vector. Stacking turns them into a few large matrix products and lets
+    the waveform be queried once per channel.
 
     Layout, with C chains, G grid points and L links:
 
@@ -545,16 +472,13 @@ def sparse_channel_stacked(source, harmonic, geometry, lamb, beta):
 class TermGeometry:
     """Geometry gathered down to the (chain, link) pairs a channel uses.
 
-    `StackedGeometry` keeps every link of every chain and then indexes out the
-    ones the terms need. For a Michelson combination that is 15 chains x 6
-    links = 90 entries to build the sky projections for, of which 16 are used:
-    two thirds of the arithmetic is thrown away. Gathering at construction
-    leaves arrays of shape (T, G) with T the term count, and the per-likelihood
-    work becomes proportional to the terms rather than to chains x links.
+    `StackedGeometry` builds sky projections for every link of every chain:
+    90 entries for a Michelson combination, of which the terms use 16.
+    Gathering at construction leaves (T, G) arrays for T terms, so the
+    per-call work scales with the term count.
 
-    This is the form to hand a likelihood: build once per (orbit, grid,
-    combination), then each call is a few (T, G) matrix products, one waveform
-    evaluation and one complex exponential.
+    The form to hand a likelihood. Each call is then a few (T, G) matrix
+    products, one waveform evaluation and one complex exponential.
     """
 
     def __init__(self, orbit, grid, terms, links=LINK_ORDER,

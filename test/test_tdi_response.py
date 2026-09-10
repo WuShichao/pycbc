@@ -91,14 +91,13 @@ def test_monochromatic_response_matches_frequency_domain_expression():
 
 
 def test_antenna_pattern_is_the_polarization_tensor_contraction():
-    """``xi_p = n^a n^b e^p_ab``, by the tensors rather than by the shortcut.
+    """``xi_p = n^a n^b e^p_ab``, by the tensors and not by the shortcut.
 
-    `antenna_pattern` returns (n.u)^2 - (n.v)^2 and 2 (n.u)(n.v), which is
-    Speri Eq (7)-(8) and Costa Barroso Eq (A5)-(A6) -- cheaper than building
-    3x3 polarization tensors, and the same form the coronagraphic-kappa
-    coefficients need, so one implementation has to serve both.  Checking it
-    against the contraction it stands in for is the only way that claim is
-    load-bearing rather than a comment.
+    `antenna_pattern` returns (n.u)^2 - (n.v)^2 and 2 (n.u)(n.v): Speri
+    Eq (7)-(8), Costa Barroso Eq (A5)-(A6), cheaper than building 3x3
+    polarization tensors, and the same form the coronagraphic-kappa
+    coefficients need. Checking it against the contraction it stands in for is
+    what makes that claim load-bearing.
     """
     generator = np.random.default_rng(20260910)
     for _ in range(8):

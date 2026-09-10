@@ -1,22 +1,22 @@
 """The ESA numeric orbit files, read the way the reader reads them.
 
 These fetch real ephemerides from https://github.com/esa/lisa-orbit-files,
-which ESA publishes under CC-BY-4.0.  Two sets are used:
+which ESA publishes under CC-BY-4.0. Two sets are used:
 
-  default   the ~208 kB per-spacecraft files, on a 2.3-day grid.  Enough to
+  default   the ~208 kB per-spacecraft files, on a 2.3-day grid. Enough to
             show that reading the velocity column beats differentiating a
             position spline, and cheap enough to fetch every run.
   full      the 35 MB per-spacecraft 1-minute files, fetched only when
-            PYCBC_LISA_ORBIT_FULL is set.  These carry the numbers the
-            reader was actually changed for -- the coarse grid flatters the
-            spline, so the margin there is 10x where on the 1-minute grid it
-            is 1e4 -- and the microsecond-quantised epochs behind them.
+            PYCBC_LISA_ORBIT_FULL is set. These carry the numbers the reader
+            was changed for: the coarse grid flatters the spline, giving a
+            margin of 10x where the 1-minute grid gives 1e4, and the
+            microsecond-quantised epochs behind that.
 
 Downloads are cached, so the cost is paid once per machine; point
-PYCBC_LISA_ORBIT_FILES at an existing checkout to skip them entirely.  A
-network failure SKIPS rather than fails: an unreachable third-party host is
-not a defect in this code, and a test that goes red for it teaches the reader
-to ignore red.
+PYCBC_LISA_ORBIT_FILES at an existing checkout to skip them entirely. A
+network failure skips instead of failing. An unreachable third-party host is
+not a defect in this code, and a test that goes red for one teaches the
+reader to ignore red.
 """
 
 import os
@@ -169,12 +169,11 @@ def test_the_one_minute_epochs_are_not_a_uniform_grid():
     """The dominant error in the position route is in the timestamps.
 
     The labels are microsecond-quantised, so a 'one-minute' file is not on a
-    60 s grid and a second derivative divides by the square of a spacing that
-    wobbles.  Recorded because two earlier explanations were wrong: a
-    position text quantisation that does not exist -- the files carry 18
-    significant digits -- and an assumption that the epochs are exactly
-    uniform, which made the GPS conversion the suspect.  It is the secondary
-    term, not the cause.
+    60 s grid and a second derivative divides by the square of a wobbling
+    spacing. Two earlier explanations were wrong: a position text
+    quantisation that does not exist (the files carry 18 significant digits),
+    and an assumption that the epochs are exactly uniform, which made the GPS
+    conversion the suspect. That conversion is the secondary term.
     """
     _, _, _, _, labels = _fetch_or_skip(FINE, WINDOW)
     endings = [label.split('.')[-1] for label in labels]
