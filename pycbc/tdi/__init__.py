@@ -1,7 +1,8 @@
 """Native single-link response and optional TDI-combination interfaces."""
 
 from pycbc.tdi.onthefly import (SparseGeometry, StackedGeometry, TermGeometry,
-                                adaptive_time_grid, chain_delay, reconstruct,
+                                adaptive_time_grid, chain_delay,
+                                delay_padding, harmonic_windows, reconstruct,
                                 sparse_channel, sparse_channel_cached,
                                 sparse_channel_stacked, sparse_channel_terms)
 from pycbc.tdi.combination import TDICombination, Term, orthogonal_channels
@@ -24,6 +25,8 @@ __all__ = [
     "ArrayWaveformSource",
     "adaptive_time_grid",
     "chain_delay",
+    "delay_padding",
+    "harmonic_windows",
     "reconstruct",
     "SparseGeometry",
     "StackedGeometry",

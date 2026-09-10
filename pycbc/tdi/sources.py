@@ -258,37 +258,81 @@ class PyEFPEHMSource:
         out = tuple(a.reshape(query.shape)
                     for a in (amp_p, amp_c, phase, omega))
         self._cache = {k: v for k, v in self._cache.items()
-                       if k[0] in ('proj', 'support')}
+                       if k[0] in ('proj', 'blocks')}
         self._cache[key] = out
         return out
 
-    def support(self, harmonic):
-        """The time window over which this harmonic is actually defined.
+    def support_blocks(self, harmonic, n_probe=8192):
+        """Every contiguous stretch over which this harmonic has amplitude.
 
-        Harmonics do not all cover the mission: pyEFPEHM returns a per-mode
-        ``time_idxs``. Outside its window a harmonic's carrier phase is zero,
-        so a grid builder that inverts the phase without knowing the window
-        puts all of its points in the flat stretch and resolves nothing.
+        pyEFPEHM keeps a harmonic only while it carries more than
+        ``Amplitude_tol`` of the total, so a harmonic is live over part of the
+        trajectory -- and NOT necessarily over one interval. Measured on a
+        precessing, eccentric configuration, (2, 1, 2) is live over
+        [0.000, 0.009] and again over [0.174, 0.619] of the span, with a dead
+        gap of 16% in between. Reporting only the outer hull, as an earlier
+        version did, spends grid points on the gap.
+
+        Liveness is read off the amplitude, not the phase: `carrier_phase` is
+        now defined everywhere, and even before that a mode's phase passes
+        through zero at an interior point.
         """
-        key = ('support', harmonic)
+        key = ('blocks', harmonic)
         if key not in self._cache:
-            probe = np.linspace(self.t_start, self.t_end, 2048)
-            _, _, phase, _ = self._evaluate(harmonic, probe)
-            live = np.nonzero(phase != 0.0)[0]
-            self._cache[key] = ((self.t_start, self.t_end) if live.size == 0
-                                else (float(probe[live[0]]),
-                                      float(probe[live[-1]])))
+            probe = np.linspace(self.t_start, self.t_end, int(n_probe))
+            amp_p, amp_c = self.amplitude(harmonic, probe)
+            live = (amp_p != 0) | (amp_c != 0)
+            edge = np.diff(live.astype(np.int8))
+            starts = np.nonzero(edge == 1)[0] + 1
+            stops = np.nonzero(edge == -1)[0]
+            if live[0]:
+                starts = np.concatenate(([0], starts))
+            if live[-1]:
+                stops = np.concatenate((stops, [len(live) - 1]))
+            self._cache[key] = tuple(
+                (float(probe[a]), float(probe[b]))
+                for a, b in zip(starts, stops))
         return self._cache[key]
+
+    def support(self, harmonic):
+        """Outer hull of `support_blocks`; empty harmonics give a null window."""
+        blocks = self.support_blocks(harmonic)
+        if not blocks:
+            return (self.t_start, self.t_start)
+        return (blocks[0][0], blocks[-1][1])
 
     def amplitude(self, harmonic, t):
         amp_p, amp_c, _, _ = self._evaluate(harmonic, t)
         return amp_p, amp_c
 
+    def _orbital_phases(self, t, derivative):
+        """``(lambda, delta_lambda)`` from the model's own ODE solution."""
+        query = np.clip(np.asarray(t, dtype=float), self.t_start, self.t_end)
+        first, second = self.model.sol(query.reshape(-1),
+                                       derivative=derivative, idxs=[2, 3])
+        return first.reshape(query.shape), second.reshape(query.shape)
+
     def carrier_phase(self, harmonic, t):
-        return self._evaluate(harmonic, t)[2]
+        """Phi(t) = n lambda + (m - n) delta_lambda, defined EVERYWHERE.
+
+        Not ``_evaluate``'s phase array, which is zero wherever the harmonic
+        is not in pyEFPEHM's selected set. The factorisation
+        h = Re[B exp(i Phi)] holds for any Phi, but only a smooth one leaves B
+        slowly varying: setting Phi = 0 outside the window makes B oscillate at
+        the carrier rate there, and no sparse grid can spline that. The
+        formula is pyEFPEHM's own (``generate_tdomain_hlm_modes`` builds
+        ``phi_t`` this way) and reproduces its ``phase`` output exactly on the
+        window; the ODE solution is defined over the whole trajectory, so the
+        same expression continues it outside.
+        """
+        _, m, n = (int(v) for v in harmonic)
+        lamb, dlamb = self._orbital_phases(t, 0)
+        return n * lamb + (m - n) * dlamb
 
     def angular_frequency(self, harmonic, t):
-        return self._evaluate(harmonic, t)[3]
+        _, m, n = (int(v) for v in harmonic)
+        rate, drate = self._orbital_phases(t, 1)
+        return n * rate + (m - n) * drate
 
     def polarizations(self, t):
         """Dense-path interface: sum every harmonic's real part."""

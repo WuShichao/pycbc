@@ -52,9 +52,40 @@ class HarmonicSource:
     """
 
 
+def delay_padding(orbit, times, terms, links=LINK_ORDER):
+    """How far outside its own window a harmonic still reaches in a channel.
+
+    The channel at output time ``t`` queries the waveform at
+    ``t - net_shift - tau`` with ``tau = L + k.r_emit/c`` for the emission term
+    and ``k.r_recv/c`` for the reception term. So a harmonic that pyEFPEHM
+    switches off at ``t_off`` still contributes to the channel for another
+    ``max|tau|`` afterwards, and starts contributing that much before it
+    switches on. Bounding ``|k.r| <= |r|`` makes the result sky-independent,
+    which is what a grid held fixed across a likelihood run needs.
+
+    For LISA this is about 570 s: 500 s of light time across the orbit, one
+    arm, and the combination's own chain delay (58 s for X2).
+
+    Widening the grid by this much is correct but measured NOT to help: with
+    pyEFPEHM at ``Amplitude_tol = 1e-4`` it moves the 16-harmonic mismatch from
+    4.83e-04 to 5.34e-04, and at 1e-5 it changes nothing. The reach is real;
+    what limits the reconstruction there is the amplitude step itself, and
+    extra nodes just past the step buy ringing rather than accuracy. Hence
+    ``padding`` defaults to zero.
+    """
+    probe = np.linspace(times[0], times[-1], 32)
+    cache = {}
+    worst = max(np.max(np.abs(chain_delay(orbit, probe, chain, links,
+                                          cache=cache)))
+                for chain in {term.operators for term in terms})
+    sample = sample_constellation(probe, orbit, links=links)
+    radius = np.max(np.linalg.norm(sample.position, axis=-1))
+    return float(worst + np.max(sample.ltt) + radius / C_SI)
+
+
 def adaptive_time_grid(source, harmonic, t_start, t_end, delta_phi=0.5,
                        dt_max=None, n_probe=4096, growth=1.0,
-                       max_step_scale=np.inf):
+                       max_step_scale=np.inf, padding=0.0):
     """Grid on which the carrier advances by ``delta_phi`` per step.
 
     The definition is exactly that -- points where Phi increases by delta_phi --
@@ -75,22 +106,56 @@ def adaptive_time_grid(source, harmonic, t_start, t_end, delta_phi=0.5,
 
     ``dt_max`` still caps the step, for the stretches where the carrier is so
     slow that the constellation's own motion becomes the limit.
+
+    The grid covers `harmonic_windows`, one sub-grid per window, so a harmonic
+    with a dead gap in the middle of its span gets no points there. Pass the
+    SAME ``padding`` and windows to `reconstruct`: the spline is only valid
+    inside them, and across a gap it interpolates between two blocks with a
+    single cubic.
     """
     if dt_max is None:
         dt_max = 86400.0
-    support = getattr(source, 'support', None)
-    if support is not None:
-        low, high = support(harmonic)
-        t_start, t_end = max(t_start, low), min(t_end, high)
-        if not t_end > t_start:
-            return np.array([])
+    pieces = []
+    for low, high in harmonic_windows(source, harmonic, t_start, t_end,
+                                      padding):
+        pieces.append(_grid_over_window(
+            source, harmonic, low, high, delta_phi, dt_max, n_probe, growth,
+            max_step_scale))
+    if not pieces:
+        return np.array([])
+    return np.unique(np.concatenate(pieces))
+
+
+def harmonic_windows(source, harmonic, t_start, t_end, padding=0.0):
+    """The stretches of [t_start, t_end] a harmonic can contribute to.
+
+    Prefers ``support_blocks`` over ``support``: a harmonic's live set is not
+    always one interval, and the outer hull then spans a dead gap. ``padding``
+    widens each block by the channel's delay spread -- see `delay_padding`.
+    """
+    blocks = getattr(source, 'support_blocks', None)
+    if blocks is not None:
+        windows = blocks(harmonic)
+    else:
+        support = getattr(source, 'support', None)
+        windows = [support(harmonic)] if support is not None else [(t_start,
+                                                                    t_end)]
+    out = []
+    for low, high in windows:
+        low = max(t_start, low - padding)
+        high = min(t_end, high + padding)
+        if high > low:
+            if out and low <= out[-1][1]:
+                out[-1] = (out[-1][0], max(out[-1][1], high))
+            else:
+                out.append((low, high))
+    return out
+
+
+def _grid_over_window(source, harmonic, t_start, t_end, delta_phi, dt_max,
+                      n_probe, growth, max_step_scale):
     probe = np.linspace(t_start, t_end, int(n_probe))
     phase = np.asarray(source.carrier_phase(harmonic, probe), dtype=float)
-    # A harmonic pyEFPEHM defines over only part of the mission returns
-    # phase = 0 outside its window. Inverting a phase that is flat at zero for
-    # most of the probe piles every grid point into the flat stretch and
-    # produces a grid that resolves nothing -- which is what a `support` method
-    # on the source exists to prevent.
     if not np.all(np.diff(phase) > 0):          # phase must be monotone to invert
         phase = np.maximum.accumulate(phase)
     total = phase[-1] - phase[0]
@@ -242,21 +307,37 @@ def reconstruct(source, harmonic, grid, bracket, times, support=None):
     slowly varying by construction, so its real and imaginary parts are too,
     and splining them needs no unwrapping and no sign bookkeeping.
 
-    ``support`` optionally restricts the output to a harmonic's validity
-    window. A harmonic that pyEFPEHM only defines over part of the mission has
-    ``carrier_phase = 0`` outside it, so ``exp(i*0) = 1`` would otherwise
-    multiply a splined amplitude into a signal that is not there.
+    ``support`` restricts the output to where the harmonic can contribute at
+    all, so that the spline is never read outside the grid it was built on. It
+    takes one ``(low, high)`` pair or a sequence of them, since a harmonic's
+    live set need not be one interval. Pass the windows `harmonic_windows`
+    returns for the same ``padding`` the grid was built with.
     """
     from scipy.interpolate import CubicSpline
-    real = CubicSpline(grid, np.real(bracket))(times)
-    imaginary = CubicSpline(grid, np.imag(bracket))(times)
-    out = np.real((real + 1j * imaginary)
-                  * np.exp(1j * source.carrier_phase(harmonic, times)))
-    if support is not None:
-        low, high = support
-        out = np.where((times >= low) & (times <= high), out, 0.0)
-    return out
+    times = np.asarray(times, dtype=float)
+    carrier = np.exp(1j * source.carrier_phase(harmonic, times))
+    if support is None:
+        value = (CubicSpline(grid, np.real(bracket))(times)
+                 + 1j * CubicSpline(grid, np.imag(bracket))(times))
+        return np.real(value * carrier)
 
+    # One spline per window, not one across all of them: a harmonic with a
+    # dead gap has no grid points in it, and a single spline would then join
+    # the two blocks with one cubic reaching across the gap. Its end
+    # conditions leak back into the block edges, which is exactly where the
+    # error lives. Measured on the 16-harmonic case, splining per window
+    # instead of once takes the mismatch from 5.69e-04 to 4.83e-04.
+    out = np.zeros(times.shape)
+    for low, high in ([support] if np.ndim(support) == 1 else support):
+        nodes = (grid >= low) & (grid <= high)
+        want = (times >= low) & (times <= high)
+        if np.count_nonzero(nodes) < 4 or not np.any(want):
+            continue
+        piece = grid[nodes]
+        value = (CubicSpline(piece, np.real(bracket)[nodes])(times[want])
+                 + 1j * CubicSpline(piece, np.imag(bracket)[nodes])(times[want]))
+        out[want] = np.real(value * carrier[want])
+    return out
 
 
 class SparseGeometry:
