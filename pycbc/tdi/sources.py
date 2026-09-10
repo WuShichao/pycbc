@@ -661,7 +661,8 @@ class LALTDSource:
         except (ValueError, KeyError):
             modes = None
         if modes is not None:
-            extra = sorted({(l, abs(m)) for l, m in modes} - {(2, 2)})
+            extra = sorted({(degree, abs(order)) for degree, order in modes}
+                           - {(2, 2)})
             if extra:
                 raise ValueError(
                     f"{self.approximant} carries {extra} besides the (2, 2) "
@@ -987,16 +988,17 @@ class PyEFPEHMSource:
             self.model.generate_tdomain_hlm_modes(times=probe)['modes'])
         self._cache = {}
 
-    def _projector(self, l, m):
+    def _projector(self, degree, order):
         from pyEFPEHM.waveform.EFPE import compute_m2_Ylm
-        key = ('proj', l, abs(m))
+        key = ('proj', degree, abs(order))
         if key not in self._cache:
             theta = (np.arccos(self.model.cos_theta_JN) if self.theta is None
                      else self.theta)
             phi = self.model.phi_JN if self.phi is None else self.phi
-            ylm = compute_m2_Ylm(np.cos(theta), phi, l_array=np.array([l]))[0]
+            ylm = compute_m2_Ylm(np.cos(theta), phi,
+                                 l_array=np.array([degree]))[0]
             mirrored = np.conj(ylm[::-1])
-            if abs(m) % 2 == 0:
+            if abs(order) % 2 == 0:
                 mirrored[1::2] = -mirrored[1::2]
             else:
                 mirrored[::2] = -mirrored[::2]
@@ -1005,13 +1007,19 @@ class PyEFPEHMSource:
         return self._cache[key]
 
     def _evaluate(self, harmonic, t):
-        """(A_plus, A_cross, phase, omega) at arbitrary, possibly 2-D ``t``."""
-        query = np.asarray(t, dtype=float)
-        key = ('eval', harmonic, query.shape, query.ctypes.data,
-               float(query.flat[0]), float(query.flat[-1]))
-        if key in self._cache:
-            return self._cache[key]
+        """(A_plus, A_cross, phase, omega) at arbitrary, possibly 2-D ``t``.
 
+        Deliberately uncached.  An earlier version memoised on
+        ``(harmonic, shape, query.ctypes.data, first, last)``, which is not a
+        key: a freed buffer's address is handed straight back to the next
+        array of the same size, so two different query arrays that agree at
+        their endpoints can collide and one gets the other's amplitudes.
+        Instrumented against a fresh recomputation it never once hit -- since
+        `carrier_phase` stopped going through here it has no repeat callers --
+        so it was pure risk.  If a cache is wanted again it has to be keyed on
+        the times themselves, not on where they happen to live.
+        """
+        query = np.asarray(t, dtype=float)
         flat = query.reshape(-1)
         order = np.argsort(flat)
         inside = ((flat[order] >= self.t_start) & (flat[order] <= self.t_end))
@@ -1026,9 +1034,10 @@ class PyEFPEHMSource:
                 times=times, return_waveform_pieces=True)
             mode = result['modes'].get(harmonic)
             if mode is not None:
-                l, m, _ = harmonic
+                mode_l, mode_m, _ = harmonic
                 contribution = np.tensordot(
-                    np.asarray(mode['hlm']), self._projector(l, m),
+                    np.asarray(mode['hlm']),
+                    self._projector(mode_l, mode_m),
                     axes=(1, 0))                        # (N_mode, 2), complex
                 mode_phase = np.asarray(mode['phase'])
                 carrier = np.exp(-1j * mode_phase)
@@ -1049,12 +1058,8 @@ class PyEFPEHMSource:
                                           omega[valid])
             else:
                 omega[:] = 1.0
-        out = tuple(a.reshape(query.shape)
-                    for a in (amp_p, amp_c, phase, omega))
-        self._cache = {k: v for k, v in self._cache.items()
-                       if k[0] in ('proj', 'blocks')}
-        self._cache[key] = out
-        return out
+        return tuple(a.reshape(query.shape)
+                     for a in (amp_p, amp_c, phase, omega))
 
     def support_blocks(self, harmonic, n_probe=8192):
         """Every contiguous stretch over which this harmonic has amplitude.

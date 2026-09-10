@@ -3,15 +3,15 @@
 import numpy as np
 import pytest
 
+from pycbc.detector.space import SpaceDetector
+from pycbc.types import TimeSeries
+
 
 def _relative_difference(a, b):
     """Fractional difference, since np.allclose's atol=1e-8 default swallows
     everything at strain amplitudes of 1e-22."""
     a, b = np.asarray(a), np.asarray(b)
     return np.max(np.abs(a - b)) / np.max(np.abs(a))
-
-from pycbc.detector.space import SpaceDetector
-from pycbc.types import TimeSeries
 
 
 def _strain(n=8192, delta_t=5.0, frequency=0.005):

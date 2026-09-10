@@ -533,7 +533,6 @@ def sparse_channel_stacked(source, harmonic, geometry, lamb, beta):
     phase = source.carrier_phase(harmonic, query)
     phase -= source.carrier_phase(harmonic, geometry.grid)[None, :]
 
-    n_term = len(chain)
     weight = np.concatenate((w1[chain, :, link], -w2[chain, :, link]))
     plus = np.concatenate([pref_plus[chain, :, link]] * 2)
     cross = np.concatenate([pref_cross[chain, :, link]] * 2)
