@@ -5,6 +5,7 @@ import numpy as np
 from pycbc.coordinates.space_orbit import LisaEqualArmOrbit
 from pycbc.tdi.response import (
     C_SI,
+    antenna_pattern,
     doppler_factors,
     link_geometry,
     link_response,
@@ -87,3 +88,37 @@ def test_monochromatic_response_matches_frequency_domain_expression():
         - geometry.weight_recv
     )
     assert np.allclose(actual, expected, rtol=2e-14, atol=2e-14)
+
+
+def test_antenna_pattern_is_the_polarization_tensor_contraction():
+    """``xi_p = n^a n^b e^p_ab``, by the tensors rather than by the shortcut.
+
+    `antenna_pattern` returns (n.u)^2 - (n.v)^2 and 2 (n.u)(n.v), which is
+    Speri Eq (7)-(8) and Costa Barroso Eq (A5)-(A6) -- cheaper than building
+    3x3 polarization tensors, and the same form the coronagraphic-kappa
+    coefficients need, so one implementation has to serve both.  Checking it
+    against the contraction it stands in for is the only way that claim is
+    load-bearing rather than a comment.
+    """
+    generator = np.random.default_rng(20260910)
+    for _ in range(8):
+        lamb = generator.uniform(0, 2 * np.pi)
+        beta = np.arcsin(generator.uniform(-1, 1))
+        u_hat, v_hat, k_hat = polarization_basis(lamb, beta)
+        plus_tensor = np.outer(u_hat, u_hat) - np.outer(v_hat, v_hat)
+        cross_tensor = np.outer(u_hat, v_hat) + np.outer(v_hat, u_hat)
+
+        direction = generator.normal(size=(32, 3))
+        direction /= np.linalg.norm(direction, axis=-1, keepdims=True)
+        xi_plus, xi_cross = antenna_pattern(direction, u_hat, v_hat)
+        contracted_plus = np.einsum('na,ab,nb->n', direction, plus_tensor,
+                                    direction)
+        contracted_cross = np.einsum('na,ab,nb->n', direction, cross_tensor,
+                                     direction)
+        assert np.max(np.abs(xi_plus - contracted_plus)) < 1e-14
+        assert np.max(np.abs(xi_cross - contracted_cross)) < 1e-14
+
+        # transverse-traceless: a wave carries no response along its own
+        # propagation direction
+        along_plus, along_cross = antenna_pattern(k_hat[None, :], u_hat, v_hat)
+        assert abs(along_plus[0]) < 1e-14 and abs(along_cross[0]) < 1e-14

@@ -101,15 +101,19 @@ def test_verified_combination_registry_and_extents():
     times = np.arange(512, dtype=float) * 2.0
     sample = sample_constellation(times, LisaEqualArmOrbit())
     arm = np.median(sample.ltt)
-    for name, expected_arms in (("X2", 7), ("UU", 7), ("PD4L-1", 3)):
+    for name, expected_arms in (("X2", 7), ("UU", 7), ("PD4L-1", 3),
+                                ("PD4L-2", 3), ("PD4L-3", 3)):
         adapter = PyTDICombinationAdapter(
             name, get_pytdi_combination(name), delta_t=2.0
         )
-        assert np.isclose(
-            adapter.data_delay_extent(sample) / arm,
-            expected_arms,
-            rtol=0.01,
-        )
+        extent = adapter.data_delay_extent(sample) / arm
+        support = adapter.waveform_support(sample) / arm
+        assert np.isclose(extent, expected_arms, rtol=0.01)
+        # exactly one arm longer, not merely longer: the earliest
+        # inter-spacecraft link is emitted an arm before it is received, and
+        # that arm is what an on-the-fly evaluator has to generate strain
+        # over even though no recorded sample reaches back to it
+        assert np.isclose(support - extent, 1.0, rtol=0.01)
 
 
 def test_registered_combination_returns_timeseries():
@@ -122,3 +126,29 @@ def test_registered_combination_returns_timeseries():
     )
     assert isinstance(result, TimeSeries)
     assert len(result) == len(times)
+
+
+def test_wangs_arrow_notation_transcribes_to_pytdi():
+    """Wang's X1 path, written out, IS pytdi's second-generation Michelson.
+
+    This is what makes his PD4L strings usable: his ``<-beam`` is an
+    unprefixed beam and his ``->beam`` is a '-'-prefixed one, and the only
+    way to be sure of that mapping is to transcribe a combination he shares
+    with pytdi and compare the monomials.  Getting it backwards would leave
+    PD4L quietly wrong with no other symptom, since D3 symmetry holds either
+    way.
+    """
+    from pytdi import michelson
+    from pytdi.core import LISATDICombination
+
+    transcribed = LISATDICombination.from_string('131212131 -121313121')
+    assert transcribed.components == michelson.X2_ETA.components
+    # four eta variables, four monomials each: the sixteen the plan counts
+    assert set(transcribed.components) == {'eta_12', 'eta_13',
+                                           'eta_21', 'eta_31'}
+    assert sum(len(v) for v in transcribed.components.values()) == 16
+
+    # and the mapping is not symmetric: swapping which arrow takes the minus
+    # sign gives a different combination, so the test above is a real check
+    swapped = LISATDICombination.from_string('-131212131 121313121')
+    assert swapped.components != michelson.X2_ETA.components
