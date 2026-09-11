@@ -215,6 +215,17 @@ _space_detectors = {'LISA': {'armlength': 2.5e9,
                     # a single station, has no TDI combination.
                     'LGWA': {'armlength': None,
                              'aliases': ['LGWA_X', 'LGWA_Y']},
+                    # LILA Observatory: an equilateral triangle of three
+                    # lunar-surface stations, so unlike LGWA it does have
+                    # a meaningful armlength -- the 40 km triangle side.
+                    # Its aliases are the three vertex interferometers
+                    # ('_1'/'_2'/'_3') and their orthogonal recombination
+                    # ('_A'/'_E'/'_T', with T the null stream); as with
+                    # LGWA these are not TDI channels, since each vertex
+                    # is an ordinary Michelson, not a spacecraft link.
+                    'LILA': {'armlength': 4.0e4,
+                             'aliases': ['LILA_1', 'LILA_2', 'LILA_3',
+                                         'LILA_A', 'LILA_E', 'LILA_T']},
                    }
 
 class AbsSpaceDet(ABC):
@@ -1191,6 +1202,451 @@ class _LGWA_detector(AbsSpaceDet):
         return {'LGWA_X': h_x, 'LGWA_Y': h_y}
 
 
+class _LILA_detector(AbsSpaceDet):
+    """
+    LILA (Laser Interferometer Lunar Antenna) Observatory, modeled as an
+    equilateral triangle of three lunar-surface interferometer stations
+    with 40 km arms -- the lunar analogue of the Einstein Telescope's
+    layout, and handled here with exactly ET's geometric conventions
+    (see `pycbc.coordinates.moon.moon_triangle_sites`).
+
+    Only the Geodesic Displacement Channel (GDC) is modeled: each vertex
+    has suspended test masses, so it is an ordinary long-wavelength
+    Michelson interferometer with a 60 degree opening angle and its
+    response is the usual two-arm difference tensor. The Lunar
+    Deformation Channel (LDC), in which the Moon's own elastic normal
+    modes are part of the instrument, is a genuinely different response
+    function and is not modeled here.
+
+    Unlike `_LGWA_detector`, this backend needs no external package: the
+    lunar orientation comes from `lunarsky` (already an optional
+    dependency of `pycbc.coordinates.moon`) via the Moon-centred
+    Moon-fixed (MCMF) frame, and the antenna-pattern contraction is
+    PyCBC's own. Sky position and polarization are converted on entry
+    from this module's SSB-ecliptic interface to LAL-convention ICRS
+    ra/dec/psi, which is the convention `Detector.antenna_pattern` and
+    the tensor construction below both use -- hence
+    `lal_convention=True` here, where `_LGWA_detector` needs False for
+    `lgwa_response`'s unrelated convention.
+
+    Because the arms are short (40 km) compared with the mid-band
+    wavelengths LILA targets (0.1-10 Hz, against a free spectral range
+    c/2L = 3.75 kHz), the long-wavelength approximation is used
+    throughout and no `single_arm_frequency_response` correction is
+    applied.
+
+    Parameters
+    ----------
+    detector_name : str
+        The name of the detector. Accepts any output from
+        `get_available_space_detectors`.
+
+    reference_time : float (optional)
+        The reference time in seconds of the signal in the SSB frame.
+        This is defined such that the detector mission start time
+        corresponds to 0. Default None.
+
+    longitude_site, latitude_site : float
+        Selenodetic longitude/latitude (radians) of the triangle
+        *centroid*, in the same convention as
+        `pycbc.coordinates.moon.moon_site_position_ssb`. Required:
+        antenna-pattern geometry needs an actual oriented site, and
+        unlike arrival time it cannot fall back to the Moon's barycenter.
+
+    orientation : float (optional)
+        Bearing, from the centroid, of the first vertex, in radians.
+        Default 0.
+
+    arm_length : float (optional)
+        Triangle side length in metres. Default 40 km, the LILA
+        Observatory baseline.
+
+    height : float (optional)
+        Height of the vertices above the reference selenoid, in metres.
+        Default 0.
+
+    cadence : float (optional)
+        Spacing, in seconds, of the coarse time grid on which the slow
+        `lunarsky`/astropy geometry is evaluated before being
+        interpolated onto the waveform's sample times. As for
+        `_LGWA_detector`, lunar libration evolves over days, so the
+        3600 s default is generously fine: measured against exact
+        per-sample evaluation it costs 2e-10 in F+/Fx and 25 ps in the
+        propagation delay. Pass None to disable interpolation and
+        evaluate every sample exactly (much slower).
+    """
+    # Orthogonal recombination of the three vertex channels, in the same
+    # convention `_LDC_detector` uses for LISA's TDI variables (see its
+    # `project_wave`), with the vertex channels 1/2/3 playing the role of
+    # X/Y/Z there:
+    #     A = (Z - X)/sqrt(2), E = (X - 2Y + Z)/sqrt(6),
+    #     T = (X + Y + Z)/sqrt(3).
+    # Any orthonormal basis of the two-dimensional signal subspace would
+    # do -- these three rows are one particular choice among a rotation's
+    # worth -- but matching LISA's keeps 'LILA_A' meaning the same
+    # combination as 'LISA_A' for anyone reading across the two backends.
+    #
+    # T is the triangle's null stream: the three vertices' response
+    # tensors sum to zero identically (an exact geometric identity for any
+    # three sites whose arms lie along the connecting great circles, not a
+    # small-triangle approximation), so T carries no GW signal in the
+    # long-wavelength limit and is an instrumental/glitch monitor. Under
+    # the usual symmetry assumption -- equal noise at each vertex, equal
+    # correlation between each pair -- this basis also diagonalizes the
+    # noise covariance, as it does for LISA.
+    _AET = numpy.array([[-1.0, 0.0, 1.0],
+                        [1.0, -2.0, 1.0],
+                        [1.0, 1.0, 1.0]]) / numpy.array([[numpy.sqrt(2.0)],
+                                                         [numpy.sqrt(6.0)],
+                                                         [numpy.sqrt(3.0)]])
+
+    def __init__(self, detector_name, reference_time=None,
+                 longitude_site=None, latitude_site=None, orientation=0.0,
+                 arm_length=4.0e4, height=0.0, cadence=3600.0, **kwargs):
+        super().__init__(detector_name, reference_time, **kwargs)
+        assert self.det == 'LILA', (
+            'LILAResponse backend only works with the LILA detector')
+        if longitude_site is None or latitude_site is None:
+            raise ValueError(
+                'longitude_site and latitude_site (radians, the triangle '
+                'centroid) are required: antenna-pattern geometry needs an '
+                'actual oriented site on the Moon, unlike arrival time '
+                '(which can default to the Moon\'s barycenter, see '
+                'coordinates.moon.moon_site_position_ssb).')
+
+        from pycbc.coordinates.moon import moon_triangle_sites
+        from pycbc.detector.ground import body_fixed_detector_tensor
+
+        self.longitude_site = longitude_site
+        self.latitude_site = latitude_site
+        self.arm_length = arm_length
+        self.cadence = cadence
+        self.sites = moon_triangle_sites(
+            longitude_site, latitude_site, arm_length,
+            orientation=orientation, height=height)
+        self.channels = ['1', '2', '3']
+
+        # Constant Moon-fixed response tensors, one per vertex. Built with
+        # the same body-agnostic core that add_detector_on_earth uses, so
+        # the LILA triangle and the ET triangle are literally the same
+        # code path modulo which body the site sits on.
+        self.responses = {}
+        for chan, site in zip(self.channels, self.sites):
+            resps, _, _ = body_fixed_detector_tensor(
+                site['longitude'], site['latitude'],
+                yangle=site['yangle'], xangle=site['xangle'])
+            self.responses[chan] = numpy.squeeze(resps[0] - resps[1])
+
+    @property
+    def sky_coords(self):
+        return 'eclipticlongitude', 'eclipticlatitude'
+
+    def _source_basis_mcmf(self, ra, dec, psi, times):
+        """The GW polarization basis vectors (x, y), each shape (3, M),
+        rotated from ICRS into the Moon-fixed MCMF frame at `times` (GPS
+        seconds).
+
+        This is site-independent -- the ICRS -> MCMF rotation depends
+        only on time -- so it is evaluated once and shared by all three
+        vertices, each of which then only needs a cheap contraction with
+        its own constant response tensor.
+        """
+        from astropy import units as apy_units
+        from astropy.coordinates import (CartesianRepresentation, ICRS,
+                                         SkyCoord)
+        from astropy.time import Time
+        from lunarsky import MCMF
+
+        obstimes = Time(times, format='gps')
+        n_time = len(times)
+
+        ca, sa = numpy.cos(ra), numpy.sin(ra)
+        cd, sd = numpy.cos(dec), numpy.sin(dec)
+        # ICRS sky basis: e_ra toward increasing RA, e_dec toward
+        # increasing Dec.
+        basis_icrs = [numpy.array([-sa, ca, 0.0]),
+                      numpy.array([-sd * ca, -sd * sa, cd])]
+
+        # Astropy frame transforms translate between frame origins, so a
+        # finite-distance point would pick up a parallax term. Transform
+        # both a displaced point and the origin, then subtract, to isolate
+        # the pure rotation. The baseline length is NOT arbitrary in
+        # floating point: both endpoints pass through the Moon's ~1.5e11 m
+        # barycentric position, whose ulp is ~3e-5 m, so a 1 m baseline
+        # would leave ~3e-5 rad of direction error after the subtraction.
+        # 1e6 m puts the residual at astropy's own ~2e-8 rad floor.
+        baseline = 1.0e6
+        zeros = numpy.zeros(n_time) * apy_units.m
+        origin = SkyCoord(CartesianRepresentation(x=zeros, y=zeros, z=zeros),
+                          frame=ICRS()).transform_to(MCMF(obstime=obstimes))
+        origin_xyz = origin.cartesian.xyz.to_value(apy_units.m)
+
+        rotated = []
+        for vec in basis_icrs:
+            end = SkyCoord(CartesianRepresentation(
+                x=numpy.full(n_time, vec[0]) * baseline * apy_units.m,
+                y=numpy.full(n_time, vec[1]) * baseline * apy_units.m,
+                z=numpy.full(n_time, vec[2]) * baseline * apy_units.m),
+                frame=ICRS()).transform_to(MCMF(obstime=obstimes))
+            xyz = end.cartesian.xyz.to_value(apy_units.m) - origin_xyz
+            rotated.append(xyz / numpy.linalg.norm(xyz, axis=0))
+
+        e_ra, e_dec = rotated
+        # Re-orthonormalize: the two transforms are independent, so their
+        # results are only orthogonal to within the transform's own error.
+        e_dec = e_dec - e_ra * numpy.sum(e_ra * e_dec, axis=0)
+        e_dec = e_dec / numpy.linalg.norm(e_dec, axis=0)
+
+        cpsi, spsi = numpy.cos(psi), numpy.sin(psi)
+        return (cpsi * e_ra + spsi * e_dec, -spsi * e_ra + cpsi * e_dec)
+
+    def _grid(self, t_start, t_end):
+        """Coarse evaluation grid spanning [t_start, t_end], padded by one
+        cadence at each end so the interpolants never extrapolate."""
+        if self.cadence is None:
+            return None
+        n_points = max(
+            4, int(numpy.ceil((t_end - t_start) / self.cadence)) + 4)
+        return numpy.linspace(t_start - self.cadence, t_end + self.cadence,
+                              n_points)
+
+    def antenna_pattern(self, ra, dec, psi, times):
+        """F+ and Fx for each of the three vertices, at the given GPS
+        `times`.
+
+        Parameters
+        ----------
+        ra, dec, psi : float
+            ICRS right ascension, declination and LAL-convention
+            polarization angle of the source, in radians.
+        times : numpy.array
+            GPS times at which to evaluate the patterns.
+
+        Returns
+        -------
+        dict
+            Channel name ('1', '2', '3') -> (fplus, fcross), each an
+            array of len(times).
+        """
+        from scipy.interpolate import CubicSpline
+
+        times = numpy.asarray(times, dtype=numpy.float64)
+        grid = self._grid(float(times[0]), float(times[-1]))
+        eval_times = times if grid is None else grid
+
+        x_pol, y_pol = self._source_basis_mcmf(ra, dec, psi, eval_times)
+
+        out = {}
+        for chan in self.channels:
+            resp = self.responses[chan]
+            dx, dy = resp @ x_pol, resp @ y_pol
+            fplus = numpy.sum(x_pol * dx - y_pol * dy, axis=0)
+            fcross = numpy.sum(x_pol * dy + y_pol * dx, axis=0)
+            if grid is not None:
+                fplus = CubicSpline(grid, fplus)(times)
+                fcross = CubicSpline(grid, fcross)(times)
+            out[chan] = (fplus, fcross)
+        return out
+
+    def _vertex_positions(self, times):
+        """Barycentric-ecliptic positions of the three vertices at the given
+        GPS `times`, shape (3 vertices, 3 components, M), in metres.
+
+        A vectorised counterpart to
+        `pycbc.coordinates.moon.moon_site_position_ssb`, which is
+        scalar-only (it reshapes its result to (3, 1)). The frame matches
+        that function's, so these positions may be contracted directly
+        with a propagation vector from
+        `coordinates.space.localization_to_propagation_vector`.
+        """
+        from astropy import units as apy_units
+        from astropy.coordinates import ICRS
+        from astropy.time import Time
+        from lunarsky import MoonLocation
+
+        from pycbc.coordinates.space_orbit import (
+            _icrs_to_ecliptic_rotation_matrix)
+
+        obstimes = Time(numpy.atleast_1d(times), format='gps')
+        rotation = _icrs_to_ecliptic_rotation_matrix()
+
+        out = numpy.empty((3, 3, len(obstimes)))
+        for j, site in enumerate(self.sites):
+            loc = MoonLocation.from_selenodetic(
+                lon=site['longitude'] * apy_units.rad,
+                lat=site['latitude'] * apy_units.rad,
+                height=site['height'] * apy_units.m)
+            icrs = loc.get_mcmf(obstimes).transform_to(ICRS())
+            xyz = numpy.vstack([
+                icrs.cartesian.x.to_value(apy_units.m),
+                icrs.cartesian.y.to_value(apy_units.m),
+                icrs.cartesian.z.to_value(apy_units.m)])
+            out[j] = rotation @ xyz
+        return out
+
+    def vertex_delays(self, lamb, beta, times):
+        """Light-travel delay from the SSB to each vertex, in seconds, at the
+        given *detector* GPS `times`.
+
+        This is the explicit, detector-time form
+        .. math::
+            \Delta t_i(t) = \hat{k}\cdot\bm{r}_i(t)/c ,
+        in which the position is evaluated at the known detector time, so
+        no root-finding is involved. It is the direction in which the
+        mapping is explicit: going the other way, from a known SSB time to
+        the unknown arrival time, puts the unknown inside
+        :math:`\bm{r}(\cdot)` and requires the implicit solve performed by
+        `coordinates.moon.t_moon_from_ssb` (which `_LGWA_detector` uses).
+
+        The delay is evaluated on the coarse `self.cadence` grid and cubic
+        interpolated, as the antenna patterns are; it varies on orbital
+        timescales, and a 3600 s grid reproduces it to well under a
+        nanosecond.
+
+        Returns
+        -------
+        dict
+            Channel name -> delay array of len(times), in seconds.
+        """
+        from scipy.interpolate import CubicSpline
+
+        from astropy.constants import c as speed_of_light
+        from pycbc.coordinates.space import (
+            localization_to_propagation_vector)
+
+        times = numpy.asarray(times, dtype=numpy.float64)
+        grid = self._grid(float(times[0]), float(times[-1]))
+        eval_times = times if grid is None else grid
+
+        k = numpy.asarray(
+            localization_to_propagation_vector(lamb, beta, use_astropy=False),
+            dtype=numpy.float64).reshape(3)
+        positions = self._vertex_positions(eval_times)
+
+        out = {}
+        for j, chan in enumerate(self.channels):
+            delay = (k @ positions[j]) / speed_of_light.value
+            if grid is not None:
+                delay = CubicSpline(grid, delay)(times)
+            out[chan] = delay
+        return out
+
+    def _window_epoch(self, lamb, beta, t_ref):
+        """Detector time at which to start the output series.
+
+        This only selects *which window* of detector time is emitted; the
+        delays applied within it are exact at every sample, so an error
+        here costs a sliver of signal at the segment edges and nothing
+        else. Two explicit evaluations are therefore ample, and no
+        implicit solve is needed: the first uses the Moon's position at
+        the SSB epoch, the second corrects it for the Moon's motion during
+        the light-travel time (about 11 ms of the 475 s total).
+        """
+        delay = self.vertex_delays(lamb, beta, numpy.array([t_ref, t_ref]))
+        guess = float(numpy.mean([delay[c][0] for c in self.channels]))
+        refined = self.vertex_delays(
+            lamb, beta, numpy.array([t_ref + guess, t_ref + guess]))
+        return float(numpy.mean([refined[c][0] for c in self.channels]))
+
+    def project_wave(self, hp, hc, lamb, beta, polarization=0,
+                     include_aet=False, **kwargs):
+        """
+        Project the plus/cross polarizations onto the three GDC vertex
+        interferometers of the LILA triangle.
+
+        `hp`/`hc` are assumed to already be in the SSB frame (as for the
+        other backends in this module); `lamb`/`beta`/`polarization` are
+        the SSB-frame `eclipticlongitude`/`eclipticlatitude`/polarization
+        of the source.
+
+        The output grid is a *detector*-time grid, which is what makes the
+        propagation delay explicit (see `vertex_delays`). For each vertex,
+        .. math::
+            h_i(t) = F^{(i)}_+(t)\,h_+(t - \Delta t_i(t))
+                   + F^{(i)}_\times(t)\,h_\times(t - \Delta t_i(t)),
+        the minus sign following from the plane-wave form
+        :math:`h(t,\bm{x}) = f(t - \hat{k}\cdot\bm{x}/c)`: a vertex
+        further along the propagation direction receives later, so at a
+        given detector time it displays an earlier barycentric sample.
+
+        Unlike `_LDC_detector`/`_LGWA_detector`, which apply a single
+        constant epoch shift, :math:`\Delta t_i` is evaluated at every
+        sample. That is not a refinement but a requirement here: the
+        Moon's barycentric motion is dominated by the Earth's ~30 km/s
+        orbit, not by libration, so the delay drifts by ~44 ms across an
+        hour of signal and ~1 s across a day -- 10 cycles at 10 Hz, which
+        would destroy phase coherence for exactly the long mid-band
+        signals LILA is built to see.
+
+        All three channels share one grid. Per-vertex delays differ by at
+        most L/c = 133 us and are applied by interpolation, never by
+        relabelling epochs, since a coherent three-channel analysis -- and
+        the A/E/T recombination above all -- requires a common grid.
+
+        Parameters
+        ----------
+        include_aet : bool (optional)
+            Also return the orthogonal (A, E, T) recombination of the
+            three vertex channels, where T is the null stream. Default
+            False.
+
+        Returns
+        -------
+        dict of pycbc.types.TimeSeries
+            Keyed 'LILA_1'/'LILA_2'/'LILA_3', plus 'LILA_A'/'LILA_E'/
+            'LILA_T' if `include_aet` is set.
+        """
+        from scipy.interpolate import CubicSpline
+
+        from pycbc.coordinates import moon as coord_moon
+
+        # SSB-frame ecliptic lon/lat/pol -> LAL-convention ICRS
+        # ra/dec/psi, which is what the response tensors expect. `t_geo`
+        # is discarded: arrival times come from vertex_delays, not via the
+        # geocenter.
+        _, ra, dec, psi = coord_moon.moon_to_geo(
+            t_moon=0.0, longitude_moon=lamb, latitude_moon=beta,
+            polarization_moon=polarization, lal_convention=True)
+
+        t_ref = float(hp.start_time)
+        delta_t = float(hp.delta_t)
+        n_sample = len(hp)
+
+        epoch_delay = self._window_epoch(lamb, beta, t_ref)
+        times = t_ref + epoch_delay + numpy.arange(n_sample) * delta_t
+
+        delays = self.vertex_delays(lamb, beta, times)
+        patterns = self.antenna_pattern(ra, dec, psi, times)
+
+        # All time arithmetic below is done in seconds *relative to
+        # t_ref*, never on absolute GPS times. At t ~ 1.4e9 s the spacing
+        # between doubles is 0.24 us, which would quantise the 133 us
+        # inter-vertex structure to 0.2%; the delays themselves are only
+        # ~475 s, where the spacing is 6e-14 s.
+        tau = numpy.arange(n_sample) * delta_t
+        hp_spline = CubicSpline(tau, hp.numpy(), extrapolate=False)
+        hc_spline = CubicSpline(tau, hc.numpy(), extrapolate=False)
+
+        out = {}
+        for chan in self.channels:
+            query = tau + (epoch_delay - delays[chan])
+            hp_v = numpy.nan_to_num(hp_spline(query))
+            hc_v = numpy.nan_to_num(hc_spline(query))
+            fplus, fcross = patterns[chan]
+            out['LILA_' + chan] = TimeSeries(
+                fplus * hp_v + fcross * hc_v, delta_t=delta_t,
+                epoch=times[0], copy=False)
+
+        if include_aet:
+            stack = numpy.vstack([out['LILA_' + c].numpy()
+                                  for c in self.channels])
+            aet = self._AET @ stack
+            for name, row in zip(['A', 'E', 'T'], aet):
+                out['LILA_' + name] = TimeSeries(
+                    row, delta_t=delta_t, epoch=times[0], copy=False)
+        return out
+
+
 class _Generic_detector(AbsSpaceDet):
     """
     Placeholder backend for space-borne detectors that do not yet have a
@@ -1235,6 +1691,8 @@ _backends = {'LISA': {'LDC': _LDC_detector,
              'TianQin': {'Generic': _Generic_detector},
              'LGWA': {'Generic': _Generic_detector,
                       'LGWAResponse': _LGWA_detector},
+             'LILA': {'Generic': _Generic_detector,
+                      'LILAResponse': _LILA_detector},
             }
 
 class SpaceDetector(AbsSpaceDet):
