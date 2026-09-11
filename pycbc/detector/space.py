@@ -1405,7 +1405,8 @@ class _LILA_detector(AbsSpaceDet):
         cadence at each end so the interpolants never extrapolate."""
         if self.cadence is None:
             return None
-        n_points = max(4, int(numpy.ceil((t_end - t_start) / self.cadence)) + 4)
+        n_points = max(
+            4, int(numpy.ceil((t_end - t_start) / self.cadence)) + 4)
         return numpy.linspace(t_start - self.cadence, t_end + self.cadence,
                               n_points)
 

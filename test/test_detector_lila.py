@@ -23,7 +23,8 @@ import numpy
 
 from pycbc.coordinates.moon import (LUNAR_RADIUS, _bearing, _unit_from_lonlat,
                                     moon_triangle_sites)
-from pycbc.detector import (Detector, SpaceDetector, body_fixed_detector_tensor,
+from pycbc.detector import (Detector, SpaceDetector,
+                            body_fixed_detector_tensor,
                             get_available_space_detectors)
 from utils import simple_exit
 
