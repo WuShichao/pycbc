@@ -179,7 +179,7 @@ class PreparedMultibandTDI:
         self.t_end = response.t_end
 
     def project(self, source, lamb, beta, matrix=None, channels=None,
-                source_batch_size=1):
+                source_batch_size=1, source_workers=1):
         """Project one candidate on the fixed multiband geometry grids.
 
         A constant ``matrix`` may form named output ``channels`` before the
@@ -187,6 +187,9 @@ class PreparedMultibandTDI:
         harmonic can be evaluated together by increasing
         ``source_batch_size``. The default reflects the measured pyEFPEHM
         optimum; larger source arrays are not always faster.
+        ``source_workers`` optionally evaluates independent batches in a
+        thread pool. Keep it at one unless the source implementation supports
+        concurrent read-only evaluation.
         """
         if matrix is None:
             if channels is not None:
@@ -234,11 +237,33 @@ class PreparedMultibandTDI:
             geometry = item.prepared.geometries[template.harmonic]
             candidates.append((item, windowed, candidate_support, geometry))
 
-        native_brackets = sparse_windowed_channels_terms(
-            [windowed for _, windowed, _, _ in candidates],
-            [item.template.harmonic for item, _, _, _ in candidates],
-            [geometry for _, _, _, geometry in candidates],
-            lamb, beta, source_batch_size=source_batch_size)
+        source_batch_size = int(source_batch_size)
+        source_workers = int(source_workers)
+        if source_batch_size < 1:
+            raise ValueError("source_batch_size must be positive")
+        if source_workers < 1:
+            raise ValueError("source_workers must be positive")
+        groups = [
+            candidates[first:first + source_batch_size]
+            for first in range(0, len(candidates), source_batch_size)
+        ]
+
+        def evaluate_group(group):
+            return sparse_windowed_channels_terms(
+                [windowed for _, windowed, _, _ in group],
+                [item.template.harmonic for item, _, _, _ in group],
+                [geometry for _, _, _, geometry in group],
+                lamb, beta, source_batch_size=len(group))
+
+        if source_workers == 1 or len(groups) < 2:
+            grouped_brackets = tuple(evaluate_group(group) for group in groups)
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(
+                    max_workers=min(source_workers, len(groups))) as pool:
+                grouped_brackets = tuple(pool.map(evaluate_group, groups))
+        native_brackets = tuple(
+            brackets for group in grouped_brackets for brackets in group)
         bands = []
         for (item, windowed, candidate_support, geometry), brackets in zip(
                 candidates, native_brackets, strict=True):
@@ -789,8 +814,17 @@ class PreparedMultibandFrequencySampler:
             "kernel_count": kernel_count,
         }
 
-    def evaluate(self, response):
-        """Return required frequency samples for one compatible candidate."""
+    def evaluate(self, response, workers=1):
+        """Return required frequency samples for one compatible candidate.
+
+        ``workers`` may parallelize independent, read-only frequency bands.
+        Results are accumulated serially in task order, so worker threads do
+        not write shared output arrays or change floating-point reduction
+        order.
+        """
+        workers = int(workers)
+        if workers < 1:
+            raise ValueError("workers must be positive")
         signature = tuple(
             (band.harmonic, band.index, band.f_lower, band.f_upper,
              band.lower_overlap, band.upper_overlap,
@@ -812,21 +846,30 @@ class PreparedMultibandFrequencySampler:
             phase_groups.setdefault(
                 (id(base), band.harmonic),
                 (base, band.harmonic, []))[2].append(task_index)
+        phase_jobs = []
         for base, harmonic, task_indices in phase_groups.values():
             for first in range(0, len(task_indices),
                                self.carrier_batch_size):
                 batch = task_indices[first:first + self.carrier_batch_size]
-                sizes = [len(self.tasks[index]["times"])
-                         for index in batch]
-                joined = np.concatenate([
-                    self.tasks[index]["times"] for index in batch])
-                phases = base.carrier_phase(harmonic, joined)
-                offset = 0
-                for task_index, size in zip(batch, sizes, strict=True):
-                    carrier_phases[task_index] = phases[offset:offset + size]
-                    offset += size
+                phase_jobs.append((base, harmonic, tuple(batch)))
 
-        for task_index, task in enumerate(self.tasks):
+        def evaluate_phases(job):
+            base, harmonic, task_indices = job
+            sizes = [len(self.tasks[index]["times"])
+                     for index in task_indices]
+            joined = np.concatenate([
+                self.tasks[index]["times"] for index in task_indices])
+            phases = base.carrier_phase(harmonic, joined)
+            offset = 0
+            output_phases = []
+            for task_index, size in zip(task_indices, sizes, strict=True):
+                output_phases.append(
+                    (task_index, phases[offset:offset + size]))
+                offset += size
+            return tuple(output_phases)
+
+        def evaluate_task(index_and_task):
+            task_index, task = index_and_task
             band = response.bands[task["band_position"]]
             names = tuple(task["channels"])
             records = band.response.sample_brackets(
@@ -842,11 +885,34 @@ class PreparedMultibandFrequencySampler:
                 kernel_groups.setdefault(
                     (id(kernel), positions.tobytes()),
                     (positions, kernel, []))[2].append(name)
+            contributions = []
             for positions, kernel, group_names in kernel_groups.values():
                 samples = np.stack([values[name] for name in group_names])
                 transformed = samples @ kernel.T
                 for row, name in enumerate(group_names):
-                    output[name][positions] += transformed[row]
+                    contributions.append(
+                        (name, positions, transformed[row]))
+            return tuple(contributions)
+
+        if workers == 1 or len(self.tasks) < 2:
+            phase_results = map(evaluate_phases, phase_jobs)
+            for result in phase_results:
+                carrier_phases.update(result)
+            task_results = map(evaluate_task, enumerate(self.tasks))
+            for result in task_results:
+                for name, positions, transformed in result:
+                    output[name][positions] += transformed
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(
+                    max_workers=min(workers, len(self.tasks))) as pool:
+                for result in pool.map(evaluate_phases, phase_jobs):
+                    carrier_phases.update(result)
+                task_results = tuple(pool.map(
+                    evaluate_task, enumerate(self.tasks)))
+            for result in task_results:
+                for name, positions, transformed in result:
+                    output[name][positions] += transformed
         return output
 
 

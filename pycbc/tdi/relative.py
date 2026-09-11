@@ -415,9 +415,10 @@ class TDIRelativeBinning:
             self.required_frequencies, delta_f=self.delta_fs,
             epoch=self.epochs, channels=self.channels, **transform_options)
 
-    def evaluate_prepared(self, sampler, response):
+    def evaluate_prepared(self, sampler, response, **evaluation_options):
         """Evaluate one response through a prepared sparse-frequency sampler."""
-        return self.evaluate_sparse(sampler.evaluate(response))
+        return self.evaluate_sparse(
+            sampler.evaluate(response, **evaluation_options))
 
     def loglr(self, waveforms, sparse=False):
         """Return the unmarginalized Gaussian log-likelihood ratio."""

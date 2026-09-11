@@ -227,10 +227,13 @@ def test_multiband_frequency_samples_match_dense_time_domain_transform():
         epoch={"X1": common["t_start"], "X2": common["t_start"]},
         spectral_padding=1e-2, max_matrix_bytes=16 * 2 ** 20)
     duplicated_values = duplicated_sampler.evaluate(duplicated)
+    threaded_values = duplicated_sampler.evaluate(duplicated, workers=2)
     assert duplicated_sampler.diagnostics["kernel_count"] == len(
         duplicated_sampler.tasks)
     assert np.allclose(duplicated_values["X1"], prepared_values["X"])
     assert np.allclose(duplicated_values["X2"], 2 * prepared_values["X"])
+    assert np.array_equal(threaded_values["X1"], duplicated_values["X1"])
+    assert np.array_equal(threaded_values["X2"], duplicated_values["X2"])
 
 
 def test_prepared_multiband_reuses_geometry_for_projection():
@@ -260,6 +263,12 @@ def test_prepared_multiband_reuses_geometry_for_projection():
     assert transformed.channels == ("twice_X",)
     assert np.allclose(
         transformed.sample(times)["twice_X"], 2 * expected,
+        rtol=2e-12, atol=1e-30)
+
+    threaded = prepared.project(
+        source, 1.1, -0.4, source_workers=2)
+    assert np.allclose(
+        threaded.sample(times)["X"], expected,
         rtol=2e-12, atol=1e-30)
 
     with pytest.raises(ValueError, match="native channels"):
