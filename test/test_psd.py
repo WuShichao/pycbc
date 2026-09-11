@@ -125,8 +125,58 @@ class TestPSD(unittest.TestCase):
                                 msg='seg_len=%d max_len=%d -> rms=%.3f' \
                                 % (seg_len, max_len, err_rms))
 
+
+class TestSpacePSD(unittest.TestCase):
+    """Network-free checks of the space-borne analytical PSD models."""
+
+    def setUp(self):
+        self.length = 3001
+        self.delta_f = 1e-5
+        self.low_freq_cutoff = 1e-4
+
+    def test_extragalactic_dwd_amplitude(self):
+        """The fit must reproduce Omega_gw ~ 4e-12 at 1 mHz."""
+        from pycbc.cosmology import get_cosmology
+        from pycbc.psd.analytical_space import extragalactic_dwd_fit_lisa
+
+        sh = extragalactic_dwd_fit_lisa(self.length, self.delta_f,
+                                        self.low_freq_cutoff)
+        freq = sh.sample_frequencies.numpy()
+        idx = int(numpy.argmin(numpy.abs(freq - 1e-3)))
+        h0 = get_cosmology(None).H0.si.value
+        omega = (sh.numpy()[idx] * 4 * numpy.pi**2 * freq[idx]**3
+                 / (3 * h0**2))
+        self.assertTrue(abs(omega / 4e-12 - 1) < 0.05,
+                        msg='Omega(1 mHz) = %.3e' % omega)
+
+    def test_omega_gw_to_strain_psd_roundtrip(self):
+        from pycbc.cosmology import get_cosmology
+        from pycbc.psd.analytical_space import omega_gw_to_strain_psd
+
+        h0 = get_cosmology(None).H0.si.value
+        freq = numpy.array([1e-4, 1e-3, 1e-2])
+        omega = numpy.array([1e-11, 4e-12, 1e-12])
+        sh = omega_gw_to_strain_psd(freq, omega)
+        back = sh * 4 * numpy.pi**2 * freq**3 / (3 * h0**2)
+        self.assertTrue(numpy.allclose(back, omega, rtol=1e-12))
+
+    def test_extragalactic_dwd_amplitude_scaling(self):
+        """The strain PSD must be linear in the Omega amplitude."""
+        from pycbc.psd.analytical_space import extragalactic_dwd_fit_lisa
+
+        one = extragalactic_dwd_fit_lisa(self.length, self.delta_f,
+                                         self.low_freq_cutoff,
+                                         amplitude=1.72e-11).numpy()
+        two = extragalactic_dwd_fit_lisa(self.length, self.delta_f,
+                                         self.low_freq_cutoff,
+                                         amplitude=3.44e-11).numpy()
+        keep = one > 0
+        self.assertTrue(numpy.allclose(two[keep] / one[keep], 2, rtol=1e-10))
+
+
 suite = unittest.TestSuite()
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestPSD))
+suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestSpacePSD))
 
 if __name__ == '__main__':
     results = unittest.TextTestRunner(verbosity=2).run(suite)
