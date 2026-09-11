@@ -27,7 +27,8 @@ borne detectors, such as LISA, Taiji, and TianQin. Based on LISA technical note
 <LISA-LCST-SGS-TN-001>, LDC manual <LISA-LCST-SGS-MAN-001>,
 paper <10.1088/1361-6382/ab1101>, <10.1088/0264-9381/33/3/035010>,
 <10.1103/PhysRevD.102.063021>, <10.1103/PhysRevD.100.043003>,
-<10.1103/PhysRevD.107.064021>, and <10.48550/arXiv.2407.10642>.
+<10.1103/PhysRevD.107.064021>, <10.48550/arXiv.2407.10642>,
+and <10.48550/arXiv.2506.18390>.
 """
 
 import numpy as np
@@ -1334,18 +1335,90 @@ def omega_gw_to_strain_psd(f, omega_gw, cosmology=None):
     return omega_gw * 3 * h0**2 / (4 * np.pi**2 * f**3)
 
 
+# Fits to the GW energy density of the extragalactic double white dwarf
+# background. 'cutoff' entries are a broken power law times exp(-B f^3),
+# (A, f_break, gamma_1, gamma_2, gamma_3, B); 'smooth' entries are the
+# smoothly broken power law of astropy's SmoothlyBrokenPowerLaw1D,
+# (A, f_break, alpha_1, alpha_2, delta). The boileau_* keys name the star
+# formation rate density model (Madau & Dickinson 2014, Madau & Fragos 2017,
+# Strolger et al. 2004) and then the COSMIC initial population model.
+EXTRAGALACTIC_DWD_MODELS = {
+    # Eq.(2) of <10.48550/arXiv.2407.10642>
+    'hofman2024': ('cutoff', (1.72e-11, 7.2e-3, 0.741, 4.15, -0.255, 1.54e4)),
+    # Table B.1 of <10.48550/arXiv.2506.18390>
+    'boileau_md_default': ('smooth', (5e-12, 7e-3, -0.72, 2.43, 0.24)),
+    'boileau_md_alpha4': ('smooth', (10e-12, 7e-3, -0.69, 2.74, 0.26)),
+    'boileau_md_fb1': ('smooth', (7e-12, 7e-3, -0.74, 2.31, 0.23)),
+    'boileau_md_multidim': ('smooth', (6e-12, 7e-3, -0.73, 2.41, 0.24)),
+    'boileau_mf_default': ('smooth', (4e-12, 7e-3, -0.72, 2.41, 0.24)),
+    'boileau_mf_alpha4': ('smooth', (6e-12, 8e-3, -0.76, 4.20, 0.22)),
+    'boileau_mf_fb1': ('smooth', (4e-12, 7e-3, -0.72, 2.45, 0.24)),
+    'boileau_mf_multidim': ('smooth', (6e-12, 7e-3, -0.75, 2.77, 0.22)),
+    'boileau_strolger_default': ('smooth', (20e-12, 7e-3, -0.75, 3.71, 0.22)),
+    'boileau_strolger_alpha4': ('smooth', (30e-12, 1e-2, -0.69, 5.11, 0.31)),
+    'boileau_strolger_fb1': ('smooth', (30e-12, 7e-3, -0.75, 4.23, 0.22)),
+    'boileau_strolger_multidim': ('smooth', (20e-12, 7e-3, -0.75, 3.27, 0.22)),
+}
+
+
+def omega_gw_extragalactic_dwd(f, model='boileau_md_default', amplitude=None):
+    r""" The GW energy density spectrum of the extragalactic double white
+    dwarf background.
+
+    Parameters
+    ----------
+    f : float or numpy.array
+        The frequency or frequency range, in the unit of "Hz".
+    model : str
+        A key of `EXTRAGALACTIC_DWD_MODELS`.
+    amplitude : float, optional
+        Override the model's amplitude :math:`A`, which is the value of
+        :math:`\Omega_{\rm gw}` at the break frequency. Default is the
+        amplitude of the chosen model.
+
+    Returns
+    -------
+    omega_gw : float or numpy.array
+        The dimensionless GW energy density spectrum.
+    Notes
+    -----
+        The default is the fiducial model of <10.48550/arXiv.2506.18390>:
+        the Madau & Dickinson (2014) star formation rate density with the
+        COSMIC default initial population. It sits at the 17th percentile of
+        that paper's twelve fits, which span a factor of 9 to 13 in amplitude
+        depending on frequency, so it is a low choice within the family;
+        sweep `model` or `amplitude` to see what that systematic does to a
+        result.
+
+        The 'hofman2024' fit has the most extended high-frequency tail of the
+        published models: it sits at the 58th to 67th percentile of the
+        boileau_* family below 7 mHz but at the 92nd to 100th percentile
+        above 10 mHz, where the two papers differ over their treatment of
+        mass transfer and tidal torques after the DWD forms.
+    """
+    if model not in EXTRAGALACTIC_DWD_MODELS:
+        raise ValueError("Unknown extragalactic DWD model '%s', choose from %s"
+                         % (model, sorted(EXTRAGALACTIC_DWD_MODELS)))
+    form, par = EXTRAGALACTIC_DWD_MODELS[model]
+    if form == 'cutoff':
+        amp, f_break, gamma_1, gamma_2, gamma_3, b_cut = par
+        amp = amp if amplitude is None else amplitude
+        return (amp * (f/f_break)**gamma_1 *
+                (1 + (f/f_break)**gamma_2)**gamma_3 * np.exp(-b_cut * f**3))
+    amp, f_break, alpha_1, alpha_2, delta = par
+    amp = amp if amplitude is None else amplitude
+    x = f / f_break
+
+    return (amp * x**(-alpha_1) *
+            (0.5*(1 + x**(1.0/delta)))**((alpha_1-alpha_2)*delta))
+
+
 def extragalactic_dwd_fit_lisa(length, delta_f, low_freq_cutoff,
-                               amplitude=1.72e-11, cosmology=None):
+                               model='boileau_md_default', amplitude=None,
+                               cosmology=None):
     r""" The strain PSD of the astrophysical GW background from extragalactic
     double white dwarfs, averaged over sky and polarization angle. No
     instrumental noise.
-
-    .. math::
-        \Omega_{\rm gw}(f) = A\left(\frac{f}{\hat{f}}\right)^{0.741}
-        \left[1+\left(\frac{f}{\hat{f}}\right)^{4.15}\right]^{-0.255}
-        e^{-Bf^{3}}
-
-    with :math:`\hat{f} = 7.2` mHz and :math:`B = 1.54\times10^{4}`.
 
     Parameters
     ----------
@@ -1355,11 +1428,15 @@ def extragalactic_dwd_fit_lisa(length, delta_f, low_freq_cutoff,
         Frequency step for output FrequencySeries.
     low_freq_cutoff : float
         Low-frequency cutoff for output FrequencySeries.
-    amplitude : float
-        The amplitude :math:`A` of the energy density spectrum. The default is
-        the central value of the fit; the population-synthesis systematics
-        studied in the reference span a factor of ~5 in total, roughly
-        0.77e-11 to 3.8e-11.
+    model : str
+        Which published fit to use, a key of `EXTRAGALACTIC_DWD_MODELS`.
+        The default is the fiducial model of the reference below; see
+        `omega_gw_extragalactic_dwd` for where it sits among the others.
+    amplitude : float, optional
+        Override the model's amplitude, the value of
+        :math:`\Omega_{\rm gw}` at its break frequency. The 12 boileau_*
+        fits span a factor of 13 in amplitude, which is the honest size of
+        the astrophysical systematics here.
     cosmology : str or astropy.cosmology.FlatLambdaCDM, optional
         The cosmology used to convert the energy density into a strain PSD.
 
@@ -1370,16 +1447,14 @@ def extragalactic_dwd_fit_lisa(length, delta_f, low_freq_cutoff,
         extragalactic DWD background. No instrumental noise.
     Notes
     -----
-        Please see Eq.(4) in <10.48550/arXiv.2407.10642> for more details.
-        Unlike the Galactic foreground this background is not reduced by
-        resolving and subtracting individual binaries, so it carries no
+        Please see Eq.(2) in <10.48550/arXiv.2407.10642> and Table B.1 in
+        <10.48550/arXiv.2506.18390> for more details. Unlike the Galactic
+        foreground this background is not reduced by resolving and
+        subtracting individual binaries, so it carries no
         observation-duration dependence.
     """
     fr = np.linspace(low_freq_cutoff, (length-1)*2*delta_f, length)
-    f_break = 7.2e-3
-    omega_gw = (amplitude * (fr/f_break)**0.741 *
-                (1 + (fr/f_break)**4.15)**(-0.255) *
-                np.exp(-1.54e4 * fr**3))
+    omega_gw = omega_gw_extragalactic_dwd(fr, model, amplitude)
     sh_extragalactic = omega_gw_to_strain_psd(fr, omega_gw, cosmology)
     fseries = from_numpy_arrays(fr, sh_extragalactic, length, delta_f,
                                 low_freq_cutoff)
@@ -1523,7 +1598,8 @@ def sensitivity_curve_lisa_confusion(length, delta_f, low_freq_cutoff,
                                      oms_noise_level=15e-12,
                                      base_model="semi", duration=1.0,
                                      extragalactic_dwd=False,
-                                     extragalactic_amplitude=1.72e-11,
+                                     extragalactic_model='boileau_md_default',
+                                     extragalactic_amplitude=None,
                                      cosmology=None):
     """ The LISA's sensitivity curve with Galactic confusion noise, optionally
     including the extragalactic double white dwarf background, averaged over
@@ -1551,9 +1627,10 @@ def sensitivity_curve_lisa_confusion(length, delta_f, low_freq_cutoff,
         subtracted; it does not affect the extragalactic component.
     extragalactic_dwd : bool
         Whether to add the extragalactic double white dwarf background.
-    extragalactic_amplitude : float
-        The amplitude of the extragalactic energy density spectrum, see
-        `extragalactic_dwd_fit_lisa`.
+    extragalactic_model : str
+        Which published fit to use for it, see `extragalactic_dwd_fit_lisa`.
+    extragalactic_amplitude : float, optional
+        Override that model's amplitude, see `extragalactic_dwd_fit_lisa`.
     cosmology : str or astropy.cosmology.FlatLambdaCDM, optional
         The cosmology used to convert the energy density into a strain PSD.
 
@@ -1583,8 +1660,8 @@ def sensitivity_curve_lisa_confusion(length, delta_f, low_freq_cutoff,
     total = base_curve + fseries_confusion
     if extragalactic_dwd:
         total += extragalactic_dwd_fit_lisa(
-            length, delta_f, low_freq_cutoff, extragalactic_amplitude,
-            cosmology)
+            length, delta_f, low_freq_cutoff, extragalactic_model,
+            extragalactic_amplitude, cosmology)
     fseries = from_numpy_arrays(base_curve.sample_frequencies, total,
                                 length, delta_f, low_freq_cutoff)
 
@@ -1683,7 +1760,8 @@ def sh_transformed_psd_lisa_tdi_XYZ(length, delta_f, low_freq_cutoff,
                                     oms_noise_level=15e-12,
                                     base_model="semi", duration=1.0,
                                     tdi=None, extragalactic_dwd=False,
-                                    extragalactic_amplitude=1.72e-11,
+                                    extragalactic_model='boileau_md_default',
+                                    extragalactic_amplitude=None,
                                     cosmology=None):
     """ The TDI-1.5/2.0 PSD (X,Y,Z channel) for LISA with confusion noise,
     transformed from LISA sensitivity curve.
@@ -1710,9 +1788,10 @@ def sh_transformed_psd_lisa_tdi_XYZ(length, delta_f, low_freq_cutoff,
         The version of TDI, currently only for 1.5 or 2.0.
     extragalactic_dwd : bool
         Whether to add the extragalactic double white dwarf background.
-    extragalactic_amplitude : float
-        The amplitude of the extragalactic energy density spectrum, see
-        `extragalactic_dwd_fit_lisa`.
+    extragalactic_model : str
+        Which published fit to use for it, see `extragalactic_dwd_fit_lisa`.
+    extragalactic_amplitude : float, optional
+        Override that model's amplitude, see `extragalactic_dwd_fit_lisa`.
     cosmology : str or astropy.cosmology.FlatLambdaCDM, optional
         The cosmology used to convert the energy density into a strain PSD.
 
@@ -1736,6 +1815,7 @@ def sh_transformed_psd_lisa_tdi_XYZ(length, delta_f, low_freq_cutoff,
                                           len_arm, acc_noise_level,
                                           oms_noise_level, base_model,
                                           duration, extragalactic_dwd,
+                                          extragalactic_model,
                                           extragalactic_amplitude, cosmology)
     psd = 2*sh.data * fseries_response.data
     fseries = from_numpy_arrays(sh.sample_frequencies, psd,
@@ -1790,7 +1870,8 @@ def semi_analytical_psd_lisa_confusion_noise(length, delta_f, low_freq_cutoff,
 
 def semi_analytical_psd_lisa_extragalactic_dwd(length, delta_f,
                                               low_freq_cutoff, len_arm=2.5e9,
-                                              amplitude=1.72e-11, tdi=None,
+                                              model='boileau_md_default',
+                                              amplitude=None, tdi=None,
                                               cosmology=None):
     """ The TDI-1.5/2.0 PSD (X,Y,Z channel) for the extragalactic double white
     dwarf background, no instrumental noise.
@@ -1805,9 +1886,10 @@ def semi_analytical_psd_lisa_extragalactic_dwd(length, delta_f,
         Low-frequency cutoff for output FrequencySeries.
     len_arm : float
         The arm length of LISA, in the unit of "m".
-    amplitude : float
-        The amplitude of the energy density spectrum, see
-        `extragalactic_dwd_fit_lisa`.
+    model : str
+        Which published fit to use, see `extragalactic_dwd_fit_lisa`.
+    amplitude : float, optional
+        Override the model's amplitude, see `extragalactic_dwd_fit_lisa`.
     tdi : string
         The version of TDI, currently only for 1.5 or 2.0.
     cosmology : str or astropy.cosmology.FlatLambdaCDM, optional
@@ -1827,7 +1909,7 @@ def semi_analytical_psd_lisa_extragalactic_dwd(length, delta_f,
     fseries_response = from_numpy_arrays(fr, np.array(response),
                                          length, delta_f, low_freq_cutoff)
     fseries_extragalactic = extragalactic_dwd_fit_lisa(
-        length, delta_f, low_freq_cutoff, amplitude, cosmology)
+        length, delta_f, low_freq_cutoff, model, amplitude, cosmology)
     psd_extragalactic = 2*fseries_extragalactic.data * fseries_response.data
     fseries = from_numpy_arrays(fseries_extragalactic.sample_frequencies,
                                 psd_extragalactic, length, delta_f,
@@ -1924,13 +2006,12 @@ def analytical_psd_taiji_confusion_noise(length, delta_f, low_freq_cutoff,
     return fseries
 
 
-def analytical_psd_lisa_tdi_AE_confusion(length, delta_f, low_freq_cutoff,
-                                         len_arm=2.5e9, acc_noise_level=3e-15,
-                                         oms_noise_level=15e-12,
-                                         duration=1.0, tdi=None,
-                                         extragalactic_dwd=False,
-                                         extragalactic_amplitude=1.72e-11,
-                                         cosmology=None):
+def analytical_psd_lisa_tdi_AE_confusion(
+        length, delta_f, low_freq_cutoff, len_arm=2.5e9,
+        acc_noise_level=3e-15, oms_noise_level=15e-12, duration=1.0,
+        tdi=None, extragalactic_dwd=False,
+        extragalactic_model='boileau_md_default',
+        extragalactic_amplitude=None, cosmology=None):
     """ The TDI-1.5/2.0 PSD (A,E channel) for LISA with Galactic confusion
     noise, optionally including the extragalactic double white dwarf
     background.
@@ -1957,9 +2038,10 @@ def analytical_psd_lisa_tdi_AE_confusion(length, delta_f, low_freq_cutoff,
         The version of TDI. Choose from "1.5" or "2.0".
     extragalactic_dwd : bool
         Whether to add the extragalactic double white dwarf background.
-    extragalactic_amplitude : float
-        The amplitude of the extragalactic energy density spectrum, see
-        `extragalactic_dwd_fit_lisa`.
+    extragalactic_model : str
+        Which published fit to use for it, see `extragalactic_dwd_fit_lisa`.
+    extragalactic_amplitude : float, optional
+        Override that model's amplitude, see `extragalactic_dwd_fit_lisa`.
     cosmology : str or astropy.cosmology.FlatLambdaCDM, optional
         The cosmology used to convert the energy density into a strain PSD.
 
@@ -1985,7 +2067,7 @@ def analytical_psd_lisa_tdi_AE_confusion(length, delta_f, low_freq_cutoff,
     fseries = psd_AE + 1.5 * psd_X_confusion
     if extragalactic_dwd:
         fseries += 1.5 * semi_analytical_psd_lisa_extragalactic_dwd(
-            length, delta_f, low_freq_cutoff, len_arm,
+            length, delta_f, low_freq_cutoff, len_arm, extragalactic_model,
             extragalactic_amplitude, tdi, cosmology)
 
     return fseries
