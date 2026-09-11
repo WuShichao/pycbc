@@ -409,6 +409,16 @@ class TDIRelativeBinning:
             epoch=self.epochs, channels=self.channels, **transform_options)
         return self.evaluate_sparse(samples)
 
+    def prepare_response(self, response, **transform_options):
+        """Prepare fixed Fourier kernels for repeated response candidates."""
+        return response.prepare_frequency_sampler(
+            self.required_frequencies, delta_f=self.delta_fs,
+            epoch=self.epochs, channels=self.channels, **transform_options)
+
+    def evaluate_prepared(self, sampler, response):
+        """Evaluate one response through a prepared sparse-frequency sampler."""
+        return self.evaluate_sparse(sampler.evaluate(response))
+
     def loglr(self, waveforms, sparse=False):
         """Return the unmarginalized Gaussian log-likelihood ratio."""
         filt, norm = (self.evaluate_sparse(waveforms) if sparse

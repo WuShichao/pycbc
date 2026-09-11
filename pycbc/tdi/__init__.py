@@ -3,9 +3,13 @@
 from pycbc.tdi.combination import TDICombination, Term, orthogonal_channels
 from pycbc.tdi.multiband import (
     MultibandSparseTDIResponse,
+    PreparedMultibandFrequencySampler,
+    PreparedMultibandTDI,
     TDIBandResponse,
     TDIMultibandBlock,
     multiband_sparse_tdi_response,
+    prepare_multiband_tdi,
+    prepare_multiband_tdi_response,
 )
 from pycbc.tdi.onthefly import (
     MultiChannelTermGeometry,
@@ -73,9 +77,13 @@ __all__ = [
     "TDIBandResponse",
     "TDIMultibandBlock",
     "MultibandSparseTDIResponse",
+    "PreparedMultibandFrequencySampler",
+    "PreparedMultibandTDI",
     "adaptive_tdi_frequency_bins",
     "frequency_partition_sources",
     "multiband_sparse_tdi_response",
+    "prepare_multiband_tdi",
+    "prepare_multiband_tdi_response",
     "adaptive_time_grid",
     "adaptive_sparse_tdi_response",
     "chain_delay",

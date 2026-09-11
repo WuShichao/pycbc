@@ -83,6 +83,17 @@ class TimeShiftedHarmonicSource:
         """Return harmonic amplitudes at translated source times."""
         return self.source.amplitude(harmonic, self._source_time(time))
 
+    def harmonic_components(self, harmonic, time):
+        """Return amplitude, phase and frequency in one translated query."""
+        combined = getattr(self.source, "harmonic_components", None)
+        shifted = self._source_time(time)
+        if combined is not None:
+            return combined(harmonic, shifted)
+        amp_plus, amp_cross = self.source.amplitude(harmonic, shifted)
+        phase = self.source.carrier_phase(harmonic, shifted)
+        omega = self.source.angular_frequency(harmonic, shifted)
+        return amp_plus, amp_cross, phase, omega
+
     def carrier_phase(self, harmonic, time):
         """Return the carrier phase at translated source times."""
         return self.source.carrier_phase(harmonic, self._source_time(time))
@@ -1333,23 +1344,36 @@ class PyEFPEHMSource:
 
         if np.any(inside):
             times = flat[order][inside]
-            result = self.model.generate_tdomain_hlm_modes(
-                times=times, return_waveform_pieces=True)
+            native_projection = self.theta is None and self.phi is None
+            generator = (self.model.generate_tdomain_modes
+                         if native_projection
+                         else self.model.generate_tdomain_hlm_modes)
+            result = generator(times=times, return_waveform_pieces=True)
             mode = result['modes'].get(harmonic)
             if mode is not None:
-                mode_l, mode_m, _ = harmonic
-                contribution = np.tensordot(
-                    np.asarray(mode['hlm']),
-                    self._projector(mode_l, mode_m),
-                    axes=(1, 0))                        # (N_mode, 2), complex
+                if native_projection:
+                    contribution = (
+                        2 * self.model.h0_pref
+                        * np.asarray(mode['Apc_prec'])
+                        * np.asarray(mode['Nlm_p'])[:, None])
+                else:
+                    mode_l, mode_m, _ = harmonic
+                    contribution = np.tensordot(
+                        np.asarray(mode['hlm']),
+                        self._projector(mode_l, mode_m),
+                        axes=(1, 0))                    # (N_mode, 2), complex
                 mode_phase = np.asarray(mode['phase'])
                 # place back into the sorted-inside slots this mode covers
                 slot = np.nonzero(inside)[0][np.asarray(mode['time_idxs'])]
                 target = order[slot]
-                amp_p[target] = _positive_frequency_envelope(
-                    contribution[:, 0], mode_phase)
-                amp_c[target] = _positive_frequency_envelope(
-                    contribution[:, 1], mode_phase)
+                if native_projection:
+                    amp_p[target] = np.conj(contribution[:, 0])
+                    amp_c[target] = np.conj(contribution[:, 1])
+                else:
+                    amp_p[target] = _positive_frequency_envelope(
+                        contribution[:, 0], mode_phase)
+                    amp_c[target] = _positive_frequency_envelope(
+                        contribution[:, 1], mode_phase)
                 phase[target] = mode_phase
                 omega[target] = np.asarray(mode['omega'])
 
@@ -1404,6 +1428,10 @@ class PyEFPEHMSource:
     def amplitude(self, harmonic, t):
         amp_p, amp_c, _, _ = self._evaluate(harmonic, t)
         return amp_p, amp_c
+
+    def harmonic_components(self, harmonic, t):
+        """Evaluate amplitude, native live phase and frequency together."""
+        return self._evaluate(harmonic, t)
 
     def _orbital_phases(self, t, derivative):
         """``(lambda, delta_lambda)`` from the model's own ODE solution."""

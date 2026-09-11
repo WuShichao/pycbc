@@ -590,8 +590,8 @@ class MultiChannelTermGeometry(TermGeometry):
                          velocity_order=velocity_order)
 
 
-def _sparse_term_contributions(source, harmonic, geometry, lamb, beta):
-    """Return each gathered term before reducing it into output channels."""
+def _sparse_term_projection(geometry, lamb, beta):
+    """Return delayed queries and polarization weights for sparse terms."""
     u_hat, v_hat, k_hat = polarization_basis(lamb, beta)
     n_dot_u = geometry._project(geometry.n_hat, u_hat)
     n_dot_v = geometry._project(geometry.n_hat, v_hat)
@@ -611,18 +611,35 @@ def _sparse_term_contributions(source, harmonic, geometry, lamb, beta):
 
     query = np.concatenate((geometry.shifted - tau_emit,
                             geometry.shifted - tau_recv))
-    amp_p, amp_c = source.amplitude(harmonic, query)
-    phase = source.carrier_phase(harmonic, query)
-    phase -= source.carrier_phase(harmonic, geometry.grid)[None, :]
-
     weight = np.concatenate((np.broadcast_to(w1, geometry.shape),
                              -np.broadcast_to(w2, geometry.shape)))
     plus = np.concatenate((pref_plus, pref_plus))
     cross = np.concatenate((pref_cross, pref_cross))
     coefficient = np.concatenate((geometry.coefficient,
                                   geometry.coefficient))
-    return (coefficient * weight * (plus * amp_p + cross * amp_c)
+    return (query, coefficient * weight * plus,
+            coefficient * weight * cross)
+
+
+def _sparse_term_contributions(source, harmonic, geometry, lamb, beta):
+    """Return each gathered term before reducing it into output channels."""
+    query, plus, cross = _sparse_term_projection(geometry, lamb, beta)
+    amp_p, amp_c = source.amplitude(harmonic, query)
+    phase = source.carrier_phase(harmonic, query)
+    phase -= source.carrier_phase(harmonic, geometry.grid)[None, :]
+    return ((plus * amp_p + cross * amp_c)
             * np.exp(1j * phase))
+
+
+def _reduce_sparse_contributions(contribution, geometry):
+    """Reduce gathered term contributions into their output channels."""
+    channels = np.concatenate((geometry.term_channel,
+                               geometry.term_channel))
+    output = np.zeros((len(geometry.channel_names), geometry.shape[1]),
+                      dtype=complex)
+    for index in range(len(output)):
+        output[index] = contribution[channels == index].sum(axis=0)
+    return dict(zip(geometry.channel_names, output, strict=True))
 
 
 def sparse_channel_terms(source, harmonic, geometry, lamb, beta):
@@ -642,13 +659,91 @@ def sparse_channels_terms(source, harmonic, geometry, lamb, beta):
         raise TypeError("geometry must be a MultiChannelTermGeometry")
     contribution = _sparse_term_contributions(
         source, harmonic, geometry, lamb, beta)
-    channels = np.concatenate((geometry.term_channel,
-                               geometry.term_channel))
-    output = np.zeros((len(geometry.channel_names), geometry.shape[1]),
-                      dtype=complex)
-    for index in range(len(output)):
-        output[index] = contribution[channels == index].sum(axis=0)
-    return dict(zip(geometry.channel_names, output, strict=True))
+    return _reduce_sparse_contributions(contribution, geometry)
+
+
+def sparse_windowed_channels_terms(sources, harmonics, geometries,
+                                   lamb, beta, source_batch_size=1):
+    """Batch source evaluation across several pre-response frequency bands.
+
+    Every ``source`` must be a frequency-window view exposing ``source`` and
+    ``frequency_weight``. The shared underlying harmonic is evaluated once
+    on the concatenated delayed queries, after which each window is applied
+    at those same retarded source times. Thus batching changes call layout,
+    not the order of the physical response operations.
+    """
+    sources = tuple(sources)
+    harmonics = tuple(harmonics)
+    geometries = tuple(geometries)
+    source_batch_size = int(source_batch_size)
+    if source_batch_size < 1:
+        raise ValueError("source_batch_size must be positive")
+    if not (len(sources) == len(harmonics) == len(geometries)):
+        raise ValueError("sources, harmonics and geometries must match")
+    outputs = [None] * len(sources)
+    groups = {}
+    group_counts = {}
+    for index, (source, harmonic, geometry) in enumerate(zip(
+            sources, harmonics, geometries, strict=True)):
+        if not isinstance(geometry, MultiChannelTermGeometry):
+            raise TypeError("geometry must be a MultiChannelTermGeometry")
+        if not hasattr(source, "source") or not hasattr(
+                source, "frequency_weight"):
+            raise TypeError("sources must be frequency-window views")
+        base_key = (id(source.source), harmonic)
+        count = group_counts.get(base_key, 0)
+        key = (*base_key, count // source_batch_size)
+        groups.setdefault(key, []).append(index)
+        group_counts[base_key] = count + 1
+
+    for (_, harmonic, _), positions in groups.items():
+        base = sources[positions[0]].source
+        if any(sources[index].source is not base for index in positions):
+            raise ValueError("frequency windows in one group must share a source")
+        projections = [
+            _sparse_term_projection(geometries[index], lamb, beta)
+            for index in positions
+        ]
+        query_sizes = [query.size for query, _, _ in projections]
+        grid_sizes = [len(geometries[index].grid) for index in positions]
+        all_query = np.concatenate([
+            query.reshape(-1) for query, _, _ in projections])
+        all_grids = np.concatenate([
+            geometries[index].grid for index in positions])
+        combined = getattr(base, "harmonic_components", None)
+        if combined is None:
+            amp_p, amp_c = base.amplitude(harmonic, all_query)
+            query_phase = base.carrier_phase(harmonic, all_query)
+            omega = base.angular_frequency(harmonic, all_query)
+        else:
+            amp_p, amp_c, query_phase, omega = combined(
+                harmonic, all_query)
+        frequency = omega / (2 * np.pi)
+        # The combined pyEFPEHM phase is defined only where a mode is live.
+        # A grid point just outside that window can still factor a nonzero
+        # delayed query, so use the source's continuous carrier on grids.
+        grid_phase = base.carrier_phase(harmonic, all_grids)
+
+        query_offset = grid_offset = 0
+        for position, projection, query_size, grid_size in zip(
+                positions, projections, query_sizes, grid_sizes, strict=True):
+            query, plus, cross = projection
+            query_slice = slice(query_offset, query_offset + query_size)
+            grid_slice = slice(grid_offset, grid_offset + grid_size)
+            shape = query.shape
+            weight = sources[position].frequency_weight(
+                frequency[query_slice]).reshape(shape)
+            phase = query_phase[query_slice].reshape(shape)
+            phase -= grid_phase[grid_slice][None, :]
+            contribution = (
+                plus * amp_p[query_slice].reshape(shape) * weight
+                + cross * amp_c[query_slice].reshape(shape) * weight)
+            contribution *= np.exp(1j * phase)
+            outputs[position] = _reduce_sparse_contributions(
+                contribution, geometries[position])
+            query_offset += query_size
+            grid_offset += grid_size
+    return tuple(outputs)
 
 
 def frequency_response_factors(geometry, frequencies, lamb, beta):
@@ -1012,14 +1107,19 @@ class SparseTDIResponse:
                     pieces.append((
                         float(low),
                         float(high),
-                        CubicSpline(grid[nodes], np.real(bracket[nodes])),
-                        CubicSpline(grid[nodes], np.imag(bracket[nodes])),
+                        CubicSpline(grid[nodes], bracket[nodes]),
                     ))
                 channel_splines[name] = tuple(pieces)
             self._splines.append(channel_splines)
 
-    def sample(self, times, channels=None, complex_output=False):
-        """Evaluate selected channels at arbitrary increasing mission times."""
+    def sample_brackets(self, times, channels=None):
+        """Return each response record before reattaching its carrier.
+
+        The tuple order matches :attr:`responses`; every item is a mapping of
+        selected channel names to complex carrier-factored brackets. This is
+        useful when a consumer can batch carrier evaluation across several
+        independently windowed views of the same source harmonic.
+        """
         times = np.asarray(times, dtype=float)
         if times.ndim != 1:
             raise ValueError("times must be one-dimensional")
@@ -1032,21 +1132,33 @@ class SparseTDIResponse:
         unknown = set(selected) - set(self.channels)
         if unknown:
             raise ValueError(f"unknown channels: {sorted(unknown)}")
-        dtype = complex if complex_output else float
-        output = {name: np.zeros(len(times), dtype=dtype) for name in selected}
-        for item, channel_splines in zip(
-                self.responses, self._splines, strict=True):
-            carrier = np.exp(1j * self.source.carrier_phase(
-                item['harmonic'], times))
+        records = []
+        for channel_splines in self._splines:
+            output = {}
             for name in selected:
                 bracket = np.zeros(len(times), dtype=complex)
-                for low, high, real_spline, imag_spline in \
+                for low, high, spline in \
                         channel_splines[name]:
                     want = (times >= low) & (times <= high)
                     if np.any(want):
-                        bracket[want] = (real_spline(times[want])
-                                         + 1j * imag_spline(times[want]))
-                value = bracket * carrier
+                        bracket[want] = spline(times[want])
+                output[name] = bracket
+            records.append(output)
+        return tuple(records)
+
+    def sample(self, times, channels=None, complex_output=False):
+        """Evaluate selected channels at arbitrary increasing mission times."""
+        times = np.asarray(times, dtype=float)
+        brackets = self.sample_brackets(times, channels=channels)
+        selected = self.channels if channels is None else (
+            (channels,) if isinstance(channels, str) else tuple(channels))
+        dtype = complex if complex_output else float
+        output = {name: np.zeros(len(times), dtype=dtype) for name in selected}
+        for item, record in zip(self.responses, brackets, strict=True):
+            carrier = np.exp(1j * self.source.carrier_phase(
+                item['harmonic'], times))
+            for name in selected:
+                value = record[name] * carrier
                 output[name] += value if complex_output else np.real(value)
         return output
 
@@ -1197,22 +1309,57 @@ class PreparedSparseTDI:
         geometry = next(iter(self.geometries.values()), None)
         return () if geometry is None else geometry.channel_names
 
-    def project(self, source, lamb, beta):
-        """Evaluate one source while reusing all prepared geometric work."""
+    def project(self, source, lamb, beta, support_padding=0.0,
+                matrix=None, channels=None):
+        """Evaluate one source while reusing all prepared geometric work.
+
+        ``support_padding`` must match the padding used to choose a prepared
+        grid for a frequency-windowed source. It keeps delayed link terms live
+        just outside the source window without rebuilding any geometry.
+
+        ``matrix`` and ``channels`` optionally apply a constant channel
+        transform to the carrier-factored brackets before spline construction.
+        This avoids constructing an intermediate set of native-channel
+        splines for every likelihood candidate.
+        """
+        support_padding = float(support_padding)
+        if support_padding < 0:
+            raise ValueError("support_padding must be non-negative")
+        if matrix is None:
+            if channels is not None:
+                raise ValueError("channels requires a channel-transform matrix")
+            output_channels = self.channels
+        else:
+            matrix = np.asarray(matrix, dtype=float)
+            if channels is None:
+                raise ValueError("matrix requires output channel names")
+            output_channels = tuple(channels)
+            if matrix.shape != (len(output_channels), len(self.channels)):
+                raise ValueError(
+                    "matrix shape must be (output channels, native channels)")
+            if len(set(output_channels)) != len(output_channels):
+                raise ValueError("output channel names must be distinct")
         missing = set(source.harmonics) - set(self.geometries)
         if missing:
             raise ValueError(f"no prepared grids for harmonics: {missing}")
         records = []
         for harmonic in source.harmonics:
             geometry = self.geometries[harmonic]
+            brackets = sparse_channels_terms(
+                source, harmonic, geometry, lamb, beta)
+            if matrix is not None:
+                native = np.stack([
+                    brackets[name] for name in self.channels])
+                transformed = matrix @ native
+                brackets = dict(zip(
+                    output_channels, transformed, strict=True))
             records.append({
                 'harmonic': harmonic,
                 'grid': geometry.grid,
-                'brackets': sparse_channels_terms(
-                    source, harmonic, geometry, lamb, beta),
+                'brackets': brackets,
                 'support': harmonic_windows(
                     source, harmonic, float(geometry.grid[0]),
-                    float(geometry.grid[-1])),
+                    float(geometry.grid[-1]), padding=support_padding),
             })
         return SparseTDIResponse(source, records)
 

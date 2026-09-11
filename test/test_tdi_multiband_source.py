@@ -1,6 +1,7 @@
 """Tests for pre-response multiband harmonic windows."""
 
 import numpy as np
+import pytest
 
 from pycbc.coordinates.space_orbit import LisaEqualArmOrbit
 from pycbc.tdi.backends.pytdi_backend import (
@@ -10,6 +11,8 @@ from pycbc.tdi.backends.pytdi_backend import (
 from pycbc.tdi.multiband import (
     _zoom_frequency_samples,
     multiband_sparse_tdi_response,
+    prepare_multiband_tdi,
+    prepare_multiband_tdi_response,
 )
 from pycbc.tdi.onthefly import adaptive_sparse_tdi_response
 from pycbc.tdi.sources import frequency_partition_sources
@@ -202,6 +205,92 @@ def test_multiband_frequency_samples_match_dense_time_domain_transform():
         time_window=lambda time: np.zeros_like(time),
     )
     assert np.all(zeroed["X"] == 0)
+
+    sampler = multiband.prepare_frequency_sampler(
+        {"X": frequencies}, delta_f={"X": delta_f},
+        epoch={"X": common["t_start"]}, spectral_padding=1e-2,
+        max_matrix_bytes=16 * 2 ** 20)
+    prepared_values = sampler.evaluate(multiband)
+    heterodyned_values = multiband.frequency_samples(
+        {"X": frequencies}, delta_f={"X": delta_f},
+        epoch={"X": common["t_start"]}, spectral_padding=1e-2)
+    assert np.allclose(
+        prepared_values["X"], heterodyned_values["X"],
+        rtol=2e-12, atol=1e-30)
+    assert sampler.diagnostics["matrix_bytes"] > 0
+
+    duplicated = multiband.linear_transform(
+        [[1.0], [2.0]], ("X1", "X2"))
+    duplicated_sampler = duplicated.prepare_frequency_sampler(
+        {"X1": frequencies, "X2": frequencies},
+        delta_f={"X1": delta_f, "X2": delta_f},
+        epoch={"X1": common["t_start"], "X2": common["t_start"]},
+        spectral_padding=1e-2, max_matrix_bytes=16 * 2 ** 20)
+    duplicated_values = duplicated_sampler.evaluate(duplicated)
+    assert duplicated_sampler.diagnostics["kernel_count"] == len(
+        duplicated_sampler.tasks)
+    assert np.allclose(duplicated_values["X1"], prepared_values["X"])
+    assert np.allclose(duplicated_values["X2"], 2 * prepared_values["X"])
+
+
+def test_prepared_multiband_reuses_geometry_for_projection():
+    source = _CompactChirpSource()
+    orbit = LisaEqualArmOrbit(t0=0.0)
+    terms = PyTDICombinationAdapter(
+        "X2", get_pytdi_combination("X2"), delta_t=25.0).terms()
+    channel_terms = {"X": terms}
+    response = multiband_sparse_tdi_response(
+        source, orbit, channel_terms, 1.1, -0.4,
+        band_edges=[1e-3, 5e-3, 1e-2], overlap=1e-3,
+        samples_per_cycle=4, t_start=800.0, t_end=3200.0,
+        initial_step=200.0, relative_tolerance=2e-5,
+        velocity_order=1)
+    prepared = prepare_multiband_tdi_response(
+        response, orbit, channel_terms, velocity_order=1)
+    projected = prepared.project(source, 1.1, -0.4)
+
+    times = np.linspace(1000.0, 3000.0, 301)
+    expected = response.sample(times)["X"]
+    actual = projected.sample(times)["X"]
+    assert np.allclose(actual, expected, rtol=2e-12, atol=1e-30)
+    assert projected.channels == response.channels
+
+    transformed = prepared.project(
+        source, 1.1, -0.4, matrix=[[2.0]], channels=("twice_X",))
+    assert transformed.channels == ("twice_X",)
+    assert np.allclose(
+        transformed.sample(times)["twice_X"], 2 * expected,
+        rtol=2e-12, atol=1e-30)
+
+    with pytest.raises(ValueError, match="native channels"):
+        prepare_multiband_tdi_response(
+            response.linear_transform([[1.0]], ("A",)),
+            orbit, channel_terms, velocity_order=1)
+
+
+def test_fixed_multiband_preparation_reproduces_adaptive_response():
+    source = _CompactChirpSource()
+    orbit = LisaEqualArmOrbit(t0=0.0)
+    terms = PyTDICombinationAdapter(
+        "X2", get_pytdi_combination("X2"), delta_t=25.0).terms()
+    channel_terms = {"X": terms}
+    common = dict(
+        band_edges=[1e-3, 5e-3, 1e-2], overlap=1e-3,
+        samples_per_cycle=4, t_start=800.0, t_end=3200.0,
+        velocity_order=1)
+    adaptive = multiband_sparse_tdi_response(
+        source, orbit, channel_terms, 1.1, -0.4,
+        initial_step=200.0, relative_tolerance=2e-5, **common)
+    prepared = prepare_multiband_tdi(
+        source, orbit, channel_terms, 1.1, -0.4,
+        geometry_step=10.0, minimum_grid_points=64, **common)
+    fixed = prepared.response
+
+    times = np.linspace(1000.0, 3000.0, 301)
+    expected = adaptive.sample(times)["X"]
+    actual = fixed.sample(times)["X"]
+    scale = np.max(np.abs(expected))
+    assert np.max(np.abs(actual - expected)) / scale < 2e-4
 
 
 def test_zoom_frequency_samples_has_correct_scale_and_epoch():
