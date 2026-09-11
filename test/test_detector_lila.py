@@ -227,6 +227,17 @@ class TestLILARegistration(unittest.TestCase):
 class TestLILAProjection(unittest.TestCase):
 
     def setUp(self):
+        # `lunarsky` is an optional dependency of pycbc.coordinates.moon and
+        # is what supplies the Moon-fixed frame, so the projection tests
+        # cannot run without it. The geometry, response-tensor and
+        # registration tests above are pure numpy and always run. This
+        # mirrors how test_detector_space.py guards its LGWA cases.
+        try:
+            import lunarsky  # noqa: F401
+        except ImportError:
+            self.skipTest('lunarsky not installed; skipping LILA projection '
+                          'tests (the geometry and response-tensor tests do '
+                          'not need it and still run)')
         from pycbc.waveform import get_td_waveform
         self.det = SpaceDetector('LILA', backend='LILAResponse',
                                  longitude_site=LON_C, latitude_site=LAT_C,
