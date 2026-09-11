@@ -528,6 +528,20 @@ def test_pyefpehm_source_reconstructs_its_native_time_domain():
     assert np.max(np.abs(got_plus - want_plus)) / scale < 2e-14
     assert np.max(np.abs(got_cross - want_cross)) / scale < 2e-14
 
+    # The default-angle shortcut uses pyEFPEHM's already projected complex
+    # amplitudes. Force the general raw-inertial-mode projection at the same
+    # angles and verify that this is an exact call-path optimization.
+    harmonic = source.harmonics[0]
+    fast = source.harmonic_components(harmonic, times)
+    source.theta = np.arccos(source.model.cos_theta_JN)
+    source.phi = source.model.phi_JN
+    general = source.harmonic_components(harmonic, times)
+    source.theta = source.phi = None
+    for fast_values, general_values in zip(fast, general, strict=True):
+        scale = np.max(np.abs(general_values))
+        assert np.max(np.abs(fast_values - general_values)) \
+            / max(scale, np.finfo(float).tiny) < 2e-14
+
     frequencies = np.linspace(0.021, 0.099, 1000)
     got_plus, got_cross = source.frequency_polarizations(frequencies)
     want_plus, want_cross = source.model.generate_waveform(frequencies)

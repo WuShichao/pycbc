@@ -121,10 +121,30 @@ def test_relative_binning_requests_only_required_response_samples():
             indices = np.rint(frequencies["A"] / delta_f["A"]).astype(int)
             return {"A": candidate[indices]}
 
+        def prepare_frequency_sampler(
+                self, frequencies, delta_f, epoch, channels, **options):
+            assert channels == ("A",)
+            assert delta_f == summary.delta_fs
+            assert epoch == summary.epochs
+            assert options == {"spectral_padding": 1e-4}
+            indices = np.rint(frequencies["A"] / delta_f["A"]).astype(int)
+
+            class Sampler:
+                def evaluate(self, response):
+                    assert response is sparse_response
+                    return {"A": candidate[indices]}
+
+            return Sampler()
+
     expected = summary.evaluate({"A": _series(candidate, delta_f)})
+    sparse_response = SparseResponse()
     actual = summary.evaluate_response(
-        SparseResponse(), spectral_padding=1e-4)
+        sparse_response, spectral_padding=1e-4)
     assert np.allclose(actual, expected, rtol=0, atol=0)
+    sampler = summary.prepare_response(
+        sparse_response, spectral_padding=1e-4)
+    prepared = summary.evaluate_prepared(sampler, sparse_response)
+    assert np.allclose(prepared, expected, rtol=0, atol=0)
 
 
 def test_adaptive_bins_resolve_curved_ratio_around_unsafe_gap():

@@ -1285,6 +1285,11 @@ class PyEFPEHMSource:
     do not all cover the same times; a query outside a window returns zero
     amplitude.
 
+    At the model's own viewing angles, pyEFPEHM's projected complex
+    amplitudes are algebraically identical to projecting its raw inertial
+    multipoles, so the adapter uses that cheaper path. Supplying ``theta`` or
+    ``phi`` retains the general raw-multipole projection.
+
     Parameters
     ----------
     parameters : dict
