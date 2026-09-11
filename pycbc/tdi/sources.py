@@ -20,6 +20,370 @@ class WaveformSource(Protocol):
         ...
 
 
+def _positive_frequency_envelope(mode, phase):
+    """Factor a native ``C exp(-i phase)`` mode onto ``exp(+i phase)``.
+
+    pyEFPEHM's native time-domain modes carry the negative-frequency
+    exponential explicitly. A real strain can equivalently be written from
+    the conjugate mode, so its slowly varying positive-frequency envelope is
+    ``conj(mode) exp(-i phase)``. Omitting the conjugation reconstructs the
+    same real strain only by leaving ``exp(-2 i phase)`` in the object called
+    an envelope, defeating sparse response sampling.
+    """
+    return np.conj(mode) * np.exp(-1j * phase)
+
+
+class TimeShiftedHarmonicSource:
+    """Expose a harmonic source on a translated time coordinate.
+
+    This is a transparent clock adapter: a query at time ``t`` is evaluated
+    on the wrapped source at ``t + offset``.  The wrapped object is not
+    modified.  By default its translated validity interval is exposed; an
+    observation can select a smaller interval with ``t_start`` and ``t_end``.
+
+    Parameters
+    ----------
+    source : object
+        A harmonic source providing ``harmonics``, ``amplitude``,
+        ``carrier_phase`` and ``angular_frequency``.  ``support_blocks`` or
+        ``support`` are used when available.
+    offset : float
+        Source-clock time corresponding to zero on the exposed clock, in
+        seconds.  In other words, ``source_time = exposed_time + offset``.
+    t_start, t_end : float, optional
+        Exposed observation interval.  Each defaults to the corresponding
+        wrapped-source bound translated by ``offset``.
+    """
+
+    def __init__(self, source, offset, t_start=None, t_end=None):
+        self.source = source
+        self.offset = float(offset)
+        self.harmonics = source.harmonics
+
+        source_start = getattr(source, "t_start", None)
+        source_end = getattr(source, "t_end", None)
+        if t_start is None:
+            if source_start is None:
+                raise ValueError(
+                    "t_start is required when source has no t_start")
+            t_start = float(source_start) - self.offset
+        if t_end is None:
+            if source_end is None:
+                raise ValueError("t_end is required when source has no t_end")
+            t_end = float(source_end) - self.offset
+        self.t_start = float(t_start)
+        self.t_end = float(t_end)
+        if not self.t_end > self.t_start:
+            raise ValueError("t_end must be greater than t_start")
+
+    def _source_time(self, time):
+        return np.asarray(time, dtype=float) + self.offset
+
+    def amplitude(self, harmonic, time):
+        """Return harmonic amplitudes at translated source times."""
+        return self.source.amplitude(harmonic, self._source_time(time))
+
+    def carrier_phase(self, harmonic, time):
+        """Return the carrier phase at translated source times."""
+        return self.source.carrier_phase(harmonic, self._source_time(time))
+
+    def angular_frequency(self, harmonic, time):
+        """Return the angular frequency at translated source times."""
+        return self.source.angular_frequency(harmonic,
+                                             self._source_time(time))
+
+    def polarizations(self, time):
+        """Return dense polarizations when the wrapped source provides them."""
+        return self.source.polarizations(self._source_time(time))
+
+    def frequency_harmonics(self, frequencies):
+        """Translate native stationary times and Fourier phases.
+
+        For ``h_exposed(t) = h_source(t + offset)``, the Fourier-domain
+        waveform acquires ``exp(+2 pi i f offset)``.  Records whose
+        stationary times lie outside the exposed observation are omitted.
+        """
+        native = getattr(self.source, "frequency_harmonics", None)
+        if native is None:
+            raise TypeError("wrapped source has no frequency_harmonics method")
+        records = {}
+        for harmonic, item in native(frequencies).items():
+            time = np.asarray(item['time']) - self.offset
+            keep = (time >= self.t_start) & (time <= self.t_end)
+            frequency = np.asarray(item['frequency'])[keep]
+            shift = np.exp(1j * np.remainder(
+                2 * np.pi * frequency * self.offset, 2 * np.pi))
+            records[harmonic] = {
+                'indices': np.asarray(item['indices'])[keep],
+                'frequency': frequency,
+                'time': time[keep],
+                'plus': np.asarray(item['plus'])[keep] * shift,
+                'cross': np.asarray(item['cross'])[keep] * shift,
+            }
+        return records
+
+    def frequency_polarizations(self, frequencies):
+        """Sum translated native harmonics on an arbitrary frequency grid."""
+        frequencies = np.asarray(frequencies, dtype=float)
+        plus = np.zeros(len(frequencies), dtype=complex)
+        cross = np.zeros(len(frequencies), dtype=complex)
+        for item in self.frequency_harmonics(frequencies).values():
+            np.add.at(plus, item['indices'], item['plus'])
+            np.add.at(cross, item['indices'], item['cross'])
+        return plus, cross
+
+    def support_blocks(self, harmonic):
+        """Translate and clip every live block to the observation interval."""
+        blocks = getattr(self.source, "support_blocks", None)
+        if blocks is not None:
+            native = blocks(harmonic)
+        else:
+            support = getattr(self.source, "support", None)
+            if support is None:
+                native = ((self.t_start + self.offset,
+                           self.t_end + self.offset),)
+            else:
+                native = (support(harmonic),)
+
+        translated = []
+        for low, high in native:
+            low = max(self.t_start, float(low) - self.offset)
+            high = min(self.t_end, float(high) - self.offset)
+            if high > low:
+                translated.append((low, high))
+        return tuple(translated)
+
+    def support(self, harmonic):
+        """Return the outer hull of the translated live blocks."""
+        blocks = self.support_blocks(harmonic)
+        if not blocks:
+            return self.t_start, self.t_start
+        return blocks[0][0], blocks[-1][1]
+
+
+class FrequencyWindowedHarmonicSource:
+    """One harmonic multiplied by a partition-of-unity frequency window.
+
+    The window is applied to the source amplitude at every queried source
+    time, including the retarded times used inside a link response. This is
+    different from multiplying an already-formed TDI channel by a window and
+    preserves linearity through moving link and TDI delay operators.
+
+    Adjacent bands centred on the same boundary use complementary
+    ``sin²``/``cos²`` tapers and therefore sum to the original harmonic.
+
+    Parameters
+    ----------
+    source : harmonic source
+        Object providing ``amplitude``, ``carrier_phase`` and
+        ``angular_frequency``.
+    harmonic : hashable
+        The single harmonic retained by this view.
+    f_lower, f_upper : float
+        Nominal frequency-band boundaries in Hz.
+    lower_overlap, upper_overlap : float, optional
+        Full widths of the complementary tapers around each boundary.
+    include_below, include_above : bool, optional
+        Leave the first or last partition open beyond the nominal observation
+        band. TDI delays may query source times just outside that band.
+    """
+
+    def __init__(self, source, harmonic, f_lower, f_upper,
+                 lower_overlap=0.0, upper_overlap=0.0,
+                 include_below=False, include_above=False):
+        self.source = source
+        self.harmonic = harmonic
+        self.harmonics = (harmonic,)
+        self.f_lower = float(f_lower)
+        self.f_upper = float(f_upper)
+        self.lower_overlap = float(lower_overlap)
+        self.upper_overlap = float(upper_overlap)
+        self.include_below = bool(include_below)
+        self.include_above = bool(include_above)
+        if not 0 <= self.f_lower < self.f_upper:
+            raise ValueError("frequency bounds must be increasing and positive")
+        if self.lower_overlap < 0 or self.upper_overlap < 0:
+            raise ValueError("frequency overlaps must be non-negative")
+        width = self.f_upper - self.f_lower
+        if 0.5 * (self.lower_overlap + self.upper_overlap) > width:
+            raise ValueError("frequency tapers overlap across the whole band")
+        self.t_start = float(source.t_start)
+        self.t_end = float(source.t_end)
+        self._support_cache = {}
+
+    def _check_harmonic(self, harmonic):
+        if harmonic != self.harmonic:
+            raise ValueError(f"window contains only harmonic {self.harmonic!r}")
+
+    def frequency_weight(self, frequency):
+        """Return the real partition weight at arbitrary frequencies."""
+        frequency = np.asarray(frequency, dtype=float)
+        weight = np.ones_like(frequency)
+        if self.include_below:
+            pass
+        elif self.lower_overlap:
+            start = self.f_lower - 0.5 * self.lower_overlap
+            phase = np.clip((frequency - start) / self.lower_overlap, 0, 1)
+            weight *= np.sin(0.5 * np.pi * phase) ** 2
+        else:
+            weight *= frequency >= self.f_lower
+        if self.include_above:
+            pass
+        elif self.upper_overlap:
+            start = self.f_upper - 0.5 * self.upper_overlap
+            phase = np.clip((frequency - start) / self.upper_overlap, 0, 1)
+            weight *= np.cos(0.5 * np.pi * phase) ** 2
+        else:
+            # Hard partitions are lower-inclusive and upper-exclusive so an
+            # exact boundary sample belongs to only one adjacent band.
+            weight *= frequency < self.f_upper
+        return weight
+
+    def amplitude(self, harmonic, time):
+        """Return the wrapped amplitude with the frequency window applied."""
+        self._check_harmonic(harmonic)
+        amp_plus, amp_cross = self.source.amplitude(harmonic, time)
+        frequency = self.angular_frequency(harmonic, time) / (2 * np.pi)
+        weight = self.frequency_weight(frequency)
+        return amp_plus * weight, amp_cross * weight
+
+    def carrier_phase(self, harmonic, time):
+        """Delegate the unmodified carrier phase to the wrapped source."""
+        self._check_harmonic(harmonic)
+        return self.source.carrier_phase(harmonic, time)
+
+    def angular_frequency(self, harmonic, time):
+        """Delegate the unmodified angular frequency to the wrapped source."""
+        self._check_harmonic(harmonic)
+        return self.source.angular_frequency(harmonic, time)
+
+    def polarizations(self, time):
+        """Return the real strain carried by this windowed harmonic."""
+        amp_plus, amp_cross = self.amplitude(self.harmonic, time)
+        carrier = np.exp(1j * self.carrier_phase(self.harmonic, time))
+        return np.real(amp_plus * carrier), np.real(amp_cross * carrier)
+
+    def _native_support_blocks(self):
+        blocks = getattr(self.source, "support_blocks", None)
+        if blocks is not None:
+            return tuple(blocks(self.harmonic))
+        support = getattr(self.source, "support", None)
+        if support is not None:
+            return (tuple(support(self.harmonic)),)
+        return ((self.t_start, self.t_end),)
+
+    def support_blocks(self, harmonic, n_probe=8192):
+        """Locate every time interval on which this band has nonzero weight."""
+        self._check_harmonic(harmonic)
+        n_probe = int(n_probe)
+        if n_probe < 16:
+            raise ValueError("n_probe must be at least 16")
+        if n_probe in self._support_cache:
+            return self._support_cache[n_probe]
+
+        from scipy.optimize import brentq
+
+        lower = (-np.inf if self.include_below else
+                 self.f_lower - 0.5 * self.lower_overlap
+                 if self.lower_overlap else self.f_lower)
+        upper = (np.inf if self.include_above else
+                 self.f_upper + 0.5 * self.upper_overlap
+                 if self.upper_overlap else self.f_upper)
+
+        def distance(time):
+            frequency = float(
+                self.angular_frequency(harmonic, time) / (2 * np.pi))
+            return min(frequency - lower, upper - frequency)
+
+        output = []
+        for block_low, block_high in self._native_support_blocks():
+            block_low = max(self.t_start, float(block_low))
+            block_high = min(self.t_end, float(block_high))
+            if block_high <= block_low:
+                continue
+            probe = np.linspace(block_low, block_high, n_probe)
+            frequency = self.angular_frequency(harmonic, probe) / (2 * np.pi)
+            live = (frequency >= lower) & (frequency <= upper)
+            for start, stop in _boolean_runs(live):
+                low = float(probe[start])
+                high = float(probe[stop - 1])
+                if start:
+                    try:
+                        low = brentq(distance, probe[start - 1], probe[start])
+                    except ValueError:
+                        pass
+                if stop < len(probe):
+                    try:
+                        high = brentq(distance, probe[stop - 1], probe[stop])
+                    except ValueError:
+                        pass
+                if high > low:
+                    output.append((low, high))
+        self._support_cache[n_probe] = tuple(output)
+        return self._support_cache[n_probe]
+
+    def support(self, harmonic):
+        """Return the outer hull of the band support."""
+        blocks = self.support_blocks(harmonic)
+        if not blocks:
+            return self.t_start, self.t_start
+        return blocks[0][0], blocks[-1][1]
+
+
+def _boolean_runs(mask):
+    padded = np.pad(np.asarray(mask, dtype=np.int8), 1)
+    changes = np.diff(padded)
+    return tuple(zip(np.flatnonzero(changes == 1),
+                     np.flatnonzero(changes == -1), strict=True))
+
+
+def frequency_partition_sources(source, band_edges, overlap=0.0,
+                                harmonics=None):
+    """Construct complementary pre-response frequency windows per harmonic.
+
+    Returns a mapping from harmonic label to a tuple ordered like adjacent
+    pairs in ``band_edges``. ``overlap`` may be one scalar or one width for
+    every internal boundary.
+    """
+    edges = np.asarray(band_edges, dtype=float)
+    if (edges.ndim != 1 or len(edges) < 2
+            or np.any(~np.isfinite(edges)) or np.any(np.diff(edges) <= 0)):
+        raise ValueError("band_edges must contain increasing finite values")
+    count = len(edges) - 2
+    if np.ndim(overlap) == 0:
+        overlaps = np.full(count, float(overlap))
+    else:
+        overlaps = np.asarray(overlap, dtype=float)
+        if overlaps.shape != (count,):
+            raise ValueError("overlap needs one value per internal boundary")
+    if np.any(overlaps < 0):
+        raise ValueError("overlap widths must be non-negative")
+    widths = np.diff(edges)
+    for index, value in enumerate(overlaps):
+        if value > min(widths[index], widths[index + 1]):
+            raise ValueError("overlap cannot exceed either neighbouring band")
+
+    selected = source.harmonics if harmonics is None else tuple(harmonics)
+    unknown = set(selected) - set(source.harmonics)
+    if unknown:
+        raise ValueError(f"source does not contain harmonics: {sorted(unknown)}")
+    output = {}
+    for harmonic in selected:
+        bands = []
+        for index, (lower, upper) in enumerate(
+                zip(edges[:-1], edges[1:], strict=True)):
+            lower_overlap = overlaps[index - 1] if index else 0.0
+            upper_overlap = overlaps[index] if index < len(overlaps) else 0.0
+            bands.append(FrequencyWindowedHarmonicSource(
+                source, harmonic, lower, upper,
+                lower_overlap=lower_overlap,
+                upper_overlap=upper_overlap,
+                include_below=index == 0,
+                include_above=index == len(widths) - 1))
+        output[harmonic] = tuple(bands)
+    return output
+
+
 class ArrayWaveformSource:
     """Linearly interpolate sampled polarizations onto arbitrary times.
 
@@ -904,7 +1268,7 @@ class PyEFPEHMSource:
     pyEFPEHM's docstrings are explicit that the two must not be mixed. So the
     amplitude handed to the evaluator is
 
-        A = (hlm . Proj) exp(-i phase),      h = Re[A exp(i phase)]
+        A = conj(hlm . Proj) exp(-i phase),  h = Re[A exp(i phase)]
 
     Validity windows. pyEFPEHM returns ``time_idxs`` per mode, and harmonics
     do not all cover the same times; a query outside a window returns zero
@@ -979,12 +1343,13 @@ class PyEFPEHMSource:
                     self._projector(mode_l, mode_m),
                     axes=(1, 0))                        # (N_mode, 2), complex
                 mode_phase = np.asarray(mode['phase'])
-                carrier = np.exp(-1j * mode_phase)
                 # place back into the sorted-inside slots this mode covers
                 slot = np.nonzero(inside)[0][np.asarray(mode['time_idxs'])]
                 target = order[slot]
-                amp_p[target] = contribution[:, 0] * carrier
-                amp_c[target] = contribution[:, 1] * carrier
+                amp_p[target] = _positive_frequency_envelope(
+                    contribution[:, 0], mode_phase)
+                amp_c[target] = _positive_frequency_envelope(
+                    contribution[:, 1], mode_phase)
                 phase[target] = mode_phase
                 omega[target] = np.asarray(mode['omega'])
 
@@ -1026,7 +1391,7 @@ class PyEFPEHMSource:
                 stops = np.concatenate((stops, [len(live) - 1]))
             self._cache[key] = tuple(
                 (float(probe[a]), float(probe[b]))
-                for a, b in zip(starts, stops))
+                for a, b in zip(starts, stops, strict=True))
         return self._cache[key]
 
     def support(self, harmonic):
@@ -1068,6 +1433,45 @@ class PyEFPEHMSource:
         _, m, n = (int(v) for v in harmonic)
         rate, drate = self._orbital_phases(t, 1)
         return n * rate + (m - n) * drate
+
+    def frequency_harmonics(self, frequencies):
+        """Return projected native FD harmonics and their stationary times.
+
+        pyEFPEHM supplies the SPA/SUA frequency-domain modes directly.  This
+        method preserves their per-harmonic decomposition so a slowly varying
+        detector response can be evaluated at each harmonic's own ``t_SPA``.
+        """
+        frequencies = np.asarray(frequencies, dtype=float)
+        if (frequencies.ndim != 1 or len(frequencies) < 2
+                or np.any(np.diff(frequencies) <= 0)):
+            raise ValueError("frequencies must be one-dimensional and increasing")
+        result = self.model.generate_hlm_modes(
+            frequencies, return_waveform_pieces=True)
+        records = {}
+        for harmonic, mode in result['modes'].items():
+            degree, order, _ = harmonic
+            projected = np.tensordot(
+                np.asarray(mode['hlm']),
+                np.conj(self._projector(degree, order)), axes=(1, 0))
+            indices = np.asarray(mode['freq_idxs'], dtype=int)
+            records[harmonic] = {
+                'indices': indices,
+                'frequency': frequencies[indices],
+                'time': np.asarray(mode['t_SPA'], dtype=float),
+                'plus': projected[:, 0],
+                'cross': projected[:, 1],
+            }
+        return records
+
+    def frequency_polarizations(self, frequencies):
+        """Sum native SPA/SUA harmonics on an arbitrary frequency grid."""
+        frequencies = np.asarray(frequencies, dtype=float)
+        plus = np.zeros(len(frequencies), dtype=complex)
+        cross = np.zeros(len(frequencies), dtype=complex)
+        for item in self.frequency_harmonics(frequencies).values():
+            np.add.at(plus, item['indices'], item['plus'])
+            np.add.at(cross, item['indices'], item['cross'])
+        return plus, cross
 
     def polarizations(self, t):
         """Dense-path interface: sum every harmonic's real part."""
