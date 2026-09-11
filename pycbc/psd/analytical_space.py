@@ -2061,8 +2061,8 @@ def analytical_psd_lisa_tdi_AE_confusion(
     # and T is a null channel for such a background: R_T/R_X falls off as
     # (2*pi*f*L/c)^6. That leaves S_XY = -0.5*S_X and S_A = 1.5*S_X, with
     # S_T = S_X + 2*S_XY unchanged. A sky integral over the full 6x6 link
-    # response gives R_A/R_X = 1.4967 at 0.1 mHz, 1.4951 at 9 mHz and 1.4427
-    # at 33 mHz, so the 1.5 holds to 2% across the band and degrades above
+    # response gives R_A/R_X = 1.4967 at 0.1 mHz, 1.4946 at 10 mHz and 1.4584
+    # at 30 mHz, so the 1.5 holds to 2.8% across the band and degrades above
     # ~35 mHz where T stops being null.
     fseries = psd_AE + 1.5 * psd_X_confusion
     if extragalactic_dwd:
