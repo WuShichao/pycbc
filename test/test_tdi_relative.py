@@ -95,6 +95,38 @@ def test_sparse_and_full_relative_binning_interfaces_agree():
     assert np.allclose(full, sparse, rtol=0, atol=0)
 
 
+def test_relative_binning_requests_only_required_response_samples():
+    size, delta_f = 513, 2e-3
+    frequency = np.arange(size) * delta_f
+    reference = (2 + frequency) * np.exp(2j * frequency)
+    data = (0.4 - 0.3j) * reference
+    candidate = (0.9 + 0.1j) * reference
+    psd = np.ones(size)
+    summary = TDIRelativeBinning(
+        {"A": _series(data, delta_f)},
+        {"A": _series(reference, delta_f)},
+        {"A": _series(psd, delta_f)},
+        bin_indices=np.arange(5, 401, 23),
+        low_frequency_cutoff=0.01,
+        high_frequency_cutoff=0.8,
+    )
+
+    class SparseResponse:
+        def frequency_samples(self, frequencies, delta_f, epoch, channels,
+                              **options):
+            assert channels == ("A",)
+            assert delta_f == summary.delta_fs
+            assert epoch == summary.epochs
+            assert options == {"spectral_padding": 1e-4}
+            indices = np.rint(frequencies["A"] / delta_f["A"]).astype(int)
+            return {"A": candidate[indices]}
+
+    expected = summary.evaluate({"A": _series(candidate, delta_f)})
+    actual = summary.evaluate_response(
+        SparseResponse(), spectral_padding=1e-4)
+    assert np.allclose(actual, expected, rtol=0, atol=0)
+
+
 def test_adaptive_bins_resolve_curved_ratio_around_unsafe_gap():
     size, delta_f = 2049, 5e-4
     frequency = np.arange(size) * delta_f

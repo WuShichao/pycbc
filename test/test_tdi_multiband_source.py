@@ -7,9 +7,13 @@ from pycbc.tdi.backends.pytdi_backend import (
     PyTDICombinationAdapter,
     get_pytdi_combination,
 )
-from pycbc.tdi.multiband import multiband_sparse_tdi_response
+from pycbc.tdi.multiband import (
+    _zoom_frequency_samples,
+    multiband_sparse_tdi_response,
+)
 from pycbc.tdi.onthefly import adaptive_sparse_tdi_response
 from pycbc.tdi.sources import frequency_partition_sources
+from pycbc.types import TimeSeries
 
 
 class _LinearFrequencySource:
@@ -138,3 +142,98 @@ def test_multiband_tdi_sum_reconstructs_full_time_domain_response():
     assert all(tuple(block.series) == ("X",) for block in blocks)
     assert all(block.series["X"].delta_t == block.band.delta_t
                for block in blocks)
+
+    transformed = multiband.linear_transform([[2.0]], ("twice_X",))
+    assert transformed.channels == ("twice_X",)
+    assert np.allclose(
+        transformed.sample(times)["twice_X"], 2 * actual,
+        rtol=2e-15, atol=2e-15 * scale)
+
+
+def test_multiband_frequency_samples_match_dense_time_domain_transform():
+    source = _CompactChirpSource()
+    orbit = LisaEqualArmOrbit(t0=0.0)
+    terms = PyTDICombinationAdapter(
+        "X2", get_pytdi_combination("X2"), delta_t=25.0).terms()
+    channel_terms = {"X": terms}
+    common = dict(
+        t_start=800.0,
+        t_end=3200.0,
+        initial_step=200.0,
+        relative_tolerance=1e-5,
+        velocity_order=1,
+    )
+    multiband = multiband_sparse_tdi_response(
+        source, orbit, channel_terms, 1.1, -0.4,
+        band_edges=[1e-3, 5e-3, 1e-2],
+        overlap=1e-3,
+        samples_per_cycle=4,
+        **common,
+    )
+
+    # A fine-grid transform is the continuous-time oracle. This deliberately
+    # short chirp has appreciable endpoint quadrature error at four samples per
+    # cycle; that error scales away for mission-length observations.
+    delta_t = 1.0
+    dense = multiband.sample(
+        np.arange(common["t_start"], common["t_end"], delta_t))["X"]
+    expected = np.fft.rfft(dense) * delta_t
+    delta_f = 1.0 / (len(dense) * delta_t)
+    indices = np.arange(3, min(24, len(expected)))
+    frequencies = indices * delta_f
+    actual, diagnostics = multiband.frequency_samples(
+        {"X": frequencies}, delta_f={"X": delta_f},
+        epoch={"X": common["t_start"]},
+        # Include both short-band spectra throughout this deliberately short
+        # transform. Production overlaps make the required padding smaller.
+        spectral_padding=1e-2,
+        heterodyne=False,
+        return_diagnostics=True,
+    )
+
+    scale = np.max(np.abs(expected[indices]))
+    assert np.max(np.abs(actual["X"] - expected[indices])) / scale < 2e-2
+    assert diagnostics
+    assert sum(item["time_samples"] for item in diagnostics) < len(dense)
+
+    zeroed = multiband.frequency_samples(
+        {"X": frequencies}, delta_f={"X": delta_f},
+        epoch={"X": common["t_start"]}, spectral_padding=1e-2,
+        time_window=lambda time: np.zeros_like(time),
+    )
+    assert np.all(zeroed["X"] == 0)
+
+
+def test_zoom_frequency_samples_has_correct_scale_and_epoch():
+    delta_t = 0.125
+    epoch = 731.25
+    times = epoch + np.arange(257) * delta_t
+    values = (np.cos(2 * np.pi * 0.37 * times)
+              + 0.2 * np.sin(2 * np.pi * 0.81 * times))
+    series = TimeSeries(values, delta_t=delta_t, epoch=epoch, copy=False)
+    delta_f = 1 / 128.0
+    indices = np.arange(11, 71, 6)
+    frequencies = indices * delta_f
+
+    actual, diagnostics = _zoom_frequency_samples(
+        series, frequencies, indices, delta_f, epoch - 19.0, 64)
+    weights = np.ones(len(values))
+    weights[[0, -1]] = 0.5
+    relative_times = times - (epoch - 19.0)
+    expected = delta_t * (
+        np.exp(-2j * np.pi * frequencies[:, None] * relative_times)
+        @ (weights * values))
+
+    assert np.allclose(actual, expected, rtol=2e-12, atol=2e-12)
+    assert diagnostics["zoom_points"] > 0
+
+    direct_indices = indices[[1, -2]]
+    direct_frequencies = direct_indices * delta_f
+    direct, diagnostics = _zoom_frequency_samples(
+        series, direct_frequencies, direct_indices, delta_f,
+        epoch - 19.0, 64)
+    expected = delta_t * (
+        np.exp(-2j * np.pi * direct_frequencies[:, None] * relative_times)
+        @ (weights * values))
+    assert np.allclose(direct, expected, rtol=2e-12, atol=2e-12)
+    assert diagnostics["direct_points"] == 2

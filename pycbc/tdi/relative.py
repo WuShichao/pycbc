@@ -180,6 +180,7 @@ class _ChannelSummary:
                  low_frequency_cutoff, high_frequency_cutoff,
                  reference_floor, valid_mask):
         self.delta_f = float(reference.delta_f)
+        self.epoch = float(reference.start_time)
         if not np.isclose(self.delta_f, float(data.delta_f)) or not np.isclose(
                 self.delta_f, float(psd.delta_f)):
             raise ValueError("data, reference and psd must share delta_f")
@@ -351,6 +352,18 @@ class TDIRelativeBinning:
         }
 
     @property
+    def delta_fs(self):
+        """Frequency spacing used by each channel summary."""
+        return {name: summary.delta_f
+                for name, summary in self._summaries.items()}
+
+    @property
+    def epochs(self):
+        """FFT phase origin used by each channel summary."""
+        return {name: summary.epoch
+                for name, summary in self._summaries.items()}
+
+    @property
     def diagnostics(self):
         return {
             name: {
@@ -383,6 +396,18 @@ class TDIRelativeBinning:
             filt += part_filt
             norm += part_norm
         return filt, norm
+
+    def evaluate_response(self, response, **transform_options):
+        """Evaluate a sparse multiband response without a full FD series.
+
+        ``response`` is intentionally a protocol rather than a concrete type:
+        it must provide ``frequency_samples`` with the interface implemented
+        by :class:`pycbc.tdi.multiband.MultibandSparseTDIResponse`.
+        """
+        samples = response.frequency_samples(
+            self.required_frequencies, delta_f=self.delta_fs,
+            epoch=self.epochs, channels=self.channels, **transform_options)
+        return self.evaluate_sparse(samples)
 
     def loglr(self, waveforms, sparse=False):
         """Return the unmarginalized Gaussian log-likelihood ratio."""
