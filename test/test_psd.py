@@ -137,14 +137,14 @@ class TestSpacePSD(unittest.TestCase):
     def test_extragalactic_dwd_amplitude(self):
         """Each paper's fit must reproduce its own Omega_gw at 1 mHz."""
         from pycbc.cosmology import get_cosmology
-        from pycbc.psd.analytical_space import extragalactic_dwd_fit_lisa
+        from pycbc.psd.analytical_space import extragalactic_dwd_fit
 
         h0 = get_cosmology(None).H0.si.value
         # hofman2024 quotes ~4e-12 at 1 mHz; the boileau_md_default fit
         # evaluates to 2.08e-12 there.
         for model, expect in (('hofman2024', 4.0e-12),
                               ('boileau_md_default', 2.08e-12)):
-            sh = extragalactic_dwd_fit_lisa(self.length, self.delta_f,
+            sh = extragalactic_dwd_fit(self.length, self.delta_f,
                                             self.low_freq_cutoff, model)
             freq = sh.sample_frequencies.numpy()
             idx = int(numpy.argmin(numpy.abs(freq - 1e-3)))
@@ -179,6 +179,42 @@ class TestSpacePSD(unittest.TestCase):
                 at_break = space.omega_gw_extragalactic_dwd(par[1], name)
                 self.assertTrue(abs(at_break/par[0] - 1) < 1e-12, msg=name)
 
+    def test_extragalactic_dwd_shared_across_detectors(self):
+        """The strain fit is a property of the universe, so each detector's
+        PSD must be it times that detector's own response. Taiji and TianQin
+        are used because their response needs no download."""
+        from pycbc.psd import analytical_space as space
+
+        sh = space.extragalactic_dwd_fit(self.length, self.delta_f,
+                                         self.low_freq_cutoff)
+        freq = sh.sample_frequencies.numpy()
+        keep = (freq > 1e-3) & (freq < 1e-2)
+        for psd_func, response, arm in (
+                (space.analytical_psd_taiji_extragalactic_dwd,
+                 space.averaged_response_taiji_tdi, 3e9),
+                (space.analytical_psd_tianqin_extragalactic_dwd,
+                 space.averaged_response_tianqin_tdi, numpy.sqrt(3)*1e8)):
+            psd = psd_func(self.length, self.delta_f, self.low_freq_cutoff,
+                           tdi='1.5').numpy()
+            expect = 2*sh.numpy()*response(freq, arm, '1.5')
+            self.assertTrue(
+                numpy.allclose(psd[keep], expect[keep], rtol=1e-6),
+                msg=psd_func.__name__)
+
+    def test_extragalactic_dwd_off_by_default(self):
+        """Switching the flag off must reproduce the old behaviour exactly."""
+        from pycbc.psd import analytical_space as space
+
+        for func in (space.analytical_psd_taiji_tdi_AE_confusion,
+                     space.analytical_psd_tianqin_tdi_AE_confusion):
+            default = func(self.length, self.delta_f, self.low_freq_cutoff,
+                           duration=1.0, tdi='1.5').numpy()
+            explicit = func(self.length, self.delta_f, self.low_freq_cutoff,
+                            duration=1.0, tdi='1.5',
+                            extragalactic_dwd=False).numpy()
+            self.assertTrue(numpy.array_equal(default, explicit),
+                            msg=func.__name__)
+
     def test_extragalactic_dwd_unknown_model(self):
         from pycbc.psd.analytical_space import omega_gw_extragalactic_dwd
 
@@ -187,12 +223,12 @@ class TestSpacePSD(unittest.TestCase):
 
     def test_extragalactic_dwd_amplitude_scaling(self):
         """The strain PSD must be linear in the Omega amplitude."""
-        from pycbc.psd.analytical_space import extragalactic_dwd_fit_lisa
+        from pycbc.psd.analytical_space import extragalactic_dwd_fit
 
-        one = extragalactic_dwd_fit_lisa(self.length, self.delta_f,
+        one = extragalactic_dwd_fit(self.length, self.delta_f,
                                          self.low_freq_cutoff,
                                          amplitude=1.72e-11).numpy()
-        two = extragalactic_dwd_fit_lisa(self.length, self.delta_f,
+        two = extragalactic_dwd_fit(self.length, self.delta_f,
                                          self.low_freq_cutoff,
                                          amplitude=3.44e-11).numpy()
         self.assertTrue(numpy.any(one > 0))
