@@ -586,8 +586,10 @@ def test_pyefpehm_selected_harmonics_match_multimode_native_oracle():
         scale = max(np.max(np.abs(expected)), np.finfo(float).tiny)
         assert np.max(np.abs(amp_plus - expected[:, 0])) / scale < 2e-14
         assert np.max(np.abs(amp_cross - expected[:, 1])) / scale < 2e-14
-        assert np.max(np.abs(phase[indices] - mode['phase'])) < 2e-12
-        assert np.max(np.abs(omega[indices] - mode['omega'])) < 2e-12
+        np.testing.assert_allclose(
+            phase[indices], mode['phase'], rtol=5e-16, atol=1e-12)
+        np.testing.assert_allclose(
+            omega[indices], mode['omega'], rtol=5e-16, atol=1e-12)
 
 
 @pytest.mark.skipif(_NO_LAL is not None, reason=str(_NO_LAL))

@@ -1357,16 +1357,10 @@ class PyEFPEHMSource:
         """
         from pyEFPEHM.utils.utils import sorted_vals_in_intervals
 
-        degree, order, eccentric = (int(value) for value in harmonic)
-        mirrored = order < 0
-        internal_order = -order if mirrored else order
-        internal_eccentric = -eccentric if mirrored else eccentric
-        rows = np.asarray(self.model.mode_array)
-        matches = np.nonzero(
-            (rows[:, 0] == degree) & (rows[:, 1] == internal_order))[0]
-        if len(matches) != 1:
+        descriptor = self._native_harmonic_descriptor(harmonic)
+        if descriptor is None:
             return np.empty(0, dtype=int), np.empty((0, 2), dtype=complex)
-        multipole = int(matches[0])
+        multipole, internal_eccentric, mirrored, _, _, _ = descriptor
 
         times = np.asarray(times, dtype=float)
         time_indices, interval_indices = sorted_vals_in_intervals(
@@ -1388,12 +1382,86 @@ class PyEFPEHMSource:
             active_times, multipole, np.empty(0, dtype=int))
         if mirrored:
             amplitude = np.conj(amplitude)
-            if degree % 2:
+            if int(self.model.mode_array[multipole, 0]) % 2:
                 amplitude = -amplitude
         amplitude *= self.model.compute_Nlm_p(
             active_times, interval_indices)[:, None]
         amplitude *= 2 * self.model.h0_pref
         return time_indices, amplitude
+
+    def _native_harmonic_descriptor(self, harmonic):
+        """Cache pyEFPEHM's internal indices for one public mode label."""
+        key = ('native-harmonic', tuple(harmonic))
+        if key in self._cache:
+            return self._cache[key]
+        degree, order, eccentric = (int(value) for value in harmonic)
+        mirrored = order < 0
+        internal_order = -order if mirrored else order
+        internal_eccentric = -eccentric if mirrored else eccentric
+        rows = np.asarray(self.model.mode_array)
+        matches = np.nonzero(
+            (rows[:, 0] == degree) & (rows[:, 1] == internal_order))[0]
+        if len(matches) != 1:
+            self._cache[key] = None
+            return None
+        multipole = int(matches[0])
+        active = (
+            (self.model.necessary_multipole_idxs == multipole)
+            & (self.model.necessary_ps == internal_eccentric))
+        intervals = self.model.mode_interp_idx[active]
+        expected = np.arange(len(self.model.sol.ts))
+        full_support = np.array_equal(intervals, expected)
+        nlm_spline = None
+        if full_support and self.model.params['Interpolate_Amplitudes']:
+            spline_indices = np.unique(
+                self.model.interp_idx_to_Nlm_p_idx[active])
+            if len(spline_indices) == 1:
+                nlm_spline = int(spline_indices[0])
+        active_indices = np.nonzero(active)[0]
+        value = (multipole, internal_eccentric, mirrored,
+                 full_support, nlm_spline, active_indices)
+        self._cache[key] = value
+        return value
+
+    def _native_full_support_amplitude(self, descriptor, times):
+        """Fast path for a mode carried by one spline over every interval."""
+        if descriptor is None:
+            return None
+        multipole, _, mirrored, _, nlm_spline, _ = descriptor
+        if nlm_spline is None:
+            return None
+        degree = int(self.model.mode_array[multipole, 0])
+        amplitude = self.model.Apc_prec_cspline[multipole](times)
+        if mirrored:
+            amplitude = np.conj(amplitude)
+            if degree % 2:
+                amplitude = -amplitude
+        amplitude *= self.model.Nlm_p_csplines[nlm_spline](times)[:, None]
+        amplitude *= 2 * self.model.h0_pref
+        return amplitude
+
+    def _native_full_support_phase(self, descriptor, times):
+        """Evaluate phase and frequency with one shared interval lookup."""
+        if descriptor is None or not descriptor[3]:
+            return None
+        active_indices = descriptor[5]
+        query = np.clip(np.asarray(times, dtype=float),
+                        self.t_start, self.t_end)
+        segments = np.searchsorted(
+            self.model.sol.ts, query, side='right') - 1
+        segments = np.clip(segments, 0, len(self.model.sol.ts) - 1)
+        entries = active_indices[segments]
+        x = ((query - self.model.sol.ts[segments])
+             / self.model.sol.hs[segments])
+        values = []
+        for derivative in (0, 1):
+            coefficients = self.model.mode_phases_Qs[derivative][entries]
+            value = x * coefficients[:, -1]
+            for index in reversed(range(coefficients.shape[1] - 1)):
+                value = x * (coefficients[:, index] + value)
+            value += self.model.mode_phases_y0[derivative][entries]
+            values.append(value)
+        return tuple(values)
 
     def _evaluate(self, harmonic, t):
         """(A_plus, A_cross, phase, omega) at arbitrary, possibly 2-D ``t``.
@@ -1414,16 +1482,23 @@ class PyEFPEHMSource:
         omega = np.full(flat.size, np.nan)
 
         if np.any(inside):
-            times = flat[order][inside]
             native_projection = self.theta is None and self.phi is None
             if native_projection:
-                time_indices, contribution = \
-                    self._native_harmonic_amplitude(harmonic, times)
-                slot = np.nonzero(inside)[0][time_indices]
-                target = order[slot]
+                descriptor = self._native_harmonic_descriptor(harmonic)
+                target = np.nonzero(
+                    (flat >= self.t_start) & (flat <= self.t_end))[0]
+                contribution = self._native_full_support_amplitude(
+                    descriptor, flat[target])
+                if contribution is None:
+                    times = flat[order][inside]
+                    time_indices, contribution = \
+                        self._native_harmonic_amplitude(harmonic, times)
+                    slot = np.nonzero(inside)[0][time_indices]
+                    target = order[slot]
                 amp_p[target] = np.conj(contribution[:, 0])
                 amp_c[target] = np.conj(contribution[:, 1])
             else:
+                times = flat[order][inside]
                 result = self.model.generate_tdomain_hlm_modes(
                     times=times, return_waveform_pieces=True)
                 mode = result['modes'].get(harmonic)
@@ -1446,8 +1521,14 @@ class PyEFPEHMSource:
                     omega[target] = np.asarray(mode['omega'])
 
         if self.theta is None and self.phi is None:
-            phase = np.asarray(self.carrier_phase(harmonic, flat))
-            omega = np.asarray(self.angular_frequency(harmonic, flat))
+            descriptor = self._native_harmonic_descriptor(harmonic)
+            phase_frequency = self._native_full_support_phase(
+                descriptor, flat)
+            if phase_frequency is None:
+                phase = np.asarray(self.carrier_phase(harmonic, flat))
+                omega = np.asarray(self.angular_frequency(harmonic, flat))
+            else:
+                phase, omega = phase_frequency
 
         # a harmonic's phase must stay continuous where it is not defined,
         # otherwise exp(i * (phase - phase0)) jumps at the window edge
