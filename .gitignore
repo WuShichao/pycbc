@@ -14,6 +14,7 @@ pycbc/fft/fftw_pruned_cython.cpp
 pycbc/filter/matchedfilter_cpu.cpp
 pycbc/filter/simd_correlate_cython.cpp
 pycbc/inference/models/relbin_cpu.cpp
+pycbc/tdi/sparse_cpu.cpp
 pycbc/types/array_cpu.cpp
 pycbc/vetoes/chisq_cpu.cpp
 pycbc/waveform/decompress_cpu_cython.cpp

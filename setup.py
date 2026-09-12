@@ -197,7 +197,8 @@ extras_require['test'] = get_reqs_from_file('requirements.txt') + get_reqs_from_
 # do the actual work of building the package
 VERSION = get_version_info()
 
-cythonext = ['pycbc.waveform.spa_tmplt_cpu',
+cythonext = ['pycbc.tdi.sparse_cpu',
+             'pycbc.waveform.spa_tmplt_cpu',
              'pycbc.waveform.utils_cpu',
              'pycbc.types.array_cpu',
              'pycbc.filter.matchedfilter_cpu',

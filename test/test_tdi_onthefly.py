@@ -1064,3 +1064,41 @@ def test_the_delay_expansion_matches_evaluating_every_delayed_time():
 
     with pytest.raises(ValueError, match="delay_expansion"):
         project(4)
+
+
+def test_the_compiled_kernel_agrees_with_numpy_and_with_itself():
+    """The fused pass must not depend on how many threads run it."""
+    from pycbc.tdi import onthefly as module
+    if module._sparse_cpu is None:                     # pragma: no cover
+        pytest.skip("pycbc.tdi.sparse_cpu is not built")
+    orbit = LisaEqualArmOrbit()
+    source = NewtonianChirp(3.0e4, 1e6)
+    grid = np.linspace(1.0e5, 4.0e5, 1500)
+    channel_terms = {name: _terms(f"{name}2") for name in "XYZ"}
+
+    for order in (2, 3):
+        for shared in (False, True):
+            for velocity in (0, 1):
+                geometry = module.MultiChannelTermGeometry(
+                    orbit, grid, channel_terms, velocity_order=velocity,
+                    delay_expansion=order, reference_delay=shared)
+                fused = module._fused_channels(source, 2, geometry, 0.9, -0.25)
+                numpy_path = module._reduce_sparse_contributions(
+                    module._sparse_term_contributions(
+                        source, 2, geometry, 0.9, -0.25), geometry)
+                worst = max(
+                    np.max(np.abs(fused[name] - numpy_path[name]))
+                    / np.max(np.abs(numpy_path[name])) for name in "XYZ")
+                assert worst < 1e-8, (order, shared, velocity, worst)
+
+    # Blocks are independent and each carries its own accumulator, so the
+    # thread count must not reach the answer at all. It did, twice: a C array
+    # at function scope is shared, and so is anything whose address is taken.
+    geometry = module.MultiChannelTermGeometry(
+        orbit, grid, channel_terms, delay_expansion=3, reference_delay=True,
+        threads=8)
+    threaded = module._fused_channels(source, 2, geometry, 0.9, -0.25)
+    geometry.threads = 1
+    serial = module._fused_channels(source, 2, geometry, 0.9, -0.25)
+    for name in "XYZ":
+        assert np.array_equal(threaded[name], serial[name])
