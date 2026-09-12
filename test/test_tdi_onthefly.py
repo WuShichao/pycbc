@@ -931,3 +931,104 @@ def test_lal_modes_source_carries_a_precessing_waveform():
     assert abs(against_kept) < 1e-9                  # the representation
     assert abs(against_all - dropped) < 0.2 * abs(dropped)   # all of the rest
     assert 1e-4 < abs(dropped) < 5e-2                # and it is the m = 0 part
+
+
+class _CutOffHarmonic:
+    """A harmonic the model drops while it is still at full amplitude.
+
+    pyEFPEHM does this at ``Amplitude_tol``. The point of the class is the
+    mismatch between ``support_blocks``, which ends at ``t_cut``, and the
+    amplitude, which is still 1 just inside it.
+    """
+
+    harmonics = (2,)
+    t_start = 0.0
+    t_end = 4.0e5
+
+    def __init__(self, t_cut, fade=False):
+        self.t_cut = float(t_cut)
+        self.fade = bool(fade)
+
+    def _weight(self, time):
+        if not self.fade:
+            return ((time >= self.t_start) & (time <= self.t_cut)).astype(float)
+        ramp = np.clip((self.t_cut - time) / (0.25 * self.t_cut), 0.0, 1.0)
+        return np.where(time >= self.t_start, ramp ** 2, 0.0)
+
+    def amplitude(self, harmonic, time):
+        weight = self._weight(np.asarray(time, dtype=float))
+        return 2.0e-21 * weight, -0.3e-21 * weight
+
+    def carrier_phase(self, harmonic, time):
+        return 2 * np.pi * 5.0e-3 * np.asarray(time, dtype=float)
+
+    def angular_frequency(self, harmonic, time):
+        return np.full(np.shape(time), 2 * np.pi * 5.0e-3)
+
+    def support_blocks(self, harmonic):
+        return ((self.t_start, self.t_cut),)
+
+
+def test_a_cut_off_harmonic_is_trimmed_instead_of_padded():
+    """Padding past a hard edge puts one step per term inside the window."""
+    from pycbc.tdi.onthefly import harmonic_windows
+
+    t_cut, padding = 2.0e5, 600.0
+    cut = _CutOffHarmonic(t_cut)
+    windows = harmonic_windows(cut, 2, 0.0, cut.t_end, padding=padding)
+    assert len(windows) == 1
+    assert windows[0][1] == t_cut - padding            # trimmed, not padded
+
+    # A harmonic that fades to zero at its own edge keeps the padding: the
+    # channel still carries delayed copies of it there and nothing steps.
+    faded = _CutOffHarmonic(t_cut, fade=True)
+    windows = harmonic_windows(faded, 2, 0.0, faded.t_end, padding=padding)
+    assert np.isclose(windows[0][1], t_cut + padding)
+
+    # An observation ending before the stepped interval needs no trim: the
+    # steps straddle the edge, so what matters is t_end against t_cut - pad.
+    windows = harmonic_windows(cut, 2, 0.0, t_cut - 2 * padding,
+                               padding=padding)
+    assert windows[0][1] == t_cut - 2 * padding
+
+
+def test_a_cut_off_harmonic_builds_and_names_itself_if_it_cannot():
+    """The trim makes the grid buildable; a step must not be silent."""
+    from pycbc.tdi.onthefly import (adaptive_sparse_tdi_response,
+                                    harmonic_windows)
+    orbit = LisaEqualArmOrbit()
+    source = _CutOffHarmonic(2.0e5)
+    channel_terms = {"X": _terms("X2")}
+    response = adaptive_sparse_tdi_response(
+        source, orbit, channel_terms, 0.9, -0.25,
+        t_start=0.0, t_end=source.t_end, initial_step=2.0e4,
+        relative_tolerance=1e-5, support_padding=600.0)
+    assert response.responses[0]['support'][0][1] == source.t_cut - 600.0
+
+    # Force the untrimmed window back in and the refinement must say what it
+    # hit, not "floating-point spacing".
+    real_windows = harmonic_windows
+    try:
+        import pycbc.tdi.onthefly as module
+        module.harmonic_windows = (
+            lambda src, h, lo, hi, padding=0.0, **kw:
+            [(0.0, min(hi, src.t_cut + padding))])
+        with pytest.raises(RuntimeError, match="stopped improving"):
+            adaptive_sparse_tdi_response(
+                source, orbit, channel_terms, 0.9, -0.25,
+                t_start=0.0, t_end=source.t_end, initial_step=2.0e4,
+                relative_tolerance=1e-5, support_padding=600.0)
+    finally:
+        module.harmonic_windows = real_windows
+
+
+def test_a_runaway_tolerance_is_refused_before_it_fills_memory():
+    """Active intervals quadruple per refinement; 24 of those is not a bound."""
+    from pycbc.tdi.onthefly import adaptive_sparse_tdi_response
+    orbit = LisaEqualArmOrbit()
+    source = NewtonianChirp(3.0e4, 1e6)
+    with pytest.raises(RuntimeError, match="max_grid_points"):
+        adaptive_sparse_tdi_response(
+            source, orbit, {"X": _terms("X2")}, 0.9, -0.25,
+            t_start=1e5, t_end=1e5 + 30 * 86400.0, initial_step=86400.0,
+            relative_tolerance=1e-14, max_grid_points=5000)

@@ -100,12 +100,53 @@ def adaptive_time_grid(source, harmonic, t_start, t_end, delta_phi=0.5,
     return np.unique(np.concatenate(pieces))
 
 
-def harmonic_windows(source, harmonic, t_start, t_end, padding=0.0):
+def _edge_fades(source, harmonic, low, high, tolerance):
+    """``(front, back)``: does the harmonic reach zero at each block edge?
+
+    An edge where the amplitude is still a finite fraction of the block's own
+    peak is a cut, not a fade.
+    """
+    span = high - low
+    if not span > 0:
+        return True, True
+    offset = max(1e-9 * span, 4 * np.spacing(max(abs(low), abs(high))))
+    probe = np.concatenate((np.linspace(low, high, 33),
+                            [low + offset, high - offset]))
+    amp_p, amp_c = source.amplitude(harmonic, probe)
+    magnitude = np.hypot(np.abs(amp_p), np.abs(amp_c))
+    peak = float(np.max(magnitude[:33]))
+    if not peak > 0:
+        return True, True
+    return (float(magnitude[33]) <= tolerance * peak,
+            float(magnitude[34]) <= tolerance * peak)
+
+
+def harmonic_windows(source, harmonic, t_start, t_end, padding=0.0,
+                     edge_tolerance=1e-6):
     """The stretches of [t_start, t_end] a harmonic can contribute to.
 
     Uses ``support_blocks`` where the source has it. A live set spanning two
     intervals with a dead gap between them would otherwise be covered by its
-    outer hull. ``padding`` widens each block by `delay_padding`.
+    outer hull.
+
+    ``padding`` widens each block by `delay_padding`. That is what a harmonic
+    fading out at its own edge needs, because the channel still carries
+    delayed copies of it for one more padding.
+
+    An edge the source cuts while the harmonic is still loud is a different
+    object. pyEFPEHM drops a harmonic once it falls under ``Amplitude_tol``,
+    at up to 60% of that harmonic's own peak, and every term of the delay
+    chain then steps as its own query crosses that cut. The bracket acquires
+    as many staggered steps as the channel has terms, which no spline fits and
+    no refinement resolves.
+
+    Those steps straddle the edge. A second-generation chain carries
+    advancements as well as delays, and ``k.r/c`` changes sign over a year, so
+    a term's query runs from ``t - padding`` to ``t + padding`` and the
+    stepped interval is ``[edge - padding, edge + padding]``. Such an edge is
+    therefore trimmed by a padding on the inside: the window begins one
+    padding after a cut-on and ends one before a cut-off. The response over
+    those two paddings is not represented.
     """
     blocks = getattr(source, 'support_blocks', None)
     if blocks is not None:
@@ -114,10 +155,24 @@ def harmonic_windows(source, harmonic, t_start, t_end, padding=0.0):
         support = getattr(source, 'support', None)
         windows = [support(harmonic)] if support is not None else [(t_start,
                                                                     t_end)]
+    padding = float(padding)
     out = []
     for low, high in windows:
-        low = max(t_start, low - padding)
-        high = min(t_end, high + padding)
+        first, last = low - padding, high + padding
+        # A cut edge steps every term somewhere in [edge, edge + padding].
+        # Only if that interval reaches into the observation does the trim
+        # matter, so a block spanning the whole of it costs no source call.
+        front_bites = low + padding > t_start
+        back_bites = high - padding < t_end
+        if padding > 0 and (front_bites or back_bites):
+            fades_front, fades_back = _edge_fades(
+                source, harmonic, low, high, edge_tolerance)
+            if front_bites and not fades_front:
+                first = low + padding
+            if back_bites and not fades_back:
+                last = high - padding
+        low = max(t_start, first)
+        high = min(t_end, last)
         if high > low:
             if out and low <= out[-1][1]:
                 out[-1] = (out[-1][0], max(out[-1][1], high))
@@ -1388,7 +1443,7 @@ def adaptive_sparse_tdi_response(
         source, orbit, channel_terms, lamb, beta, t_start=None, t_end=None,
         initial_step=86400.0, relative_tolerance=1e-4,
         amplitude_floor=1e-3, max_refinements=24, velocity_order=1,
-        links=LINK_ORDER, support_padding=0.0):
+        links=LINK_ORDER, support_padding=0.0, max_grid_points=1000000):
     """Build an error-controlled response-envelope representation.
 
     Refinement tests the *carrier-factored TDI brackets*, not the carrier
@@ -1418,6 +1473,10 @@ def adaptive_sparse_tdi_response(
         Widen source support blocks on the mission-time grid. Restricted
         frequency bands need a bound from :func:`delay_padding`, because a
         delayed source sample can contribute just outside its native support.
+    max_grid_points : int, optional
+        Give up once one harmonic's grid passes this size. Active intervals
+        quadruple per refinement, so a tolerance asked for by mistake fills
+        memory long before ``max_refinements`` stops it.
     """
     from scipy.interpolate import CubicSpline
 
@@ -1436,6 +1495,9 @@ def adaptive_sparse_tdi_response(
         raise ValueError("amplitude_floor must lie in [0, 1]")
     if support_padding < 0:
         raise ValueError("support_padding must be non-negative")
+    max_grid_points = int(max_grid_points)
+    if max_grid_points < 4:
+        raise ValueError("max_grid_points must be at least four")
 
     channel_names = tuple(channel_terms)
     records, diagnostics = [], {}
@@ -1454,11 +1516,15 @@ def adaptive_sparse_tdi_response(
         harmonic_grids, harmonic_values = [], []
         tested = 0
         deepest = 0
+        stalled_count = 0
+        stalled_error = 0.0
         for low, high in windows:
             count = max(4, int(np.ceil((high - low) / initial_step)) + 1)
             grid = np.linspace(low, high, count)
             values = evaluate(harmonic, grid)
             active_left, active_right = grid[:-1], grid[1:]
+            active_error = np.full(len(active_left), np.inf)
+            active_stall = np.zeros(len(active_left), dtype=int)
 
             for depth in range(int(max_refinements) + 1):
                 if not len(active_left):
@@ -1480,12 +1546,42 @@ def adaptive_sparse_tdi_response(
                 peak = np.maximum(np.max(np.abs(values), axis=1),
                                   np.max(np.abs(exact), axis=1))[:, None]
                 local = np.maximum(np.abs(exact), amplitude_floor * peak)
-                failed_probe = np.any(
-                    np.abs(exact - predicted)
-                    > relative_tolerance * local, axis=0)
+                error = np.abs(exact - predicted)
+                failed_probe = np.any(error > relative_tolerance * local,
+                                      axis=0)
                 failed_interval = np.zeros(len(active_left), dtype=bool)
                 failed_interval[owners[failed_probe]] = True
                 tested += len(probes)
+                if not np.any(failed_interval):
+                    active_left = active_right = np.array([])
+                    break
+
+                # An interval whose error stops falling is not under-resolved.
+                # Where the terms of a channel cancel -- a band straddling
+                # c/2L is the case that brought this up -- the carrier phase,
+                # a difference of two values of order 1e7 rad, carries that
+                # cancellation's worth of roundoff into the bracket, and no
+                # splitting reaches below it. Measured on such a band: seven
+                # orders of interval width for no change in an error already
+                # at 1.5e-8 of the channel peak.
+                #
+                # Three consecutive splits have to miss a factor of two before
+                # an interval is given up on. A cubic over a resolved stretch
+                # gains 4**4 per split, so that margin is 1e7 wide; one split
+                # is not, because an early probe can land on a worse point
+                # than its parent did and every harmonic of a ten-harmonic
+                # source was then abandoned on the first bump.
+                scaled = np.max(error / peak, axis=0)
+                interval_error = np.zeros(len(active_left))
+                np.maximum.at(interval_error, owners, scaled)
+                stalling = np.where(interval_error > 0.5 * active_error,
+                                    active_stall + 1, 0)
+                stuck = failed_interval & (stalling >= 3)
+                if np.any(stuck):
+                    stalled_error = max(
+                        stalled_error, float(np.max(interval_error[stuck])))
+                    stalled_count += int(np.count_nonzero(stuck))
+                    failed_interval &= ~stuck
                 if not np.any(failed_interval):
                     active_left = active_right = np.array([])
                     break
@@ -1495,6 +1591,13 @@ def adaptive_sparse_tdi_response(
                         f"tolerance after {max_refinements} refinements")
 
                 selected = failed_interval[owners]
+                if len(grid) + int(np.count_nonzero(selected)) > max_grid_points:
+                    raise RuntimeError(
+                        f"harmonic {harmonic}: the grid would pass "
+                        f"max_grid_points={max_grid_points:,} at refinement "
+                        f"{depth} with {int(np.count_nonzero(failed_interval)):,}"
+                        " intervals still failing; loosen relative_tolerance "
+                        "or split the window")
                 insert_t = probes[selected]
                 insert_v = exact[:, selected]
                 joined_t = np.concatenate((grid, insert_t))
@@ -1502,6 +1605,7 @@ def adaptive_sparse_tdi_response(
                 order = np.argsort(joined_t)
                 grid, values = joined_t[order], joined_v[:, order]
                 next_left, next_right = [], []
+                next_error, next_stall = [], []
                 for owner in np.flatnonzero(failed_interval):
                     interior = probes[owners == owner]
                     edges = np.concatenate((
@@ -1509,8 +1613,13 @@ def adaptive_sparse_tdi_response(
                         [active_right[owner]]))
                     next_left.extend(edges[:-1])
                     next_right.extend(edges[1:])
+                    next_error.extend([interval_error[owner]]
+                                      * (len(edges) - 1))
+                    next_stall.extend([stalling[owner]] * (len(edges) - 1))
                 active_left = np.asarray(next_left)
                 active_right = np.asarray(next_right)
+                active_error = np.asarray(next_error)
+                active_stall = np.asarray(next_stall, dtype=int)
                 deepest = max(deepest, depth + 1)
 
             harmonic_grids.append(grid)
@@ -1518,6 +1627,18 @@ def adaptive_sparse_tdi_response(
 
         if not harmonic_grids:
             continue
+        # A stall well under the tolerance is arithmetic, and the grid is as
+        # good as float64 allows. One at or above it is a feature the grid
+        # never resolved -- a step, most often a source that drops this
+        # harmonic mid-window -- and the caller has to hear about it.
+        if stalled_error > relative_tolerance:
+            raise RuntimeError(
+                f"harmonic {harmonic}: {stalled_count} interval(s) stopped "
+                f"improving with an interpolation error of "
+                f"{stalled_error:.2e} of the channel peak, above the "
+                f"requested {relative_tolerance:.1e}. The bracket is most "
+                "likely stepped rather than under-resolved; check whether "
+                "the source cuts this harmonic off inside the window")
         grid = np.concatenate(harmonic_grids)
         values = np.concatenate(harmonic_values, axis=1)
         records.append({
@@ -1531,5 +1652,7 @@ def adaptive_sparse_tdi_response(
             'tested_points': tested,
             'deepest_refinement': deepest,
             'relative_tolerance': relative_tolerance,
+            'stalled_intervals': stalled_count,
+            'stalled_error': stalled_error,
         }
     return SparseTDIResponse(source, records, diagnostics=diagnostics)
