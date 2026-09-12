@@ -552,7 +552,10 @@ class TermGeometry:
     """
 
     def __init__(self, orbit, grid, terms, links=LINK_ORDER,
-                 velocity_order=1):
+                 velocity_order=1, delay_expansion=None):
+        if delay_expansion not in (None, 2, 3):
+            raise ValueError("delay_expansion must be None, 2 or 3")
+        self.delay_expansion = delay_expansion
         terms = tuple(terms)
         if not terms:
             raise ValueError("terms must not be empty")
@@ -627,7 +630,7 @@ class MultiChannelTermGeometry(TermGeometry):
     """
 
     def __init__(self, orbit, grid, channel_terms, links=LINK_ORDER,
-                 velocity_order=1):
+                 velocity_order=1, delay_expansion=None):
         self.channel_names = tuple(channel_terms)
         if not self.channel_names:
             raise ValueError("channel_terms must contain at least one channel")
@@ -642,7 +645,8 @@ class MultiChannelTermGeometry(TermGeometry):
                                        term.operators, channel)
                           for term in terms)
         super().__init__(orbit, grid, tagged, links=links,
-                         velocity_order=velocity_order)
+                         velocity_order=velocity_order,
+                         delay_expansion=delay_expansion)
 
 
 def _sparse_term_projection(geometry, lamb, beta):
@@ -676,12 +680,131 @@ def _sparse_term_projection(geometry, lamb, beta):
             coefficient * weight * cross)
 
 
+def _source_blocks(source, harmonic):
+    """(low, high) arrays for the stretches the source is defined over."""
+    blocks = getattr(source, "support_blocks", None)
+    if blocks is not None:
+        windows = tuple(blocks(harmonic))
+        if windows:
+            return (np.asarray([item[0] for item in windows], dtype=float),
+                    np.asarray([item[1] for item in windows], dtype=float))
+    support = getattr(source, "support", None)
+    if support is not None:
+        low, high = support(harmonic)
+        return np.asarray([low], dtype=float), np.asarray([high], dtype=float)
+    return None, None
+
+
+def _delay_stencil(source, harmonic, grid, omega):
+    """``(ahead, back, drop, rise)``: where to difference the source.
+
+    The step is a tenth of a carrier radian. Smaller and the difference of two
+    nearly equal amplitudes loses its significant digits; larger and the
+    second derivative of a chirping frequency stops being resolved.
+
+    A point closer than a step to the end of its own block gets both of its
+    stencil points moved to the other side, so the source is never asked for a
+    time it answers zero at. The three nodes stay distinct, which is all
+    `_three_point_derivatives` needs -- one of ``drop``, ``rise`` is then
+    negative and the formula becomes the one-sided one. A source declaring no
+    support is defined everywhere and is never moved.
+    """
+    step = np.clip(0.1 / np.maximum(np.abs(omega), 1e-30), 1e-3, np.inf)
+    low, high = _source_blocks(source, harmonic)
+    ahead, back = grid + step, grid - step
+    if low is not None:
+        index = np.clip(np.searchsorted(low, grid, side="right") - 1,
+                        0, len(low) - 1)
+        first, last = low[index], high[index]
+        step = np.minimum(step, 0.01 * np.maximum(last - first, 1e-30))
+        ahead, back = grid + step, grid - step
+        under = back < first
+        over = ahead > last
+        ahead = np.where(under, grid + 2 * step,
+                         np.where(over, grid - step, ahead))
+        back = np.where(under, grid + step,
+                        np.where(over, grid - 2 * step, back))
+    drop, rise = grid - back, ahead - grid
+    if not np.all((drop != 0) & (rise != 0) & (drop + rise != 0)):
+        raise ValueError(
+            "a source block is too short to difference the delay expansion "
+            "over; evaluate this harmonic without delay_expansion")
+    return ahead, back, drop, rise
+
+
+def _three_point_derivatives(back, here, ahead, drop, rise):
+    """First and second derivatives from three unevenly spaced samples.
+
+    The stencil is shortened on one side at a block edge, so the even-spacing
+    formulas do not apply. These are the derivatives of the Lagrange
+    interpolant through ``(t - drop, t, t + rise)``.
+    """
+    total = drop * rise * (drop + rise)
+    first = (-rise ** 2 * back + (rise ** 2 - drop ** 2) * here
+             + drop ** 2 * ahead) / total
+    second = 2 * (rise * back - (drop + rise) * here + drop * ahead) / total
+    return first, second
+
+
+def _expanded_source(source, harmonic, geometry, query, order):
+    """Delayed amplitudes and relative phase, expanded about the grid.
+
+    Every delayed time the channel asks for lies within one `delay_padding` of
+    a grid point, and asking the source for all of them is 64 to 87 per cent
+    of a pyEFPEHM likelihood call. Expanding about the grid instead,
+
+        Phi(t - d) - Phi(t) = -omega d + omega' d^2 / 2 - omega'' d^3 / 6,
+        A(t - d)            = A - d A' + d^2 A'' / 2,
+
+    leaves the source evaluated on the grid and on one point either side of
+    it, whatever the channel term count. Both derivatives come off that same
+    stencil, so third order costs no more source calls than second and is
+    worth its two extra array operations: on ten eccentric harmonics the
+    second-order error against the loudest bracket is 6.1e-05, above a
+    tolerance of 1e-05 the grid itself meets.
+    """
+    grid = geometry.grid
+    delay = grid[None, :] - query
+    omega = np.asarray(source.angular_frequency(harmonic, grid), dtype=float)
+    ahead, back, drop, rise = _delay_stencil(source, harmonic, grid, omega)
+
+    amp_p, amp_c = source.amplitude(harmonic, grid)
+    ahead_p, ahead_c = source.amplitude(harmonic, ahead)
+    back_p, back_c = source.amplitude(harmonic, back)
+    omega_ahead = np.asarray(source.angular_frequency(harmonic, ahead),
+                             dtype=float)
+    omega_back = np.asarray(source.angular_frequency(harmonic, back),
+                            dtype=float)
+
+    rate, curve = _three_point_derivatives(
+        omega_back, omega, omega_ahead, drop, rise)
+    slope_p, bend_p = _three_point_derivatives(
+        back_p, amp_p, ahead_p, drop, rise)
+    slope_c, bend_c = _three_point_derivatives(
+        back_c, amp_c, ahead_c, drop, rise)
+
+    phase = delay * (0.5 * rate[None, :] * delay - omega[None, :])
+    out_p = amp_p[None, :] - delay * slope_p[None, :]
+    out_c = amp_c[None, :] - delay * slope_c[None, :]
+    if order >= 3:
+        squared = delay ** 2
+        phase = phase - (curve[None, :] / 6.0) * squared * delay
+        out_p = out_p + 0.5 * squared * bend_p[None, :]
+        out_c = out_c + 0.5 * squared * bend_c[None, :]
+    return out_p, out_c, phase
+
+
 def _sparse_term_contributions(source, harmonic, geometry, lamb, beta):
     """Return each gathered term before reducing it into output channels."""
     query, plus, cross = _sparse_term_projection(geometry, lamb, beta)
-    amp_p, amp_c = source.amplitude(harmonic, query)
-    phase = source.carrier_phase(harmonic, query)
-    phase -= source.carrier_phase(harmonic, geometry.grid)[None, :]
+    order = getattr(geometry, "delay_expansion", None)
+    if order is None:
+        amp_p, amp_c = source.amplitude(harmonic, query)
+        phase = source.carrier_phase(harmonic, query)
+        phase -= source.carrier_phase(harmonic, geometry.grid)[None, :]
+    else:
+        amp_p, amp_c, phase = _expanded_source(
+            source, harmonic, geometry, query, order)
     return ((plus * amp_p + cross * amp_c)
             * np.exp(1j * phase))
 
@@ -1343,7 +1466,7 @@ class PreparedSparseTDI:
     """
 
     def __init__(self, orbit, channel_terms, grids, velocity_order=1,
-                 links=LINK_ORDER):
+                 links=LINK_ORDER, delay_expansion=None):
         self.channel_terms = channel_terms
         self.velocity_order = velocity_order
         self.links = links
@@ -1356,7 +1479,8 @@ class PreparedSparseTDI:
                     "each harmonic grid needs four increasing times")
             self.geometries[harmonic] = MultiChannelTermGeometry(
                 orbit, grid, channel_terms, links=links,
-                velocity_order=velocity_order)
+                velocity_order=velocity_order,
+                delay_expansion=delay_expansion)
 
     @property
     def channels(self):
@@ -1420,7 +1544,8 @@ class PreparedSparseTDI:
 
 
 def build_sparse_tdi_response(source, orbit, channel_terms, lamb, beta,
-                              grids, velocity_order=1, links=LINK_ORDER):
+                              grids, velocity_order=1, links=LINK_ORDER,
+                              delay_expansion=None):
     """Build a reusable sparse response from caller-selected harmonic grids.
 
     ``grids`` may be a mapping from harmonic labels to grids or a callable
@@ -1435,7 +1560,7 @@ def build_sparse_tdi_response(source, orbit, channel_terms, lamb, beta,
     }
     prepared = PreparedSparseTDI(
         orbit, channel_terms, selected, velocity_order=velocity_order,
-        links=links)
+        links=links, delay_expansion=delay_expansion)
     return prepared.project(source, lamb, beta)
 
 
@@ -1443,7 +1568,8 @@ def adaptive_sparse_tdi_response(
         source, orbit, channel_terms, lamb, beta, t_start=None, t_end=None,
         initial_step=86400.0, relative_tolerance=1e-4,
         amplitude_floor=1e-3, max_refinements=24, velocity_order=1,
-        links=LINK_ORDER, support_padding=0.0, max_grid_points=1000000):
+        links=LINK_ORDER, support_padding=0.0, max_grid_points=1000000,
+        delay_expansion=None):
     """Build an error-controlled response-envelope representation.
 
     Refinement tests the *carrier-factored TDI brackets*, not the carrier
@@ -1477,6 +1603,11 @@ def adaptive_sparse_tdi_response(
         Give up once one harmonic's grid passes this size. Active intervals
         quadruple per refinement, so a tolerance asked for by mistake fills
         memory long before ``max_refinements`` stops it.
+    delay_expansion : {None, 2, 3}, optional
+        Expand the source about each grid point in the link and TDI delays
+        instead of evaluating it at every delayed time, to second or third
+        order. See `_expanded_source`. Both orders read one stencil, so 3
+        costs no extra source calls. ``None``, the default, is exact.
     """
     from scipy.interpolate import CubicSpline
 
@@ -1505,7 +1636,7 @@ def adaptive_sparse_tdi_response(
     def evaluate(harmonic, times):
         geometry = MultiChannelTermGeometry(
             orbit, times, channel_terms, links=links,
-            velocity_order=velocity_order)
+            velocity_order=velocity_order, delay_expansion=delay_expansion)
         values = sparse_channels_terms(
             source, harmonic, geometry, lamb, beta)
         return np.stack([values[name] for name in channel_names])

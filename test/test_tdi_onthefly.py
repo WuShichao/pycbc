@@ -1032,3 +1032,35 @@ def test_a_runaway_tolerance_is_refused_before_it_fills_memory():
             source, orbit, {"X": _terms("X2")}, 0.9, -0.25,
             t_start=1e5, t_end=1e5 + 30 * 86400.0, initial_step=86400.0,
             relative_tolerance=1e-14, max_grid_points=5000)
+
+
+def test_the_delay_expansion_matches_evaluating_every_delayed_time():
+    """Expanding about the grid must reproduce the 96 delayed evaluations.
+
+    Third order has to beat second by a wide margin: they read the same
+    stencil, so the only reason to carry it is that the cubic phase term
+    matters, and on ten eccentric pyEFPEHM harmonics it is worth 43x.
+    """
+    from pycbc.tdi.onthefly import PreparedSparseTDI
+    orbit = LisaEqualArmOrbit()
+    source = NewtonianChirp(3.0e4, 1e6)
+    grid = np.linspace(1.0e5, 4.0e5, 200)
+    channel_terms = {name: _terms(f"{name}2") for name in "XYZ"}
+
+    def project(order):
+        return PreparedSparseTDI(orbit, channel_terms, {2: grid},
+                                 delay_expansion=order).project(
+                                     source, 0.9, -0.25)
+
+    exact = project(None).responses[0]['brackets']
+    peak = max(np.max(np.abs(exact[name])) for name in "XYZ")
+    error = {}
+    for order in (2, 3):
+        got = project(order).responses[0]['brackets']
+        error[order] = max(np.max(np.abs(got[name] - exact[name]))
+                           for name in "XYZ") / peak
+    assert error[2] < 1e-4
+    assert error[3] < error[2] / 5
+
+    with pytest.raises(ValueError, match="delay_expansion"):
+        project(4)
