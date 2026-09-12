@@ -520,6 +520,8 @@ def test_pyefpehm_source_reconstructs_its_native_time_domain():
         inclination=1.0, phase=0.0, f22_start=0.02098508,
         f22_ref=0.02098508, f22_end=0.1, Amplitude_tol=1e-4,
     ))
+    assert not source.model.params['Compute_hlm_Modes']
+    assert source.model.params['Interp_points_per_prec_cycle'] == 0
     times = np.linspace(source.t_start + 1000.0,
                         source.t_end - 1000.0, 1000)
     got_plus, got_cross = source.polarizations(times)
@@ -533,10 +535,12 @@ def test_pyefpehm_source_reconstructs_its_native_time_domain():
     # angles and verify that this is an exact call-path optimization.
     harmonic = source.harmonics[0]
     fast = source.harmonic_components(harmonic, times)
-    source.theta = np.arccos(source.model.cos_theta_JN)
-    source.phi = source.model.phi_JN
-    general = source.harmonic_components(harmonic, times)
-    source.theta = source.phi = None
+    general_source = PyEFPEHMSource(
+        source.model.params,
+        theta=np.arccos(source.model.cos_theta_JN),
+        phi=source.model.phi_JN)
+    assert general_source.model.params['Compute_hlm_Modes']
+    general = general_source.harmonic_components(harmonic, times)
     for fast_values, general_values in zip(fast, general, strict=True):
         scale = np.max(np.abs(general_values))
         assert np.max(np.abs(fast_values - general_values)) \
@@ -548,6 +552,42 @@ def test_pyefpehm_source_reconstructs_its_native_time_domain():
     scale = max(np.max(np.abs(want_plus)), np.max(np.abs(want_cross)))
     assert np.max(np.abs(got_plus - want_plus)) / scale < 2e-14
     assert np.max(np.abs(got_cross - want_cross)) / scale < 2e-14
+
+
+def test_pyefpehm_selected_harmonics_match_multimode_native_oracle():
+    """The selected-mode shortcut also handles eccentric negative-m labels."""
+    pytest.importorskip("pyEFPEHM")
+    from pycbc.tdi.sources import PyEFPEHMSource
+
+    source = PyEFPEHMSource(dict(
+        mass1=1.824, mass2=0.739, distance=100.0, eccentricity=0.7,
+        spin1x=-0.44, spin1y=-0.26, spin1z=0.48,
+        spin2x=-0.31, spin2y=0.01, spin2z=-0.84,
+        inclination=1.57, phase=0.4, f22_start=10.0, f22_end=20.0,
+        Amplitude_tol=1e-4,
+    ))
+    times = np.linspace(source.t_start + 1e-6,
+                        source.t_end - 1e-6, 128)
+    native = source.model.generate_tdomain_modes(
+        times=times, return_waveform_pieces=True)
+    assert len(native['modes']) > 1
+    assert any(harmonic[1] < 0 for harmonic in native['modes'])
+
+    for harmonic, mode in native['modes'].items():
+        amp_plus, amp_cross, phase, omega = \
+            source.harmonic_components(harmonic, times)
+        expected = np.zeros((len(times), 2), dtype=complex)
+        contribution = (
+            2 * source.model.h0_pref
+            * np.asarray(mode['Apc_prec'])
+            * np.asarray(mode['Nlm_p'])[:, None])
+        indices = np.asarray(mode['time_idxs'])
+        expected[indices] = np.conj(contribution)
+        scale = max(np.max(np.abs(expected)), np.finfo(float).tiny)
+        assert np.max(np.abs(amp_plus - expected[:, 0])) / scale < 2e-14
+        assert np.max(np.abs(amp_cross - expected[:, 1])) / scale < 2e-14
+        assert np.max(np.abs(phase[indices] - mode['phase'])) < 2e-12
+        assert np.max(np.abs(omega[indices] - mode['omega'])) < 2e-12
 
 
 @pytest.mark.skipif(_NO_LAL is not None, reason=str(_NO_LAL))

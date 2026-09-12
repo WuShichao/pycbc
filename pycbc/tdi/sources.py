@@ -1293,7 +1293,13 @@ class PyEFPEHMSource:
     Parameters
     ----------
     parameters : dict
-        Passed to ``pyEFPE``; ``Compute_hlm_Modes=True`` is forced.
+        Passed to ``pyEFPE``.  Raw inertial-mode interpolants are enabled only
+        when a custom viewing angle needs them; a caller may still request
+        them explicitly for the native-viewing-angle path.  If all transverse
+        spin components vanish and ``Interp_points_per_prec_cycle`` is not
+        supplied, its minimum value is used: the precession projector is then
+        constant, so the denser default produces identical values at needless
+        construction cost.
     theta, phi : float, optional
         Viewing angles for the projector. Default: the model's own.
     """
@@ -1301,14 +1307,24 @@ class PyEFPEHMSource:
     def __init__(self, parameters, theta=None, phi=None):
         from pyEFPEHM.waveform.EFPE import pyEFPE
         parameters = dict(parameters)
-        parameters['Compute_hlm_Modes'] = True
+        transverse_spins = (
+            'spin1x', 'spin1y', 'spin2x', 'spin2y')
+        if ('Interp_points_per_prec_cycle' not in parameters
+                and all(float(parameters.get(name, 0.0)) == 0.0
+                        for name in transverse_spins)):
+            parameters['Interp_points_per_prec_cycle'] = 0
+        native_projection = theta is None and phi is None
+        if not native_projection:
+            parameters['Compute_hlm_Modes'] = True
         self.model = pyEFPE(parameters)
         self.theta, self.phi = theta, phi
         self.t_start = float(self.model.sol.all_ts[0])
         self.t_end = float(self.model.sol.all_ts[-1])
         probe = np.linspace(self.t_start + 1.0, self.t_end - 1.0, 64)
-        self.harmonics = tuple(
-            self.model.generate_tdomain_hlm_modes(times=probe)['modes'])
+        generator = (self.model.generate_tdomain_modes
+                     if native_projection
+                     else self.model.generate_tdomain_hlm_modes)
+        self.harmonics = tuple(generator(times=probe)['modes'])
         self._cache = {}
 
     def _projector(self, degree, order):
@@ -1328,6 +1344,56 @@ class PyEFPEHMSource:
             self._cache[key] = np.transpose(
                 [0.5 * (ylm + mirrored), -0.5j * (ylm - mirrored)])
         return self._cache[key]
+
+    def _native_harmonic_amplitude(self, harmonic, times):
+        """Evaluate one native projected harmonic without generating all modes.
+
+        pyEFPEHM's public time-domain mode method loops over every live
+        multipole and also constructs a second phase derivative.  The sparse
+        TDI evaluator requests one labelled harmonic and needs only its
+        complex amplitude.  Use the same interval tables and amplitude
+        routines as ``generate_tdomain_modes`` while selecting that label
+        before doing the expensive work.
+        """
+        from pyEFPEHM.utils.utils import sorted_vals_in_intervals
+
+        degree, order, eccentric = (int(value) for value in harmonic)
+        mirrored = order < 0
+        internal_order = -order if mirrored else order
+        internal_eccentric = -eccentric if mirrored else eccentric
+        rows = np.asarray(self.model.mode_array)
+        matches = np.nonzero(
+            (rows[:, 0] == degree) & (rows[:, 1] == internal_order))[0]
+        if len(matches) != 1:
+            return np.empty(0, dtype=int), np.empty((0, 2), dtype=complex)
+        multipole = int(matches[0])
+
+        times = np.asarray(times, dtype=float)
+        time_indices, interval_indices = sorted_vals_in_intervals(
+            times,
+            self.model.sol.all_ts[self.model.mode_interp_idx],
+            self.model.sol.all_ts[self.model.mode_interp_idx + 1])
+        active = (
+            (self.model.necessary_multipole_idxs[interval_indices]
+             == multipole)
+            & (self.model.necessary_ps[interval_indices]
+               == internal_eccentric))
+        time_indices = time_indices[active]
+        interval_indices = interval_indices[active]
+        if not len(time_indices):
+            return time_indices, np.empty((0, 2), dtype=complex)
+
+        active_times = times[time_indices]
+        amplitude = self.model.raw_Apc_prec_im(
+            active_times, multipole, np.empty(0, dtype=int))
+        if mirrored:
+            amplitude = np.conj(amplitude)
+            if degree % 2:
+                amplitude = -amplitude
+        amplitude *= self.model.compute_Nlm_p(
+            active_times, interval_indices)[:, None]
+        amplitude *= 2 * self.model.h0_pref
+        return time_indices, amplitude
 
     def _evaluate(self, harmonic, t):
         """(A_plus, A_cross, phase, omega) at arbitrary, possibly 2-D ``t``.
@@ -1350,37 +1416,38 @@ class PyEFPEHMSource:
         if np.any(inside):
             times = flat[order][inside]
             native_projection = self.theta is None and self.phi is None
-            generator = (self.model.generate_tdomain_modes
-                         if native_projection
-                         else self.model.generate_tdomain_hlm_modes)
-            result = generator(times=times, return_waveform_pieces=True)
-            mode = result['modes'].get(harmonic)
-            if mode is not None:
-                if native_projection:
-                    contribution = (
-                        2 * self.model.h0_pref
-                        * np.asarray(mode['Apc_prec'])
-                        * np.asarray(mode['Nlm_p'])[:, None])
-                else:
+            if native_projection:
+                time_indices, contribution = \
+                    self._native_harmonic_amplitude(harmonic, times)
+                slot = np.nonzero(inside)[0][time_indices]
+                target = order[slot]
+                amp_p[target] = np.conj(contribution[:, 0])
+                amp_c[target] = np.conj(contribution[:, 1])
+            else:
+                result = self.model.generate_tdomain_hlm_modes(
+                    times=times, return_waveform_pieces=True)
+                mode = result['modes'].get(harmonic)
+                if mode is not None:
                     mode_l, mode_m, _ = harmonic
                     contribution = np.tensordot(
                         np.asarray(mode['hlm']),
                         self._projector(mode_l, mode_m),
                         axes=(1, 0))                    # (N_mode, 2), complex
-                mode_phase = np.asarray(mode['phase'])
-                # place back into the sorted-inside slots this mode covers
-                slot = np.nonzero(inside)[0][np.asarray(mode['time_idxs'])]
-                target = order[slot]
-                if native_projection:
-                    amp_p[target] = np.conj(contribution[:, 0])
-                    amp_c[target] = np.conj(contribution[:, 1])
-                else:
+                    mode_phase = np.asarray(mode['phase'])
+                    # place back into the sorted-inside slots this mode covers
+                    slot = np.nonzero(inside)[0][
+                        np.asarray(mode['time_idxs'])]
+                    target = order[slot]
                     amp_p[target] = _positive_frequency_envelope(
                         contribution[:, 0], mode_phase)
                     amp_c[target] = _positive_frequency_envelope(
                         contribution[:, 1], mode_phase)
-                phase[target] = mode_phase
-                omega[target] = np.asarray(mode['omega'])
+                    phase[target] = mode_phase
+                    omega[target] = np.asarray(mode['omega'])
+
+        if self.theta is None and self.phi is None:
+            phase = np.asarray(self.carrier_phase(harmonic, flat))
+            omega = np.asarray(self.angular_frequency(harmonic, flat))
 
         # a harmonic's phase must stay continuous where it is not defined,
         # otherwise exp(i * (phase - phase0)) jumps at the window edge
@@ -1478,14 +1545,20 @@ class PyEFPEHMSource:
         if (frequencies.ndim != 1 or len(frequencies) < 2
                 or np.any(np.diff(frequencies) <= 0)):
             raise ValueError("frequencies must be one-dimensional and increasing")
-        result = self.model.generate_hlm_modes(
-            frequencies, return_waveform_pieces=True)
+        native_projection = self.theta is None and self.phi is None
+        generator = (self.model.generate_modes
+                     if native_projection
+                     else self.model.generate_hlm_modes)
+        result = generator(frequencies, return_waveform_pieces=True)
         records = {}
         for harmonic, mode in result['modes'].items():
-            degree, order, _ = harmonic
-            projected = np.tensordot(
-                np.asarray(mode['hlm']),
-                np.conj(self._projector(degree, order)), axes=(1, 0))
+            if native_projection:
+                projected = np.asarray(mode['polarizations']).T
+            else:
+                degree, order, _ = harmonic
+                projected = np.tensordot(
+                    np.asarray(mode['hlm']),
+                    np.conj(self._projector(degree, order)), axes=(1, 0))
             indices = np.asarray(mode['freq_idxs'], dtype=int)
             records[harmonic] = {
                 'indices': indices,
