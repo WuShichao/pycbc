@@ -566,12 +566,13 @@ def test_pyefpehm_selected_harmonics_match_multimode_native_oracle():
         inclination=1.57, phase=0.4, f22_start=10.0, f22_end=20.0,
         Amplitude_tol=1e-4,
     ))
-    times = np.linspace(source.t_start + 1e-6,
-                        source.t_end - 1e-6, 128)
+    times = 0.5 * (
+        source.model.sol.all_ts[:-1] + source.model.sol.all_ts[1:])
     native = source.model.generate_tdomain_modes(
         times=times, return_waveform_pieces=True)
     assert len(native['modes']) > 1
     assert any(harmonic[1] < 0 for harmonic in native['modes'])
+    assert set(source.harmonics) == set(native['modes'])
 
     for harmonic, mode in native['modes'].items():
         amp_plus, amp_cross, phase, omega = \
@@ -590,6 +591,12 @@ def test_pyefpehm_selected_harmonics_match_multimode_native_oracle():
             phase[indices], mode['phase'], rtol=5e-16, atol=1e-12)
         np.testing.assert_allclose(
             omega[indices], mode['omega'], rtol=5e-16, atol=1e-12)
+
+        blocks = source.support_blocks(harmonic)
+        assert blocks
+        assert all(low < high for low, high in blocks)
+        assert all(first[1] <= second[0]
+                   for first, second in zip(blocks, blocks[1:]))
 
 
 @pytest.mark.skipif(_NO_LAL is not None, reason=str(_NO_LAL))

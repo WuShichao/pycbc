@@ -1320,12 +1320,17 @@ class PyEFPEHMSource:
         self.theta, self.phi = theta, phi
         self.t_start = float(self.model.sol.all_ts[0])
         self.t_end = float(self.model.sol.all_ts[-1])
-        probe = np.linspace(self.t_start + 1.0, self.t_end - 1.0, 64)
-        generator = (self.model.generate_tdomain_modes
-                     if native_projection
-                     else self.model.generate_tdomain_hlm_modes)
-        self.harmonics = tuple(generator(times=probe)['modes'])
         self._cache = {}
+        labels = set()
+        for multipole, eccentric in zip(
+                self.model.necessary_multipole_idxs,
+                self.model.necessary_ps, strict=True):
+            degree, order = self.model.mode_array[multipole]
+            if eccentric < 0:
+                labels.add((int(degree), -int(order), -int(eccentric)))
+            else:
+                labels.add((int(degree), int(order), int(eccentric)))
+        self.harmonics = tuple(sorted(labels))
 
     def _projector(self, degree, order):
         from pyEFPEHM.waveform.EFPE import compute_m2_Ylm
@@ -1554,21 +1559,24 @@ class PyEFPEHMSource:
         Liveness comes from the amplitude, not the phase, which is defined
         everywhere and passes through zero at interior points.
         """
+        # ``n_probe`` remains in the signature for source-interface
+        # compatibility. pyEFPEHM already records exact live ODE intervals,
+        # so sampling the amplitude can only lose short-lived modes.
         key = ('blocks', harmonic)
         if key not in self._cache:
-            probe = np.linspace(self.t_start, self.t_end, int(n_probe))
-            amp_p, amp_c = self.amplitude(harmonic, probe)
-            live = (amp_p != 0) | (amp_c != 0)
-            edge = np.diff(live.astype(np.int8))
-            starts = np.nonzero(edge == 1)[0] + 1
-            stops = np.nonzero(edge == -1)[0]
-            if live[0]:
-                starts = np.concatenate(([0], starts))
-            if live[-1]:
-                stops = np.concatenate((stops, [len(live) - 1]))
-            self._cache[key] = tuple(
-                (float(probe[a]), float(probe[b]))
-                for a, b in zip(starts, stops, strict=True))
+            descriptor = self._native_harmonic_descriptor(harmonic)
+            if descriptor is None:
+                blocks = ()
+            else:
+                intervals = self.model.mode_interp_idx[descriptor[5]]
+                split = np.flatnonzero(np.diff(intervals) > 1) + 1
+                groups = np.split(intervals, split)
+                boundaries = self.model.sol.all_ts
+                blocks = tuple(
+                    (float(boundaries[group[0]]),
+                     float(boundaries[group[-1] + 1]))
+                    for group in groups if len(group))
+            self._cache[key] = blocks
         return self._cache[key]
 
     def support(self, harmonic):
