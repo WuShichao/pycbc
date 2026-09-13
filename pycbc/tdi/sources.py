@@ -94,6 +94,24 @@ class TimeShiftedHarmonicSource:
         omega = self.source.angular_frequency(harmonic, shifted)
         return amp_plus, amp_cross, phase, omega
 
+    def amplitude_frequency(self, harmonic, time):
+        """Return the two amplitudes and frequency in one translated query."""
+        combined = getattr(self.source, "amplitude_frequency", None)
+        shifted = self._source_time(time)
+        if combined is not None:
+            return combined(harmonic, shifted)
+        amp_plus, amp_cross = self.source.amplitude(harmonic, shifted)
+        omega = self.source.angular_frequency(harmonic, shifted)
+        return amp_plus, amp_cross, omega
+
+    def delay_expansion_coefficients(self, harmonic, time, order):
+        """Forward optional analytic delay coefficients on the shifted clock."""
+        coefficients = getattr(
+            self.source, "delay_expansion_coefficients", None)
+        if coefficients is None:
+            return None
+        return coefficients(harmonic, self._source_time(time), order)
+
     def carrier_phase(self, harmonic, time):
         """Return the carrier phase at translated source times."""
         return self.source.carrier_phase(harmonic, self._source_time(time))
@@ -1468,6 +1486,32 @@ class PyEFPEHMSource:
             values.append(value)
         return tuple(values)
 
+    def _native_full_support_frequency(self, descriptor, times):
+        """Evaluate only frequency when the native mode spans every segment."""
+        return self._native_full_support_phase_derivative(
+            descriptor, times, 1)
+
+    def _native_full_support_phase_derivative(
+            self, descriptor, times, derivative):
+        """Evaluate one stored native phase derivative on all ODE segments."""
+        if (descriptor is None or not descriptor[3]
+                or derivative >= len(self.model.mode_phases_Qs)):
+            return None
+        active_indices = descriptor[5]
+        query = np.clip(np.asarray(times, dtype=float),
+                        self.t_start, self.t_end)
+        segments = np.searchsorted(
+            self.model.sol.ts, query, side='right') - 1
+        segments = np.clip(segments, 0, len(self.model.sol.ts) - 1)
+        entries = active_indices[segments]
+        x = ((query - self.model.sol.ts[segments])
+             / self.model.sol.hs[segments])
+        coefficients = self.model.mode_phases_Qs[derivative][entries]
+        value = x * coefficients[:, -1]
+        for index in reversed(range(coefficients.shape[1] - 1)):
+            value = x * (coefficients[:, index] + value)
+        return value + self.model.mode_phases_y0[derivative][entries]
+
     def _evaluate(self, harmonic, t):
         """(A_plus, A_cross, phase, omega) at arbitrary, possibly 2-D ``t``.
 
@@ -1593,6 +1637,132 @@ class PyEFPEHMSource:
     def harmonic_components(self, harmonic, t):
         """Evaluate amplitude, native live phase and frequency together."""
         return self._evaluate(harmonic, t)
+
+    def amplitude_frequency(self, harmonic, t):
+        """Evaluate native amplitudes and frequency without an unused phase.
+
+        Delay expansions require these three arrays but not the absolute
+        carrier phase.  Keeping this optional source capability separate from
+        :meth:`harmonic_components` lets the generic response avoid needless
+        work when an adapter can provide it, without making it part of the
+        required harmonic-source protocol.
+        """
+        if self.theta is not None or self.phi is not None:
+            amp_plus, amp_cross, _, omega = self._evaluate(harmonic, t)
+            return amp_plus, amp_cross, omega
+
+        query = np.asarray(t, dtype=float)
+        flat = query.reshape(-1)
+        amp_plus = np.zeros(flat.size, dtype=complex)
+        amp_cross = np.zeros(flat.size, dtype=complex)
+        inside = (flat >= self.t_start) & (flat <= self.t_end)
+        descriptor = self._native_harmonic_descriptor(harmonic)
+        if np.any(inside):
+            target = np.flatnonzero(inside)
+            contribution = self._native_full_support_amplitude(
+                descriptor, flat[target])
+            if contribution is None:
+                order = np.argsort(flat)
+                sorted_inside = inside[order]
+                times = flat[order][sorted_inside]
+                time_indices, contribution = \
+                    self._native_harmonic_amplitude(harmonic, times)
+                slot = np.flatnonzero(sorted_inside)[time_indices]
+                target = order[slot]
+            amp_plus[target] = np.conj(contribution[:, 0])
+            amp_cross[target] = np.conj(contribution[:, 1])
+
+        omega = self._native_full_support_frequency(descriptor, flat)
+        if omega is None:
+            omega = np.asarray(self.angular_frequency(harmonic, flat))
+        shape = query.shape
+        return (amp_plus.reshape(shape), amp_cross.reshape(shape),
+                np.asarray(omega).reshape(shape))
+
+    def delay_expansion_coefficients(self, harmonic, t, order):
+        """Return analytic coefficients when both native amplitudes are splines.
+
+        This optional optimization is deliberately narrower than the source
+        protocol.  A source using exact rather than spline amplitudes returns
+        ``None`` and the response uses its generic finite-difference stencil.
+        Modes with changing support are handled interval by interval.  The
+        common second-order path needs only first amplitude derivatives and
+        ``d omega / dt``.
+        """
+        if int(order) != 2 or self.theta is not None or self.phi is not None:
+            return None
+        query = np.asarray(t, dtype=float)
+        flat = query.reshape(-1)
+        descriptor = self._native_harmonic_descriptor(harmonic)
+        if (descriptor is None
+                or not self.model.params['Interpolate_Amplitudes']):
+            return None
+        multipole, internal_eccentric, mirrored, _, _, _ = descriptor
+        degree = int(self.model.mode_array[multipole, 0])
+        precession = self.model.Apc_prec_cspline[multipole]
+        amplitude = np.zeros((flat.size, 2), dtype=complex)
+        slope = np.zeros((flat.size, 2), dtype=complex)
+        order_indices = np.argsort(flat)
+        inside = ((flat[order_indices] >= self.t_start)
+                  & (flat[order_indices] <= self.t_end))
+        if np.any(inside):
+            from pyEFPEHM.utils.utils import sorted_vals_in_intervals
+
+            times = flat[order_indices][inside]
+            time_indices, interval_indices = sorted_vals_in_intervals(
+                times,
+                self.model.sol.all_ts[self.model.mode_interp_idx],
+                self.model.sol.all_ts[self.model.mode_interp_idx + 1])
+            active = (
+                (self.model.necessary_multipole_idxs[interval_indices]
+                 == multipole)
+                & (self.model.necessary_ps[interval_indices]
+                   == internal_eccentric))
+            time_indices = time_indices[active]
+            interval_indices = interval_indices[active]
+            if len(time_indices):
+                active_times = times[time_indices]
+                precession_0 = precession(active_times)
+                precession_1 = precession(active_times, 1)
+                if mirrored:
+                    precession_0 = np.conj(precession_0)
+                    precession_1 = np.conj(precession_1)
+                    if degree % 2:
+                        precession_0 = -precession_0
+                        precession_1 = -precession_1
+                spline_indices = self.model.interp_idx_to_Nlm_p_idx[
+                    interval_indices]
+                eccentric_0 = np.empty(len(active_times), dtype=complex)
+                eccentric_1 = np.empty(len(active_times), dtype=complex)
+                for spline_index in np.unique(spline_indices):
+                    selected = spline_indices == spline_index
+                    spline = self.model.Nlm_p_csplines[spline_index]
+                    eccentric_0[selected] = spline(active_times[selected])
+                    eccentric_1[selected] = spline(
+                        active_times[selected], 1)
+                factor = 2 * self.model.h0_pref
+                active_amplitude = np.conj(
+                    precession_0 * eccentric_0[:, None] * factor)
+                active_slope = np.conj(
+                    (precession_1 * eccentric_0[:, None]
+                     + precession_0 * eccentric_1[:, None]) * factor)
+                sorted_slots = np.flatnonzero(inside)[time_indices]
+                target = order_indices[sorted_slots]
+                amplitude[target] = active_amplitude
+                slope[target] = active_slope
+
+        _, m, n = (int(value) for value in harmonic)
+        orbital_rate, precession_rate = self._orbital_phases(flat, 1)
+        orbital_accel, precession_accel = self._orbital_phases(flat, 2)
+        omega = n * orbital_rate + (m - n) * precession_rate
+        rate = n * orbital_accel + (m - n) * precession_accel
+        zeros_complex = np.zeros(flat.size, dtype=complex)
+        zeros_real = np.zeros(flat.size)
+        shape = query.shape
+        return tuple(np.asarray(value).reshape(shape) for value in (
+            amplitude[:, 0], slope[:, 0], zeros_complex,
+            amplitude[:, 1], slope[:, 1], zeros_complex,
+            omega, rate, zeros_real))
 
     def _orbital_phases(self, t, derivative):
         """``(lambda, delta_lambda)`` from the model's own ODE solution."""

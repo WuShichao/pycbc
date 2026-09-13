@@ -6,15 +6,22 @@ import pytest
 from pycbc.coordinates.space_orbit import LisaEqualArmOrbit
 from pycbc.tdi.backends.pytdi_backend import (
     PyTDICombinationAdapter,
+    combine_links,
     get_pytdi_combination,
 )
 from pycbc.tdi.multiband import (
+    PreparedMultibandTDI,
     _zoom_frequency_samples,
     multiband_sparse_tdi_response,
     prepare_multiband_tdi,
     prepare_multiband_tdi_response,
 )
 from pycbc.tdi.onthefly import adaptive_sparse_tdi_response
+from pycbc.tdi.response import (
+    link_geometry,
+    link_response,
+    sample_constellation,
+)
 from pycbc.tdi.sources import frequency_partition_sources
 from pycbc.types import TimeSeries
 
@@ -151,6 +158,114 @@ def test_multiband_tdi_sum_reconstructs_full_time_domain_response():
     assert np.allclose(
         transformed.sample(times)["twice_X"], 2 * actual,
         rtol=2e-15, atol=2e-15 * scale)
+
+
+def test_prepared_multiband_unions_training_source_coverage():
+    """A prior-envelope source extends fixed geometry beyond the fiducial."""
+    source = _CompactChirpSource()
+    from pycbc.tdi.sources import TimeShiftedHarmonicSource
+    candidate = TimeShiftedHarmonicSource(
+        source, offset=-400.0, t_start=0.0, t_end=4000.0)
+    orbit = LisaEqualArmOrbit(t0=0.0)
+    terms = {"X": PyTDICombinationAdapter(
+        "X2", get_pytdi_combination("X2"), delta_t=25.0).terms()}
+    options = dict(
+        source=source, orbit=orbit, channel_terms=terms,
+        lamb=1.1, beta=-0.4, band_edges=[1e-3, 5e-3, 1e-2],
+        overlap=1e-3, t_start=800.0, t_end=3200.0,
+        geometry_step=5.0, minimum_grid_points=16,
+    )
+
+    fiducial_only = prepare_multiband_tdi(**options)
+    with pytest.raises(ValueError, match="leaves prepared coverage"):
+        fiducial_only.project(candidate, 1.1, -0.4)
+
+    prepared = prepare_multiband_tdi(
+        **options, coverage_sources=[candidate])
+    projected = prepared.project(candidate, 1.1, -0.4)
+    times = np.linspace(900.0, 3100.0, 401)
+    sample = sample_constellation(times, orbit)
+    expected = combine_links(
+        link_response(
+            candidate, sample,
+            link_geometry(sample, 1.1, -0.4, velocity_order=1)),
+        sample, channels="XYZ", generation=2,
+        interpolation_order=31, delay_order=5)["X"]
+    actual = projected.sample(times)["X"]
+    interior = slice(40, -40)
+    scale = np.max(np.abs(np.asarray(expected)[interior]))
+    assert np.max(np.abs(
+        actual[interior] - np.asarray(expected)[interior])) / scale < 2e-4
+
+
+def test_prepared_multiband_rejects_unprepared_harmonic():
+    source = _CompactChirpSource()
+    prepared = prepare_multiband_tdi(
+        source, LisaEqualArmOrbit(t0=0.0),
+        {"X": PyTDICombinationAdapter(
+            "X2", get_pytdi_combination("X2"), delta_t=25.0).terms()},
+        1.1, -0.4, [1e-3, 5e-3, 1e-2], t_start=800.0, t_end=3200.0,
+        geometry_step=25.0, harmonics=(2,))
+
+    class ExtraHarmonicSource(_CompactChirpSource):
+        harmonics = (2, 3)
+
+    with pytest.raises(ValueError, match="unprepared harmonics"):
+        prepared.project(ExtraHarmonicSource(), 1.1, -0.4)
+
+
+def test_prepared_multiband_rejects_band_absent_from_preparation():
+    source = _CompactChirpSource()
+    orbit = LisaEqualArmOrbit(t0=0.0)
+    terms = {"X": PyTDICombinationAdapter(
+        "X2", get_pytdi_combination("X2"), delta_t=25.0).terms()}
+    prepared = prepare_multiband_tdi(
+        source, orbit, terms, 1.1, -0.4,
+        [1e-3, 3e-3, 5e-3, 1e-2], t_start=800.0, t_end=3200.0,
+        geometry_step=25.0)
+    # Remove one prepared band to exercise the fail-closed invariant directly.
+    missing = prepared.prepared_bands[0]
+    reduced = PreparedMultibandTDI(
+        prepared.response,
+        tuple(item for item in prepared.prepared_bands if item is not missing),
+        prepared.band_edges, prepared.overlaps, prepared.harmonics)
+    with pytest.raises(ValueError, match="unprepared live band"):
+        reduced.project(source, 1.1, -0.4)
+
+
+def test_prepared_multiband_candidate_may_have_an_empty_covered_band():
+    class NarrowBand(_CompactChirpSource):
+        def carrier_phase(self, harmonic, time):
+            time = np.asarray(time)
+            return 2 * np.pi * (1e-3 * time + 0.5e-3 / self.t_end
+                                * time ** 2)
+
+        def angular_frequency(self, harmonic, time):
+            return 2 * np.pi * (
+                1e-3 + 1e-3 * np.asarray(time) / self.t_end)
+
+    class HighBand(NarrowBand):
+        def carrier_phase(self, harmonic, time):
+            return super().carrier_phase(harmonic, time) \
+                + 7e-3 * 2 * np.pi * np.asarray(time)
+
+        def angular_frequency(self, harmonic, time):
+            return super().angular_frequency(harmonic, time) + 7e-3 * 2*np.pi
+
+    source = NarrowBand()
+    distant = HighBand()
+    orbit = LisaEqualArmOrbit(t0=0.0)
+    terms = {"X": PyTDICombinationAdapter(
+        "X2", get_pytdi_combination("X2"), delta_t=25.0).terms()}
+    prepared = prepare_multiband_tdi(
+        source, orbit, terms, 1.1, -0.4,
+        [1e-3, 3e-3, 5e-3, 1e-2], t_start=0.0, t_end=5000.0,
+        geometry_step=25.0, coverage_sources=[distant])
+    response = prepared.project(source, 1.1, -0.4)
+    empty = [band for band in response.bands if not band.support_blocks]
+    assert empty
+    values = response.sample(np.linspace(100.0, 1000.0, 20))["X"]
+    assert np.all(np.isfinite(values))
 
 
 def test_multiband_frequency_samples_match_dense_time_domain_transform():

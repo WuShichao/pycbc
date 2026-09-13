@@ -535,6 +535,10 @@ def test_pyefpehm_source_reconstructs_its_native_time_domain():
     # angles and verify that this is an exact call-path optimization.
     harmonic = source.harmonics[0]
     fast = source.harmonic_components(harmonic, times)
+    amp_plus, amp_cross, omega = source.amplitude_frequency(harmonic, times)
+    np.testing.assert_array_equal(amp_plus, fast[0])
+    np.testing.assert_array_equal(amp_cross, fast[1])
+    np.testing.assert_array_equal(omega, fast[3])
     general_source = PyEFPEHMSource(
         source.model.params,
         theta=np.arccos(source.model.cos_theta_JN),
@@ -577,6 +581,15 @@ def test_pyefpehm_selected_harmonics_match_multimode_native_oracle():
     for harmonic, mode in native['modes'].items():
         amp_plus, amp_cross, phase, omega = \
             source.harmonic_components(harmonic, times)
+        coefficients = source.delay_expansion_coefficients(
+            harmonic, times, 2)
+        assert coefficients is not None
+        np.testing.assert_allclose(
+            coefficients[0], amp_plus, rtol=2e-14, atol=0)
+        np.testing.assert_allclose(
+            coefficients[3], amp_cross, rtol=2e-14, atol=0)
+        np.testing.assert_allclose(
+            coefficients[6], omega, rtol=2e-14, atol=0)
         expected = np.zeros((len(times), 2), dtype=complex)
         contribution = (
             2 * source.model.h0_pref

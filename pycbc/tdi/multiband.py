@@ -131,6 +131,8 @@ class TDIBandResponse:
         blocks = []
         for item in self.response.responses:
             support = item["support"]
+            if len(support) == 0:
+                continue
             if np.ndim(support) == 1:
                 blocks.append(tuple(support))
             else:
@@ -205,6 +207,11 @@ class PreparedMultibandTDI:
                     "matrix shape must be (output channels, native channels)")
             if len(set(output_channels)) != len(output_channels):
                 raise ValueError("output channel names must be distinct")
+        extra_harmonics = set(source.harmonics) - set(self.harmonics)
+        if extra_harmonics:
+            raise ValueError(
+                "candidate has unprepared harmonics: "
+                f"{sorted(extra_harmonics, key=repr)!r}")
         partitions = frequency_partition_sources(
             source, self.band_edges, overlap=self.overlaps,
             harmonics=self.harmonics)
@@ -216,6 +223,18 @@ class PreparedMultibandTDI:
         candidates = []
         scale = max(1.0, self.t_end - self.t_start)
         tolerance = 64 * np.finfo(float).eps * scale
+        prepared_keys = {
+            (item.template.harmonic, item.template.index)
+            for item in self.prepared_bands
+        }
+        for key, windowed in windows.items():
+            if key in prepared_keys:
+                continue
+            support = harmonic_windows(
+                windowed, key[0], self.t_start, self.t_end,
+                padding=self.padding)
+            if support:
+                raise ValueError(f"candidate has unprepared live band {key!r}")
         for item in self.prepared_bands:
             template = item.template
             key = (template.harmonic, template.index)
@@ -338,14 +357,16 @@ def prepare_multiband_tdi(
         source, orbit, channel_terms, lamb, beta, band_edges, overlap=0.0,
         t_start=None, t_end=None, samples_per_cycle=4.0,
         geometry_step=86400.0, minimum_grid_points=16, velocity_order=1,
-        links=None, padding=None, harmonics=None):
+        links=None, padding=None, harmonics=None, coverage_sources=None):
     """Prepare a fixed narrow-band geometry without adaptive window chasing.
 
     This cold-path constructor is intended for a likelihood epoch. The band
     windows determine their padded time coverage, while ``geometry_step`` and
     ``minimum_grid_points`` control a fixed spline grid in each live block.
-    Validate these two settings against a dense fiducial response before using
-    the returned preparation for candidates.
+    ``coverage_sources`` may supply prior-boundary or training sources whose
+    window supports are unioned into that coverage.  Validate both the source
+    ensemble and the grid settings against held-out dense responses before
+    using the returned preparation for candidates.
     """
     if samples_per_cycle <= 2:
         raise ValueError("samples_per_cycle must exceed the Nyquist minimum")
@@ -365,6 +386,22 @@ def prepare_multiband_tdi(
 
     partitions = frequency_partition_sources(
         source, band_edges, overlap=overlap, harmonics=harmonics)
+    selected_harmonics = tuple(partitions)
+    coverage_sources = (() if coverage_sources is None
+                        else tuple(coverage_sources))
+    selected_set = set(selected_harmonics)
+    for index, item in enumerate(coverage_sources):
+        extra = set(item.harmonics) - selected_set
+        if extra:
+            raise ValueError(
+                f"coverage source {index} has unprepared harmonics: "
+                f"{sorted(extra, key=repr)!r}")
+    coverage_partitions = (partitions,) + tuple(
+        frequency_partition_sources(
+            item, band_edges, overlap=overlap,
+            harmonics=selected_harmonics)
+        for item in coverage_sources
+    )
     all_terms = tuple(
         term for terms in channel_terms.values() for term in terms)
     delay_options = {} if links is None else {"links": links}
@@ -380,8 +417,18 @@ def prepare_multiband_tdi(
     prepare_options = {} if links is None else {"links": links}
     for harmonic, windows in partitions.items():
         for index, windowed in enumerate(windows):
-            coverage = harmonic_windows(
-                windowed, harmonic, t_start, t_end, padding=padding)
+            raw_coverage = []
+            for current in coverage_partitions:
+                raw_coverage.extend(harmonic_windows(
+                    current[harmonic][index], harmonic, t_start, t_end,
+                    padding=padding))
+            coverage = []
+            for low, high in sorted(raw_coverage):
+                if coverage and low <= coverage[-1][1]:
+                    coverage[-1] = (
+                        coverage[-1][0], max(coverage[-1][1], high))
+                else:
+                    coverage.append((low, high))
             pieces = []
             for low, high in coverage:
                 count = max(
@@ -921,12 +968,20 @@ def multiband_sparse_tdi_response(
         t_start=None, t_end=None, samples_per_cycle=4.0,
         initial_step=86400.0, relative_tolerance=1e-4,
         amplitude_floor=1e-3, max_refinements=24, velocity_order=1,
-        links=None, padding=None, harmonics=None):
+        links=None, padding=None, harmonics=None, max_grid_points=None,
+        delay_expansion=None, reference_delay=False, threads=1,
+        interpolation_order=3):
     """Build independently sampled time-domain TDI frequency bands.
 
     This function performs no frequency-domain detector projection. Each
     complementary source window is evaluated at the retarded source times
     inside the ordinary link response and TDI delay chains.
+
+    The adaptive-grid controls are forwarded to
+    :func:`~pycbc.tdi.onthefly.adaptive_sparse_tdi_response`.  In particular,
+    ``max_grid_points`` provides the same fail-closed memory guard for every
+    live band; ``delay_expansion`` and ``reference_delay`` select the optional
+    source-query reduction without changing the multiband partition.
     """
     if samples_per_cycle <= 2:
         raise ValueError("samples_per_cycle must exceed the Nyquist minimum")
@@ -959,7 +1014,13 @@ def multiband_sparse_tdi_response(
         max_refinements=max_refinements,
         velocity_order=velocity_order,
         support_padding=padding,
+        delay_expansion=delay_expansion,
+        reference_delay=reference_delay,
+        threads=threads,
+        interpolation_order=interpolation_order,
     )
+    if max_grid_points is not None:
+        response_options["max_grid_points"] = max_grid_points
     if links is not None:
         response_options["links"] = links
 

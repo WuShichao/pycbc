@@ -787,13 +787,36 @@ def _three_point_derivatives(back, here, ahead, drop, rise):
     return first, second
 
 
-def expansion_coefficients(source, harmonic, anchor):
-    """Amplitude and frequency with their first two derivatives on ``anchor``.
+def expansion_coefficients(source, harmonic, anchor, order=3):
+    """Amplitude/frequency delay coefficients on ``anchor``.
 
-    One stencil, six source calls, whatever the channel term count.
+    A source may provide the coefficients analytically.  Otherwise one
+    stencil supplies the derivatives with a number of source calls that does
+    not depend on the channel term count.
     """
+    analytic = getattr(source, 'delay_expansion_coefficients', None)
+    if analytic is not None:
+        coefficients = analytic(harmonic, anchor, order)
+        if coefficients is not None:
+            return tuple(
+                np.ascontiguousarray(value, dtype=(
+                    complex if index < 6 else float))
+                for index, value in enumerate(coefficients))
+    amplitude_frequency = getattr(source, 'amplitude_frequency', None)
     combined = getattr(source, 'harmonic_components', None)
-    if combined is None:
+    if amplitude_frequency is not None:
+        amp_p, amp_c, omega = amplitude_frequency(harmonic, anchor)
+        omega = np.asarray(omega, dtype=float)
+        ahead, back, drop, rise = _delay_stencil(
+            source, harmonic, anchor, omega)
+        pair_p, pair_c, pair_omega = amplitude_frequency(
+            harmonic, np.concatenate((ahead, back)))
+        count = len(anchor)
+        ahead_p, back_p = pair_p[:count], pair_p[count:]
+        ahead_c, back_c = pair_c[:count], pair_c[count:]
+        omega_ahead = np.asarray(pair_omega[:count], dtype=float)
+        omega_back = np.asarray(pair_omega[count:], dtype=float)
+    elif combined is None:
         omega = np.asarray(source.angular_frequency(harmonic, anchor),
                            dtype=float)
         ahead, back, drop, rise = _delay_stencil(
@@ -863,7 +886,8 @@ def _expanded_source(source, harmonic, geometry, query, order, offset):
     anchor = geometry.grid if offset is None else geometry.grid - offset
     delay = anchor[None, :] - query
     (amp_p, slope_p, bend_p, amp_c, slope_c, bend_c,
-     omega, rate, curve) = expansion_coefficients(source, harmonic, anchor)
+     omega, rate, curve) = expansion_coefficients(
+         source, harmonic, anchor, order=order)
 
     phase = delay * (0.5 * rate[None, :] * delay - omega[None, :])
     out_p = amp_p[None, :] - delay * slope_p[None, :]
@@ -922,7 +946,8 @@ def _fused_channels(source, harmonic, geometry, lamb, beta):
     offset = _reference_delay(geometry, lamb, beta)
     anchor = np.ascontiguousarray(
         geometry.grid if offset is None else geometry.grid - offset)
-    coefficients = expansion_coefficients(source, harmonic, anchor)
+    coefficients = expansion_coefficients(
+        source, harmonic, anchor, order=order)
     u_hat, v_hat, k_hat = polarization_basis(lamb, beta)
     boosted = bool(geometry.velocity_order)
     out = np.empty((len(geometry.channel_names), len(geometry.grid)),
@@ -1419,6 +1444,8 @@ class SparseTDIResponse:
             support = item.get('support')
             if support is None:
                 windows = ((float(grid[0]), float(grid[-1])),)
+            elif len(support) == 0:
+                windows = ()
             elif np.ndim(support) == 1:
                 windows = (tuple(support),)
             else:
