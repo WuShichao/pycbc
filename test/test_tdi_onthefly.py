@@ -369,12 +369,32 @@ def test_cached_geometries_agree_with_the_direct_path():
                               max_step_scale=512)
     direct = sparse_channel(source, 2, grid, terms, orbit, 0.9, -0.25)
     scale = np.max(np.abs(direct))
-    for builder, evaluate, tolerance in (
+
+    # The three forms are algebraically identical and sum in different
+    # orders, so what separates them is roundoff -- and the roundoff here is
+    # not at the level of the answer. Every path reaches the O(10 rad) delay
+    # phase by subtracting two absolute carrier phases of order |Phi|, which
+    # costs |Phi| * eps of absolute phase, and the TDI terms then cancel by
+    # `gross / |net|`. That product is the honest tolerance. A fixed 1e-12
+    # stood here before and was passing on the luck of the grid: moving one
+    # point by 0.7 ms took the disagreement from 6.6e-14 to 3.1e-11 with the
+    # cancellation unchanged at 3.7e3, which is the signature of a different
+    # roundoff draw rather than a different calculation.
+    from pycbc.tdi.onthefly import _sparse_term_contributions
+    rows = _sparse_term_contributions(
+        source, 2, TermGeometry(orbit, grid, terms), 0.9, -0.25)
+    cancellation = float(np.max(np.abs(rows).sum(axis=0)
+                                / np.maximum(np.abs(rows.sum(axis=0)), 1e-300)))
+    phase_scale = float(np.max(np.abs(source.carrier_phase(2, grid))))
+    tolerance = phase_scale * np.finfo(float).eps * cancellation
+    assert tolerance < 1e-6, "conditioning bound is too loose to test anything"
+
+    for builder, evaluate, allowed in (
             (SparseGeometry, sparse_channel_cached, 0.0),
-            (StackedGeometry, sparse_channel_stacked, 1e-12),
-            (TermGeometry, sparse_channel_terms, 1e-12)):
+            (StackedGeometry, sparse_channel_stacked, tolerance),
+            (TermGeometry, sparse_channel_terms, tolerance)):
         got = evaluate(source, 2, builder(orbit, grid, terms), 0.9, -0.25)
-        assert np.max(np.abs(got - direct)) / scale <= tolerance
+        assert np.max(np.abs(got - direct)) / scale <= allowed
 
 
 def test_term_geometry_keeps_only_the_pairs_the_channel_uses():
@@ -1228,3 +1248,54 @@ def test_the_compiled_kernel_agrees_with_numpy_and_with_itself():
     serial = module._fused_channels(source, 2, geometry, 0.9, -0.25)
     for name in "XYZ":
         assert np.array_equal(threaded[name], serial[name])
+
+
+def test_the_phase_inversion_is_newton_corrected_not_read_off_a_table():
+    """Cornish & Littenberg's grid has to land on the phases it asked for.
+
+    The step rule is only as good as the map from carrier phase back to time.
+    Reading that map off a uniform probe table costs nothing on a slow source
+    and everything on a fast one: over a year, 4096 probe points are spaced in
+    hours, while the steps the rule wants near merger are tens of seconds.
+    Newton on the phase itself removes the table from the answer.
+    """
+    from pycbc.tdi.onthefly import adaptive_time_grid
+    times = np.arange(200000) * 5.0
+    source = NewtonianChirp(3.0e4, times[-1] + 2e4)
+    achieved = {}
+    for refinements in (0, 2):
+        grid = adaptive_time_grid(
+            source, 2, times[0], times[-1], delta_phi=0.5, growth=1.0,
+            dt_max=1e9, refinements=refinements)
+        steps = np.diff(np.asarray(source.carrier_phase(2, grid)))
+        interior = steps[1:-1]
+        achieved[refinements] = float(np.max(np.abs(interior - 0.5)))
+    assert achieved[2] < achieved[0] / 100, achieved
+    assert achieved[2] < 1e-6, achieved
+
+
+def test_the_prescribed_grid_anchors_at_the_merger_and_grows_away_from_it():
+    """arXiv:2506.08093 Sec. III.2: dense at t_c, geometric outwards, capped."""
+    from pycbc.tdi.onthefly import adaptive_time_grid
+    times = np.arange(200000) * 5.0
+    source = NewtonianChirp(3.0e4, times[-1] + 2e4)
+    grid = adaptive_time_grid(
+        source, 2, times[0], times[-1], delta_phi=0.5, growth=1.1,
+        dt_max=2.0e5)
+    gaps = np.diff(grid)
+    assert gaps[-1] < gaps[0], "the grid must densify towards the merger"
+    assert np.max(gaps) <= 2.0e5 * (1 + 1e-9), np.max(gaps)
+
+    # The plateau is the paper's "hold delta_phi until |t - t_c| > 100 M". It
+    # can only add points, and it must add them next to the anchor.
+    flat = adaptive_time_grid(
+        source, 2, times[0], times[-1], delta_phi=0.5, growth=1.1,
+        dt_max=2.0e5, plateau=5.0e3)
+    assert len(flat) > len(grid)
+    # Counting within a region cannot be exact at its edge -- one point can
+    # cross it when the whole sequence shifts -- so require the fraction, not
+    # the count.
+    tail = 0.2 * (times[-1] - times[0])
+    added = len(flat[flat > times[-1] - tail]) - len(grid[grid > times[-1] - tail])
+    assert added >= 0.99 * (len(flat) - len(grid)), \
+        f"plateau added {added} of {len(flat) - len(grid)} points near the anchor"

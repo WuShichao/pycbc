@@ -81,13 +81,35 @@ def delay_padding(orbit, times, terms, links=LINK_ORDER):
 
 
 def adaptive_time_grid(source, harmonic, t_start, t_end, delta_phi=0.5,
-                       dt_max=None, n_probe=4096, growth=1.0,
-                       max_step_scale=np.inf, padding=0.0):
+                       dt_max=2.0e5, n_probe=4096, growth=1.1,
+                       max_step_scale=np.inf, padding=0.0, plateau=0.0,
+                       reference=None, refinements=2):
     """Grid on which the carrier advances by ``delta_phi`` per step.
 
-    The carrier phase is evaluated once on a probe grid and inverted, so the
-    grid densifies wherever omega rises. ``dt_max`` caps the step where the
-    carrier is slow enough that the constellation's motion sets the scale.
+    Cornish & Littenberg's prescription (arXiv:2506.08093 Sec. III.2): anchor
+    at the merger, step by ``delta_phi`` of carrier phase, and once the anchor
+    is further than ``plateau`` away let ``delta_phi`` grow by ``growth`` per
+    step, with the step capped at ``dt_max``. Their published values are
+    ``delta_phi = 0.5``, ``growth = 1.1``, ``dt_max = 2e5`` (2.3 days) and a
+    plateau of 100 M in seconds; those are the defaults here except for the
+    plateau, which needs a total mass this layer does not have. Pass it.
+
+    Stepping the phase rather than the time is a deliberate difference. The
+    paper writes ``dt = delta_phi / omega(t)`` with omega at the *current*
+    time, which is the first-order form of advancing the phase by exactly
+    ``delta_phi``; the two part company over a step near merger, where omega
+    moves appreciably within one step, and the phase form is the one that
+    delivers the constant carrier resolution both are after.
+
+    The inversion from phase back to time is Newton-corrected
+    (``t += (wanted - phase(t)) / omega(t)``, ``refinements`` times). Without
+    it the map is read off a uniform probe table, which over a year of data
+    is spaced in hours -- coarser than the entire merger it is meant to
+    resolve.
+
+    ``reference`` is the anchor; the default is the time of largest ``|omega|``
+    in each window, which is the merger for a monotone chirp and harmless for
+    a monochromatic source.
 
     One sub-grid per window of `harmonic_windows`. Pass the same ``padding``
     to `reconstruct`; the spline is valid only inside the windows.
@@ -99,7 +121,7 @@ def adaptive_time_grid(source, harmonic, t_start, t_end, delta_phi=0.5,
                                       padding):
         pieces.append(_grid_over_window(
             source, harmonic, low, high, delta_phi, dt_max, n_probe, growth,
-            max_step_scale))
+            max_step_scale, plateau, reference, refinements))
     if not pieces:
         return np.array([])
     return np.unique(np.concatenate(pieces))
@@ -187,7 +209,8 @@ def harmonic_windows(source, harmonic, t_start, t_end, padding=0.0,
 
 
 def _grid_over_window(source, harmonic, t_start, t_end, delta_phi, dt_max,
-                      n_probe, growth, max_step_scale):
+                      n_probe, growth, max_step_scale, plateau=0.0,
+                      reference=None, refinements=2):
     probe = np.linspace(t_start, t_end, int(n_probe))
     phase = np.asarray(source.carrier_phase(harmonic, probe), dtype=float)
     if not np.all(np.diff(phase) > 0):          # must be monotone to invert
@@ -196,21 +219,65 @@ def _grid_over_window(source, harmonic, t_start, t_end, delta_phi, dt_max,
     if not np.isfinite(total) or total <= 0:
         return np.linspace(t_start, t_end, 2)
 
-    # Walk the carrier phase backwards from the merger, letting the step grow
-    # away from it. Cornish & Littenberg's own optimisation, and the direction
-    # matters: growing forwards from t_start puts the dense region where the
-    # signal is slowest and the coarse region at the merger.
+    # Anchor at the merger and let the step grow away from it, in both
+    # directions. The direction matters: growing forwards from t_start puts
+    # the dense region where the signal is slowest and the coarse region at
+    # the merger.
+    if reference is None:
+        rate = np.abs(np.asarray(
+            source.angular_frequency(harmonic, probe), dtype=float))
+        usable = np.isfinite(rate) & (rate > 0)
+        anchor_phase = (phase[np.argmax(np.where(usable, rate, -np.inf))]
+                        if usable.any() else phase[-1])
+    else:
+        anchor_phase = float(np.interp(
+            min(max(float(reference), t_start), t_end), probe, phase))
+
     if growth <= 1.0:
         wanted = np.arange(phase[0], phase[-1], float(delta_phi))
     else:
-        wanted, value, step = [], phase[-1], float(delta_phi)
         limit = float(max_step_scale) * float(delta_phi)
-        while value > phase[0]:
-            wanted.append(value)
-            value -= step
-            step = min(step * growth, limit)
-        wanted = np.asarray(wanted[::-1])
+        # The plateau is the paper's "hold delta_phi until |t - tc| > 100 M",
+        # counted in steps rather than seconds because the times are not known
+        # until after the inversion. Near the anchor omega is by construction
+        # close to its largest value, so plateau * omega / delta_phi is the
+        # step count that covers it.
+        anchor_rate = float(np.interp(
+            anchor_phase, phase,
+            np.abs(np.asarray(source.angular_frequency(harmonic, probe),
+                              dtype=float))))
+        flat = 0
+        if plateau > 0 and np.isfinite(anchor_rate) and anchor_rate > 0:
+            flat = int(np.ceil(plateau * anchor_rate / float(delta_phi)))
+        wanted = [anchor_phase]
+        for sign, bound in ((-1.0, phase[0]), (1.0, phase[-1])):
+            value, step, taken = anchor_phase, float(delta_phi), 0
+            while (value - bound) * sign < 0:
+                value += sign * step
+                wanted.append(value)
+                taken += 1
+                if taken >= flat:
+                    step = min(step * growth, limit)
+        wanted = np.unique(np.asarray(wanted))
+        wanted = wanted[(wanted >= phase[0]) & (wanted <= phase[-1])]
     grid = np.interp(wanted, phase, probe)
+
+    # The probe table is uniform, so over a year it is spaced in hours -- far
+    # coarser than the merger the grid exists to resolve. Newton on the phase
+    # itself removes that: the correction is (wanted - phase(t)) / omega(t),
+    # and the source can evaluate both at arbitrary times.
+    for _ in range(int(refinements)):
+        current = np.asarray(source.carrier_phase(harmonic, grid), dtype=float)
+        rate = np.asarray(
+            source.angular_frequency(harmonic, grid), dtype=float)
+        ok = np.isfinite(current) & np.isfinite(rate) & (np.abs(rate) > 0)
+        if not ok.any():
+            break
+        step = np.zeros_like(grid)
+        step[ok] = (wanted[ok] - current[ok]) / rate[ok]
+        grid = np.clip(grid + step, t_start, t_end)
+        grid = np.maximum.accumulate(grid)
+
     grid = np.unique(np.concatenate(([t_start], grid, [t_end])))
 
     gaps = np.diff(grid)
