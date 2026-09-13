@@ -1,0 +1,248 @@
+"""Expose the sparse time-domain TDI response to ``pycbc_inference``.
+
+PyCBC already knows how to sample a likelihood from a waveform that carries
+its own detector response: `pycbc.waveform.waveform.fd_det_sequence` is the
+registry of such approximants, `BBHX_PhenomD` is in it, and
+`pycbc.inference.models.relbin.Relative` switches to
+``likelihood_parts_det`` and asks the generator for values at its own bin
+edges. A TDI channel is exactly that kind of observable, so nothing in the
+likelihood has to change -- the "detectors" are the channels.
+
+What this module adds is the generator. It builds a source from the sampled
+parameters, projects it through a *prepared* multiband geometry, and returns
+the channels at the requested frequencies.
+
+The preparation is the whole point. Building the geometry costs about half a
+second and projecting a candidate through it costs about seven milliseconds,
+so a likelihood that rebuilt it would be seventy times slower than it needs
+to be. It is cached on everything that defines it -- the observation window,
+the band edges, the channels, the combination -- and deliberately *not* on
+sky position: `PreparedMultibandTDI.project` takes the sky, and reprojecting
+a geometry prepared at one sky position onto another is both correct and
+cheap (measured: 7.4 ms, and the response genuinely changes).
+
+The coverage is fail-closed. A candidate whose band support leaves what the
+preparation covers is refused rather than extrapolated, and since a chirp-mass
+change of one part in 1e5 moves t(f) by weeks, the prior's own boundary has to
+be declared through ``tdi_coverage_sources``.
+"""
+import numpy as np
+
+from pycbc.coordinates.space_orbit import LisaEqualArmOrbit
+from pycbc.tdi.backends.pytdi_backend import (PyTDICombinationAdapter,
+                                              get_pytdi_combination)
+from pycbc.tdi.combination import Term
+from pycbc.tdi.multiband import prepare_multiband_tdi
+from pycbc.types import Array
+
+#: Prepared geometries, keyed by everything that defines one. Sky position is
+#: not part of the key; see the module docstring.
+_PREPARED = {}
+
+#: Source builders, selected by the ``tdi_source`` parameter.
+_SOURCES = {}
+
+DEFAULT_ARM = 2.5e9
+DEFAULT_CHANNELS = ('A', 'E')
+
+#: A and E as term lists rather than a post-hoc combination of X, Y and Z.
+#: The combination is linear in the channels and hence in the terms, so
+#: scaling coefficients gives the orthogonal channels natively -- which a
+#: multiband response has to have in order to answer a request for "A".
+_ORTHOGONAL = {'A': {'Z': 2 ** -0.5, 'X': -(2 ** -0.5)},
+               'E': {'X': 6 ** -0.5, 'Y': -2 * 6 ** -0.5, 'Z': 6 ** -0.5},
+               'T': {'X': 3 ** -0.5, 'Y': 3 ** -0.5, 'Z': 3 ** -0.5}}
+
+
+def channel_terms(channels=DEFAULT_CHANNELS, generation=2, delta_t=5.0):
+    """Term lists for the requested channels, Michelson or orthogonal."""
+    michelson = {}
+    for label in 'XYZ':
+        name = f'{label}{generation}'
+        michelson[label] = PyTDICombinationAdapter(
+            name, get_pytdi_combination(name), delta_t=delta_t).terms()
+    terms = {}
+    for channel in channels:
+        if channel in michelson:
+            terms[channel] = michelson[channel]
+        elif channel in _ORTHOGONAL:
+            terms[channel] = tuple(
+                Term(term.link, term.coefficient * weight, term.operators)
+                for label, weight in _ORTHOGONAL[channel].items()
+                for term in michelson[label])
+        else:
+            raise ValueError(f"unknown TDI channel {channel!r}")
+    return terms
+
+
+def register_source(name, builder):
+    """Make a source class available through the ``tdi_source`` parameter.
+
+    ``builder`` takes the sampled parameters as keyword arguments and returns
+    an object satisfying the harmonic-source protocol.
+    """
+    _SOURCES[str(name)] = builder
+
+
+def _preparation(params, terms, orbit):
+    """Fetch or build the prepared geometry for this observation."""
+    channels = tuple(terms)
+    edges = tuple(float(value) for value in np.atleast_1d(
+        params['tdi_band_edges']))
+    bounds = params.get('tdi_coverage_bounds') or {}
+    key = (params['tdi_source'], channels, edges,
+           tuple(sorted((name, float(low), float(high))
+                        for name, (low, high) in bounds.items())),
+           float(params['t_obs_start']), float(params['t_obs_end']),
+           float(params.get('tdi_arm_length', DEFAULT_ARM)),
+           int(params.get('tdi_generation', 2)))
+    if key not in _PREPARED:
+        fiducial = _SOURCES[params['tdi_source']](**params)
+        coverage = _coverage_sources(params)
+        _PREPARED[key] = prepare_multiband_tdi(
+            fiducial, orbit, terms,
+            float(params['eclipticlongitude']),
+            float(params['eclipticlatitude']),
+            band_edges=list(edges),
+            t_start=float(params['t_obs_start']),
+            t_end=float(params['t_obs_end']),
+            coverage_sources=list(coverage))
+    return _PREPARED[key]
+
+
+def _coverage_sources(params):
+    """Sources at the prior's own edges, so the preparation covers them.
+
+    `PreparedMultibandTDI.project` refuses a candidate whose band support
+    leaves the prepared coverage rather than extrapolating into it, and a
+    chirp-mass change of one part in 1e5 moves t(f) by weeks. Declaring the
+    boundary as parameter ranges rather than as pre-built source objects keeps
+    it expressible in a configuration file: ``tdi_coverage_bounds`` maps a
+    parameter to its (low, high), and each end is built with everything else
+    held at its fiducial value. Varying one at a time is enough while t(f) is
+    monotone in each of them, which it is for masses and start frequency; a
+    parameter that fails that has to be given as an explicit corner.
+    """
+    bounds = params.get('tdi_coverage_bounds') or {}
+    builder = _SOURCES[params['tdi_source']]
+    sources = []
+    for name, (low, high) in bounds.items():
+        for value in (float(low), float(high)):
+            edge = dict(params)
+            edge[name] = value
+            sources.append(builder(**edge))
+    return sources
+
+
+def clear_cache():
+    """Drop every prepared geometry. Mostly for tests and for a new epoch."""
+    _PREPARED.clear()
+
+
+def sparse_tdi_fd_det_sequence(**params):
+    """TDI channels at requested frequencies, for ``fd_det_sequence``.
+
+    Returns
+    -------
+    dict
+        Channel name to `FrequencySeries` evaluated at ``sample_points``.
+    """
+    requested = params['ifos']
+    if isinstance(requested, str):
+        requested = (requested,)
+    requested = tuple(requested)
+    sample_points = np.asarray(params['sample_points'], dtype=float)
+
+    orbit = LisaEqualArmOrbit(
+        armlength=float(params.get('tdi_arm_length', DEFAULT_ARM)), t0=0.0)
+    terms = channel_terms(
+        requested, generation=int(params.get('tdi_generation', 2)),
+        delta_t=float(params.get('tdi_delta_t', 5.0)))
+    prepared = _preparation(params, terms, orbit)
+
+    source = _SOURCES[params['tdi_source']](**params)
+    response = prepared.project(source,
+                                float(params['eclipticlongitude']),
+                                float(params['eclipticlatitude']))
+    delta_f = float(params['tdi_delta_f'])
+    # Absolute zero on the mission clock, not the start of the observation.
+    # `Relative` multiplies the data by exp(-2 pi i f * end_time), and for a
+    # series whose epoch is the observation start that is a shift by
+    # t_obs_start plus one whole duration -- and a shift by exactly the
+    # duration is the identity on the FFT grid. So the data it compares
+    # against has its origin at zero, and the generator has to match. Getting
+    # this wrong is silent: every candidate comes back at -rho^2/2 because
+    # <d|h> has gone to zero. Measured on Yorsh sobhb1, loglr -19.18 with the
+    # observation start against +18.97 with zero, where the exact peak is
+    # +18.99.
+    epoch = float(params.get('tdi_epoch', 0.0))
+    samples = response.frequency_samples(
+        {name: sample_points for name in requested},
+        delta_f={name: delta_f for name in requested},
+        epoch={name: epoch for name in requested},
+        channels=requested)
+    # A pycbc Array, not a FrequencySeries. `Relative.__init__` reverses the
+    # fiducial with ``curr_wav[::-1]`` to find trailing zeros, and reversing a
+    # FrequencySeries hands its constructor a negative delta_f; it also
+    # resizes and rolls it. The non-det branch feeds it Arrays from
+    # `get_fd_waveform_sequence`, and the det branch has to match, because
+    # ``sample_points`` is an arbitrary set of frequencies rather than a grid.
+    return {name: Array(np.asarray(samples[name], dtype=np.complex128))
+            for name in requested}
+
+
+#: `get_fd_det_waveform_sequence` checks these before dispatching.
+sparse_tdi_fd_det_sequence.required = (
+    'approximant', 'tdi_source', 'tdi_band_edges', 'tdi_delta_f',
+    't_obs_start', 't_obs_end', 'eclipticlongitude', 'eclipticlatitude')
+
+
+def register(approximant='TDISparse', force=False):
+    """Add the generator to PyCBC's detector-response sequence registry."""
+    from pycbc.waveform.plugin import add_custom_waveform
+    add_custom_waveform(approximant, sparse_tdi_fd_det_sequence, 'frequency',
+                        sequence=True, has_det_response=True, force=force)
+    return approximant
+
+
+def _lal_dominant(**params):
+    """A dominant-mode LAL approximant through the inverse-SPA adapter."""
+    from pycbc.tdi.sources import LALFDSource
+    return LALFDSource(
+        mass1=float(params['mass1']), mass2=float(params['mass2']),
+        f_lower=float(params['f_lower']),
+        f_upper=float(params['tdi_f_upper']),
+        t_start=float(params.get('tdi_t_start', 0.0)),
+        polarization=float(params.get('polarization', 0.0)),
+        approximant=str(params.get('tdi_approximant', 'IMRPhenomD')),
+        spin1z=float(params.get('spin1z', 0.0)),
+        spin2z=float(params.get('spin2z', 0.0)),
+        distance=float(params['distance']),
+        inclination=float(params.get('inclination', 0.0)),
+        coa_phase=float(params.get('coa_phase', 0.0)))
+
+
+def _pyefpehm(**params):
+    """pyEFPEHM's co-precessing harmonics, time-shifted onto the mission clock.
+
+    Every harmonic is kept separate here. Summing them before the likelihood
+    sees them is what makes plain relative binning fail on an eccentric or
+    precessing source: at one frequency several harmonics contribute from
+    different times, and their ratio to a fiducial carries the beat between
+    them rather than a smooth trend. `pycbc.tdi.relative` has to bin each
+    harmonic against its own fiducial and add the cross terms back.
+    """
+    from pycbc.tdi.sources import PyEFPEHMSource, TimeShiftedHarmonicSource
+    keys = ('mass1', 'mass2', 'spin1x', 'spin1y', 'spin1z',
+            'spin2x', 'spin2y', 'spin2z', 'distance', 'inclination',
+            'eccentricity', 'phase', 'f22_start', 'f22_ref', 'f22_end',
+            'Amplitude_tol')
+    arguments = {key: params[key] for key in keys if key in params}
+    arguments.setdefault('f22_start', params.get('f_lower'))
+    arguments.setdefault('f22_ref', arguments.get('f22_start'))
+    native = PyEFPEHMSource(arguments)
+    return TimeShiftedHarmonicSource(native, offset=native.t_start)
+
+
+register_source('lal', _lal_dominant)
+register_source('pyefpehm', _pyefpehm)
