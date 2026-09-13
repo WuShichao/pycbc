@@ -1299,3 +1299,43 @@ def test_the_prescribed_grid_anchors_at_the_merger_and_grows_away_from_it():
     added = len(flat[flat > times[-1] - tail]) - len(grid[grid > times[-1] - tail])
     assert added >= 0.99 * (len(flat) - len(grid)), \
         f"plateau added {added} of {len(flat) - len(grid)} points near the anchor"
+
+
+def test_the_compact_interpolator_is_third_order_at_its_edges_too():
+    """`LALTDSource` swapped CubicSpline for a compact form; measure the cost.
+
+    The compact form is Catmull-Rom: centred differences for the endpoint
+    slopes, which are second-order accurate and give a third-order
+    interpolant. The first and last samples have no centred difference. Taking
+    the two-point one-sided form there is first-order and drops those two
+    intervals to second order, and since the error is a maximum over the whole
+    support, that boundary is what gets reported -- 3.6e-08 against the
+    interior's 2.9e-11 on a Newtonian chirp phase at a 5 s step. The
+    three-point one-sided form restores third order everywhere.
+
+    The dense and sparse response paths query a source at different times, so
+    this error does not cancel between them.
+    """
+    from pycbc.tdi.sources import _UniformCubicInterpolator
+
+    def phase(t):
+        return -2.0 * ((1.0e4 - t) / 30.0) ** 0.625
+
+    rng = np.random.default_rng(20260914)
+    query = np.sort(rng.uniform(1e-6, 8.0e3 - 1e-6, 8009))
+    truth = phase(query)
+    scale = np.max(np.abs(truth))
+    steps, errors = [80.0, 40.0, 20.0, 10.0, 5.0], []
+    for step in steps:
+        grid = np.arange(0.0, 8.0e3 + step, step)
+        interpolant = _UniformCubicInterpolator(0.0, step, phase(grid))
+        errors.append(
+            np.max(np.abs(interpolant(query) - truth)) / scale)
+    order = np.polyfit(np.log(steps), np.log(errors), 1)[0]
+    assert order > 2.8, (order, errors)
+    assert errors[-1] < 1e-9, errors
+
+    # A two-sample interpolant has no room for a three-point difference and
+    # must fall back rather than read past its own data.
+    short = _UniformCubicInterpolator(0.0, 1.0, np.array([1.0, 3.0]))
+    assert np.allclose(short(np.array([0.0, 0.5, 1.0])), [1.0, 2.0, 3.0])

@@ -1016,6 +1016,16 @@ class _UniformCubicInterpolator:
         if self.values.ndim != 1 or len(self.values) < 2:
             raise ValueError("uniform interpolation needs at least two samples")
 
+    def _edge_slope(self, index, direction):
+        """Step times the derivative at an outer sample, to second order."""
+        if len(self.values) < 3:
+            return direction * (self.values[index + direction]
+                                - self.values[index])
+        return 0.5 * direction * (
+            -3.0 * self.values[index]
+            + 4.0 * self.values[index + direction]
+            - self.values[index + 2 * direction])
+
     def __call__(self, query):
         coordinate = ((np.asarray(query, dtype=float) - self.start)
                       / self.step)
@@ -1028,12 +1038,22 @@ class _UniformCubicInterpolator:
         after = np.minimum(right + 1, len(self.values) - 1)
         y0 = self.values[left]
         y1 = self.values[right]
-        # These are step times the endpoint derivatives.  The denominator is
-        # one at an outer boundary and two for a centred interior difference.
-        slope0 = ((self.values[right] - self.values[before])
-                  / (right - before))
-        slope1 = ((self.values[after] - self.values[left])
-                  / (after - left))
+        # These are step times the endpoint derivatives.  A centred difference
+        # is second-order accurate and gives a third-order interpolant.  The
+        # first and last samples have no centred difference, and the two-point
+        # one-sided form is only first-order, which drops the interpolant to
+        # second order in the outer intervals -- measured on a Newtonian chirp
+        # phase at a 5 s step, 3.6e-08 of relative error there against the
+        # interior's 2.9e-11, and it sets the maximum over the whole support.
+        # The three-point one-sided difference is second-order like the
+        # centred one and costs two more terms.
+        last = len(self.values) - 1
+        slope0 = np.where(left > 0,
+                          (self.values[right] - self.values[before]) / 2.0,
+                          self._edge_slope(0, +1))
+        slope1 = np.where(right < last,
+                          (self.values[after] - self.values[left]) / 2.0,
+                          self._edge_slope(last, -1))
         square = fraction * fraction
         cube = square * fraction
         return ((2 * cube - 3 * square + 1) * y0
