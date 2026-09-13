@@ -2021,16 +2021,19 @@ def adaptive_sparse_tdi_response(
 
         if not harmonic_grids:
             continue
-        # A stall well under the tolerance is arithmetic, and the grid is as
-        # good as float64 allows. One at or above it is a feature the grid
-        # never resolved -- a step, most often a source that drops this
-        # harmonic mid-window -- and the caller has to hear about it.
-        if stalled_error > relative_tolerance:
+        # What the refusal is for is a step: a source that drops this
+        # harmonic mid-window leaves one at 0.1 to 1 of the channel peak,
+        # four orders above a tolerance anyone asks for. Arithmetic stalls sit
+        # at 1e-8. Refusing at the tolerance itself put a hard stop in between
+        # -- 6.3e-05 against a requested 1e-05 on one Yorsh source, a grid
+        # that was perfectly usable -- so the refusal keeps a factor of a
+        # hundred of margin and anything short of that is recorded instead.
+        if stalled_error > 100 * relative_tolerance:
             raise RuntimeError(
                 f"harmonic {harmonic}: {stalled_count} interval(s) stopped "
                 f"improving with an interpolation error of "
-                f"{stalled_error:.2e} of the channel peak, above the "
-                f"requested {relative_tolerance:.1e}. The bracket is most "
+                f"{stalled_error:.2e} of the channel peak, a hundred times "
+                f"the requested {relative_tolerance:.1e}. The bracket is most "
                 "likely stepped rather than under-resolved; check whether "
                 "the source cuts this harmonic off inside the window")
         grid = np.concatenate(harmonic_grids)
