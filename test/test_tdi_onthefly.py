@@ -15,6 +15,7 @@ from pycbc.tdi.response import (link_geometry, link_response,
 from pycbc.tdi.sources import (LALFDSource, LALIMRPhenomDSource,
                                LALModesSource, LALTDSource,
                                NewtonianChirp,
+                               PolarizationRotatedHarmonicSource,
                                TimeShiftedHarmonicSource,
                                _positive_frequency_envelope)
 
@@ -97,6 +98,80 @@ class _LinearCarrier:
 
     def angular_frequency(self, harmonic, time):
         return np.full(np.shape(time), 2 * np.pi * self.frequency)
+
+
+def test_polarization_rotation_forwards_every_source_view():
+    """Dense, sparse, frequency and delay-expansion paths rotate identically."""
+
+    class CompleteSource(_ClockProbe):
+        def harmonic_components(self, harmonic, time):
+            plus, cross = self.amplitude(harmonic, time)
+            return (plus, cross, self.carrier_phase(harmonic, time),
+                    self.angular_frequency(harmonic, time))
+
+        def amplitude_frequency(self, harmonic, time):
+            plus, cross = self.amplitude(harmonic, time)
+            return plus, cross, self.angular_frequency(harmonic, time)
+
+        def delay_expansion_coefficients(self, harmonic, time, order):
+            time = np.asarray(time)
+            return tuple((index + 1) * (time + 1j)
+                         if index < 6 else (index + 1) * time
+                         for index in range(9))
+
+        def frequency_harmonics(self, frequencies):
+            frequencies = np.asarray(frequencies)
+            return {2: {"indices": np.arange(len(frequencies)),
+                        "frequency": frequencies,
+                        "time": frequencies + 100.0,
+                        "plus": frequencies + 2j,
+                        "cross": 3 * frequencies - 1j}}
+
+        def frequency_polarizations(self, frequencies):
+            item = self.frequency_harmonics(frequencies)[2]
+            return item["plus"], item["cross"]
+
+    source = CompleteSource()
+    angle = 0.37
+    rotated = PolarizationRotatedHarmonicSource(source, angle)
+    cosine, sine = np.cos(2 * angle), np.sin(2 * angle)
+
+    def expected(plus, cross):
+        return (cosine * plus - sine * cross,
+                sine * plus + cosine * cross)
+
+    times = np.asarray([110.0, 130.0])
+    want = expected(*source.amplitude(2, times))
+    np.testing.assert_allclose(rotated.amplitude(2, times), want)
+    components = rotated.harmonic_components(2, times)
+    np.testing.assert_allclose(components[:2], want)
+    np.testing.assert_array_equal(
+        components[2:], source.harmonic_components(2, times)[2:])
+    amplitude_frequency = rotated.amplitude_frequency(2, times)
+    np.testing.assert_allclose(amplitude_frequency[:2], want)
+    np.testing.assert_array_equal(
+        amplitude_frequency[2], source.angular_frequency(2, times))
+
+    coefficients = source.delay_expansion_coefficients(2, times, 2)
+    actual = rotated.delay_expansion_coefficients(2, times, 2)
+    for plus_index, cross_index in ((0, 3), (1, 4), (2, 5)):
+        pair = expected(coefficients[plus_index], coefficients[cross_index])
+        np.testing.assert_allclose(actual[plus_index], pair[0])
+        np.testing.assert_allclose(actual[cross_index], pair[1])
+    for index in (6, 7, 8):
+        np.testing.assert_array_equal(actual[index], coefficients[index])
+
+    frequencies = np.asarray([0.01, 0.02, 0.03])
+    native = source.frequency_polarizations(frequencies)
+    want_frequency = expected(*native)
+    np.testing.assert_allclose(
+        rotated.frequency_polarizations(frequencies), want_frequency)
+    record = rotated.frequency_harmonics(frequencies)[2]
+    np.testing.assert_allclose(record["plus"], want_frequency[0])
+    np.testing.assert_allclose(record["cross"], want_frequency[1])
+    np.testing.assert_array_equal(
+        record["indices"], np.arange(len(frequencies)))
+    assert rotated.support_blocks(2) == source.support_blocks(2)
 
 
 class _LinearFDSource:
@@ -1045,6 +1120,16 @@ def test_a_runaway_tolerance_is_refused_before_it_fills_memory():
             source, orbit, {"X": _terms("X2")}, 0.9, -0.25,
             t_start=1e5, t_end=1e5 + 30 * 86400.0, initial_step=86400.0,
             relative_tolerance=1e-14, max_grid_points=5000)
+
+
+def test_stalled_tolerance_policy_is_explicit_and_validated():
+    """The arithmetic-stall allowance must not be a hidden magic threshold."""
+    from pycbc.tdi.onthefly import adaptive_sparse_tdi_response
+    with pytest.raises(ValueError, match="stall_refusal_factor"):
+        adaptive_sparse_tdi_response(
+            NewtonianChirp(3.0e4, 1e6), LisaEqualArmOrbit(),
+            {"X": _terms("X2")}, 0.9, -0.25,
+            t_start=1e5, t_end=2e5, stall_refusal_factor=0.5)
 
 
 def test_the_delay_expansion_matches_evaluating_every_delayed_time():

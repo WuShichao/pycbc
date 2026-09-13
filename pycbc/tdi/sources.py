@@ -190,6 +190,141 @@ class TimeShiftedHarmonicSource:
         return blocks[0][0], blocks[-1][1]
 
 
+class PolarizationRotatedHarmonicSource:
+    r"""Rotate a harmonic source's polarization basis by a fixed angle.
+
+    This adapter applies the standard spin-2 rotation
+
+    .. math::
+
+        h'_+ = h_+\cos(2\psi) - h_\times\sin(2\psi),\qquad
+        h'_\times = h_+\sin(2\psi) + h_\times\cos(2\psi).
+
+    It forwards the optional combined-evaluation and analytic delay-expansion
+    interfaces as well as the required harmonic-source methods.  Keeping the
+    rotation here avoids reimplementing it in catalogue adapters and, more
+    importantly, ensures the dense, sparse and frequency-domain views all use
+    exactly the same convention.
+
+    Parameters
+    ----------
+    source : harmonic source
+        Source whose polarization basis is to be rotated.
+    polarization : float
+        Rotation angle ``psi`` in radians.
+    """
+
+    def __init__(self, source, polarization):
+        self.source = source
+        self.polarization = float(polarization)
+        self.harmonics = source.harmonics
+        self.t_start = float(source.t_start)
+        self.t_end = float(source.t_end)
+        angle = 2 * self.polarization
+        self._cosine = np.cos(angle)
+        self._sine = np.sin(angle)
+
+    def _rotate(self, plus, cross):
+        return (self._cosine * plus - self._sine * cross,
+                self._sine * plus + self._cosine * cross)
+
+    def amplitude(self, harmonic, time):
+        """Return rotated complex harmonic amplitudes."""
+        return self._rotate(*self.source.amplitude(harmonic, time))
+
+    def harmonic_components(self, harmonic, time):
+        """Return rotated amplitudes with the unchanged phase and frequency."""
+        combined = getattr(self.source, "harmonic_components", None)
+        if combined is None:
+            plus, cross = self.source.amplitude(harmonic, time)
+            phase = self.source.carrier_phase(harmonic, time)
+            frequency = self.source.angular_frequency(harmonic, time)
+        else:
+            plus, cross, phase, frequency = combined(harmonic, time)
+        plus, cross = self._rotate(plus, cross)
+        return plus, cross, phase, frequency
+
+    def amplitude_frequency(self, harmonic, time):
+        """Return rotated amplitudes and the unchanged angular frequency."""
+        combined = getattr(self.source, "amplitude_frequency", None)
+        if combined is None:
+            plus, cross = self.source.amplitude(harmonic, time)
+            frequency = self.source.angular_frequency(harmonic, time)
+        else:
+            plus, cross, frequency = combined(harmonic, time)
+        plus, cross = self._rotate(plus, cross)
+        return plus, cross, frequency
+
+    def delay_expansion_coefficients(self, harmonic, time, order):
+        """Rotate every plus/cross pair in optional delay coefficients."""
+        coefficients = getattr(
+            self.source, "delay_expansion_coefficients", None)
+        if coefficients is None:
+            return None
+        values = coefficients(harmonic, time, order)
+        if values is None:
+            return None
+        output = list(values)
+        for plus_index, cross_index in ((0, 3), (1, 4), (2, 5)):
+            output[plus_index], output[cross_index] = self._rotate(
+                values[plus_index], values[cross_index])
+        return tuple(output)
+
+    def carrier_phase(self, harmonic, time):
+        """Return the wrapped source's carrier phase."""
+        return self.source.carrier_phase(harmonic, time)
+
+    def angular_frequency(self, harmonic, time):
+        """Return the wrapped source's angular frequency."""
+        return self.source.angular_frequency(harmonic, time)
+
+    def polarizations(self, time):
+        """Return rotated dense polarizations."""
+        return self._rotate(*self.source.polarizations(time))
+
+    def frequency_harmonics(self, frequencies):
+        """Return every native frequency harmonic in the rotated basis."""
+        native = getattr(self.source, "frequency_harmonics", None)
+        if native is None:
+            raise TypeError("wrapped source has no frequency_harmonics method")
+        records = {}
+        for harmonic, item in native(frequencies).items():
+            record = dict(item)
+            record["plus"], record["cross"] = self._rotate(
+                np.asarray(item["plus"]), np.asarray(item["cross"]))
+            records[harmonic] = record
+        return records
+
+    def frequency_polarizations(self, frequencies):
+        """Return the wrapped frequency polarizations in the rotated basis."""
+        native = getattr(self.source, "frequency_polarizations", None)
+        if native is not None:
+            return self._rotate(*native(frequencies))
+        frequencies = np.asarray(frequencies, dtype=float)
+        plus = np.zeros(len(frequencies), dtype=complex)
+        cross = np.zeros(len(frequencies), dtype=complex)
+        for item in self.frequency_harmonics(frequencies).values():
+            np.add.at(plus, item["indices"], item["plus"])
+            np.add.at(cross, item["indices"], item["cross"])
+        return plus, cross
+
+    def support_blocks(self, harmonic):
+        """Return the wrapped source's disjoint support intervals."""
+        blocks = getattr(self.source, "support_blocks", None)
+        if blocks is not None:
+            return blocks(harmonic)
+        return (self.source.support(harmonic),)
+
+    def support(self, harmonic):
+        """Return the outer hull of the wrapped source's support."""
+        support = getattr(self.source, "support", None)
+        if support is not None:
+            return support(harmonic)
+        blocks = self.support_blocks(harmonic)
+        if not blocks:
+            return self.t_start, self.t_start
+        return blocks[0][0], blocks[-1][1]
+
 class FrequencyWindowedHarmonicSource:
     """One harmonic multiplied by a partition-of-unity frequency window.
 

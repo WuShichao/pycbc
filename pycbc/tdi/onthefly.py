@@ -1826,7 +1826,7 @@ def adaptive_sparse_tdi_response(
         amplitude_floor=1e-3, max_refinements=24, velocity_order=1,
         links=LINK_ORDER, support_padding=0.0, max_grid_points=1000000,
         delay_expansion=None, reference_delay=False, threads=1,
-        interpolation_order=3):
+        interpolation_order=3, stall_refusal_factor=100.0):
     """Build an error-controlled response-envelope representation.
 
     Refinement tests the *carrier-factored TDI brackets*, not the carrier
@@ -1870,6 +1870,14 @@ def adaptive_sparse_tdi_response(
         time to the constellation barycentre, and carry that delay in the
         carrier instead. See `_reference_delay`. The bracket then varies an
         order of magnitude more slowly and the grid shrinks with it.
+    stall_refusal_factor : float, optional
+        A refinement can stop improving at a response cancellation because
+        float64 phase reduction sets a floor even while the reconstructed
+        waveform is accurate.  Such an interval is recorded in diagnostics
+        and accepted only if its error relative to the channel peak is below
+        ``stall_refusal_factor * relative_tolerance``.  The default 100
+        separates the measured arithmetic floor from a discontinuous source
+        cutoff.  Set this to 1 for a strictly literal tolerance.
     """
     if t_start is None:
         t_start = source.t_start
@@ -1882,6 +1890,9 @@ def adaptive_sparse_tdi_response(
         raise ValueError("initial_step must be positive")
     if relative_tolerance <= 0:
         raise ValueError("relative_tolerance must be positive")
+    stall_refusal_factor = float(stall_refusal_factor)
+    if not np.isfinite(stall_refusal_factor) or stall_refusal_factor < 1:
+        raise ValueError("stall_refusal_factor must be finite and at least one")
     if not 0 <= amplitude_floor <= 1:
         raise ValueError("amplitude_floor must lie in [0, 1]")
     if support_padding < 0:
@@ -2028,12 +2039,13 @@ def adaptive_sparse_tdi_response(
         # -- 6.3e-05 against a requested 1e-05 on one Yorsh source, a grid
         # that was perfectly usable -- so the refusal keeps a factor of a
         # hundred of margin and anything short of that is recorded instead.
-        if stalled_error > 100 * relative_tolerance:
+        if stalled_error > stall_refusal_factor * relative_tolerance:
             raise RuntimeError(
                 f"harmonic {harmonic}: {stalled_count} interval(s) stopped "
                 f"improving with an interpolation error of "
-                f"{stalled_error:.2e} of the channel peak, a hundred times "
-                f"the requested {relative_tolerance:.1e}. The bracket is most "
+                f"{stalled_error:.2e} of the channel peak, above "
+                f"{stall_refusal_factor:g} times the requested "
+                f"{relative_tolerance:.1e}. The bracket is most "
                 "likely stepped rather than under-resolved; check whether "
                 "the source cuts this harmonic off inside the window")
         grid = np.concatenate(harmonic_grids)
@@ -2053,6 +2065,7 @@ def adaptive_sparse_tdi_response(
             'relative_tolerance': relative_tolerance,
             'stalled_intervals': stalled_count,
             'stalled_error': stalled_error,
+            'stall_refusal_factor': stall_refusal_factor,
         }
     return SparseTDIResponse(source, records, diagnostics=diagnostics,
                              interpolation_order=interpolation_order)
