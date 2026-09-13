@@ -792,16 +792,37 @@ def expansion_coefficients(source, harmonic, anchor):
 
     One stencil, six source calls, whatever the channel term count.
     """
-    omega = np.asarray(source.angular_frequency(harmonic, anchor), dtype=float)
-    ahead, back, drop, rise = _delay_stencil(source, harmonic, anchor, omega)
-    amp_p, amp_c = source.amplitude(harmonic, anchor)
-    ahead_p, ahead_c = source.amplitude(harmonic, ahead)
-    back_p, back_c = source.amplitude(harmonic, back)
+    combined = getattr(source, 'harmonic_components', None)
+    if combined is None:
+        omega = np.asarray(source.angular_frequency(harmonic, anchor),
+                           dtype=float)
+        ahead, back, drop, rise = _delay_stencil(
+            source, harmonic, anchor, omega)
+        amp_p, amp_c = source.amplitude(harmonic, anchor)
+        ahead_p, ahead_c = source.amplitude(harmonic, ahead)
+        back_p, back_c = source.amplitude(harmonic, back)
+        omega_ahead = np.asarray(
+            source.angular_frequency(harmonic, ahead), dtype=float)
+        omega_back = np.asarray(
+            source.angular_frequency(harmonic, back), dtype=float)
+    else:
+        # One pass gives amplitude and frequency together, and the two
+        # stencil sides go in one array: two source calls where the separate
+        # accessors need six. On pyEFPEHM that is 0.42 us per grid point
+        # against 0.72.
+        amp_p, amp_c, _, omega = combined(harmonic, anchor)
+        omega = np.asarray(omega, dtype=float)
+        ahead, back, drop, rise = _delay_stencil(
+            source, harmonic, anchor, omega)
+        pair_p, pair_c, _, pair_omega = combined(
+            harmonic, np.concatenate((ahead, back)))
+        count = len(anchor)
+        ahead_p, back_p = pair_p[:count], pair_p[count:]
+        ahead_c, back_c = pair_c[:count], pair_c[count:]
+        omega_ahead = np.asarray(pair_omega[:count], dtype=float)
+        omega_back = np.asarray(pair_omega[count:], dtype=float)
     rate, curve = _three_point_derivatives(
-        np.asarray(source.angular_frequency(harmonic, back), dtype=float),
-        omega,
-        np.asarray(source.angular_frequency(harmonic, ahead), dtype=float),
-        drop, rise)
+        omega_back, omega, omega_ahead, drop, rise)
     slope_p, bend_p = _three_point_derivatives(
         back_p, amp_p, ahead_p, drop, rise)
     slope_c, bend_c = _three_point_derivatives(
@@ -1346,6 +1367,20 @@ def project_frequency_tdi_series(
     return (output, diagnostics) if return_diagnostics else output
 
 
+def interpolant(x, y, order=3, extrapolate=False):
+    """``order``-degree interpolating spline through ``(x, y)``.
+
+    Cubic is the default. A quintic resolves an oscillation with fewer knots,
+    but scipy builds one at 0.21 us per point against 0.06, so whether it pays
+    depends on how much the grid actually shrinks.
+    """
+    from scipy.interpolate import CubicSpline, make_interp_spline
+
+    if order == 3:
+        return CubicSpline(x, y, extrapolate=extrapolate or None)
+    return make_interp_spline(x, y, k=order)
+
+
 class SparseTDIResponse:
     """Carrier-factored TDI harmonics sampled on arbitrary sparse grids.
 
@@ -1354,9 +1389,11 @@ class SparseTDIResponse:
     caller.  Every harmonic may use a different grid and support window.
     """
 
-    def __init__(self, source, responses, diagnostics=None):
-        from scipy.interpolate import CubicSpline
-
+    def __init__(self, source, responses, diagnostics=None,
+                 interpolation_order=3):
+        if interpolation_order not in (3, 5):
+            raise ValueError("interpolation_order must be 3 or 5")
+        self.interpolation_order = interpolation_order
         self.source = source
         self.responses = tuple(responses)
         self.diagnostics = {} if diagnostics is None else diagnostics
@@ -1364,8 +1401,14 @@ class SparseTDIResponse:
         if len(names) > 1:
             raise ValueError("every harmonic must contain the same channels")
         self.channels = next(iter(names), ())
-        self._splines = []
-        self._offsets = []
+        # Splines are built on demand and kept. A consumer that reads one
+        # channel of a ten-harmonic response pays for one, and one that reads
+        # none -- asking only for diagnostics, or for the grids -- pays for
+        # nothing. Building all of them eagerly was 31.6 ms of a 204.6 ms
+        # candidate.
+        self._splines = [{} for _ in self.responses]
+        self._windows = []
+        self._grids = []
         for item in self.responses:
             grid = np.asarray(item['grid'], dtype=float)
             support = item.get('support')
@@ -1375,26 +1418,73 @@ class SparseTDIResponse:
                 windows = (tuple(support),)
             else:
                 windows = tuple(tuple(window) for window in support)
-            offset = item.get('reference_delay')
-            self._offsets.append(
-                None if offset is None
-                else CubicSpline(grid, np.asarray(offset, dtype=float),
-                                 extrapolate=True))
-            channel_splines = {}
-            for name, bracket in item['brackets'].items():
-                bracket = np.asarray(bracket)
-                pieces = []
-                for low, high in windows:
-                    nodes = (grid >= low) & (grid <= high)
-                    if np.count_nonzero(nodes) < 4:
-                        continue
-                    pieces.append((
-                        float(low),
-                        float(high),
-                        CubicSpline(grid[nodes], bracket[nodes]),
-                    ))
-                channel_splines[name] = tuple(pieces)
-            self._splines.append(channel_splines)
+            self._grids.append(grid)
+            self._windows.append(windows)
+        self._offset = self._shared_offset()
+
+    def _shared_offset(self):
+        """k . R / c does not depend on the harmonic, so build it once.
+
+        Ten harmonics carry ten samplings of one function of time. The widest
+        grid covers the rest, and the others are checked against it rather
+        than trusted: a caller is free to hand in records whose offsets really
+        do differ, and then each keeps its own.
+        """
+        from scipy.interpolate import CubicSpline
+
+        offsets = [item.get('reference_delay') for item in self.responses]
+        if all(offset is None for offset in offsets):
+            return None
+        widest = max(
+            (index for index, offset in enumerate(offsets)
+             if offset is not None),
+            key=lambda index: self._grids[index][-1] - self._grids[index][0])
+        shared = CubicSpline(self._grids[widest],
+                             np.asarray(offsets[widest], dtype=float),
+                             extrapolate=True)
+        for index, offset in enumerate(offsets):
+            if offset is None:
+                return [None if item is None
+                        else CubicSpline(self._grids[i],
+                                         np.asarray(item, dtype=float),
+                                         extrapolate=True)
+                        for i, item in enumerate(offsets)]
+            grid = self._grids[index]
+            probe = grid[::max(1, len(grid) // 8)]
+            wanted = np.interp(probe, grid, np.asarray(offset, dtype=float))
+            scale = max(np.max(np.abs(wanted)), 1e-30)
+            if np.max(np.abs(shared(probe) - wanted)) > 1e-9 * scale:
+                return [CubicSpline(self._grids[i],
+                                    np.asarray(item, dtype=float),
+                                    extrapolate=True)
+                        for i, item in enumerate(offsets)]
+        return shared
+
+    def _offset_for(self, index):
+        """The reference delay of one record, shared or its own."""
+        if self._offset is None:
+            return None
+        if isinstance(self._offset, list):
+            return self._offset[index]
+        return self._offset
+
+    def _channel_spline(self, index, name):
+        """Build, and keep, the pieces of one channel of one harmonic."""
+        cached = self._splines[index].get(name)
+        if cached is not None:
+            return cached
+        grid = self._grids[index]
+        bracket = np.asarray(self.responses[index]['brackets'][name])
+        order = self.interpolation_order
+        pieces = []
+        for low, high in self._windows[index]:
+            nodes = (grid >= low) & (grid <= high)
+            if np.count_nonzero(nodes) < order + 1:
+                continue
+            pieces.append((float(low), float(high),
+                           interpolant(grid[nodes], bracket[nodes], order)))
+        self._splines[index][name] = tuple(pieces)
+        return self._splines[index][name]
 
     def sample_brackets(self, times, channels=None):
         """Return each response record before reattaching its carrier.
@@ -1417,12 +1507,11 @@ class SparseTDIResponse:
         if unknown:
             raise ValueError(f"unknown channels: {sorted(unknown)}")
         records = []
-        for channel_splines in self._splines:
+        for index in range(len(self.responses)):
             output = {}
             for name in selected:
                 bracket = np.zeros(len(times), dtype=complex)
-                for low, high, spline in \
-                        channel_splines[name]:
+                for low, high, spline in self._channel_spline(index, name):
                     want = (times >= low) & (times <= high)
                     if np.any(want):
                         bracket[want] = spline(times[want])
@@ -1438,8 +1527,9 @@ class SparseTDIResponse:
             (channels,) if isinstance(channels, str) else tuple(channels))
         dtype = complex if complex_output else float
         output = {name: np.zeros(len(times), dtype=dtype) for name in selected}
-        for offset, item, record in zip(self._offsets, self.responses,
-                                        brackets, strict=True):
+        for index, (item, record) in enumerate(
+                zip(self.responses, brackets, strict=True)):
+            offset = self._offset_for(index)
             # the bracket was reduced against Phi(t - tau_0), so the carrier
             # has to be read at the same shifted time
             anchor = times if offset is None else times - offset(times)
@@ -1578,7 +1668,8 @@ class PreparedSparseTDI:
 
     def __init__(self, orbit, channel_terms, grids, velocity_order=1,
                  links=LINK_ORDER, delay_expansion=None,
-                 reference_delay=False, threads=1):
+                 reference_delay=False, threads=1, interpolation_order=3):
+        self.interpolation_order = interpolation_order
         self.channel_terms = channel_terms
         self.velocity_order = velocity_order
         self.links = links
@@ -1654,7 +1745,8 @@ class PreparedSparseTDI:
                     float(geometry.grid[-1]), padding=support_padding),
                 'reference_delay': _reference_delay(geometry, lamb, beta),
             })
-        return SparseTDIResponse(source, records)
+        return SparseTDIResponse(
+            source, records, interpolation_order=self.interpolation_order)
 
 
 def build_sparse_tdi_response(source, orbit, channel_terms, lamb, beta,
@@ -1684,7 +1776,8 @@ def adaptive_sparse_tdi_response(
         initial_step=86400.0, relative_tolerance=1e-4,
         amplitude_floor=1e-3, max_refinements=24, velocity_order=1,
         links=LINK_ORDER, support_padding=0.0, max_grid_points=1000000,
-        delay_expansion=None, reference_delay=False, threads=1):
+        delay_expansion=None, reference_delay=False, threads=1,
+        interpolation_order=3):
     """Build an error-controlled response-envelope representation.
 
     Refinement tests the *carrier-factored TDI brackets*, not the carrier
@@ -1729,8 +1822,6 @@ def adaptive_sparse_tdi_response(
         carrier instead. See `_reference_delay`. The bracket then varies an
         order of magnitude more slowly and the grid shrinks with it.
     """
-    from scipy.interpolate import CubicSpline
-
     if t_start is None:
         t_start = source.t_start
     if t_end is None:
@@ -1771,7 +1862,8 @@ def adaptive_sparse_tdi_response(
         stalled_count = 0
         stalled_error = 0.0
         for low, high in windows:
-            count = max(4, int(np.ceil((high - low) / initial_step)) + 1)
+            count = max(interpolation_order + 1,
+                        int(np.ceil((high - low) / initial_step)) + 1)
             grid = np.linspace(low, high, count)
             values = evaluate(harmonic, grid)
             active_left, active_right = grid[:-1], grid[1:]
@@ -1793,7 +1885,8 @@ def adaptive_sparse_tdi_response(
                 owners = np.repeat(np.arange(len(active_left)), 3)
                 exact = evaluate(harmonic, probes)
                 predicted = np.stack([
-                    CubicSpline(grid, row)(probes) for row in values
+                    interpolant(grid, row, interpolation_order)(probes)
+                    for row in values
                 ])
                 peak = np.maximum(np.max(np.abs(values), axis=1),
                                   np.max(np.abs(exact), axis=1))[:, None]
@@ -1909,4 +2002,5 @@ def adaptive_sparse_tdi_response(
             'stalled_intervals': stalled_count,
             'stalled_error': stalled_error,
         }
-    return SparseTDIResponse(source, records, diagnostics=diagnostics)
+    return SparseTDIResponse(source, records, diagnostics=diagnostics,
+                             interpolation_order=interpolation_order)
