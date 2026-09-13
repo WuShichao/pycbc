@@ -986,6 +986,11 @@ def sparse_windowed_channels_terms(sources, harmonics, geometries,
             sources, harmonics, geometries, strict=True)):
         if not isinstance(geometry, MultiChannelTermGeometry):
             raise TypeError("geometry must be a MultiChannelTermGeometry")
+        if getattr(geometry, "reference_delay", False):
+            raise ValueError(
+                "this path reattaches the carrier at t, and a bracket reduced "
+                "against the reference delay needs it at t - tau_0; build the "
+                "geometry with reference_delay=False")
         if not hasattr(source, "source") or not hasattr(
                 source, "frequency_weight"):
             raise TypeError("sources must be frequency-window views")
@@ -1493,6 +1498,12 @@ class SparseTDIResponse:
         selected channel names to complex carrier-factored brackets. This is
         useful when a consumer can batch carrier evaluation across several
         independently windowed views of the same source harmonic.
+
+        A caller reattaching the carrier itself has to read it at
+        ``times - carrier_offset(times, index)``, not at ``times``: a bracket
+        reduced against the reference delay carries the difference. That
+        method returns zeros when there is nothing to correct, so it is always
+        safe to subtract.
         """
         times = np.asarray(times, dtype=float)
         if times.ndim != 1:
@@ -1518,6 +1529,17 @@ class SparseTDIResponse:
                 output[name] = bracket
             records.append(output)
         return tuple(records)
+
+    def carrier_offset(self, times, index):
+        """How far back one record's carrier is read, at ``times``.
+
+        Zero unless the bracket was reduced against the reference delay. See
+        :meth:`sample_brackets`.
+        """
+        offset = self._offset_for(index)
+        times = np.asarray(times, dtype=float)
+        return (np.zeros(len(times)) if offset is None
+                else np.asarray(offset(times), dtype=float))
 
     def sample(self, times, channels=None, complex_output=False):
         """Evaluate selected channels at arbitrary increasing mission times."""
