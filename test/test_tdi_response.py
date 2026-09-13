@@ -5,6 +5,7 @@ import numpy as np
 from pycbc.coordinates.space_orbit import LisaEqualArmOrbit
 from pycbc.tdi.response import (
     C_SI,
+    antenna_prefactor,
     antenna_pattern,
     doppler_factors,
     link_geometry,
@@ -63,7 +64,7 @@ def test_doppler_formula_and_basis_are_orthonormal():
         np.array([0.0, 0.0, 1.0]), n_hat, v_emitter, v_receiver
     )
     assert np.allclose(eps1, (-30.0 + 40.0) / C_SI)
-    assert np.allclose(eps2, (-60.0 + 10.0 - 80.0) / C_SI)
+    assert np.allclose(eps2, (-60.0 + 10.0 - 2 * 40.0) / C_SI)
 
 
 def test_monochromatic_response_matches_frequency_domain_expression():
@@ -121,3 +122,22 @@ def test_antenna_pattern_is_the_polarization_tensor_contraction():
         # propagation direction
         along_plus, along_cross = antenna_pattern(k_hat[None, :], u_hat, v_hat)
         assert abs(along_plus[0]) < 1e-14 and abs(along_cross[0]) < 1e-14
+
+
+def test_antenna_prefactor_is_stable_near_collinearity():
+    """The removable ``0/0`` must stay smooth as a link crosses ``k``."""
+    u_hat, v_hat, k_hat = polarization_basis(1.2, -0.3)
+    # An exactly collinear point has no preferred transverse approach angle,
+    # so straddle it without including it.
+    angles = np.linspace(-2e-7, 2e-7, 1000)
+    direction = (np.cos(angles)[:, None] * k_hat
+                 + np.sin(angles)[:, None] * u_hat)
+    plus, cross = antenna_prefactor(
+        direction, u_hat, v_hat, k_hat)
+    expected = 0.5 * (1 + np.cos(angles))
+    assert np.all(np.isfinite(plus))
+    assert np.all(np.isfinite(cross))
+    assert np.max(np.abs(plus - expected)) < 5e-15
+    # The nominally zero v projection is itself limited by float64 basis
+    # orthogonality and gets divided by the 1e-7 transverse component.
+    assert np.max(np.abs(cross)) < 1e-7

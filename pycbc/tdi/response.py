@@ -164,8 +164,52 @@ def antenna_pattern(n_hat, u_hat, v_hat):
     return n_dot_u ** 2 - n_dot_v ** 2, 2 * n_dot_u * n_dot_v
 
 
+def antenna_prefactor(n_hat, u_hat, v_hat, k_hat):
+    """Return the two link contractions divided by ``2 (1 - n.k)``.
+
+    The literal quotient loses precision when a link approaches the wave
+    direction: its numerator and denominator both vanish quadratically.
+    In that neighbourhood use the orthonormal-basis identity
+
+    ``(n.u)^2 + (n.v)^2 = 1 - (n.k)^2``
+
+    to cancel the removable factor before division.  Away from alignment the
+    literal expression is retained, including around ``n = -k`` where its
+    denominator is already well conditioned.
+    """
+    n_dot_u = np.einsum("...a,a->...", n_hat, u_hat)
+    n_dot_v = np.einsum("...a,a->...", n_hat, v_hat)
+    n_dot_k = np.einsum("...a,a->...", n_hat, k_hat)
+    plus = n_dot_u ** 2 - n_dot_v ** 2
+    cross = 2 * n_dot_u * n_dot_v
+    gap = 1 - n_dot_k
+    use_limit = gap < 1e-4
+    if np.any(use_limit):
+        transverse = n_dot_u ** 2 + n_dot_v ** 2
+        resolved = transverse > (64 * np.finfo(float).eps) ** 2
+        scale = np.divide(
+            0.5 * (1 + n_dot_k), transverse,
+            out=np.zeros_like(transverse), where=resolved)
+        direct_plus = np.divide(
+            plus, 2 * gap, out=np.zeros_like(plus), where=~use_limit)
+        direct_cross = np.divide(
+            cross, 2 * gap, out=np.zeros_like(cross), where=~use_limit)
+        plus = np.where(use_limit, scale * plus, direct_plus)
+        cross = np.where(use_limit, scale * cross, direct_cross)
+    else:
+        plus = plus / (2 * gap)
+        cross = cross / (2 * gap)
+    return plus, cross
+
+
 def doppler_factors(k_hat, n_hat, v_emitter, v_receiver):
-    """Return the frequency-independent Speri Eq. (D2)-(D3) factors."""
+    """Return the endpoint factors in Speri Eq. (D2)-(D3).
+
+    These two factors implement the reduced response in Speri Eq. (13), not
+    the complete first-order-in-velocity response: in particular they do not
+    include the separate laser-trajectory lensing term in van der Steen et
+    al. Eq. (A17).
+    """
     k_dot_emit = np.einsum("a,...a->...", k_hat, v_emitter)
     k_dot_recv = np.einsum("a,...a->...", k_hat, v_receiver)
     n_dot_recv = np.einsum("...a,...a->...", n_hat, v_receiver)
@@ -187,15 +231,9 @@ def link_geometry(sample, lamb, beta, *, velocity_order=1,
     if velocity_order not in (0, 1):
         raise ValueError("velocity_order must be 0 or 1")
     u_hat, v_hat, k_hat = polarization_basis(lamb, beta)
-    xi_plus, xi_cross = antenna_pattern(sample.n_hat, u_hat, v_hat)
-    denominator = 1 - np.einsum("nla,a->nl", sample.n_hat, k_hat)
-    if np.any(np.abs(denominator) < 64 * np.finfo(float).eps):
-        raise ValueError(
-            "source is numerically collinear with a link; the time-domain "
-            "prefactor has a removable 0/0 that requires a joint limit"
-        )
-    prefactor = np.stack((xi_plus, xi_cross), axis=-1)
-    prefactor /= 2 * denominator[..., None]
+    pref_plus, pref_cross = antenna_prefactor(
+        sample.n_hat, u_hat, v_hat, k_hat)
+    prefactor = np.stack((pref_plus, pref_cross), axis=-1)
 
     receivers = np.array([link[0] - 1 for link in sample.links])
     emitters = np.array([link[1] - 1 for link in sample.links])

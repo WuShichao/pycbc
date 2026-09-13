@@ -970,7 +970,8 @@ def multiband_sparse_tdi_response(
         amplitude_floor=1e-3, max_refinements=24, velocity_order=1,
         links=None, padding=None, harmonics=None, max_grid_points=None,
         delay_expansion=None, reference_delay=False, threads=1,
-        interpolation_order=3, stall_refusal_factor=100.0):
+        interpolation_order=3, stall_refusal_factor=100.0,
+        stall_patience=3, evaluation_chunk_size=16384):
     """Build independently sampled time-domain TDI frequency bands.
 
     This function performs no frequency-domain detector projection. Each
@@ -1019,6 +1020,8 @@ def multiband_sparse_tdi_response(
         threads=threads,
         interpolation_order=interpolation_order,
         stall_refusal_factor=stall_refusal_factor,
+        stall_patience=stall_patience,
+        evaluation_chunk_size=evaluation_chunk_size,
     )
     if max_grid_points is not None:
         response_options["max_grid_points"] = max_grid_points

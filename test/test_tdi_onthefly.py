@@ -1130,6 +1130,34 @@ def test_stalled_tolerance_policy_is_explicit_and_validated():
             NewtonianChirp(3.0e4, 1e6), LisaEqualArmOrbit(),
             {"X": _terms("X2")}, 0.9, -0.25,
             t_start=1e5, t_end=2e5, stall_refusal_factor=0.5)
+    with pytest.raises(ValueError, match="stall_patience"):
+        adaptive_sparse_tdi_response(
+            NewtonianChirp(3.0e4, 1e6), LisaEqualArmOrbit(),
+            {"X": _terms("X2")}, 0.9, -0.25,
+            t_start=1e5, t_end=2e5, stall_patience=0)
+    with pytest.raises(ValueError, match="evaluation_chunk_size"):
+        adaptive_sparse_tdi_response(
+            NewtonianChirp(3.0e4, 1e6), LisaEqualArmOrbit(),
+            {"X": _terms("X2")}, 0.9, -0.25,
+            t_start=1e5, t_end=2e5, evaluation_chunk_size=0)
+def test_adaptive_trial_evaluation_is_invariant_under_chunking():
+    """A memory-bound trial batch must accept the identical response grid."""
+    from pycbc.tdi.onthefly import adaptive_sparse_tdi_response
+    arguments = dict(
+        source=NewtonianChirp(3.0e4, 1e6),
+        orbit=LisaEqualArmOrbit(), channel_terms={"X": _terms("X2")},
+        lamb=0.9, beta=-0.25, t_start=1e5, t_end=2e5,
+        initial_step=2e4, relative_tolerance=1e-4,
+    )
+    whole = adaptive_sparse_tdi_response(
+        **arguments, evaluation_chunk_size=100000)
+    chunked = adaptive_sparse_tdi_response(
+        **arguments, evaluation_chunk_size=7)
+    np.testing.assert_array_equal(
+        whole.responses[0]["grid"], chunked.responses[0]["grid"])
+    np.testing.assert_array_equal(
+        whole.responses[0]["brackets"]["X"],
+        chunked.responses[0]["brackets"]["X"])
 
 
 def test_the_delay_expansion_matches_evaluating_every_delayed_time():

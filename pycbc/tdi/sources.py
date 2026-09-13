@@ -999,6 +999,70 @@ def _longest_increasing_run(values):
     return int(starts[best]), int(stops[best] - starts[best] + 1)
 
 
+class _UniformCubicInterpolator:
+    """Cubic Hermite interpolation without per-interval coefficients.
+
+    SciPy's ``CubicSpline`` stores four coefficients for every interval.  A
+    year-long, uniformly sampled waveform can therefore spend substantially
+    more memory on interpolation than on the waveform itself.  This compact
+    form stores only the samples and constructs centred (one-sided at the
+    ends) slopes for the intervals touched by each query.
+    """
+
+    def __init__(self, start, step, values):
+        self.start = float(start)
+        self.step = float(step)
+        self.values = np.asarray(values)
+        if self.values.ndim != 1 or len(self.values) < 2:
+            raise ValueError("uniform interpolation needs at least two samples")
+
+    def __call__(self, query):
+        coordinate = ((np.asarray(query, dtype=float) - self.start)
+                      / self.step)
+        coordinate = np.clip(coordinate, 0.0, len(self.values) - 1.0)
+        left = np.minimum(np.floor(coordinate).astype(np.intp),
+                          len(self.values) - 2)
+        fraction = coordinate - left
+        before = np.maximum(left - 1, 0)
+        right = left + 1
+        after = np.minimum(right + 1, len(self.values) - 1)
+        y0 = self.values[left]
+        y1 = self.values[right]
+        # These are step times the endpoint derivatives.  The denominator is
+        # one at an outer boundary and two for a centred interior difference.
+        slope0 = ((self.values[right] - self.values[before])
+                  / (right - before))
+        slope1 = ((self.values[after] - self.values[left])
+                  / (after - left))
+        square = fraction * fraction
+        cube = square * fraction
+        return ((2 * cube - 3 * square + 1) * y0
+                + (cube - 2 * square + fraction) * slope0
+                + (-2 * cube + 3 * square) * y1
+                + (cube - square) * slope1)
+
+
+class _UniformLinearInterpolator:
+    """Linear interpolation on a uniform grid, retaining only its values."""
+
+    def __init__(self, start, step, values):
+        self.start = float(start)
+        self.step = float(step)
+        self.values = np.asarray(values)
+        if self.values.ndim != 1 or len(self.values) < 2:
+            raise ValueError("uniform interpolation needs at least two samples")
+
+    def __call__(self, query):
+        coordinate = ((np.asarray(query, dtype=float) - self.start)
+                      / self.step)
+        coordinate = np.clip(coordinate, 0.0, len(self.values) - 1.0)
+        left = np.minimum(np.floor(coordinate).astype(np.intp),
+                          len(self.values) - 2)
+        fraction = coordinate - left
+        return ((1 - fraction) * self.values[left]
+                + fraction * self.values[left + 1])
+
+
 class LALTDSource:
     r"""A dominant-mode LAL waveform through merger, from its analytic signal.
 
@@ -1052,7 +1116,6 @@ class LALTDSource:
                  polarization=0.0, amplitude_floor=1e-3,
                  approximant="IMRPhenomD", check_inclination=1.0,
                  tolerance=1e-6, **waveform_options):
-        from scipy.interpolate import CubicSpline, PchipInterpolator
         from pycbc.waveform import get_td_waveform
 
         for name in ("delta_t", "approximant", "inclination"):
@@ -1087,7 +1150,6 @@ class LALTDSource:
         analytic = analytic[first:first + span]
         magnitude = magnitude[first:first + span]
         phase = phase[first:first + span]
-        times = np.asarray(plus.sample_times)[first:first + span]
 
         step = np.abs(np.diff(np.angle(analytic)))
         step = np.minimum(step, 2 * np.pi - step)
@@ -1104,12 +1166,21 @@ class LALTDSource:
         amplitude_plus = plus_factor * cos_psi - cross_factor * sin_psi
         amplitude_cross = plus_factor * sin_psi + cross_factor * cos_psi
 
-        clock = times + float(t_coalescence)
-        self.t_start, self.t_end = float(clock[0]), float(clock[-1])
-        self._times, self._magnitude_samples = times, magnitude
-        self._phase_samples = phase
-        self._magnitude = CubicSpline(clock, magnitude, extrapolate=False)
-        self._phase = CubicSpline(clock, phase, extrapolate=True)
+        intrinsic_start = float(plus.start_time) + first * self.delta_t
+        self._t_coalescence = float(t_coalescence)
+        self._intrinsic_start = intrinsic_start
+        self._intrinsic_end = intrinsic_start + (span - 1) * self.delta_t
+        self.t_start = intrinsic_start + self._t_coalescence
+        self.t_end = self._intrinsic_end + self._t_coalescence
+        # Drop the two LAL arrays and the complex analytic signal before
+        # constructing the frequency samples.  In particular, do not build a
+        # ``sample_times`` array or CubicSpline's 4 x N coefficient tables.
+        del plus, cross, analytic, loud
+        omega = np.gradient(phase, self.delta_t)
+        self._magnitude = _UniformCubicInterpolator(
+            self.t_start, self.delta_t, magnitude)
+        self._phase = _UniformCubicInterpolator(
+            self.t_start, self.delta_t, phase)
         # A monotonicity-preserving interpolant of the sampled frequency, not
         # the derivative of the phase spline: the phase is monotone at the
         # samples but a cubic through them need not be, and its derivative
@@ -1117,8 +1188,8 @@ class LALTDSource:
         # floor, which hands `adaptive_time_grid` a negative frequency. The
         # two differ at interpolation order; angular_frequency sizes grids and
         # never builds the waveform.
-        self._omega = PchipInterpolator(clock, np.gradient(phase, times),
-                                        extrapolate=True)
+        self._omega = _UniformLinearInterpolator(
+            self.t_start, self.delta_t, omega)
         self._amplitude_plus = amplitude_plus
         self._amplitude_cross = amplitude_cross
         if check_inclination is not None:
@@ -1154,15 +1225,20 @@ class LALTDSource:
         plus, cross = get_td_waveform(
             approximant=self.approximant, delta_t=self.delta_t,
             inclination=inclination, **waveform_options)
-        times = np.asarray(plus.sample_times)
-        inside = (times >= self._times[0]) & (times <= self._times[-1])
-        magnitude = np.interp(times[inside], self._times,
-                              self._magnitude_samples)
-        phase = np.interp(times[inside], self._times, self._phase_samples)
+        waveform_start = float(plus.start_time)
+        first = max(0, int(np.ceil(
+            (self._intrinsic_start - waveform_start) / self.delta_t)))
+        stop = min(len(plus), int(np.floor(
+            (self._intrinsic_end - waveform_start) / self.delta_t)) + 1)
+        times = waveform_start + np.arange(first, stop) * self.delta_t
+        clock = times + self._t_coalescence
+        magnitude = self._magnitude(clock)
+        phase = self._phase(clock)
         cosine = np.cos(inclination)
         model = magnitude * (0.5 * (1 + cosine ** 2) * np.cos(phase)
                              - 1j * cosine * np.sin(phase))
-        reference = np.asarray(plus)[inside] - 1j * np.asarray(cross)[inside]
+        reference = (np.asarray(plus)[first:stop]
+                     - 1j * np.asarray(cross)[first:stop])
         # Maximise over time and phase. The two generations need not be
         # aligned to the sample: IMRPhenomXAS puts its two inclinations 0.98 ms
         # apart, reading as mismatch 6e-02 unaligned and 3e-09 aligned. Higher

@@ -26,7 +26,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from pycbc.tdi.response import (C_SI, LINK_ORDER, antenna_pattern,
+from pycbc.tdi.response import (C_SI, LINK_ORDER, antenna_prefactor,
                                 doppler_factors, polarization_basis,
                                 sample_constellation)
 
@@ -224,10 +224,9 @@ def _grid_over_window(source, harmonic, t_start, t_end, delta_phi, dt_max,
 def _link_factors(sample, lamb, beta, velocity_order=1):
     """Prefactor, Doppler weights and the two sampling delays, per link."""
     u_hat, v_hat, k_hat = polarization_basis(lamb, beta)
-    xi_plus, xi_cross = antenna_pattern(sample.n_hat, u_hat, v_hat)
-    denominator = 1 - np.einsum('nla,a->nl', sample.n_hat, k_hat)
-    prefactor = np.stack((xi_plus, xi_cross), axis=-1) / (
-        2 * denominator[..., None])
+    pref_plus, pref_cross = antenna_prefactor(
+        sample.n_hat, u_hat, v_hat, k_hat)
+    prefactor = np.stack((pref_plus, pref_cross), axis=-1)
     receivers = np.array([link[0] - 1 for link in sample.links])
     emitters = np.array([link[1] - 1 for link in sample.links])
     tau_emit = sample.ltt + np.einsum(
@@ -422,9 +421,8 @@ def sparse_channel_cached(source, harmonic, geometry, lamb, beta):
 
     for entry in geometry.chains.values():
         n_hat = entry['n_hat']
-        xi_plus, xi_cross = antenna_pattern(n_hat, u_hat, v_hat)
-        denominator = 2 * (1 - np.einsum('nla,a->nl', n_hat, k_hat))
-        pref_plus, pref_cross = xi_plus / denominator, xi_cross / denominator
+        pref_plus, pref_cross = antenna_prefactor(
+            n_hat, u_hat, v_hat, k_hat)
         tau_emit = entry['ltt'] + np.einsum(
             'nla,a->nl', entry['r_emit'], k_hat) / C_SI
         tau_recv = np.einsum('nla,a->nl', entry['r_recv'], k_hat) / C_SI
@@ -505,20 +503,16 @@ class StackedGeometry:
 def sparse_channel_stacked(source, harmonic, geometry, lamb, beta):
     """One channel, one waveform call, a handful of matrix products."""
     u_hat, v_hat, k_hat = polarization_basis(lamb, beta)
-    n_dot_u = geometry._project(geometry.n_hat, u_hat)
-    n_dot_v = geometry._project(geometry.n_hat, v_hat)
-    n_dot_k = geometry._project(geometry.n_hat, k_hat)
-
-    denominator = 2 * (1 - n_dot_k)
-    pref_plus = (n_dot_u ** 2 - n_dot_v ** 2) / denominator
-    pref_cross = (2 * n_dot_u * n_dot_v) / denominator
+    pref_plus, pref_cross = antenna_prefactor(
+        geometry.n_hat, u_hat, v_hat, k_hat)
     tau_emit = geometry.ltt + geometry._project(geometry.r_emit, k_hat) / C_SI
     tau_recv = geometry._project(geometry.r_recv, k_hat) / C_SI
 
     if geometry.velocity_order:
         k_emit = geometry._project(geometry.v_emit, k_hat)
         k_recv = geometry._project(geometry.v_recv, k_hat)
-        n_v_recv = np.einsum('cgla,cgla->cgl', geometry.n_hat, geometry.v_recv)
+        n_v_recv = np.einsum('cgla,cgla->cgl', geometry.n_hat,
+                             geometry.v_recv)
         n_v_mix = np.einsum('cgla,cgla->cgl', geometry.n_hat,
                             geometry.v_emit - 2 * geometry.v_recv)
         w1 = 1 + (-k_emit + n_v_recv) / C_SI
@@ -622,7 +616,7 @@ class TermGeometry:
                 axis=1)
         if velocity_order:
             self.n_dot_v_recv = np.einsum('tga,tga->tg', self.n_hat,
-                                          self.v_recv)
+                                           self.v_recv)
             self.n_dot_v_mix = np.einsum('tga,tga->tg', self.n_hat,
                                          self.v_emit - 2 * self.v_recv)
         self.shape = self.ltt.shape
@@ -695,9 +689,18 @@ def _sparse_term_projection(geometry, lamb, beta):
     u_hat, v_hat, k_hat = polarization_basis(lamb, beta)
     n_dot_u = geometry._project(geometry.n_hat, u_hat)
     n_dot_v = geometry._project(geometry.n_hat, v_hat)
-    denominator = 2 * (1 - geometry._project(geometry.n_hat, k_hat))
-    pref_plus = (n_dot_u ** 2 - n_dot_v ** 2) / denominator
-    pref_cross = (2 * n_dot_u * n_dot_v) / denominator
+    n_dot_k = geometry._project(geometry.n_hat, k_hat)
+    gap = 1 - n_dot_k
+    transverse = n_dot_u ** 2 + n_dot_v ** 2
+    scale = np.divide(0.5 * (1 + n_dot_k), transverse,
+                      out=np.zeros_like(transverse), where=transverse > 0)
+    direct = gap >= 1e-4
+    pref_plus = np.where(
+        direct, (n_dot_u ** 2 - n_dot_v ** 2) / (2 * gap),
+        scale * (n_dot_u ** 2 - n_dot_v ** 2))
+    pref_cross = np.where(
+        direct, n_dot_u * n_dot_v / gap,
+        scale * (2 * n_dot_u * n_dot_v))
 
     tau_emit = geometry.ltt + geometry._project(geometry.r_emit, k_hat) / C_SI
     tau_recv = geometry._project(geometry.r_recv, k_hat) / C_SI
@@ -920,8 +923,18 @@ def _sparse_term_contributions(source, harmonic, geometry, lamb, beta):
 
 def _reduce_sparse_contributions(contribution, geometry):
     """Reduce gathered term contributions into their output channels."""
-    channels = np.concatenate((geometry.term_channel,
-                               geometry.term_channel))
+    term_count = len(geometry.term_channel)
+    if contribution.shape[0] == 2 * term_count:
+        # Keep the physical one-link subtraction together.  Near n.k = 1
+        # the emission and reception pieces are individually O(h), while
+        # their difference carries the vanishing (1 - n.k) factor.  Summing
+        # every emission side before every reception side needlessly loses
+        # that cancellation before the TDI terms are even combined.
+        contribution = (contribution[:term_count]
+                        + contribution[term_count:])
+    elif contribution.shape[0] != term_count:
+        raise ValueError("contribution rows do not match the TDI terms")
+    channels = geometry.term_channel
     output = np.zeros((len(geometry.channel_names), geometry.shape[1]),
                       dtype=complex)
     for index in range(len(output)):
@@ -931,8 +944,11 @@ def _reduce_sparse_contributions(contribution, geometry):
 
 def sparse_channel_terms(source, harmonic, geometry, lamb, beta):
     """The narrowest one-channel path: work scales with the term count."""
-    return _sparse_term_contributions(
-        source, harmonic, geometry, lamb, beta).sum(axis=0)
+    contribution = _sparse_term_contributions(
+        source, harmonic, geometry, lamb, beta)
+    term_count = len(geometry.term_channel)
+    return (contribution[:term_count]
+            + contribution[term_count:]).sum(axis=0)
 
 
 _EMPTY = np.zeros((1, 1, 3))
@@ -949,6 +965,11 @@ def _fused_channels(source, harmonic, geometry, lamb, beta):
     coefficients = expansion_coefficients(
         source, harmonic, anchor, order=order)
     u_hat, v_hat, k_hat = polarization_basis(lamb, beta)
+    # The compiled loop accumulates emission and reception sides directly.
+    # Around the removable n.k = 1 limit, use the Python path that pairs the
+    # two sides of each physical link before reducing the TDI polynomial.
+    if np.any(1 - geometry._project(geometry.n_hat, k_hat) < 1e-4):
+        return None
     boosted = bool(geometry.velocity_order)
     out = np.empty((len(geometry.channel_names), len(geometry.grid)),
                    dtype=complex)
@@ -1097,11 +1118,8 @@ def frequency_response_factors(geometry, frequencies, lamb, beta):
         raise ValueError("frequencies must have one value per geometry time")
 
     u_hat, v_hat, k_hat = polarization_basis(lamb, beta)
-    n_dot_u = geometry._project(geometry.n_hat, u_hat)
-    n_dot_v = geometry._project(geometry.n_hat, v_hat)
-    denominator = 2 * (1 - geometry._project(geometry.n_hat, k_hat))
-    pref_plus = (n_dot_u ** 2 - n_dot_v ** 2) / denominator
-    pref_cross = (2 * n_dot_u * n_dot_v) / denominator
+    pref_plus, pref_cross = antenna_prefactor(
+        geometry.n_hat, u_hat, v_hat, k_hat)
     tau_emit = (geometry.ltt
                 + geometry._project(geometry.r_emit, k_hat) / C_SI)
     tau_recv = geometry._project(geometry.r_recv, k_hat) / C_SI
@@ -1826,7 +1844,8 @@ def adaptive_sparse_tdi_response(
         amplitude_floor=1e-3, max_refinements=24, velocity_order=1,
         links=LINK_ORDER, support_padding=0.0, max_grid_points=1000000,
         delay_expansion=None, reference_delay=False, threads=1,
-        interpolation_order=3, stall_refusal_factor=100.0):
+        interpolation_order=3, stall_refusal_factor=100.0,
+        stall_patience=3, evaluation_chunk_size=16384):
     """Build an error-controlled response-envelope representation.
 
     Refinement tests the *carrier-factored TDI brackets*, not the carrier
@@ -1878,6 +1897,17 @@ def adaptive_sparse_tdi_response(
         ``stall_refusal_factor * relative_tolerance``.  The default 100
         separates the measured arithmetic floor from a discontinuous source
         cutoff.  Set this to 1 for a strictly literal tolerance.
+    stall_patience : int, optional
+        Consecutive refinements that must fail to reduce an interval's error
+        by a factor of two before it is classified as stalled.  The default
+        preserves the inexpensive narrow-band guard.  Sharply non-stationary
+        merger signals may need a larger value so a day-scale initial
+        interval can reach their physical time scale before classification.
+    evaluation_chunk_size : int, optional
+        Maximum number of trial times held in one temporary delay-geometry
+        object.  Adaptive refinement can test several hundred thousand points
+        at once near merger; chunking bounds that temporary memory without
+        changing the accepted grid or its error test.
     """
     if t_start is None:
         t_start = source.t_start
@@ -1893,6 +1923,12 @@ def adaptive_sparse_tdi_response(
     stall_refusal_factor = float(stall_refusal_factor)
     if not np.isfinite(stall_refusal_factor) or stall_refusal_factor < 1:
         raise ValueError("stall_refusal_factor must be finite and at least one")
+    stall_patience = int(stall_patience)
+    if stall_patience < 1:
+        raise ValueError("stall_patience must be at least one")
+    evaluation_chunk_size = int(evaluation_chunk_size)
+    if evaluation_chunk_size < 2:
+        raise ValueError("evaluation_chunk_size must be at least two")
     if not 0 <= amplitude_floor <= 1:
         raise ValueError("amplitude_floor must lie in [0, 1]")
     if support_padding < 0:
@@ -1905,13 +1941,27 @@ def adaptive_sparse_tdi_response(
     records, diagnostics = [], {}
 
     def evaluate(harmonic, times):
-        geometry = MultiChannelTermGeometry(
-            orbit, times, channel_terms, links=links,
-            velocity_order=velocity_order, delay_expansion=delay_expansion,
-            reference_delay=reference_delay, threads=threads)
-        values = sparse_channels_terms(
-            source, harmonic, geometry, lamb, beta)
-        return np.stack([values[name] for name in channel_names])
+        times = np.asarray(times, dtype=float)
+        pieces = []
+        for first in range(0, len(times), evaluation_chunk_size):
+            stop = min(first + evaluation_chunk_size, len(times))
+            # Constellation sampling needs two times.  If a batch leaves one
+            # point, repeat the preceding point in this last geometry and
+            # discard its duplicate output.
+            duplicate = first > 0 and stop - first == 1
+            selected = times[first - int(duplicate):stop]
+            geometry = MultiChannelTermGeometry(
+                orbit, selected, channel_terms, links=links,
+                velocity_order=velocity_order,
+                delay_expansion=delay_expansion,
+                reference_delay=reference_delay, threads=threads)
+            values = sparse_channels_terms(
+                source, harmonic, geometry, lamb, beta)
+            piece = np.stack([values[name] for name in channel_names])
+            pieces.append(piece[:, 1:] if duplicate else piece)
+        if not pieces:
+            return np.empty((len(channel_names), 0), dtype=complex)
+        return pieces[0] if len(pieces) == 1 else np.concatenate(pieces, axis=1)
 
     for harmonic in source.harmonics:
         windows = harmonic_windows(
@@ -1921,6 +1971,8 @@ def adaptive_sparse_tdi_response(
         deepest = 0
         stalled_count = 0
         stalled_error = 0.0
+        stalled_location = float('nan')
+        stalled_width = 0.0
         for low, high in windows:
             count = max(interpolation_order + 1,
                         int(np.ceil((high - low) / initial_step)) + 1)
@@ -1981,10 +2033,18 @@ def adaptive_sparse_tdi_response(
                 np.maximum.at(interval_error, owners, scaled)
                 stalling = np.where(interval_error > 0.5 * active_error,
                                     active_stall + 1, 0)
-                stuck = failed_interval & (stalling >= 3)
+                stuck = failed_interval & (stalling >= stall_patience)
                 if np.any(stuck):
-                    stalled_error = max(
-                        stalled_error, float(np.max(interval_error[stuck])))
+                    stuck_indices = np.flatnonzero(stuck)
+                    worst = stuck_indices[
+                        np.argmax(interval_error[stuck_indices])]
+                    if interval_error[worst] > stalled_error:
+                        stalled_error = float(interval_error[worst])
+                        stalled_location = float(
+                            0.5 * (active_left[worst]
+                                   + active_right[worst]))
+                        stalled_width = float(
+                            active_right[worst] - active_left[worst])
                     stalled_count += int(np.count_nonzero(stuck))
                     failed_interval &= ~stuck
                 if not np.any(failed_interval):
@@ -2045,7 +2105,9 @@ def adaptive_sparse_tdi_response(
                 f"improving with an interpolation error of "
                 f"{stalled_error:.2e} of the channel peak, above "
                 f"{stall_refusal_factor:g} times the requested "
-                f"{relative_tolerance:.1e}. The bracket is most "
+                f"{relative_tolerance:.1e}; the worst interval is centred "
+                f"at t={stalled_location:.9g} s and is "
+                f"{stalled_width:.3g} s wide. The bracket is most "
                 "likely stepped rather than under-resolved; check whether "
                 "the source cuts this harmonic off inside the window")
         grid = np.concatenate(harmonic_grids)
@@ -2065,7 +2127,11 @@ def adaptive_sparse_tdi_response(
             'relative_tolerance': relative_tolerance,
             'stalled_intervals': stalled_count,
             'stalled_error': stalled_error,
+            'stalled_location': stalled_location,
+            'stalled_width': stalled_width,
             'stall_refusal_factor': stall_refusal_factor,
+            'stall_patience': stall_patience,
+            'evaluation_chunk_size': evaluation_chunk_size,
         }
     return SparseTDIResponse(source, records, diagnostics=diagnostics,
                              interpolation_order=interpolation_order)

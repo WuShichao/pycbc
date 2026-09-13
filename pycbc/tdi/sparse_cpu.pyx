@@ -84,6 +84,7 @@ cpdef int sparse_brackets(
 
     cdef Py_ssize_t b, g, g0, g1, t, side, c, slot, base
     cdef double nu, nv, nk, prefactor_plus, prefactor_cross, inverse
+    cdef double gap, transverse
     cdef double tau_emit, tau_recv, weight_emit, weight_recv, coef
     cdef double delay, phase, weight, angle_cos, angle_sin, squared
     cdef double real, imag, cross_real, cross_imag
@@ -116,9 +117,20 @@ cpdef int sparse_brackets(
                           + n_hat[t, g, 2] * v2)
                     nk = (n_hat[t, g, 0] * k0 + n_hat[t, g, 1] * k1
                           + n_hat[t, g, 2] * k2)
-                    inverse = 1.0 / (2.0 * (1.0 - nk))
-                    prefactor_plus = (nu * nu - nv * nv) * inverse
-                    prefactor_cross = 2.0 * nu * nv * inverse
+                    gap = 1.0 - nk
+                    if gap < 1e-4:
+                        transverse = nu * nu + nv * nv
+                        if transverse > 2.0e-28:
+                            inverse = 0.5 * (1.0 + nk) / transverse
+                            prefactor_plus = (nu * nu - nv * nv) * inverse
+                            prefactor_cross = 2.0 * nu * nv * inverse
+                        else:
+                            prefactor_plus = 0.0
+                            prefactor_cross = 0.0
+                    else:
+                        inverse = 1.0 / (2.0 * gap)
+                        prefactor_plus = (nu * nu - nv * nv) * inverse
+                        prefactor_cross = 2.0 * nu * nv * inverse
                     tau_emit = ltt[t, g] + (
                         r_emit[t, g, 0] * k0 + r_emit[t, g, 1] * k1
                         + r_emit[t, g, 2] * k2) / light_speed
