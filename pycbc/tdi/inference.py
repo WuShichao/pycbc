@@ -49,14 +49,14 @@ _SOURCES = {}
 #: the band's time series, so a two-channel likelihood transformed everything
 #: twice; `frequency_samples` takes all the channels at once.
 _SAMPLED = {}
-_SAMPLED_LIMIT = 64
+_SAMPLED_LIMIT = 16
 
 #: The last projected response, keyed by preparation and parameters. PyCBC's
 #: `Relative` asks the generator for one channel at a time, so a two-channel
 #: likelihood over ten harmonics would otherwise project twenty times for ten
 #: distinct responses. Projection is the larger half of an evaluation.
 _PROJECTED = {}
-_PROJECTED_LIMIT = 64
+_PROJECTED_LIMIT = 16
 
 #: Recently built sources, keyed by builder and parameter values. Preparing
 #: one geometry per harmonic asks the builder for the same fiducial once per
@@ -65,7 +65,15 @@ _PROJECTED_LIMIT = 64
 #: for ten harmonics with a two-ended coverage boundary, which is both slow
 #: and enough allocation to exhaust a 3.5 GiB budget.
 _SOURCE_CACHE = {}
-_SOURCE_CACHE_LIMIT = 32
+_SOURCE_CACHE_LIMIT = 16
+
+#: One live candidate signature per inference-model epoch. A source or
+#: projected response can own large spline arrays, and floating-point sampler
+#: proposals are almost never revisited. Retaining the last 32 or 64 proposals
+#: therefore grew memory without helping PE. Keep only the current proposal
+#: for each active model while still sharing it across harmonics and channels.
+_RUNTIME_SIGNATURES = {}
+_RUNTIME_EPOCH_LIMIT = 4
 
 DEFAULT_ARM = 2.5e9
 DEFAULT_CHANNELS = ('A', 'E')
@@ -139,13 +147,18 @@ def _preparation(params, terms, orbit):
     edges = tuple(float(value) for value in np.atleast_1d(
         params['tdi_band_edges']))
     bounds = params.get('tdi_coverage_bounds') or {}
-    key = (params['tdi_source'], channels, edges,
+    key = (params.get('tdi_preparation_id', 'default'),
+           params['tdi_source'], channels, edges,
            params.get('tdi_harmonic'),
            tuple(sorted((name, float(low), float(high))
                         for name, (low, high) in bounds.items())),
            float(params['t_obs_start']), float(params['t_obs_end']),
            float(params.get('tdi_arm_length', DEFAULT_ARM)),
-           int(params.get('tdi_generation', 2)))
+           int(params.get('tdi_generation', 2)),
+           float(params.get('tdi_delta_t', 5.0)),
+           float(params.get('tdi_samples_per_cycle', 4.0)),
+           float(params.get('tdi_band_overlap', 0.0)),
+           bool(params.get('tdi_clip_bands', True)))
     if key not in _PREPARED:
         fiducial = _narrow(_build_source(params), params)
         coverage = [_narrow(source, params)
@@ -204,7 +217,8 @@ def _build_source(params):
     """Build a source, reusing an identical one if it is still cached."""
     builder = params['tdi_source']
     try:
-        key = (builder, _signature(params))
+        key = (params.get('tdi_preparation_id', 'default'),
+               builder, _signature(params))
     except TypeError:
         return _SOURCES[builder](**params)
     if key not in _SOURCE_CACHE:
@@ -264,7 +278,8 @@ def _projection(params, prepared):
     channel of a candidate already projected costs nothing while a genuinely
     new candidate is never served a stale response.
     """
-    key = (id(prepared), _signature(params))
+    key = (params.get('tdi_preparation_id', 'default'),
+           id(prepared), _signature(params))
     response = _PROJECTED.get(key)
     if response is not None:
         return response
@@ -296,7 +311,31 @@ def _signature(params):
     return tuple(sorted(
         (name, value) for name, value in params.items()
         if isinstance(value, (int, float, str, bool))
-        and name not in ('ifos',)))
+        and name not in ('ifos', 'tdi_harmonic')))
+
+
+def _begin_candidate(params):
+    """Discard stale runtime objects when an inference candidate changes."""
+    epoch = params.get('tdi_preparation_id', 'default')
+    signature = _signature(params)
+    previous = _RUNTIME_SIGNATURES.get(epoch)
+    if previous == signature:
+        return
+    if previous is None and len(_RUNTIME_SIGNATURES) >= _RUNTIME_EPOCH_LIMIT:
+        expired = next(iter(_RUNTIME_SIGNATURES))
+        _RUNTIME_SIGNATURES.pop(expired)
+        for cache in (_SOURCE_CACHE, _PROJECTED, _SAMPLED):
+            for key in tuple(cache):
+                if key[0] == expired:
+                    cache.pop(key)
+    if previous is None:
+        _RUNTIME_SIGNATURES[epoch] = signature
+        return
+    for cache in (_SOURCE_CACHE, _PROJECTED, _SAMPLED):
+        for key in tuple(cache):
+            if key[0] == epoch:
+                cache.pop(key)
+    _RUNTIME_SIGNATURES[epoch] = signature
 
 
 def clear_cache():
@@ -305,6 +344,7 @@ def clear_cache():
     _SOURCE_CACHE.clear()
     _PROJECTED.clear()
     _SAMPLED.clear()
+    _RUNTIME_SIGNATURES.clear()
 
 
 def sparse_tdi_fd_det_sequence(**params):
@@ -350,6 +390,7 @@ def sparse_tdi_fd_det_sequence(**params):
         return {name: Array(np.zeros(len(sample_points), dtype=complex))
                 for name in requested}
 
+    _begin_candidate(params)
     response = _projection(params, prepared)
     delta_f = float(params['tdi_delta_f'])
     # Absolute zero on the mission clock, not the start of the observation.
@@ -372,7 +413,8 @@ def sparse_tdi_fd_det_sequence(**params):
     # built for [f_lower, f_upper] and is cut there. Together they take
     # 1 - |overlap| from 6.5e-06 to 1.8e-08.
     padding = float(params.get('tdi_spectral_padding', 0.0))
-    key = (id(prepared), _signature(params), served,
+    key = (params.get('tdi_preparation_id', 'default'),
+           id(prepared), _signature(params), served,
            sample_points.tobytes(), delta_f, epoch, padding)
     samples = _SAMPLED.get(key)
     if samples is None:

@@ -33,6 +33,7 @@ since the work is the same either way -- plus the kernel calls.
 """
 import itertools
 import logging
+import uuid
 
 import numpy
 
@@ -66,6 +67,15 @@ class HarmonicRelative(Relative):
     def __init__(self, variable_params, data, low_frequency_cutoff,
                  harmonics=None, cross_terms=True,
                  harmonic_epsilon=0.1, **kwargs):
+        # The waveform registry is process-global, as is its prepared-geometry
+        # cache. Give every model instance an epoch identity so two models
+        # with the same observation window cannot silently share a geometry
+        # prepared with different fiducials or numerical settings. Candidates
+        # of this model keep the same identity and therefore still reuse it.
+        static_params = dict(kwargs.get('static_params', {}))
+        static_params.setdefault(
+            'tdi_preparation_id', f'harmonic-relative-{uuid.uuid4().hex}')
+        kwargs['static_params'] = static_params
         super().__init__(variable_params, data, low_frequency_cutoff,
                          **kwargs)
         self.harmonic_epsilon = float(harmonic_epsilon)

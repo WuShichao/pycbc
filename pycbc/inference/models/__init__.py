@@ -38,6 +38,7 @@ from .gated_gaussian_noise import (GatedGaussianNoise, GatedGaussianMargPol,
                                    GatedGaussianMargPhase)
 from .single_template import SingleTemplate
 from .relbin import Relative, RelativeTime, RelativeTimeDom
+from .tdi_harmonic_relbin import HarmonicRelative
 from .hierarchical import (HierarchicalModel, MultiSignalModel,
                            JointPrimaryMarginalizedModel)
 
@@ -206,6 +207,7 @@ _models = {_cls.name: _cls for _cls in (
     GatedGaussianMargPhase,
     SingleTemplate,
     Relative,
+    HarmonicRelative,
     RelativeTime,
     HierarchicalModel,
     MultiSignalModel,

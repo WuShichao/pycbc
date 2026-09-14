@@ -2,7 +2,6 @@
 import numpy as np
 import pytest
 
-from pycbc.tdi.combination import Term
 from pycbc.tdi.inference import (channel_terms, clear_cache, register,
                                  sparse_tdi_fd_det_sequence)
 
@@ -50,7 +49,8 @@ def test_registration_lands_in_the_detector_response_registry():
     assert 'tdi_source' in sparse_tdi_fd_det_sequence.required
 
 
-def test_the_prepared_geometry_is_cached_but_not_on_sky_position():
+def test_prepared_geometry_is_model_scoped_and_keyed_on_numerical_knobs(
+        monkeypatch):
     """The cache key decides whether a sampler can afford this.
 
     Preparing costs about half a second and projecting about seven
@@ -59,21 +59,75 @@ def test_the_prepared_geometry_is_cached_but_not_on_sky_position():
     it does not have to.
     """
     from pycbc.tdi import inference
+
+    class Narrow:
+        harmonics = (2,)
+
+        def angular_frequency(self, harmonic, times):
+            return np.full_like(
+                np.asarray(times, dtype=float), 2 * np.pi * 1.5e-3)
+
     clear_cache()
     assert not inference._PREPARED
     params = dict(tdi_source='lal', tdi_band_edges=[1e-3, 2e-3],
                   t_obs_start=0.0, t_obs_end=1.0e7,
-                  eclipticlongitude=0.9, eclipticlatitude=-0.25)
-    keys = []
-    for lamb in (0.9, 2.5):
-        edges = tuple(float(v) for v in np.atleast_1d(params['tdi_band_edges']))
-        bounds = params.get('tdi_coverage_bounds') or {}
-        keys.append((params['tdi_source'], ('A', 'E'), edges,
-                     tuple(sorted((n, float(a), float(b))
-                                  for n, (a, b) in bounds.items())),
-                     float(params['t_obs_start']),
-                     float(params['t_obs_end']), 2.5e9, 2))
-    assert keys[0] == keys[1], "sky position must not enter the cache key"
+                  eclipticlongitude=0.9, eclipticlatitude=-0.25,
+                  tdi_preparation_id='first', tdi_samples_per_cycle=4.0)
+    built = []
+    monkeypatch.setattr(inference, '_build_source', lambda _: Narrow())
+    monkeypatch.setattr(
+        inference, 'prepare_multiband_tdi',
+        lambda *args, **kwargs: built.append(kwargs) or object())
+    terms, orbit = {'A': ()}, object()
+
+    first = inference._preparation(params, terms, orbit)
+    # Sky and sampled source parameters are projected after preparation.
+    same_epoch = dict(params, eclipticlongitude=2.5, mass1=99.0)
+    assert inference._preparation(same_epoch, terms, orbit) is first
+
+    # A different model epoch or a changed preparation knob must not reuse it.
+    new_epoch = dict(params, tdi_preparation_id='second')
+    assert inference._preparation(new_epoch, terms, orbit) is not first
+    finer = dict(params, tdi_samples_per_cycle=16.0)
+    assert inference._preparation(finer, terms, orbit) is not first
+    assert len(built) == 3
+
+
+def test_runtime_source_cache_has_a_small_candidate_bound(monkeypatch):
+    """Unique sampler proposals must not retain dozens of large sources."""
+    from pycbc.tdi import inference
+
+    clear_cache()
+    monkeypatch.setitem(inference._SOURCES, 'cache-test',
+                        lambda **params: object())
+    for value in range(inference._SOURCE_CACHE_LIMIT + 3):
+        inference._build_source(dict(tdi_source='cache-test', value=value))
+    assert len(inference._SOURCE_CACHE) == inference._SOURCE_CACHE_LIMIT
+
+
+def test_new_candidate_releases_previous_runtime_objects(monkeypatch):
+    """A PE walk retains one proposal per model, not its recent history."""
+    from pycbc.tdi import inference
+
+    clear_cache()
+    monkeypatch.setitem(inference._SOURCES, 'cache-test',
+                        lambda **params: object())
+    first = dict(tdi_source='cache-test', tdi_preparation_id='model-1',
+                 value=1.0)
+    inference._begin_candidate(first)
+    inference._build_source(first)
+    signature = inference._signature(first)
+    inference._PROJECTED[('model-1', 1, signature)] = object()
+    inference._SAMPLED[('model-1', 1, signature)] = object()
+
+    second = dict(first, value=2.0)
+    inference._begin_candidate(second)
+
+    assert not inference._SOURCE_CACHE
+    assert not inference._PROJECTED
+    assert not inference._SAMPLED
+    assert inference._RUNTIME_SIGNATURES['model-1'] \
+        == inference._signature(second)
 
 
 def test_band_edges_are_clipped_to_a_single_harmonic():
