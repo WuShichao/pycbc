@@ -86,9 +86,35 @@ class HarmonicRelative(Relative):
         self.h00_h, self.sdat_h, self.cross = {}, {}, {}
         for ifo in self.data:
             self._prepare_channel(ifo)
+        self._build_shared_query()
         logging.info("%s: %d harmonics, %d cross pairs per channel",
                      self.name, len(self.harmonics),
                      len(self.harmonics) * (len(self.harmonics) - 1) // 2)
+
+    def _build_shared_query(self):
+        """One frequency set per harmonic, shared by every channel.
+
+        Each channel bins against its own fiducial and so asks for a slightly
+        different set of points, but the generator's cost is in building the
+        harmonic's response, not in evaluating it -- asking channel by channel
+        rebuilt the same band's time series once per channel. Taking the union
+        up front makes that one call, and `take` puts each channel back on its
+        own points.
+        """
+        self.uquery, self.utake = {}, {}
+        for ifo in self.data:
+            self.utake[ifo] = {}
+        for harmonic in self.harmonics:
+            live = [ifo for ifo in self.data
+                    if harmonic in self.hquery.get(ifo, {})]
+            if not live:
+                continue
+            values = numpy.unique(numpy.concatenate(
+                [self.f[ifo][self.hquery[ifo][harmonic]] for ifo in live]))
+            self.uquery[harmonic] = (tuple(live), values)
+            for ifo in live:
+                own = self.f[ifo][self.hquery[ifo][harmonic]]
+                self.utake[ifo][harmonic] = numpy.searchsorted(values, own)
 
     def _fiducial_harmonic(self, ifo, harmonic, frequencies):
         params = dict(self.fid_params)
@@ -206,21 +232,21 @@ class HarmonicRelative(Relative):
         params = self.current_params
         filt, norm = 0j, 0.0
         self._last_self, self._last_cross = 0.0, 0.0
+        sampled = {ifo: {} for ifo in self.data}
+        for harmonic, (live, values) in self.uquery.items():
+            request = dict(params)
+            request['tdi_harmonic'] = harmonic
+            wave = get_fd_det_waveform_sequence(
+                ifos=live, sample_points=Array(values.astype(numpy.float64)),
+                **request)
+            for ifo in live:
+                whole = numpy.asarray(wave[ifo], dtype=numpy.complex128)
+                sampled[ifo][harmonic] = whole[self.utake[ifo][harmonic]]
+
         for ifo in self.data:
             live = self.h00_h[ifo]
-            sampled, index = {}, {}
-            for harmonic in live:
-                points = self.hquery[ifo][harmonic]
-                request = dict(params)
-                request['tdi_harmonic'] = harmonic
-                wave = get_fd_det_waveform_sequence(
-                    ifos=ifo,
-                    sample_points=Array(self.f[ifo][points].astype(
-                        numpy.float64)),
-                    **request)
-                sampled[harmonic] = numpy.asarray(wave[ifo],
-                                                  dtype=numpy.complex128)
-                index[harmonic] = points
+            index = {h: self.hquery[ifo][h] for h in live}
+            sampled_ifo = sampled[ifo]
 
             for harmonic in live:
                 summary = self.sdat_h[ifo][harmonic]
@@ -228,7 +254,7 @@ class HarmonicRelative(Relative):
                 take = numpy.searchsorted(index[harmonic], edges)
                 part_filt, part_norm = likelihood_parts_det(
                     self.hfedges[ifo][harmonic], 0.0,
-                    numpy.ascontiguousarray(sampled[harmonic][take]),
+                    numpy.ascontiguousarray(sampled_ifo[harmonic][take]),
                     numpy.ascontiguousarray(self.h00_h[ifo][harmonic]),
                     summary['a0'], summary['a1'],
                     summary['b0'], summary['b1'])
@@ -241,10 +267,10 @@ class HarmonicRelative(Relative):
                 take2 = numpy.searchsorted(index[second], block['edges'])
                 pair = likelihood_parts_det_multi(
                     block['freqs'], 0.0,
-                    numpy.ascontiguousarray(sampled[first][take1]),
+                    numpy.ascontiguousarray(sampled_ifo[first][take1]),
                     numpy.ascontiguousarray(block['h1']),
                     0.0,
-                    numpy.ascontiguousarray(sampled[second][take2]),
+                    numpy.ascontiguousarray(sampled_ifo[second][take2]),
                     numpy.ascontiguousarray(block['h2']),
                     block['a0'], block['a1'])
                 # 2 Re<h_i|h_j> enters <h|h>, which enters the likelihood with

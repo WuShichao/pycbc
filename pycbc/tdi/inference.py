@@ -44,6 +44,13 @@ _PREPARED = {}
 #: Source builders, selected by the ``tdi_source`` parameter.
 _SOURCES = {}
 
+#: Frequency samples, keyed by preparation, parameters and the requested
+#: grid. `Relative` asks one channel at a time and each ask re-materialises
+#: the band's time series, so a two-channel likelihood transformed everything
+#: twice; `frequency_samples` takes all the channels at once.
+_SAMPLED = {}
+_SAMPLED_LIMIT = 64
+
 #: The last projected response, keyed by preparation and parameters. PyCBC's
 #: `Relative` asks the generator for one channel at a time, so a two-channel
 #: likelihood over ten harmonics would otherwise project twenty times for ten
@@ -297,6 +304,7 @@ def clear_cache():
     _PREPARED.clear()
     _SOURCE_CACHE.clear()
     _PROJECTED.clear()
+    _SAMPLED.clear()
 
 
 def sparse_tdi_fd_det_sequence(**params):
@@ -313,10 +321,17 @@ def sparse_tdi_fd_det_sequence(**params):
     requested = tuple(requested)
     sample_points = np.asarray(params['sample_points'], dtype=float)
 
+    # Prepare and transform every channel the caller will eventually ask for,
+    # not just this one. `Relative` iterates its detectors and calls in here
+    # once per detector, and each call would otherwise rebuild the band's time
+    # series for the same candidate.
+    served = tuple(params.get('tdi_channels', requested))
+    if not set(requested) <= set(served):
+        served = tuple(dict.fromkeys(served + requested))
     orbit = LisaEqualArmOrbit(
         armlength=float(params.get('tdi_arm_length', DEFAULT_ARM)), t0=0.0)
     terms = channel_terms(
-        requested, generation=int(params.get('tdi_generation', 2)),
+        served, generation=int(params.get('tdi_generation', 2)),
         delta_t=float(params.get('tdi_delta_t', 5.0)))
     try:
         prepared = _preparation(params, terms, orbit)
@@ -357,11 +372,18 @@ def sparse_tdi_fd_det_sequence(**params):
     # built for [f_lower, f_upper] and is cut there. Together they take
     # 1 - |overlap| from 6.5e-06 to 1.8e-08.
     padding = float(params.get('tdi_spectral_padding', 0.0))
-    samples = response.frequency_samples(
-        {name: sample_points for name in requested},
-        delta_f={name: delta_f for name in requested},
-        epoch={name: epoch for name in requested},
-        channels=requested, spectral_padding=padding)
+    key = (id(prepared), _signature(params), served,
+           sample_points.tobytes(), delta_f, epoch, padding)
+    samples = _SAMPLED.get(key)
+    if samples is None:
+        samples = response.frequency_samples(
+            {name: sample_points for name in served},
+            delta_f={name: delta_f for name in served},
+            epoch={name: epoch for name in served},
+            channels=served, spectral_padding=padding)
+        if len(_SAMPLED) >= _SAMPLED_LIMIT:
+            _SAMPLED.pop(next(iter(_SAMPLED)))
+        _SAMPLED[key] = samples
     # A pycbc Array, not a FrequencySeries. `Relative.__init__` reverses the
     # fiducial with ``curr_wav[::-1]`` to find trailing zeros, and reversing a
     # FrequencySeries hands its constructor a negative delta_f; it also
