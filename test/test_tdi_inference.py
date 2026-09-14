@@ -74,3 +74,50 @@ def test_the_prepared_geometry_is_cached_but_not_on_sky_position():
                      float(params['t_obs_start']),
                      float(params['t_obs_end']), 2.5e9, 2))
     assert keys[0] == keys[1], "sky position must not enter the cache key"
+
+
+def test_band_edges_are_clipped_to_a_single_harmonic():
+    """A band's sampling rate comes from its upper edge, so it must fit.
+
+    `samples_per_cycle` over `f_upper` sets the block length, so a harmonic
+    living at 5 to 10 mHz inside a band that reaches 90 mHz materialises an
+    order of magnitude more samples than its own carrier needs -- and
+    materialising the block is half the cost of a frequency evaluation.
+    """
+    from pycbc.tdi.inference import _harmonic_band_edges
+
+    class Narrow:
+        harmonics = (2,)
+
+        def angular_frequency(self, harmonic, times):
+            times = np.asarray(times, dtype=float)
+            return 2 * np.pi * (5e-3 + 5e-3 * (times - times[0])
+                                / max(times[-1] - times[0], 1.0))
+
+    edges = [4e-3, 2.55e-2, 4.7e-2, 6.85e-2, 9e-2]
+    clipped = _harmonic_band_edges(Narrow(), 2, edges, 0.0, 1.0e6)
+    assert clipped[0] < 5e-3 and clipped[-1] > 1e-2
+    assert clipped[-1] < 1.1e-2, clipped
+    # None of the global interior edges lie inside 5-10 mHz, so the clipped
+    # band is a single interval and its upper edge is the harmonic's own.
+    assert len(clipped) == 2, clipped
+
+
+def test_the_chirp_z_plan_is_reused():
+    """`zoom_fft` rebuilds its plan every call; a likelihood asks repeatedly."""
+    from pycbc.tdi.multiband import (_ZOOM_PLANS, _zoom_plan,
+                                     clear_zoom_plans)
+    clear_zoom_plans()
+    first = _zoom_plan(1024, 1e-3, 2e-3, 64, 0.2)
+    again = _zoom_plan(1024, 1e-3, 2e-3, 64, 0.2)
+    assert again is first
+    other = _zoom_plan(2048, 1e-3, 2e-3, 64, 0.2)
+    assert other is not first
+    assert len(_ZOOM_PLANS) == 2
+    values = np.random.default_rng(0).normal(size=1024)
+    from scipy.signal import zoom_fft
+    assert np.allclose(first(values),
+                       zoom_fft(values, [1e-3, 2e-3], m=64, fs=0.2,
+                                endpoint=True))
+    clear_zoom_plans()
+    assert not _ZOOM_PLANS

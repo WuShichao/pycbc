@@ -95,6 +95,30 @@ def register_source(name, builder):
     _SOURCES[str(name)] = builder
 
 
+def _harmonic_band_edges(source, harmonic, edges, t_start, t_end,
+                         probe=256, margin=1.05):
+    """Band edges clipped to where this harmonic actually lives.
+
+    A band's time sampling is set by its *upper* edge -- `samples_per_cycle`
+    over `f_upper` -- so a harmonic that occupies 5 to 10 mHz pays for the
+    90 mHz top of a global band it never reaches. Every candidate then
+    materialises several times more samples than its own carrier needs, and
+    materialising the block is half the cost of a frequency evaluation.
+
+    Clipping is safe because the band only has to contain the harmonic: the
+    partition exists to bound the sampling rate, not to filter.
+    """
+    times = np.linspace(float(t_start), float(t_end), int(probe))
+    rate = np.abs(np.asarray(source.angular_frequency(harmonic, times),
+                             dtype=float)) / (2 * np.pi)
+    rate = rate[np.isfinite(rate) & (rate > 0)]
+    if not len(rate):
+        return list(edges)
+    low, high = float(rate.min()) / margin, float(rate.max()) * margin
+    inner = [float(value) for value in edges if low < value < high]
+    return [low] + inner + [high]
+
+
 def _preparation(params, terms, orbit):
     """Fetch or build the prepared geometry for this observation."""
     channels = tuple(terms)
@@ -138,12 +162,21 @@ def _preparation(params, terms, orbit):
                 "tdi: %d harmonic(s) live in the fiducial but not across the "
                 "whole prior and are excluded from this epoch: %s",
                 len(dropped), sorted(dropped))
+        # Clip whenever the preparation covers exactly one harmonic, however
+        # it came to -- a dominant-mode source qualifies without anyone asking
+        # for `tdi_harmonic`. With several harmonics in one preparation there
+        # is no single frequency range to clip to.
+        band = list(edges)
+        if len(fiducial.harmonics) == 1 and params.get('tdi_clip_bands', True):
+            band = _harmonic_band_edges(
+                fiducial, fiducial.harmonics[0], edges,
+                params['t_obs_start'], params['t_obs_end'])
         _PREPARED[key] = prepare_multiband_tdi(
             fiducial, orbit, terms,
             float(params['eclipticlongitude']),
             float(params['eclipticlatitude']),
             harmonics=tuple(sorted(common)),
-            band_edges=list(edges),
+            band_edges=band,
             t_start=float(params['t_obs_start']),
             t_end=float(params['t_obs_end']),
             coverage_sources=[RestrictedHarmonicSource(

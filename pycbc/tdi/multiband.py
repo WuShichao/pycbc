@@ -51,10 +51,39 @@ def _direct_frequency_samples(series, frequencies, epoch, chunk_size):
     return delta_t * output
 
 
+#: Reusable chirp-z plans, keyed by everything that defines one. `zoom_fft`
+#: builds its `ZoomFFT` afresh on every call, and for a likelihood that asks
+#: for the same frequencies of the same-length block once per candidate that
+#: is pure repetition -- profiled at 0.086 s of a 0.348 s evaluation, a
+#: quarter of the whole cost, spent in `CZT.__init__`.
+_ZOOM_PLANS = {}
+_ZOOM_PLAN_LIMIT = 64
+
+
+def _zoom_plan(length, first, last, span, sample_rate):
+    """A `ZoomFFT` for this geometry, built once and kept."""
+    from scipy.signal import ZoomFFT
+
+    key = (int(length), float(first), float(last), int(span),
+           float(sample_rate))
+    plan = _ZOOM_PLANS.get(key)
+    if plan is None:
+        if len(_ZOOM_PLANS) >= _ZOOM_PLAN_LIMIT:
+            _ZOOM_PLANS.pop(next(iter(_ZOOM_PLANS)))
+        plan = ZoomFFT(int(length), [first, last], m=int(span),
+                       fs=sample_rate, endpoint=True)
+        _ZOOM_PLANS[key] = plan
+    return plan
+
+
+def clear_zoom_plans():
+    """Drop the cached chirp-z plans."""
+    _ZOOM_PLANS.clear()
+
+
 def _zoom_frequency_samples(series, frequencies, indices, delta_f, epoch,
                             direct_chunk_size):
     """Evaluate selected samples of a short block on a longer FFT grid."""
-    from scipy.signal import zoom_fft
 
     weighted = series.copy()
     if len(weighted):
@@ -96,9 +125,9 @@ def _zoom_frequency_samples(series, frequencies, indices, delta_f, epoch,
 
         first_frequency = group_indices[0] * delta_f
         last_frequency = group_indices[-1] * delta_f
-        transformed = zoom_fft(
-            values, [first_frequency, last_frequency], m=span,
-            fs=1.0 / float(series.delta_t), endpoint=True)
+        plan = _zoom_plan(len(values), first_frequency, last_frequency,
+                          span, 1.0 / float(series.delta_t))
+        transformed = plan(values)
         transformed *= float(series.delta_t)
         grid = first_frequency + np.arange(span) * delta_f
         offset = float(series.start_time) - float(epoch)
