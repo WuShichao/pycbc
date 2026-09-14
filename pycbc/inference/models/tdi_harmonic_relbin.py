@@ -188,9 +188,24 @@ class HarmonicRelative(Relative):
             -2.0j * numpy.pi * self.f[ifo] * self.ta[ifo])
         return numpy.asarray(self.data[ifo] * numpy.conjugate(tshift))
 
+    @property
+    def cross_fraction(self):
+        """Share of <h|h> carried by the harmonic cross terms, last call.
+
+        This is what decides whether the N(N-1)/2 summaries are worth
+        building. Harmonics that overlap in frequency need not overlap in
+        *time*, and when they do not the integral averages away: an eccentric
+        harmonic n sweeps the band that n-1 swept earlier, so the two share
+        frequencies while never being loud together.
+        """
+        if not getattr(self, '_last_self', 0.0):
+            return float('nan')
+        return self._last_cross / self._last_self
+
     def _loglr(self):
         params = self.current_params
         filt, norm = 0j, 0.0
+        self._last_self, self._last_cross = 0.0, 0.0
         for ifo in self.data:
             live = self.h00_h[ifo]
             sampled, index = {}, {}
@@ -219,6 +234,7 @@ class HarmonicRelative(Relative):
                     summary['b0'], summary['b1'])
                 filt += part_filt
                 norm += part_norm
+                self._last_self += part_norm
 
             for (first, second), block in self.cross[ifo].items():
                 take1 = numpy.searchsorted(index[first], block['edges'])
@@ -234,4 +250,5 @@ class HarmonicRelative(Relative):
                 # 2 Re<h_i|h_j> enters <h|h>, which enters the likelihood with
                 # a factor of one half.
                 norm += 2.0 * pair.real
+                self._last_cross += 2.0 * pair.real
         return float(numpy.real(filt) - 0.5 * norm)

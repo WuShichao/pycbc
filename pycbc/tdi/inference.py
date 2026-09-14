@@ -268,7 +268,22 @@ def sparse_tdi_fd_det_sequence(**params):
     terms = channel_terms(
         requested, generation=int(params.get('tdi_generation', 2)),
         delta_t=float(params.get('tdi_delta_t', 5.0)))
-    prepared = _preparation(params, terms, orbit)
+    try:
+        prepared = _preparation(params, terms, orbit)
+    except ValueError as error:
+        # A harmonic whose whole frequency range sits outside the analysis
+        # band has no live band to prepare, and it contributes nothing. That
+        # is a fact about the request, not an ambiguity, so it returns zeros
+        # rather than refusing -- unlike an unprepared *harmonic*, where
+        # keeping or dropping it would change the answer. An eccentric source
+        # reaches this as soon as (n/2) f22 passes the cadence's Nyquist: at
+        # e = 0.5 pyEFPEHM keeps 22 harmonics and the highest are past 0.1 Hz.
+        if 'at least one live band' not in str(error):
+            raise
+        logging.info("tdi: harmonic %s has no support in the requested band; "
+                     "returning zeros", params.get('tdi_harmonic'))
+        return {name: Array(np.zeros(len(sample_points), dtype=complex))
+                for name in requested}
 
     source = _narrow(_build_source(params), params)
     # The candidate's own harmonic set moves with its parameters too, so it
