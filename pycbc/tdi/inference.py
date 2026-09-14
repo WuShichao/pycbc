@@ -348,11 +348,20 @@ def sparse_tdi_fd_det_sequence(**params):
     # observation start against +18.97 with zero, where the exact peak is
     # +18.99.
     epoch = float(params.get('tdi_epoch', 0.0))
+    # Two knobs, both needed, both measured on an isolated single-harmonic
+    # source against an exact rfft of the same response. `samples_per_cycle`
+    # controls the quadrature error, which falls as its square: at the default
+    # 4 the amplitude is 1.3e-04 low, at 16 it is 4.5e-06. `spectral_padding`
+    # controls the band-edge truncation, which the cadence cannot touch: a
+    # requested bin at a band edge is fed only by that band, whose response was
+    # built for [f_lower, f_upper] and is cut there. Together they take
+    # 1 - |overlap| from 6.5e-06 to 1.8e-08.
+    padding = float(params.get('tdi_spectral_padding', 0.0))
     samples = response.frequency_samples(
         {name: sample_points for name in requested},
         delta_f={name: delta_f for name in requested},
         epoch={name: epoch for name in requested},
-        channels=requested)
+        channels=requested, spectral_padding=padding)
     # A pycbc Array, not a FrequencySeries. `Relative.__init__` reverses the
     # fiducial with ``curr_wav[::-1]`` to find trailing zeros, and reversing a
     # FrequencySeries hands its constructor a negative delta_f; it also
