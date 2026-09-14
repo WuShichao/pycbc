@@ -1939,6 +1939,16 @@ def adaptive_sparse_tdi_response(
     max_refinements : int, optional
         Maximum number of local bisections along any initial interval.
     support_padding : float, optional
+        Usually `delay_padding`. Note what the caller must do with it as well:
+        the response at ``t`` reads the source over ``[t - padding,
+        t + padding]``, so a window reaching closer than one padding to the
+        end of support is not represented, and a window ending exactly one
+        padding short leaves the spline one-sided there. About one and a half
+        paddings is the useful setting -- measured on Sangria's massive black
+        hole binaries, anything from 1.25 to 1.75 gives mismatches between
+        7.3e-09 and 2.6e-08 with no sharp optimum, while a larger margin loses
+        signal monotonically. Four paddings ends the window before the
+        amplitude peak and costs three quarters of rho.
         Widen source support blocks on the mission-time grid. Restricted
         frequency bands need a bound from :func:`delay_padding`, because a
         delayed source sample can contribute just outside its native support.
