@@ -93,6 +93,49 @@ def test_prepared_geometry_is_model_scoped_and_keyed_on_numerical_knobs(
     assert len(built) == 3
 
 
+def test_two_harmonics_of_one_candidate_get_separate_geometries(monkeypatch):
+    """`_signature` is harmonic-blind, so the preparation key must not be.
+
+    A projection is cached under `(epoch, id(prepared), _signature(params))`
+    and the signature deliberately drops `tdi_harmonic`, so that the ten
+    harmonic requests of one candidate share a source instead of rebuilding
+    it ten times. What keeps them apart is the preparation: it keys on
+    `tdi_harmonic`, so each harmonic holds a different object and a different
+    `id`. That coupling is load-bearing and invisible at both ends -- drop
+    the harmonic from the preparation key and every harmonic would silently
+    be served the first one's response.
+    """
+    from pycbc.tdi import inference
+
+    class Narrow:
+        harmonics = ((2, 2, 1), (2, 2, 2))
+
+        def angular_frequency(self, harmonic, times):
+            return np.full_like(
+                np.asarray(times, dtype=float), 2 * np.pi * 1.5e-3)
+
+    clear_cache()
+    params = dict(tdi_source='lal', tdi_band_edges=[1e-3, 2e-3],
+                  t_obs_start=0.0, t_obs_end=1.0e7,
+                  eclipticlongitude=0.9, eclipticlatitude=-0.25,
+                  tdi_preparation_id='epoch', tdi_samples_per_cycle=4.0)
+    monkeypatch.setattr(inference, '_build_source', lambda _: Narrow())
+    monkeypatch.setattr(inference, 'prepare_multiband_tdi',
+                        lambda *args, **kwargs: object())
+    terms, orbit = {'A': ()}, object()
+
+    first = inference._preparation(dict(params, tdi_harmonic=(2, 2, 1)),
+                                   terms, orbit)
+    second = inference._preparation(dict(params, tdi_harmonic=(2, 2, 2)),
+                                    terms, orbit)
+    assert first is not second
+
+    # And the signature really is blind to it, which is what makes the
+    # assertion above the only thing separating them.
+    assert (inference._signature(dict(params, tdi_harmonic='a'))
+            == inference._signature(dict(params, tdi_harmonic='b')))
+
+
 def test_runtime_source_cache_has_a_small_candidate_bound(monkeypatch):
     """Unique sampler proposals must not retain dozens of large sources."""
     from pycbc.tdi import inference
