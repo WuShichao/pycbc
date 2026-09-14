@@ -26,6 +26,8 @@ preparation covers is refused rather than extrapolated, and since a chirp-mass
 change of one part in 1e5 moves t(f) by weeks, the prior's own boundary has to
 be declared through ``tdi_coverage_sources``.
 """
+import logging
+
 import numpy as np
 
 from pycbc.coordinates.space_orbit import LisaEqualArmOrbit
@@ -110,14 +112,42 @@ def _preparation(params, terms, orbit):
         fiducial = _narrow(_build_source(params), params)
         coverage = [_narrow(source, params)
                     for source in _coverage_sources(params)]
+        # The live harmonic set is a function of the parameters: pyEFPEHM
+        # keeps a harmonic while it carries more than `Amplitude_tol` of the
+        # total, so a more eccentric candidate brings harmonics the fiducial
+        # never had and loses others. `project` refuses an unprepared harmonic
+        # rather than dropping it silently, and `prepare_multiband_tdi`
+        # partitions every coverage source against the primary's set, so
+        # neither the union nor the richest single source works -- only a set
+        # every source in play actually contains.
+        #
+        # So the sampling epoch gets one fixed set, the intersection over the
+        # fiducial and the prior corners, and what that costs is reported
+        # rather than absorbed. Widening it is a modelling choice: lower
+        # `Amplitude_tol` until the set stops moving across the prior.
+        common = set(fiducial.harmonics)
+        for source in coverage:
+            common &= set(source.harmonics)
+        if not common:
+            raise ValueError(
+                "the fiducial and the prior corners share no harmonic; "
+                "lower Amplitude_tol or narrow tdi_coverage_bounds")
+        dropped = set(fiducial.harmonics) - common
+        if dropped:
+            logging.info(
+                "tdi: %d harmonic(s) live in the fiducial but not across the "
+                "whole prior and are excluded from this epoch: %s",
+                len(dropped), sorted(dropped))
         _PREPARED[key] = prepare_multiband_tdi(
             fiducial, orbit, terms,
             float(params['eclipticlongitude']),
             float(params['eclipticlatitude']),
+            harmonics=tuple(sorted(common)),
             band_edges=list(edges),
             t_start=float(params['t_obs_start']),
             t_end=float(params['t_obs_end']),
-            coverage_sources=list(coverage))
+            coverage_sources=[RestrictedHarmonicSource(
+                source, tuple(sorted(common))) for source in coverage])
     return _PREPARED[key]
 
 
@@ -208,6 +238,19 @@ def sparse_tdi_fd_det_sequence(**params):
     prepared = _preparation(params, terms, orbit)
 
     source = _narrow(_build_source(params), params)
+    # The candidate's own harmonic set moves with its parameters too, so it
+    # is held to the set the epoch was prepared for: an extra harmonic would
+    # be refused by `project`, and silently keeping it would make one
+    # candidate's likelihood incomparable with another's.
+    wanted = tuple(h for h in prepared.harmonics if h in set(source.harmonics))
+    if len(wanted) != len(prepared.harmonics):
+        missing = sorted(set(prepared.harmonics) - set(wanted))
+        raise ValueError(
+            f"candidate is missing prepared harmonics {missing}; the epoch's "
+            "common set was computed from a prior boundary this candidate "
+            "falls outside")
+    if set(wanted) != set(source.harmonics):
+        source = RestrictedHarmonicSource(source, wanted)
     response = prepared.project(source,
                                 float(params['eclipticlongitude']),
                                 float(params['eclipticlatitude']))
@@ -295,7 +338,29 @@ register_source('lal', _lal_dominant)
 register_source('pyefpehm', _pyefpehm)
 
 
-class SingleHarmonicSource:
+class RestrictedHarmonicSource:
+    """A harmonic source narrowed to a subset of its harmonics.
+
+    Two places need this. Relative binning needs each harmonic on its own,
+    and `prepare_multiband_tdi` requires every coverage source to be a subset
+    of the prepared harmonic set -- a coverage source exists only to widen the
+    prepared *time* coverage, so its extra harmonics are beside the point and
+    narrowing it is the honest way to say so.
+    """
+
+    def __init__(self, source, harmonics):
+        self.source = source
+        self.harmonics = tuple(harmonics)
+        self.t_start = getattr(source, 't_start', None)
+        self.t_end = getattr(source, 't_end', None)
+
+    def __getattr__(self, name):
+        # Only reached for attributes this class does not define, so the
+        # narrowed `harmonics` is never shadowed by the wrapped source's.
+        return getattr(self.source, name)
+
+
+class SingleHarmonicSource(RestrictedHarmonicSource):
     """One harmonic of a harmonic source, presented as a source in its own right.
 
     Relative binning needs each harmonic separately. A multi-harmonic signal
@@ -310,17 +375,18 @@ class SingleHarmonicSource:
     """
 
     def __init__(self, source, harmonic):
-        self.source = source
-        self.harmonics = (harmonic,)
-        self.t_start = getattr(source, 't_start', None)
-        self.t_end = getattr(source, 't_end', None)
-
-    def __getattr__(self, name):
-        # Only reached for attributes this class does not define, so the
-        # narrowed `harmonics` is never shadowed by the wrapped source's.
-        return getattr(self.source, name)
+        super().__init__(source, (harmonic,))
 
 
 def harmonic_labels(params):
-    """The harmonic labels a source built from these parameters carries."""
-    return tuple(_build_source(params).harmonics)
+    """The harmonic labels available across this epoch's whole prior.
+
+    The intersection, not the fiducial's own set, because that is what the
+    preparation uses -- see `_preparation`. A model that binned a harmonic the
+    preparation cannot project would fail on the first candidate that needs
+    it.
+    """
+    common = set(_build_source(params).harmonics)
+    for source in _coverage_sources(params):
+        common &= set(source.harmonics)
+    return tuple(sorted(common))
