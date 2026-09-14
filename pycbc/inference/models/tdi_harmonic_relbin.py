@@ -114,7 +114,18 @@ class HarmonicRelative(Relative):
             self.uquery[harmonic] = (tuple(live), values)
             for ifo in live:
                 own = self.f[ifo][self.hquery[ifo][harmonic]]
-                self.utake[ifo][harmonic] = numpy.searchsorted(values, own)
+                take = numpy.searchsorted(values, own)
+                # `searchsorted` places a value that is not in the union at
+                # its insertion point rather than failing, so a channel whose
+                # frequency grid differed in the last bit would be served its
+                # neighbour's sample and nothing would say so. The channels
+                # share one grid here; this is what says so if they stop.
+                if not numpy.array_equal(values[take], own):
+                    raise ValueError(
+                        f"{ifo} asks for frequencies absent from the shared "
+                        f"set for harmonic {harmonic}; the channels no "
+                        "longer share one grid")
+                self.utake[ifo][harmonic] = take
 
     def _fiducial_harmonic(self, ifo, harmonic, frequencies):
         params = dict(self.fid_params)
