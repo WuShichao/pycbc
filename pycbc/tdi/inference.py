@@ -44,6 +44,13 @@ _PREPARED = {}
 #: Source builders, selected by the ``tdi_source`` parameter.
 _SOURCES = {}
 
+#: The last projected response, keyed by preparation and parameters. PyCBC's
+#: `Relative` asks the generator for one channel at a time, so a two-channel
+#: likelihood over ten harmonics would otherwise project twenty times for ten
+#: distinct responses. Projection is the larger half of an evaluation.
+_PROJECTED = {}
+_PROJECTED_LIMIT = 64
+
 #: Recently built sources, keyed by builder and parameter values. Preparing
 #: one geometry per harmonic asks the builder for the same fiducial once per
 #: harmonic, and for a precessing pyEFPEHM configuration each construction
@@ -179,6 +186,8 @@ def _preparation(params, terms, orbit):
             band_edges=band,
             t_start=float(params['t_obs_start']),
             t_end=float(params['t_obs_end']),
+            samples_per_cycle=float(params.get('tdi_samples_per_cycle', 4.0)),
+            overlap=float(params.get('tdi_band_overlap', 0.0)),
             coverage_sources=[RestrictedHarmonicSource(
                 source, tuple(sorted(common))) for source in coverage])
     return _PREPARED[key]
@@ -188,9 +197,7 @@ def _build_source(params):
     """Build a source, reusing an identical one if it is still cached."""
     builder = params['tdi_source']
     try:
-        key = (builder, tuple(sorted(
-            (name, value) for name, value in params.items()
-            if isinstance(value, (int, float, str, bool)))))
+        key = (builder, _signature(params))
     except TypeError:
         return _SOURCES[builder](**params)
     if key not in _SOURCE_CACHE:
@@ -243,10 +250,53 @@ def _coverage_sources(params):
     return sources
 
 
+def _projection(params, prepared):
+    """Project this candidate, reusing the last projection of the same one.
+
+    Keyed on the parameters rather than on time, so asking for a second
+    channel of a candidate already projected costs nothing while a genuinely
+    new candidate is never served a stale response.
+    """
+    key = (id(prepared), _signature(params))
+    response = _PROJECTED.get(key)
+    if response is not None:
+        return response
+    source = _narrow(_build_source(params), params)
+    # The candidate's own harmonic set moves with its parameters too, so it
+    # is held to the set the epoch was prepared for: an extra harmonic would
+    # be refused by `project`, and silently keeping it would make one
+    # candidate's likelihood incomparable with another's.
+    wanted = tuple(h for h in prepared.harmonics if h in set(source.harmonics))
+    if len(wanted) != len(prepared.harmonics):
+        missing = sorted(set(prepared.harmonics) - set(wanted))
+        raise ValueError(
+            f"candidate is missing prepared harmonics {missing}; the epoch's "
+            "common set was computed from a prior boundary this candidate "
+            "falls outside")
+    if set(wanted) != set(source.harmonics):
+        source = RestrictedHarmonicSource(source, wanted)
+    response = prepared.project(source,
+                                float(params['eclipticlongitude']),
+                                float(params['eclipticlatitude']))
+    if len(_PROJECTED) >= _PROJECTED_LIMIT:
+        _PROJECTED.pop(next(iter(_PROJECTED)))
+    _PROJECTED[key] = response
+    return response
+
+
+def _signature(params):
+    """Hashable summary of the scalar parameters a source is built from."""
+    return tuple(sorted(
+        (name, value) for name, value in params.items()
+        if isinstance(value, (int, float, str, bool))
+        and name not in ('ifos',)))
+
+
 def clear_cache():
     """Drop every prepared geometry and cached source."""
     _PREPARED.clear()
     _SOURCE_CACHE.clear()
+    _PROJECTED.clear()
 
 
 def sparse_tdi_fd_det_sequence(**params):
@@ -285,23 +335,7 @@ def sparse_tdi_fd_det_sequence(**params):
         return {name: Array(np.zeros(len(sample_points), dtype=complex))
                 for name in requested}
 
-    source = _narrow(_build_source(params), params)
-    # The candidate's own harmonic set moves with its parameters too, so it
-    # is held to the set the epoch was prepared for: an extra harmonic would
-    # be refused by `project`, and silently keeping it would make one
-    # candidate's likelihood incomparable with another's.
-    wanted = tuple(h for h in prepared.harmonics if h in set(source.harmonics))
-    if len(wanted) != len(prepared.harmonics):
-        missing = sorted(set(prepared.harmonics) - set(wanted))
-        raise ValueError(
-            f"candidate is missing prepared harmonics {missing}; the epoch's "
-            "common set was computed from a prior boundary this candidate "
-            "falls outside")
-    if set(wanted) != set(source.harmonics):
-        source = RestrictedHarmonicSource(source, wanted)
-    response = prepared.project(source,
-                                float(params['eclipticlongitude']),
-                                float(params['eclipticlatitude']))
+    response = _projection(params, prepared)
     delta_f = float(params['tdi_delta_f'])
     # Absolute zero on the mission clock, not the start of the observation.
     # `Relative` multiplies the data by exp(-2 pi i f * end_time), and for a
