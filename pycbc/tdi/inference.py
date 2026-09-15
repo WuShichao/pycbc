@@ -359,19 +359,30 @@ def _analysis_time_window(params):
     negligible.  A nonzero ``tdi_taper_duration`` applies a sine-squared
     fade at both observation edges.  The data must have been conditioned with
     the identical window; this option is therefore off by default.
+
+    ``tdi_taper_start`` and ``tdi_taper_end`` override it one edge at a time.
+    A taper costs nothing only where the signal is already quiet, and the two
+    edges are rarely alike: a stellar-origin binary is still chirping at
+    ``t_obs_end`` and needs the trailing fade, while a massive binary that
+    merges inside the segment must not have one -- the fade would drive its
+    merger to zero, which is most of its signal-to-noise.
     """
     duration = float(params.get('tdi_taper_duration', 0.0))
-    if not np.isfinite(duration) or duration < 0:
-        raise ValueError('tdi_taper_duration must be finite and non-negative')
-    if duration == 0:
+    lead = float(params.get('tdi_taper_start', duration))
+    trail = float(params.get('tdi_taper_end', duration))
+    for name, value in (('tdi_taper_duration', duration),
+                        ('tdi_taper_start', lead), ('tdi_taper_end', trail)):
+        if not np.isfinite(value) or value < 0:
+            raise ValueError(f'{name} must be finite and non-negative')
+    if lead == 0 and trail == 0:
         return None
     start = float(params['t_obs_start'])
     stop = float(params['t_obs_end'])
     # Validate before returning a closure that may be called much later.
-    raised_cosine_time_window(np.empty(0), start, stop, duration)
+    raised_cosine_time_window(np.empty(0), start, stop, (lead, trail))
 
     def window(times):
-        return raised_cosine_time_window(times, start, stop, duration)
+        return raised_cosine_time_window(times, start, stop, (lead, trail))
 
     return window
 

@@ -36,8 +36,44 @@ def test_raised_cosine_time_window_has_shared_endpoint_convention():
     rectangular = raised_cosine_time_window(times, 0.0, 10.0, 0.0)
     assert np.array_equal(rectangular,
                           [0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0])
-    with pytest.raises(ValueError, match="half the span"):
+    with pytest.raises(ValueError, match="cannot exceed the span"):
         raised_cosine_time_window(times, 0.0, 10.0, 5.1)
+
+
+def test_the_two_observation_edges_taper_independently():
+    """A taper is free only where the signal is already quiet.
+
+    A stellar-origin binary is still chirping at the end of the segment and
+    needs the trailing fade. A massive binary that merges inside the segment
+    must not have one: a sine-squared fade would drive the merger itself to
+    zero, which is where nearly all of its signal-to-noise lives. One
+    duration for both edges cannot express that.
+    """
+    times = np.array([-1.0, 0.0, 1.0, 2.0, 5.0, 8.0, 9.0, 10.0, 11.0])
+    symmetric = raised_cosine_time_window(times, 0.0, 10.0, 2.0)
+    assert np.array_equal(raised_cosine_time_window(times, 0.0, 10.0,
+                                                    (2.0, 2.0)), symmetric)
+
+    leading = raised_cosine_time_window(times, 0.0, 10.0, (2.0, 0.0))
+    assert np.allclose(leading,
+                       [0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0],
+                       rtol=0, atol=1e-15)
+    # The point of it: full weight at the last sample, where the merger is.
+    assert leading[-2] == 1.0
+
+    trailing = raised_cosine_time_window(times, 0.0, 10.0, (0.0, 2.0))
+    assert np.allclose(trailing,
+                       [0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5, 0.0, 0.0],
+                       rtol=0, atol=1e-15)
+
+    # Uneven edges are bounded by the whole span, not by half of it.
+    raised_cosine_time_window(times, 0.0, 10.0, (8.0, 2.0))
+    with pytest.raises(ValueError, match="cannot exceed the span"):
+        raised_cosine_time_window(times, 0.0, 10.0, (8.0, 2.1))
+    with pytest.raises(ValueError, match="non-negative"):
+        raised_cosine_time_window(times, 0.0, 10.0, (-1.0, 2.0))
+    with pytest.raises(ValueError, match="pair"):
+        raised_cosine_time_window(times, 0.0, 10.0, (1.0, 2.0, 3.0))
 
 
 class _LinearFrequencySource:

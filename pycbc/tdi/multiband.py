@@ -26,26 +26,41 @@ def raised_cosine_time_window(times, t_start, t_end, duration):
     This is shared by data conditioning and the pruned waveform transform so
     they cannot acquire subtly different endpoint conventions.  The window
     is zero outside the closed observation interval.
+
+    `duration` is either one value for both edges or a ``(lead, trail)``
+    pair.  The two edges are separate because a taper is only free where the
+    signal is already quiet: a source still chirping at ``t_end`` needs the
+    trailing fade, and one that merges inside the segment must not have it,
+    since a sine-squared fade drives the merger itself to zero.  Either value
+    may be zero.
     """
     times = np.asarray(times, dtype=float)
     t_start = float(t_start)
     t_end = float(t_end)
-    duration = float(duration)
+    durations = np.atleast_1d(np.asarray(duration, dtype=float))
+    if durations.size == 1:
+        lead = trail = float(durations[0])
+    elif durations.size == 2:
+        lead, trail = float(durations[0]), float(durations[1])
+    else:
+        raise ValueError("duration is one value or a (lead, trail) pair")
     if not np.isfinite(t_start) or not np.isfinite(t_end) or t_end <= t_start:
         raise ValueError("time-window bounds must be increasing and finite")
-    if (not np.isfinite(duration) or duration < 0
-            or 2 * duration > t_end - t_start):
+    if (not np.isfinite(lead) or not np.isfinite(trail)
+            or lead < 0 or trail < 0 or lead + trail > t_end - t_start):
         raise ValueError(
-            "duration must be finite and between zero and half the span")
+            "each taper must be finite and non-negative, and together they "
+            "cannot exceed the span")
     weights = np.ones(times.shape, dtype=float)
     outside = (times < t_start) | (times > t_end)
-    if duration:
-        left = (times >= t_start) & (times < t_start + duration)
-        right = (times > t_end - duration) & (times <= t_end)
+    if lead:
+        left = (times >= t_start) & (times < t_start + lead)
         weights[left] = np.sin(
-            0.5 * np.pi * (times[left] - t_start) / duration) ** 2
+            0.5 * np.pi * (times[left] - t_start) / lead) ** 2
+    if trail:
+        right = (times > t_end - trail) & (times <= t_end)
         weights[right] = np.sin(
-            0.5 * np.pi * (t_end - times[right]) / duration) ** 2
+            0.5 * np.pi * (t_end - times[right]) / trail) ** 2
     weights[outside] = 0.0
     return weights
 

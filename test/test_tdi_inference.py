@@ -59,8 +59,22 @@ def test_analysis_taper_is_explicit_and_validated():
                                         190.0, 195.0, 200.0])),
                        [0.0, 0.5, 1.0, 1.0, 1.0, 0.5, 0.0],
                        rtol=0, atol=1e-15)
-    with pytest.raises(ValueError, match='half the span'):
+    with pytest.raises(ValueError, match='cannot exceed the span'):
         _analysis_time_window(dict(common, tdi_taper_duration=51.0))
+
+    # One edge at a time, for a source that is quiet at one end and not the
+    # other. `tdi_taper_duration` is the shorthand for both.
+    trailing = _analysis_time_window(dict(common, tdi_taper_end=10.0))
+    assert np.allclose(trailing(np.array([100.0, 105.0, 150.0, 195.0])),
+                       [1.0, 1.0, 1.0, 0.5], rtol=0, atol=1e-15)
+    mixed = _analysis_time_window(dict(common, tdi_taper_duration=10.0,
+                                       tdi_taper_end=0.0))
+    assert np.allclose(mixed(np.array([105.0, 150.0, 195.0, 200.0])),
+                       [0.5, 1.0, 1.0, 1.0], rtol=0, atol=1e-15)
+    assert _analysis_time_window(dict(common, tdi_taper_start=0.0,
+                                      tdi_taper_end=0.0)) is None
+    with pytest.raises(ValueError, match='tdi_taper_end'):
+        _analysis_time_window(dict(common, tdi_taper_end=-1.0))
 
 
 def test_pyefpehm_builder_applies_detector_frame_extrinsics(monkeypatch):
