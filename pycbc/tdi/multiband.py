@@ -460,11 +460,17 @@ def prepare_sparse_tdi(
     prepare_options = {} if links is None else {"links": links}
     for harmonic, windows in partitions.items():
         for index, windowed in enumerate(windows):
+            # Every source the epoch must serve, fiducial first. They are
+            # what the grid has to satisfy, so they all refine against it --
+            # widening the interval to fit a prior corner while refining only
+            # on the fiducial accepts that corner without showing its
+            # brackets are resolved.
+            ensemble = [current[harmonic][index]
+                        for current in coverage_partitions]
             raw_coverage = []
-            for current in coverage_partitions:
+            for item in ensemble:
                 raw_coverage.extend(harmonic_windows(
-                    current[harmonic][index], harmonic, t_start, t_end,
-                    padding=padding))
+                    item, harmonic, t_start, t_end, padding=padding))
             coverage = []
             for low, high in sorted(raw_coverage):
                 if coverage and low <= coverage[-1][1]:
@@ -486,20 +492,28 @@ def prepare_sparse_tdi(
                     # choosing where to sample a waveform and is the wrong
                     # quantity here -- it steps by dPhi/omega, which for a
                     # 40-day source at 12 mHz is sub-second and millions of
-                    # points. The union keeps the uniform floor across the
-                    # padding, where the fiducial has no support to refine
-                    # against.
-                    refined = adaptive_sparse_tdi_response(
-                        windowed, orbit, channel_terms, lamb, beta,
-                        t_start=low, t_end=high,
-                        initial_step=geometry_step,
-                        relative_tolerance=relative_tolerance,
-                        velocity_order=velocity_order, **prepare_options)
-                    for item in refined.responses:
-                        grid = np.asarray(item['grid'], dtype=float)
-                        if len(grid) > 1:
-                            block = np.unique(np.concatenate([block, grid]))
-                    del refined
+                    # points. `support_padding` is what lets the refinement
+                    # see the response tail that the TDI delays carry past
+                    # the source's own support: without it the padded region
+                    # gets only the uniform floor, which at a day's spacing
+                    # cannot resolve a delay tail tens to hundreds of seconds
+                    # long.
+                    for item in ensemble:
+                        if not item.support_blocks(harmonic):
+                            continue
+                        refined = adaptive_sparse_tdi_response(
+                            item, orbit, channel_terms, lamb, beta,
+                            t_start=low, t_end=high,
+                            initial_step=geometry_step,
+                            relative_tolerance=relative_tolerance,
+                            support_padding=padding,
+                            velocity_order=velocity_order, **prepare_options)
+                        for entry in refined.responses:
+                            grid = np.asarray(entry['grid'], dtype=float)
+                            if len(grid) > 1:
+                                block = np.unique(
+                                    np.concatenate([block, grid]))
+                        del refined
                 pieces.append(block)
             if not pieces:
                 continue

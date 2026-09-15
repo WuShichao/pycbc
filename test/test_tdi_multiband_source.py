@@ -463,12 +463,17 @@ def test_fixed_multiband_preparation_reproduces_adaptive_response():
         band_edges=[1e-3, 5e-3, 1e-2], overlap=1e-3,
         samples_per_cycle=4, t_start=800.0, t_end=3200.0,
         velocity_order=1)
+    # The same tolerance on both sides: the point is that one grid policy
+    # serves both, so giving the prepared path a different tolerance and a
+    # much denser uniform floor would let it pass on the floor alone.
+    tolerance = 2e-5
     adaptive = sparse_tdi_response(
         source, orbit, channel_terms, 1.1, -0.4,
-        initial_step=200.0, relative_tolerance=2e-5, **common)
+        initial_step=200.0, relative_tolerance=tolerance, **common)
     prepared = prepare_sparse_tdi(
         source, orbit, channel_terms, 1.1, -0.4,
-        geometry_step=10.0, minimum_grid_points=64, **common)
+        geometry_step=200.0, minimum_grid_points=16,
+        relative_tolerance=tolerance, **common)
     fixed = prepared.response
 
     times = np.linspace(1000.0, 3000.0, 301)

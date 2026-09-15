@@ -149,6 +149,24 @@ def _harmonic_band_edges(source, harmonic, edges, t_start, t_end,
     return [low] + inner + [high]
 
 
+def _tolerance(params):
+    """The bracket-interpolation tolerance the prepared geometry is built to.
+
+    ``None`` leaves the uniform grid alone. It belongs in the preparation
+    cache key as well as the call: a looser tolerance that silently reused a
+    tighter epoch's geometry would report the accuracy of a grid it did not
+    ask for.
+    """
+    value = params.get('tdi_relative_tolerance', 1e-4)
+    if value is None:
+        return None
+    value = float(value)
+    if not np.isfinite(value) or value <= 0:
+        raise ValueError(
+            'tdi_relative_tolerance must be positive and finite, or None')
+    return value
+
+
 def _preparation(params, terms, orbit):
     """Fetch or build the prepared geometry for this observation."""
     channels = tuple(terms)
@@ -166,6 +184,7 @@ def _preparation(params, terms, orbit):
            float(params.get('tdi_delta_t', 5.0)),
            float(params.get('tdi_samples_per_cycle', 4.0)),
            float(params.get('tdi_geometry_step', 86400.0)),
+           _tolerance(params),
            int(params.get('tdi_minimum_grid_points', 16)),
            float(params.get('tdi_band_overlap', 0.0)),
            bool(params.get('tdi_clip_bands', True)))
@@ -218,6 +237,7 @@ def _preparation(params, terms, orbit):
             t_end=float(params['t_obs_end']),
             samples_per_cycle=float(params.get('tdi_samples_per_cycle', 4.0)),
             geometry_step=float(params.get('tdi_geometry_step', 86400.0)),
+            relative_tolerance=_tolerance(params),
             minimum_grid_points=int(params.get(
                 'tdi_minimum_grid_points', 16)),
             overlap=float(params.get('tdi_band_overlap', 0.0)),
