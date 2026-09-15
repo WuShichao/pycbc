@@ -12,7 +12,8 @@ from pycbc.tdi.onthefly import (adaptive_time_grid, chain_delay,
                                 sparse_channel)
 from pycbc.tdi.response import (link_geometry, link_response,
                                 sample_constellation)
-from pycbc.tdi.sources import (LALFDSource, LALIMRPhenomDSource,
+from pycbc.tdi.sources import (AmplitudeScaledHarmonicSource,
+                               LALFDSource, LALIMRPhenomDSource,
                                LALModesSource, LALTDSource,
                                NewtonianChirp,
                                PolarizationRotatedHarmonicSource,
@@ -172,6 +173,72 @@ def test_polarization_rotation_forwards_every_source_view():
     np.testing.assert_array_equal(
         record["indices"], np.arange(len(frequencies)))
     assert rotated.support_blocks(2) == source.support_blocks(2)
+
+
+def test_amplitude_scaling_forwards_every_source_view():
+    """Only strain-like fields scale; phase, frequency and support do not."""
+
+    class CompleteSource(_ClockProbe):
+        def harmonic_components(self, harmonic, time):
+            plus, cross = self.amplitude(harmonic, time)
+            return (plus, cross, self.carrier_phase(harmonic, time),
+                    self.angular_frequency(harmonic, time))
+
+        def amplitude_frequency(self, harmonic, time):
+            plus, cross = self.amplitude(harmonic, time)
+            return plus, cross, self.angular_frequency(harmonic, time)
+
+        def delay_expansion_coefficients(self, harmonic, time, order):
+            time = np.asarray(time)
+            return tuple((index + 1) * (time + 1j)
+                         if index < 6 else (index + 1) * time
+                         for index in range(9))
+
+        def frequency_harmonics(self, frequencies):
+            frequencies = np.asarray(frequencies)
+            return {2: {"indices": np.arange(len(frequencies)),
+                        "frequency": frequencies,
+                        "time": frequencies + 100.0,
+                        "plus": frequencies + 2j,
+                        "cross": 3 * frequencies - 1j}}
+
+        def frequency_polarizations(self, frequencies):
+            item = self.frequency_harmonics(frequencies)[2]
+            return item["plus"], item["cross"]
+
+    source = CompleteSource()
+    factor = 0.37
+    scaled = AmplitudeScaledHarmonicSource(source, factor)
+    times = np.asarray([110.0, 130.0])
+
+    want = tuple(factor * value for value in source.amplitude(2, times))
+    np.testing.assert_allclose(scaled.amplitude(2, times), want)
+    components = scaled.harmonic_components(2, times)
+    np.testing.assert_allclose(components[:2], want)
+    np.testing.assert_array_equal(
+        components[2:], source.harmonic_components(2, times)[2:])
+    amplitude_frequency = scaled.amplitude_frequency(2, times)
+    np.testing.assert_allclose(amplitude_frequency[:2], want)
+    np.testing.assert_array_equal(
+        amplitude_frequency[2], source.angular_frequency(2, times))
+
+    coefficients = source.delay_expansion_coefficients(2, times, 2)
+    actual = scaled.delay_expansion_coefficients(2, times, 2)
+    for index in range(6):
+        np.testing.assert_allclose(actual[index], factor * coefficients[index])
+    for index in (6, 7, 8):
+        np.testing.assert_array_equal(actual[index], coefficients[index])
+
+    frequencies = np.asarray([0.01, 0.02, 0.03])
+    native = source.frequency_polarizations(frequencies)
+    np.testing.assert_allclose(
+        scaled.frequency_polarizations(frequencies),
+        tuple(factor * value for value in native))
+    record = scaled.frequency_harmonics(frequencies)[2]
+    np.testing.assert_allclose(record["plus"], factor * native[0])
+    np.testing.assert_allclose(record["cross"], factor * native[1])
+    np.testing.assert_array_equal(record["frequency"], frequencies)
+    assert scaled.support_blocks(2) == source.support_blocks(2)
 
 
 class _LinearFDSource:
@@ -651,6 +718,35 @@ def test_pyefpehm_source_reconstructs_its_native_time_domain():
     scale = max(np.max(np.abs(want_plus)), np.max(np.abs(want_cross)))
     assert np.max(np.abs(got_plus - want_plus)) / scale < 2e-14
     assert np.max(np.abs(got_cross - want_cross)) / scale < 2e-14
+
+
+def test_pyefpehm_distance_is_an_exact_amplitude_scaling():
+    """Canonical-distance reuse must not approximate the waveform model."""
+    pytest.importorskip("pyEFPEHM")
+    from pycbc.tdi.sources import PyEFPEHMSource
+
+    parameters = dict(
+        mass1=39.458, mass2=31.719, eccentricity=0.05,
+        spin1x=0.1, spin1y=0.05, spin1z=0.2,
+        spin2x=-0.05, spin2y=0.02, spin2z=0.1,
+        inclination=1.0, phase=0.2, f22_start=0.02,
+        f22_ref=0.02, f22_end=0.03, Amplitude_tol=1e-4)
+    distance = 37.0
+    native = PyEFPEHMSource(dict(parameters, distance=distance))
+    canonical = PyEFPEHMSource(dict(parameters, distance=1.0))
+    scaled = AmplitudeScaledHarmonicSource(
+        canonical, scale=1.0 / distance)
+
+    assert scaled.harmonics == native.harmonics
+    low = max(native.t_start, canonical.t_start)
+    high = min(native.t_end, canonical.t_end)
+    times = np.linspace(low, high, 257)
+    for harmonic in native.harmonics:
+        got = scaled.harmonic_components(harmonic, times)
+        want = native.harmonic_components(harmonic, times)
+        for actual, expected in zip(got, want, strict=True):
+            np.testing.assert_allclose(actual, expected, rtol=2e-13,
+                                       atol=1e-30)
 
 
 def test_pyefpehm_selected_harmonics_match_multimode_native_oracle():

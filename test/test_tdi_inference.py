@@ -49,6 +49,69 @@ def test_registration_lands_in_the_detector_response_registry():
     assert 'tdi_source' in sparse_tdi_fd_det_sequence.required
 
 
+def test_pyefpehm_builder_applies_detector_frame_extrinsics(monkeypatch):
+    """A detector-response waveform must consume ``tc`` and polarization.
+
+    ``Relative`` deliberately skips its ground-detector time and antenna
+    factors for an approximant in ``fd_det_sequence``.  Leaving either value
+    unused in the registered TDI source would therefore make it an inert PE
+    parameter while every self-consistent injection test still passed.
+    """
+    from pycbc.tdi import inference, sources
+
+    class Native:
+        t_start = -100.0
+        t_end = 900.0
+        harmonics = ((2, 2, 2),)
+
+    clear_cache()
+    captured = []
+
+    def fake_source(parameters):
+        captured.append(dict(parameters))
+        return Native()
+
+    monkeypatch.setattr(sources, 'PyEFPEHMSource', fake_source)
+    source = inference._pyefpehm(
+        mass1=40.0, mass2=30.0, distance=3.0,
+        f_lower=0.01, tc=25.0, polarization=0.3)
+
+    assert isinstance(source, sources.PolarizationRotatedHarmonicSource)
+    assert source.polarization == pytest.approx(0.3)
+    assert isinstance(source.source, sources.TimeShiftedHarmonicSource)
+    assert source.source.offset == pytest.approx(-125.0)
+    assert source.t_start == pytest.approx(25.0)
+    assert source.t_end == pytest.approx(1025.0)
+    assert captured[0]['distance'] == pytest.approx(1.0)
+    assert captured[0]['f22_start'] == pytest.approx(0.01)
+    assert captured[0]['f22_ref'] == pytest.approx(0.01)
+
+    # These are detector-frame wrappers, not inputs to the expensive native
+    # evolution.  Varying either must change the exposed source but must not
+    # construct pyEFPEHM again.
+    moved = inference._pyefpehm(
+        mass1=40.0, mass2=30.0, distance=3.0,
+        f_lower=0.01, tc=30.0, polarization=0.7)
+    assert moved.source.source.source is source.source.source.source
+    assert moved.source.offset == pytest.approx(-130.0)
+    assert moved.polarization == pytest.approx(0.7)
+    assert len(captured) == 1
+
+    # Distance is another cheap wrapper: the canonical native object stays.
+    farther = inference._pyefpehm(
+        mass1=40.0, mass2=30.0, distance=6.0,
+        f_lower=0.01, tc=30.0, polarization=0.7)
+    assert farther.source.source.source is source.source.source.source
+    assert farther.source.source.scale == pytest.approx(1 / 6.0)
+    assert len(captured) == 1
+
+    # An intrinsic change replaces the epoch's native state exactly once.
+    inference._pyefpehm(
+        mass1=40.1, mass2=30.0, distance=3.0,
+        f_lower=0.01, tc=30.0, polarization=0.7)
+    assert len(captured) == 2
+
+
 def test_prepared_geometry_is_model_scoped_and_keyed_on_numerical_knobs(
         monkeypatch):
     """The cache key decides whether a sampler can afford this.

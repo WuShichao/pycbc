@@ -75,6 +75,13 @@ _SOURCE_CACHE_LIMIT = 16
 _RUNTIME_SIGNATURES = {}
 _RUNTIME_EPOCH_LIMIT = 4
 
+#: The expensive pyEFPEHM evolution below the cheap detector-frame wrappers.
+#: One intrinsic state per active inference epoch is enough: an extrinsic-only
+#: proposal may reuse it, while a new intrinsic proposal replaces it.  Keeping
+#: this separate from ``_SOURCE_CACHE`` matters because ``tc`` and
+#: ``polarization`` change the wrappers but not the evolution they wrap.
+_PYEFPEHM_NATIVE = {}
+
 DEFAULT_ARM = 2.5e9
 DEFAULT_CHANNELS = ('A', 'E')
 
@@ -345,6 +352,7 @@ def clear_cache():
     _PROJECTED.clear()
     _SAMPLED.clear()
     _RUNTIME_SIGNATURES.clear()
+    _PYEFPEHM_NATIVE.clear()
 
 
 def sparse_tdi_fd_det_sequence(**params):
@@ -477,7 +485,10 @@ def _pyefpehm(**params):
     them rather than a smooth trend. `pycbc.tdi.relative` has to bin each
     harmonic against its own fiducial and add the cross terms back.
     """
-    from pycbc.tdi.sources import PyEFPEHMSource, TimeShiftedHarmonicSource
+    from pycbc.tdi.sources import (AmplitudeScaledHarmonicSource,
+                                   PolarizationRotatedHarmonicSource,
+                                   PyEFPEHMSource,
+                                   TimeShiftedHarmonicSource)
     keys = ('mass1', 'mass2', 'spin1x', 'spin1y', 'spin1z',
             'spin2x', 'spin2y', 'spin2z', 'distance', 'inclination',
             'eccentricity', 'phase', 'f22_start', 'f22_ref', 'f22_end',
@@ -485,8 +496,32 @@ def _pyefpehm(**params):
     arguments = {key: params[key] for key in keys if key in params}
     arguments.setdefault('f22_start', params.get('f_lower'))
     arguments.setdefault('f22_ref', arguments.get('f22_start'))
-    native = PyEFPEHMSource(arguments)
-    return TimeShiftedHarmonicSource(native, offset=native.t_start)
+    requested_distance = float(arguments.get('distance', 100.0))
+    if not np.isfinite(requested_distance) or requested_distance <= 0:
+        raise ValueError('distance must be positive and finite')
+    # Distance enters pyEFPEHM only through h0_pref proportional to 1/d_L.
+    # Build the intrinsic state at a canonical 1 Mpc so distance proposals do
+    # not reintegrate the same orbit, then restore the requested amplitude.
+    arguments['distance'] = 1.0
+    epoch = params.get('tdi_preparation_id', 'default')
+    signature = tuple(sorted(arguments.items()))
+    cached = _PYEFPEHM_NATIVE.get(epoch)
+    if cached is None or cached[0] != signature:
+        if cached is None and len(_PYEFPEHM_NATIVE) >= _RUNTIME_EPOCH_LIMIT:
+            _PYEFPEHM_NATIVE.pop(next(iter(_PYEFPEHM_NATIVE)))
+        native = PyEFPEHMSource(arguments)
+        _PYEFPEHM_NATIVE[epoch] = (signature, native)
+    else:
+        native = cached[1]
+    # ``tc`` is a mission-clock translation for a detector-response source.
+    # A positive value moves every feature later: h_tc(t) = h_0(t - tc), so
+    # the source clock queried at mission time t is t + native.t_start - tc.
+    scaled = AmplitudeScaledHarmonicSource(
+        native, scale=1.0 / requested_distance)
+    shifted = TimeShiftedHarmonicSource(
+        scaled, offset=native.t_start - float(params.get('tc', 0.0)))
+    return PolarizationRotatedHarmonicSource(
+        shifted, float(params.get('polarization', 0.0)))
 
 
 register_source('lal', _lal_dominant)

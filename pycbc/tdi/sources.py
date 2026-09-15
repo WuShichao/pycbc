@@ -325,6 +325,124 @@ class PolarizationRotatedHarmonicSource:
             return self.t_start, self.t_start
         return blocks[0][0], blocks[-1][1]
 
+
+class AmplitudeScaledHarmonicSource:
+    """Multiply every strain view of a harmonic source by one constant.
+
+    The carrier phase, frequency and validity intervals are unchanged.  The
+    adapter is useful for parameters such as luminosity distance that alter
+    only the overall amplitude: an expensive intrinsic evolution can be
+    prepared once, then rescaled without rebuilding its ODE solution and
+    interpolation objects.
+    """
+
+    def __init__(self, source, scale):
+        self.source = source
+        self.scale = float(scale)
+        if not np.isfinite(self.scale):
+            raise ValueError("scale must be finite")
+        self.harmonics = source.harmonics
+        self.t_start = float(source.t_start)
+        self.t_end = float(source.t_end)
+
+    def _scaled_pair(self, values):
+        return tuple(self.scale * np.asarray(value) for value in values)
+
+    def amplitude(self, harmonic, time):
+        """Return the scaled complex harmonic amplitudes."""
+        return self._scaled_pair(self.source.amplitude(harmonic, time))
+
+    def harmonic_components(self, harmonic, time):
+        """Scale the amplitudes, preserving phase and angular frequency."""
+        combined = getattr(self.source, "harmonic_components", None)
+        if combined is None:
+            plus, cross = self.source.amplitude(harmonic, time)
+            phase = self.source.carrier_phase(harmonic, time)
+            frequency = self.source.angular_frequency(harmonic, time)
+        else:
+            plus, cross, phase, frequency = combined(harmonic, time)
+        return self.scale * plus, self.scale * cross, phase, frequency
+
+    def amplitude_frequency(self, harmonic, time):
+        """Scale the amplitudes, preserving angular frequency."""
+        combined = getattr(self.source, "amplitude_frequency", None)
+        if combined is None:
+            plus, cross = self.source.amplitude(harmonic, time)
+            frequency = self.source.angular_frequency(harmonic, time)
+        else:
+            plus, cross, frequency = combined(harmonic, time)
+        return self.scale * plus, self.scale * cross, frequency
+
+    def delay_expansion_coefficients(self, harmonic, time, order):
+        """Scale amplitude derivatives but not phase derivatives."""
+        method = getattr(self.source, "delay_expansion_coefficients", None)
+        if method is None:
+            return None
+        values = method(harmonic, time, order)
+        if values is None:
+            return None
+        output = list(values)
+        # The optional contract stores plus A/A'/A'' followed by cross
+        # A/A'/A''; omega and its derivatives follow and are not amplitudes.
+        for index in range(min(6, len(output))):
+            output[index] = self.scale * output[index]
+        return tuple(output)
+
+    def carrier_phase(self, harmonic, time):
+        """Return the unchanged carrier phase."""
+        return self.source.carrier_phase(harmonic, time)
+
+    def angular_frequency(self, harmonic, time):
+        """Return the unchanged angular frequency."""
+        return self.source.angular_frequency(harmonic, time)
+
+    def polarizations(self, time):
+        """Return scaled dense polarizations."""
+        return self._scaled_pair(self.source.polarizations(time))
+
+    def frequency_harmonics(self, frequencies):
+        """Scale every frequency-domain harmonic amplitude."""
+        method = getattr(self.source, "frequency_harmonics", None)
+        if method is None:
+            raise TypeError("wrapped source has no frequency_harmonics method")
+        records = {}
+        for harmonic, item in method(frequencies).items():
+            record = dict(item)
+            record["plus"] = self.scale * np.asarray(item["plus"])
+            record["cross"] = self.scale * np.asarray(item["cross"])
+            records[harmonic] = record
+        return records
+
+    def frequency_polarizations(self, frequencies):
+        """Return scaled frequency-domain polarizations."""
+        method = getattr(self.source, "frequency_polarizations", None)
+        if method is not None:
+            return self._scaled_pair(method(frequencies))
+        frequencies = np.asarray(frequencies, dtype=float)
+        plus = np.zeros(len(frequencies), dtype=complex)
+        cross = np.zeros(len(frequencies), dtype=complex)
+        for item in self.frequency_harmonics(frequencies).values():
+            np.add.at(plus, item["indices"], item["plus"])
+            np.add.at(cross, item["indices"], item["cross"])
+        return plus, cross
+
+    def support_blocks(self, harmonic):
+        """Return the unchanged disjoint support intervals."""
+        method = getattr(self.source, "support_blocks", None)
+        if method is not None:
+            return method(harmonic)
+        return (self.source.support(harmonic),)
+
+    def support(self, harmonic):
+        """Return the unchanged support hull."""
+        method = getattr(self.source, "support", None)
+        if method is not None:
+            return method(harmonic)
+        blocks = self.support_blocks(harmonic)
+        if not blocks:
+            return self.t_start, self.t_start
+        return blocks[0][0], blocks[-1][1]
+
 class FrequencyWindowedHarmonicSource:
     """One harmonic multiplied by a partition-of-unity frequency window.
 
