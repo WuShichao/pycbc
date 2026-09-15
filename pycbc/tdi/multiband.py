@@ -20,6 +20,36 @@ def _mapping_value(value, name):
     return value[name] if hasattr(value, "keys") else value
 
 
+def raised_cosine_time_window(times, t_start, t_end, duration):
+    """A unit plateau with sine-squared fades at observation boundaries.
+
+    This is shared by data conditioning and the pruned waveform transform so
+    they cannot acquire subtly different endpoint conventions.  The window
+    is zero outside the closed observation interval.
+    """
+    times = np.asarray(times, dtype=float)
+    t_start = float(t_start)
+    t_end = float(t_end)
+    duration = float(duration)
+    if not np.isfinite(t_start) or not np.isfinite(t_end) or t_end <= t_start:
+        raise ValueError("time-window bounds must be increasing and finite")
+    if (not np.isfinite(duration) or duration < 0
+            or 2 * duration > t_end - t_start):
+        raise ValueError(
+            "duration must be finite and between zero and half the span")
+    weights = np.ones(times.shape, dtype=float)
+    outside = (times < t_start) | (times > t_end)
+    if duration:
+        left = (times >= t_start) & (times < t_start + duration)
+        right = (times > t_end - duration) & (times <= t_end)
+        weights[left] = np.sin(
+            0.5 * np.pi * (times[left] - t_start) / duration) ** 2
+        weights[right] = np.sin(
+            0.5 * np.pi * (t_end - times[right]) / duration) ** 2
+    weights[outside] = 0.0
+    return weights
+
+
 def _frequency_grid_indices(frequencies, delta_f):
     """Validate frequencies on one non-negative, uniform FFT grid."""
     frequencies = np.asarray(frequencies, dtype=float)
@@ -647,6 +677,9 @@ class MultibandSparseTDIResponse:
                              else float(_mapping_value(epoch, name)))
 
         details = []
+        sample_time_cache = {}
+        window_cache = {}
+        demodulation_cache = {}
         # Transform one channel at a time. This repeats inexpensive spline
         # reconstruction but never holds all A/E/T arrays beside a ZoomFFT
         # work buffer, which is important for multi-year observations.
@@ -693,23 +726,33 @@ class MultibandSparseTDIResponse:
                         t_end=stop + 0.5 * effective_delta_t,
                         channels=name, chunk_size=chunk_size,
                         complex_output=complex_output)[name]
-                    if time_window is not None:
+                    sampling_key = (float(series.start_time),
+                                    float(series.delta_t), len(series))
+                    sample_times = sample_time_cache.get(sampling_key)
+                    if sample_times is None:
                         sample_times = (float(series.start_time)
                                         + np.arange(len(series))
                                         * float(series.delta_t))
-                        weights = np.asarray(time_window(sample_times),
-                                             dtype=float)
+                        sample_time_cache[sampling_key] = sample_times
+                    if time_window is not None:
+                        weights = window_cache.get(sampling_key)
+                        if weights is None:
+                            weights = np.asarray(time_window(sample_times),
+                                                 dtype=float)
+                            window_cache[sampling_key] = weights
                         if weights.shape != (len(series),):
                             raise ValueError(
                                 "time_window must return one weight per time")
                         series *= weights
                     if heterodyne:
-                        sample_times = (float(series.start_time)
-                                        + np.arange(len(series))
-                                        * float(series.delta_t))
-                        series *= np.exp(
-                            -2j * np.pi * centre_frequency
-                            * (sample_times - origin))
+                        phase_key = (sampling_key, centre_frequency, origin)
+                        phase = demodulation_cache.get(phase_key)
+                        if phase is None:
+                            phase = np.exp(
+                                -2j * np.pi * centre_frequency
+                                * (sample_times - origin))
+                            demodulation_cache[phase_key] = phase
+                        series *= phase
                     values, transform_detail = _zoom_frequency_samples(
                         series, transform_frequencies, transform_indices,
                         spacing,

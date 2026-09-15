@@ -34,7 +34,8 @@ from pycbc.coordinates.space_orbit import LisaEqualArmOrbit
 from pycbc.tdi.backends.pytdi_backend import (PyTDICombinationAdapter,
                                               get_pytdi_combination)
 from pycbc.tdi.combination import Term
-from pycbc.tdi.multiband import prepare_multiband_tdi
+from pycbc.tdi.multiband import (prepare_multiband_tdi,
+                                 raised_cosine_time_window)
 from pycbc.types import Array
 
 #: Prepared geometries, keyed by everything that defines one. Sky position is
@@ -345,6 +346,31 @@ def _begin_candidate(params):
     _RUNTIME_SIGNATURES[epoch] = signature
 
 
+def _analysis_time_window(params):
+    """Return the optional raised-cosine observation-edge taper.
+
+    A finite sampled data segment and a continuous pruned transform are the
+    same Fourier object only when aliases from the segment boundary are
+    negligible.  A nonzero ``tdi_taper_duration`` applies a sine-squared
+    fade at both observation edges.  The data must have been conditioned with
+    the identical window; this option is therefore off by default.
+    """
+    duration = float(params.get('tdi_taper_duration', 0.0))
+    if not np.isfinite(duration) or duration < 0:
+        raise ValueError('tdi_taper_duration must be finite and non-negative')
+    if duration == 0:
+        return None
+    start = float(params['t_obs_start'])
+    stop = float(params['t_obs_end'])
+    # Validate before returning a closure that may be called much later.
+    raised_cosine_time_window(np.empty(0), start, stop, duration)
+
+    def window(times):
+        return raised_cosine_time_window(times, start, stop, duration)
+
+    return window
+
+
 def clear_cache():
     """Drop every prepared geometry and cached source."""
     _PREPARED.clear()
@@ -430,7 +456,8 @@ def sparse_tdi_fd_det_sequence(**params):
             {name: sample_points for name in served},
             delta_f={name: delta_f for name in served},
             epoch={name: epoch for name in served},
-            channels=served, spectral_padding=padding)
+            channels=served, spectral_padding=padding,
+            time_window=_analysis_time_window(params))
         if len(_SAMPLED) >= _SAMPLED_LIMIT:
             _SAMPLED.pop(next(iter(_SAMPLED)))
         _SAMPLED[key] = samples

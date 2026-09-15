@@ -10,6 +10,7 @@ from pycbc.tdi.multiband import (
     multiband_sparse_tdi_response,
     prepare_multiband_tdi,
     prepare_multiband_tdi_response,
+    raised_cosine_time_window,
 )
 from pycbc.tdi.onthefly import (
     MultiChannelTermGeometry,
@@ -89,6 +90,7 @@ __all__ = [
     "multiband_sparse_tdi_response",
     "prepare_multiband_tdi",
     "prepare_multiband_tdi_response",
+    "raised_cosine_time_window",
     "adaptive_time_grid",
     "adaptive_sparse_tdi_response",
     "chain_delay",

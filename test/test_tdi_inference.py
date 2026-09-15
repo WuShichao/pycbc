@@ -49,6 +49,20 @@ def test_registration_lands_in_the_detector_response_registry():
     assert 'tdi_source' in sparse_tdi_fd_det_sequence.required
 
 
+def test_analysis_taper_is_explicit_and_validated():
+    from pycbc.tdi.inference import _analysis_time_window
+
+    common = {'t_obs_start': 100.0, 't_obs_end': 200.0}
+    assert _analysis_time_window(common) is None
+    window = _analysis_time_window(dict(common, tdi_taper_duration=10.0))
+    assert np.allclose(window(np.array([100.0, 105.0, 110.0, 150.0,
+                                        190.0, 195.0, 200.0])),
+                       [0.0, 0.5, 1.0, 1.0, 1.0, 0.5, 0.0],
+                       rtol=0, atol=1e-15)
+    with pytest.raises(ValueError, match='half the span'):
+        _analysis_time_window(dict(common, tdi_taper_duration=51.0))
+
+
 def test_pyefpehm_builder_applies_detector_frame_extrinsics(monkeypatch):
     """A detector-response waveform must consume ``tc`` and polarization.
 

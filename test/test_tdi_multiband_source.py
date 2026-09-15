@@ -15,6 +15,7 @@ from pycbc.tdi.multiband import (
     multiband_sparse_tdi_response,
     prepare_multiband_tdi,
     prepare_multiband_tdi_response,
+    raised_cosine_time_window,
 )
 from pycbc.tdi.onthefly import adaptive_sparse_tdi_response
 from pycbc.tdi.response import (
@@ -24,6 +25,19 @@ from pycbc.tdi.response import (
 )
 from pycbc.tdi.sources import frequency_partition_sources
 from pycbc.types import TimeSeries
+
+
+def test_raised_cosine_time_window_has_shared_endpoint_convention():
+    times = np.array([-1.0, 0.0, 1.0, 2.0, 5.0, 8.0, 9.0, 10.0, 11.0])
+    actual = raised_cosine_time_window(times, 0.0, 10.0, 2.0)
+    expected = np.array([0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 0.5, 0.0, 0.0])
+    assert np.allclose(actual, expected, rtol=0, atol=1e-15)
+
+    rectangular = raised_cosine_time_window(times, 0.0, 10.0, 0.0)
+    assert np.array_equal(rectangular,
+                          [0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0])
+    with pytest.raises(ValueError, match="half the span"):
+        raised_cosine_time_window(times, 0.0, 10.0, 5.1)
 
 
 class _LinearFrequencySource:
@@ -313,6 +327,24 @@ def test_multiband_frequency_samples_match_dense_time_domain_transform():
     assert np.max(np.abs(actual["X"] - expected[indices])) / scale < 2e-2
     assert diagnostics
     assert sum(item["time_samples"] for item in diagnostics) < len(dense)
+
+    # A shared smooth observation edge makes the dense sampled DFT and the
+    # continuous pruned transform converge to the same spectrum.  Without
+    # it, a rectangular boundary has broadband aliases which no in-band
+    # multirate quadrature can reconstruct from its sparse samples.
+    window = raised_cosine_time_window(
+        np.arange(common["t_start"], common["t_end"], delta_t),
+        common["t_start"], common["t_end"], 400.0)
+    tapered_expected = np.fft.rfft(dense * window) * delta_t
+    tapered = multiband.frequency_samples(
+        {"X": frequencies}, delta_f={"X": delta_f},
+        epoch={"X": common["t_start"]}, spectral_padding=1e-2,
+        time_window=lambda time: raised_cosine_time_window(
+            time, common["t_start"], common["t_end"], 400.0))
+    reference = tapered_expected[indices]
+    inner = np.vdot(reference, tapered["X"])
+    norm = np.linalg.norm(reference) * np.linalg.norm(tapered["X"])
+    assert 1 - abs(inner) / norm < 5e-5
 
     zeroed = multiband.frequency_samples(
         {"X": frequencies}, delta_f={"X": delta_f},
