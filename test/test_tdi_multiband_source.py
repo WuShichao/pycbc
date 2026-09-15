@@ -14,7 +14,7 @@ from pycbc.tdi.multiband import (
     _zoom_frequency_samples,
     multiband_sparse_tdi_response,
     sparse_tdi_response,
-    prepare_multiband_tdi,
+    prepare_sparse_tdi,
     raised_cosine_time_window,
 )
 from pycbc.tdi.onthefly import adaptive_sparse_tdi_response
@@ -226,11 +226,11 @@ def test_prepared_multiband_unions_training_source_coverage():
         geometry_step=5.0, minimum_grid_points=16,
     )
 
-    fiducial_only = prepare_multiband_tdi(**options)
+    fiducial_only = prepare_sparse_tdi(**options)
     with pytest.raises(ValueError, match="leaves prepared coverage"):
         fiducial_only.project(candidate, 1.1, -0.4)
 
-    prepared = prepare_multiband_tdi(
+    prepared = prepare_sparse_tdi(
         **options, coverage_sources=[candidate])
     projected = prepared.project(candidate, 1.1, -0.4)
     times = np.linspace(900.0, 3100.0, 401)
@@ -250,7 +250,7 @@ def test_prepared_multiband_unions_training_source_coverage():
 
 def test_prepared_multiband_rejects_unprepared_harmonic():
     source = _CompactChirpSource()
-    prepared = prepare_multiband_tdi(
+    prepared = prepare_sparse_tdi(
         source, LisaEqualArmOrbit(t0=0.0),
         {"X": PyTDICombinationAdapter(
             "X2", get_pytdi_combination("X2"), delta_t=25.0).terms()},
@@ -269,7 +269,7 @@ def test_prepared_multiband_rejects_band_absent_from_preparation():
     orbit = LisaEqualArmOrbit(t0=0.0)
     terms = {"X": PyTDICombinationAdapter(
         "X2", get_pytdi_combination("X2"), delta_t=25.0).terms()}
-    prepared = prepare_multiband_tdi(
+    prepared = prepare_sparse_tdi(
         source, orbit, terms, 1.1, -0.4,
         [1e-3, 3e-3, 5e-3, 1e-2], t_start=800.0, t_end=3200.0,
         geometry_step=25.0)
@@ -307,7 +307,7 @@ def test_prepared_multiband_candidate_may_have_an_empty_covered_band():
     orbit = LisaEqualArmOrbit(t0=0.0)
     terms = {"X": PyTDICombinationAdapter(
         "X2", get_pytdi_combination("X2"), delta_t=25.0).terms()}
-    prepared = prepare_multiband_tdi(
+    prepared = prepare_sparse_tdi(
         source, orbit, terms, 1.1, -0.4,
         [1e-3, 3e-3, 5e-3, 1e-2], t_start=0.0, t_end=5000.0,
         geometry_step=25.0, coverage_sources=[distant])
@@ -431,7 +431,7 @@ def test_prepared_multiband_reuses_geometry_for_projection():
     orbit = LisaEqualArmOrbit(t0=0.0)
     terms = PyTDICombinationAdapter(
         "X2", get_pytdi_combination("X2"), delta_t=25.0).terms()
-    prepared = prepare_multiband_tdi(
+    prepared = prepare_sparse_tdi(
         source, orbit, {"X": terms}, 1.1, -0.4,
         band_edges=[1e-3, 5e-3, 1e-2], overlap=1e-3, samples_per_cycle=4,
         t_start=800.0, t_end=3200.0, geometry_step=10.0,
@@ -466,7 +466,7 @@ def test_fixed_multiband_preparation_reproduces_adaptive_response():
     adaptive = sparse_tdi_response(
         source, orbit, channel_terms, 1.1, -0.4,
         initial_step=200.0, relative_tolerance=2e-5, **common)
-    prepared = prepare_multiband_tdi(
+    prepared = prepare_sparse_tdi(
         source, orbit, channel_terms, 1.1, -0.4,
         geometry_step=10.0, minimum_grid_points=64, **common)
     fixed = prepared.response

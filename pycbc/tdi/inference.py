@@ -34,7 +34,7 @@ from pycbc.coordinates.space_orbit import LisaEqualArmOrbit
 from pycbc.tdi.backends.pytdi_backend import (PyTDICombinationAdapter,
                                               get_pytdi_combination)
 from pycbc.tdi.combination import Term
-from pycbc.tdi.multiband import (prepare_multiband_tdi,
+from pycbc.tdi.multiband import (prepare_sparse_tdi,
                                  raised_cosine_time_window)
 from pycbc.types import Array
 
@@ -177,7 +177,7 @@ def _preparation(params, terms, orbit):
         # keeps a harmonic while it carries more than `Amplitude_tol` of the
         # total, so a more eccentric candidate brings harmonics the fiducial
         # never had and loses others. `project` refuses an unprepared harmonic
-        # rather than dropping it silently, and `prepare_multiband_tdi`
+        # rather than dropping it silently, and `prepare_sparse_tdi`
         # partitions every coverage source against the primary's set, so
         # neither the union nor the richest single source works -- only a set
         # every source in play actually contains.
@@ -208,7 +208,7 @@ def _preparation(params, terms, orbit):
             band = _harmonic_band_edges(
                 fiducial, fiducial.harmonics[0], edges,
                 params['t_obs_start'], params['t_obs_end'])
-        _PREPARED[key] = prepare_multiband_tdi(
+        _PREPARED[key] = prepare_sparse_tdi(
             fiducial, orbit, terms,
             float(params['eclipticlongitude']),
             float(params['eclipticlatitude']),
@@ -576,7 +576,7 @@ class RestrictedHarmonicSource:
     """A harmonic source narrowed to a subset of its harmonics.
 
     Two places need this. Relative binning needs each harmonic on its own,
-    and `prepare_multiband_tdi` requires every coverage source to be a subset
+    and `prepare_sparse_tdi` requires every coverage source to be a subset
     of the prepared harmonic set -- a coverage source exists only to widen the
     prepared *time* coverage, so its extra harmonics are beside the point and
     narrowing it is the honest way to say so.

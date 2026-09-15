@@ -167,7 +167,7 @@ def test_prepared_geometry_is_model_scoped_and_keyed_on_numerical_knobs(
     built = []
     monkeypatch.setattr(inference, '_build_source', lambda _: Narrow())
     monkeypatch.setattr(
-        inference, 'prepare_multiband_tdi',
+        inference, 'prepare_sparse_tdi',
         lambda *args, **kwargs: built.append(kwargs) or object())
     terms, orbit = {'A': ()}, object()
 
@@ -214,7 +214,7 @@ def test_two_harmonics_of_one_candidate_get_separate_geometries(monkeypatch):
                   eclipticlongitude=0.9, eclipticlatitude=-0.25,
                   tdi_preparation_id='epoch', tdi_samples_per_cycle=4.0)
     monkeypatch.setattr(inference, '_build_source', lambda _: Narrow())
-    monkeypatch.setattr(inference, 'prepare_multiband_tdi',
+    monkeypatch.setattr(inference, 'prepare_sparse_tdi',
                         lambda *args, **kwargs: object())
     terms, orbit = {'A': ()}, object()
 

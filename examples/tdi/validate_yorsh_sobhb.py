@@ -51,7 +51,7 @@ from pycbc.tdi import (
     PyEFPEHMSource,
     TimeShiftedHarmonicSource,
     orthogonal_channels,
-    prepare_multiband_tdi,
+    prepare_sparse_tdi,
 )
 from pycbc.tdi.backends.pytdi_backend import (
     PyTDICombinationAdapter,
@@ -374,7 +374,7 @@ def main(argv=None):
             0.4 * np.minimum(np.diff(edges)[:-1], np.diff(edges)[1:]),
         )
         first = entries[0]
-        prepared = prepare_multiband_tdi(
+        prepared = prepare_sparse_tdi(
             first["source"],
             orbit,
             terms,

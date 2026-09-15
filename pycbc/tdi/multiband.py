@@ -379,7 +379,7 @@ class PreparedMultibandTDI:
             t_start=self.t_start, t_end=self.t_end)
 
 
-def prepare_multiband_tdi(
+def prepare_sparse_tdi(
         source, orbit, channel_terms, lamb, beta, band_edges, overlap=0.0,
         t_start=None, t_end=None, samples_per_cycle=4.0,
         geometry_step=86400.0, minimum_grid_points=16, velocity_order=1,
@@ -1054,7 +1054,7 @@ def sparse_tdi_response(
 
     Use this for a one-shot measurement -- a signal-to-noise ratio, a
     mismatch, a validation table. For a likelihood epoch, where one geometry
-    is shared across many candidates, use :func:`prepare_multiband_tdi`
+    is shared across many candidates, use :func:`prepare_sparse_tdi`
     instead; `test_prepared_multiband_reuses_geometry_for_projection` holds
     the two to the same answer.
     """
