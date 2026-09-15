@@ -379,64 +379,28 @@ class PreparedMultibandTDI:
             t_start=self.t_start, t_end=self.t_end)
 
 
-def prepare_multiband_tdi_response(
-        response, orbit, channel_terms, velocity_order=1, links=None):
-    """Prepare fixed geometry from a validated fiducial multiband response."""
-    if tuple(response.channels) != tuple(channel_terms):
-        raise ValueError(
-            "response channels must match channel_terms; prepare the native "
-            "channels before applying a linear channel transform")
-    grouped = {}
-    for band in response.bands:
-        grouped.setdefault(band.harmonic, []).append(band)
-    harmonics = tuple(grouped)
-    if not harmonics:
-        raise ValueError("response contains no frequency bands")
-    first = sorted(grouped[harmonics[0]], key=lambda item: item.index)
-    expected_indices = list(range(len(first)))
-    if [item.index for item in first] != expected_indices:
-        raise ValueError("fiducial bands must have consecutive indices")
-    band_edges = np.asarray(
-        [first[0].f_lower] + [item.f_upper for item in first], dtype=float)
-    overlaps = np.asarray(
-        [item.upper_overlap for item in first[:-1]], dtype=float)
-    for harmonic in harmonics[1:]:
-        items = sorted(grouped[harmonic], key=lambda item: item.index)
-        edges = np.asarray(
-            [items[0].f_lower] + [item.f_upper for item in items])
-        current_overlaps = np.asarray(
-            [item.upper_overlap for item in items[:-1]])
-        if (len(items) != len(first) or not np.array_equal(edges, band_edges)
-                or not np.array_equal(current_overlaps, overlaps)):
-            raise ValueError("every harmonic must use the same partition")
-
-    options = {} if links is None else {"links": links}
-    prepared_bands = []
-    for band in response.bands:
-        records = tuple(band.response.responses)
-        if len(records) != 1 or records[0]["harmonic"] != band.harmonic:
-            raise ValueError("each prepared band must contain one harmonic")
-        prepared = PreparedSparseTDI(
-            orbit, channel_terms,
-            {band.harmonic: np.asarray(records[0]["grid"])},
-            velocity_order=velocity_order, **options)
-        prepared_bands.append(_PreparedBand(
-            template=band, prepared=prepared,
-            coverage=band.support_blocks))
-    return PreparedMultibandTDI(
-        response, prepared_bands, band_edges, overlaps, harmonics)
-
-
 def prepare_multiband_tdi(
         source, orbit, channel_terms, lamb, beta, band_edges, overlap=0.0,
         t_start=None, t_end=None, samples_per_cycle=4.0,
         geometry_step=86400.0, minimum_grid_points=16, velocity_order=1,
-        links=None, padding=None, harmonics=None, coverage_sources=None):
-    """Prepare a fixed narrow-band geometry without adaptive window chasing.
+        links=None, padding=None, harmonics=None, coverage_sources=None,
+        relative_tolerance=1e-4):
+    """Prepare one shared narrow-band geometry for a likelihood epoch.
 
     This cold-path constructor is intended for a likelihood epoch. The band
-    windows determine their padded time coverage, while ``geometry_step`` and
-    ``minimum_grid_points`` control a fixed spline grid in each live block.
+    windows determine their padded time coverage; ``relative_tolerance``
+    adds knots wherever the one-shot path would, ``geometry_step`` sets the
+    uniform floor, and ``minimum_grid_points`` floors the count in each live
+    block. ``relative_tolerance=None`` leaves the uniform grid alone.
+
+    The tolerance is the same knob, with the same meaning, that
+    :func:`sparse_tdi_response` takes: one grid policy serves a signal-to-
+    noise measurement and a likelihood epoch, so what is validated on one is
+    what a sampler evaluates on the other.
+
+    The grid is built once from ``source`` and then held fixed, so every
+    candidate shares one time coordinate and no orbit spline or light-cone
+    solve is repeated per likelihood call.
     ``coverage_sources`` may supply prior-boundary or training sources whose
     window supports are unioned into that coverage.  Validate both the source
     ensemble and the grid settings against held-out dense responses before
@@ -448,6 +412,11 @@ def prepare_multiband_tdi(
     minimum_grid_points = int(minimum_grid_points)
     if not np.isfinite(geometry_step) or geometry_step <= 0:
         raise ValueError("geometry_step must be positive and finite")
+    if relative_tolerance is not None:
+        relative_tolerance = float(relative_tolerance)
+        if not np.isfinite(relative_tolerance) or relative_tolerance <= 0:
+            raise ValueError(
+                "relative_tolerance must be positive and finite")
     if minimum_grid_points < 4:
         raise ValueError("minimum_grid_points must be at least four")
     if t_start is None:
@@ -508,7 +477,30 @@ def prepare_multiband_tdi(
                 count = max(
                     minimum_grid_points,
                     int(np.ceil((high - low) / geometry_step)) + 1)
-                pieces.append(np.linspace(low, high, count))
+                block = np.linspace(low, high, count)
+                if relative_tolerance is not None:
+                    # Place the extra knots where the one-shot path would.
+                    # It refines on the error of the carrier-factored TDI
+                    # brackets, which is what this geometry interpolates;
+                    # the carrier-phase rule of `adaptive_time_grid` is for
+                    # choosing where to sample a waveform and is the wrong
+                    # quantity here -- it steps by dPhi/omega, which for a
+                    # 40-day source at 12 mHz is sub-second and millions of
+                    # points. The union keeps the uniform floor across the
+                    # padding, where the fiducial has no support to refine
+                    # against.
+                    refined = adaptive_sparse_tdi_response(
+                        windowed, orbit, channel_terms, lamb, beta,
+                        t_start=low, t_end=high,
+                        initial_step=geometry_step,
+                        relative_tolerance=relative_tolerance,
+                        velocity_order=velocity_order, **prepare_options)
+                    for item in refined.responses:
+                        grid = np.asarray(item['grid'], dtype=float)
+                        if len(grid) > 1:
+                            block = np.unique(np.concatenate([block, grid]))
+                    del refined
+                pieces.append(block)
             if not pieces:
                 continue
             grid = np.unique(np.concatenate(pieces))
@@ -1048,6 +1040,35 @@ class PreparedMultibandFrequencySampler:
                 for name, positions, transformed in result:
                     output[name][positions] += transformed
         return output
+
+
+def sparse_tdi_response(
+        source, orbit, channel_terms, lamb, beta, band_edges=None, **kwargs):
+    """Build a sparse time-domain TDI response, banded or not.
+
+    ``band_edges=None`` evaluates the whole signal on one adaptive grid;
+    passing edges splits the analysis band into sub-bands, each heterodyned
+    to its own centre and sampled at its own cadence. Both routes run the
+    same single-band engine underneath, so this is one response model with a
+    partitioning option rather than two implementations.
+
+    Use this for a one-shot measurement -- a signal-to-noise ratio, a
+    mismatch, a validation table. For a likelihood epoch, where one geometry
+    is shared across many candidates, use :func:`prepare_multiband_tdi`
+    instead; `test_prepared_multiband_reuses_geometry_for_projection` holds
+    the two to the same answer.
+    """
+    if band_edges is None:
+        rejected = {'overlap', 'samples_per_cycle', 'padding', 'harmonics'}
+        unusable = rejected.intersection(kwargs)
+        if unusable:
+            raise ValueError(
+                f"{sorted(unusable)} describe a band partition and need "
+                "band_edges")
+        return adaptive_sparse_tdi_response(
+            source, orbit, channel_terms, lamb, beta, **kwargs)
+    return multiband_sparse_tdi_response(
+        source, orbit, channel_terms, lamb, beta, band_edges, **kwargs)
 
 
 def multiband_sparse_tdi_response(

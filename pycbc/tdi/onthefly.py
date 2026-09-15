@@ -1883,28 +1883,6 @@ class PreparedSparseTDI:
             source, records, interpolation_order=self.interpolation_order)
 
 
-def build_sparse_tdi_response(source, orbit, channel_terms, lamb, beta,
-                              grids, velocity_order=1, links=LINK_ORDER,
-                              delay_expansion=None, reference_delay=False):
-    """Build a reusable sparse response from caller-selected harmonic grids.
-
-    ``grids`` may be a mapping from harmonic labels to grids or a callable
-    ``grids(source, harmonic)``.  Keeping grid policy separate from response
-    evaluation prevents an observation-length assumption from entering this
-    low-level API.
-    """
-    selected = {
-        harmonic: (grids(source, harmonic) if callable(grids)
-                   else grids[harmonic])
-        for harmonic in source.harmonics
-    }
-    prepared = PreparedSparseTDI(
-        orbit, channel_terms, selected, velocity_order=velocity_order,
-        links=links, delay_expansion=delay_expansion,
-        reference_delay=reference_delay)
-    return prepared.project(source, lamb, beta)
-
-
 def adaptive_sparse_tdi_response(
         source, orbit, channel_terms, lamb, beta, t_start=None, t_end=None,
         initial_step=86400.0, relative_tolerance=1e-4,
@@ -1925,7 +1903,8 @@ def adaptive_sparse_tdi_response(
     Parameters
     ----------
     source, orbit, channel_terms, lamb, beta
-        As in :func:`build_sparse_tdi_response`.
+        The source to project, the orbit and per-channel `Term` lists, and
+        the ecliptic sky position in radians.
     t_start, t_end : float, optional
         Mission-time interval. Defaults to the source bounds; no duration is
         built into the implementation.

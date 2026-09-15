@@ -558,15 +558,14 @@ def test_interpolated_frequency_response_controls_error_and_standard_sigma():
 
 def test_sparse_response_samples_only_the_requested_arbitrary_times():
     """The representation has no fixed duration or uniform-cadence policy."""
-    from pycbc.tdi.onthefly import (TermGeometry,
-                                    build_sparse_tdi_response,
+    from pycbc.tdi.onthefly import (PreparedSparseTDI, TermGeometry,
                                     sparse_channel_terms)
     orbit = LisaEqualArmOrbit()
     source = NewtonianChirp(3.0e4, 1e6)
     grid = np.linspace(12345.0, 234567.0, 100)
-    response = build_sparse_tdi_response(
-        source, orbit, {"X": _terms("X2"), "Y": _terms("Y2")},
-        0.9, -0.25, {2: grid})
+    response = PreparedSparseTDI(
+        orbit, {"X": _terms("X2"), "Y": _terms("Y2")}, {2: grid}).project(
+        source, 0.9, -0.25)
     query = np.array([13000.0, 17777.5, 81000.0, 190123.25, 230000.0])
     got = response.sample(query, channels="X")
 
@@ -581,14 +580,14 @@ def test_sparse_response_samples_only_the_requested_arbitrary_times():
 
 def test_sparse_response_reuses_one_carrier_across_channels():
     """Sampling A/E/T must not repeat the source phase solve per channel."""
-    from pycbc.tdi.onthefly import build_sparse_tdi_response
+    from pycbc.tdi.onthefly import PreparedSparseTDI
 
     orbit = LisaEqualArmOrbit()
     source = NewtonianChirp(3.0e4, 1e6)
     grid = np.linspace(12345.0, 234567.0, 100)
-    response = build_sparse_tdi_response(
-        source, orbit, {"X": _terms("X2"), "Y": _terms("Y2")},
-        0.9, -0.25, {2: grid})
+    response = PreparedSparseTDI(
+        orbit, {"X": _terms("X2"), "Y": _terms("Y2")}, {2: grid}).project(
+        source, 0.9, -0.25)
     original = source.carrier_phase
     calls = []
 
@@ -604,14 +603,14 @@ def test_sparse_response_reuses_one_carrier_across_channels():
 
 def test_sparse_response_reconstructs_uniform_timeseries_in_chunks():
     """Chunked reconstruction fills caller storage and preserves metadata."""
-    from pycbc.tdi.onthefly import build_sparse_tdi_response
+    from pycbc.tdi.onthefly import PreparedSparseTDI
 
     orbit = LisaEqualArmOrbit()
     source = NewtonianChirp(3.0e4, 1e6)
     grid = np.linspace(12345.0, 234567.0, 100)
-    response = build_sparse_tdi_response(
-        source, orbit, {"X": _terms("X2"), "Y": _terms("Y2")},
-        0.9, -0.25, {2: grid})
+    response = PreparedSparseTDI(
+        orbit, {"X": _terms("X2"), "Y": _terms("Y2")}, {2: grid}).project(
+        source, 0.9, -0.25)
     start, end, delta_t = 13000.0, 14003.0, 3.25
     size = int(np.ceil(np.nextafter(end - start, 0.0) / delta_t))
     storage = {}

@@ -13,8 +13,8 @@ from pycbc.tdi.multiband import (
     PreparedMultibandTDI,
     _zoom_frequency_samples,
     multiband_sparse_tdi_response,
+    sparse_tdi_response,
     prepare_multiband_tdi,
-    prepare_multiband_tdi_response,
     raised_cosine_time_window,
 )
 from pycbc.tdi.onthefly import adaptive_sparse_tdi_response
@@ -420,45 +420,38 @@ def test_multiband_frequency_samples_match_dense_time_domain_transform():
 
 
 def test_prepared_multiband_reuses_geometry_for_projection():
+    """One prepared geometry serves repeated projections of a candidate.
+
+    That the prepared path agrees with the one-shot path is
+    `test_fixed_multiband_preparation_reproduces_adaptive_response`'s job;
+    this one covers what only projection does -- the channel transform and
+    the threaded evaluation must not change the answer.
+    """
     source = _CompactChirpSource()
     orbit = LisaEqualArmOrbit(t0=0.0)
     terms = PyTDICombinationAdapter(
         "X2", get_pytdi_combination("X2"), delta_t=25.0).terms()
-    channel_terms = {"X": terms}
-    response = multiband_sparse_tdi_response(
-        source, orbit, channel_terms, 1.1, -0.4,
-        band_edges=[1e-3, 5e-3, 1e-2], overlap=1e-3,
-        samples_per_cycle=4, t_start=800.0, t_end=3200.0,
-        initial_step=200.0, relative_tolerance=2e-5,
-        velocity_order=1)
-    prepared = prepare_multiband_tdi_response(
-        response, orbit, channel_terms, velocity_order=1)
+    prepared = prepare_multiband_tdi(
+        source, orbit, {"X": terms}, 1.1, -0.4,
+        band_edges=[1e-3, 5e-3, 1e-2], overlap=1e-3, samples_per_cycle=4,
+        t_start=800.0, t_end=3200.0, geometry_step=10.0,
+        minimum_grid_points=64, velocity_order=1)
     projected = prepared.project(source, 1.1, -0.4)
+    assert projected.channels == ("X",)
 
     times = np.linspace(1000.0, 3000.0, 301)
-    expected = response.sample(times)["X"]
-    actual = projected.sample(times)["X"]
-    assert np.allclose(actual, expected, rtol=2e-12, atol=1e-30)
-    assert projected.channels == response.channels
+    values = projected.sample(times)["X"]
+    assert np.max(np.abs(values)) > 0
 
     transformed = prepared.project(
         source, 1.1, -0.4, matrix=[[2.0]], channels=("twice_X",))
     assert transformed.channels == ("twice_X",)
-    assert np.allclose(
-        transformed.sample(times)["twice_X"], 2 * expected,
-        rtol=2e-12, atol=1e-30)
+    assert np.allclose(transformed.sample(times)["twice_X"], 2 * values,
+                       rtol=2e-12, atol=1e-30)
 
-    threaded = prepared.project(
-        source, 1.1, -0.4, source_workers=2)
-    assert np.allclose(
-        threaded.sample(times)["X"], expected,
-        rtol=2e-12, atol=1e-30)
-
-    with pytest.raises(ValueError, match="native channels"):
-        prepare_multiband_tdi_response(
-            response.linear_transform([[1.0]], ("A",)),
-            orbit, channel_terms, velocity_order=1)
-
+    threaded = prepared.project(source, 1.1, -0.4, source_workers=2)
+    assert np.allclose(threaded.sample(times)["X"], values,
+                       rtol=2e-12, atol=1e-30)
 
 def test_fixed_multiband_preparation_reproduces_adaptive_response():
     source = _CompactChirpSource()
@@ -470,7 +463,7 @@ def test_fixed_multiband_preparation_reproduces_adaptive_response():
         band_edges=[1e-3, 5e-3, 1e-2], overlap=1e-3,
         samples_per_cycle=4, t_start=800.0, t_end=3200.0,
         velocity_order=1)
-    adaptive = multiband_sparse_tdi_response(
+    adaptive = sparse_tdi_response(
         source, orbit, channel_terms, 1.1, -0.4,
         initial_step=200.0, relative_tolerance=2e-5, **common)
     prepared = prepare_multiband_tdi(
@@ -482,7 +475,11 @@ def test_fixed_multiband_preparation_reproduces_adaptive_response():
     expected = adaptive.sample(times)["X"]
     actual = fixed.sample(times)["X"]
     scale = np.max(np.abs(expected))
-    assert np.max(np.abs(actual - expected)) / scale < 2e-4
+    # 1.46e-04 on the uniform grid this preparation used to build, and
+    # 3.22e-05 once the grid also follows the fiducial's carrier. The bound
+    # sits where only the phase-following grid reaches, so the two paths
+    # cannot drift back into being different response models.
+    assert np.max(np.abs(actual - expected)) / scale < 5e-5
 
 
 def test_zoom_frequency_samples_has_correct_scale_and_epoch():
