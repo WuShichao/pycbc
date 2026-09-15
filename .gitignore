@@ -23,3 +23,6 @@ pycbc/waveform/utils_cpu.cpp
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+
+# Local TDI notebooks: kept on disk, not versioned here.
+examples/tdi/*.ipynb
