@@ -520,3 +520,122 @@ def test_zoom_frequency_samples_has_correct_scale_and_epoch():
         @ (weights * values))
     assert np.allclose(direct, expected, rtol=2e-12, atol=2e-12)
     assert diagnostics["direct_points"] == 2
+
+
+def _prepared_grids(prepared):
+    """Every band's time grid, as the preparation actually stored it."""
+    return [band.prepared.geometries[band.template.harmonic].grid
+            for band in prepared.prepared_bands]
+
+
+def test_a_prior_corner_places_knots_and_not_only_widens_the_interval():
+    """Covering a corner in time is not the same as resolving it.
+
+    `coverage_sources` extended the time coverage while only the fiducial
+    refined. A corner that leaves the interval is already refused, so the
+    gap was the other case: a corner well inside the interval whose brackets
+    vary faster than the fiducial's. It was accepted on the interval check
+    alone, against a grid that had never been asked to resolve it.
+
+    The corner here keeps the fiducial's support and band occupancy exactly,
+    and only wobbles its carrier, so nothing but the knots can differ.
+    """
+    orbit = LisaEqualArmOrbit(t0=0.0)
+    terms = {"X": PyTDICombinationAdapter(
+        "X2", get_pytdi_combination("X2"), delta_t=25.0).terms()}
+    common = dict(band_edges=[1e-3, 5e-3, 1e-2], overlap=1e-3,
+                  samples_per_cycle=4, t_start=800.0, t_end=3200.0,
+                  geometry_step=400.0, minimum_grid_points=8,
+                  relative_tolerance=2e-5, velocity_order=1)
+    fiducial = _CompactChirpSource()
+
+    class _Corner(_CompactChirpSource):
+        """Identical carrier, an envelope that varies far faster.
+
+        The band partition is driven by frequency, so leaving the carrier
+        alone keeps every band's time support identical and the corner
+        inside the coverage. What differs is the bracket the geometry
+        interpolates, which is what the knots are there for.
+        """
+
+        def amplitude(self, harmonic, time):
+            time = np.asarray(time)
+            plus, cross = super().amplitude(harmonic, time)
+            wobble = 1 + 0.5 * np.sin(2 * np.pi * time / 250.0)
+            return plus * wobble, cross * wobble
+
+    corner = _Corner()
+
+    alone = prepare_sparse_tdi(fiducial, orbit, terms, 1.1, -0.4, **common)
+    with_corner = prepare_sparse_tdi(
+        fiducial, orbit, terms, 1.1, -0.4,
+        coverage_sources=[corner], **common)
+
+    knots_alone = sum(len(g) for g in _prepared_grids(alone))
+    knots_corner = sum(len(g) for g in _prepared_grids(with_corner))
+    assert knots_corner > knots_alone
+
+    # The knots are for the corner: on the fiducial-only geometry it is
+    # served worse than on the one that was asked to resolve it.
+    times = np.linspace(1000.0, 3000.0, 301)
+    truth = sparse_tdi_response(
+        corner, orbit, terms, 1.1, -0.4, band_edges=common["band_edges"],
+        overlap=common["overlap"], samples_per_cycle=4,
+        t_start=common["t_start"], t_end=common["t_end"],
+        initial_step=400.0, relative_tolerance=2e-5,
+        velocity_order=1).sample(times)["X"]
+    scale = max(np.max(np.abs(truth)), np.finfo(float).tiny)
+    without = np.max(np.abs(
+        alone.project(corner, 1.1, -0.4).sample(times)["X"] - truth)) / scale
+    with_it = np.max(np.abs(
+        with_corner.project(corner, 1.1, -0.4).sample(times)["X"]
+        - truth)) / scale
+    assert with_it < without
+
+
+def test_the_refinement_resolves_the_delay_tail_past_the_support():
+    """Without `support_padding` the tail falls to the uniform floor.
+
+    TDI reaches several arms back, so the response continues past the
+    source's own support. The refinement only sees that tail if it is told
+    the padding; otherwise the padded margin gets nothing but the uniform
+    grid, which at the floor's spacing cannot resolve it.
+
+    The assertion is therefore about the margin specifically. An earlier
+    version asserted only that the grid was fine *somewhere*, which the
+    in-support refinement satisfies on its own -- it survived the mutation
+    that removes `support_padding`, and so proved nothing.
+    """
+    from pycbc.tdi.onthefly import harmonic_windows
+
+    orbit = LisaEqualArmOrbit(t0=0.0)
+    terms = {"X": PyTDICombinationAdapter(
+        "X2", get_pytdi_combination("X2"), delta_t=25.0).terms()}
+    source = _CompactChirpSource()
+    floor, padding = 400.0, 150.0
+    prepared = prepare_sparse_tdi(
+        source, orbit, terms, 1.1, -0.4,
+        band_edges=[1e-3, 5e-3, 1e-2], overlap=1e-3, samples_per_cycle=4,
+        t_start=800.0, t_end=3200.0, geometry_step=floor,
+        minimum_grid_points=8, relative_tolerance=2e-5, padding=padding,
+        velocity_order=1)
+
+    checked = 0
+    for band in prepared.prepared_bands:
+        harmonic = band.template.harmonic
+        grid = band.prepared.geometries[harmonic].grid
+        # Where the band's own response lives, before padding.
+        bare = harmonic_windows(
+            band.template.response.source, harmonic, 800.0, 3200.0,
+            padding=0.0)
+        if not bare:
+            continue
+        for low, high in bare:
+            for margin in ((low - padding, low), (high, high + padding)):
+                inside = grid[(grid >= margin[0]) & (grid <= margin[1])]
+                if len(inside) < 3:
+                    continue
+                assert np.min(np.diff(inside)) < 0.5 * floor, (
+                    f"margin {margin} spaced no finer than the floor")
+                checked += 1
+    assert checked, "no padded margin was populated at all"

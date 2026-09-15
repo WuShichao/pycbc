@@ -312,3 +312,56 @@ def test_the_chirp_z_plan_is_reused():
                                 endpoint=True))
     clear_zoom_plans()
     assert not _ZOOM_PLANS
+
+
+def test_the_tolerance_reaches_the_preparation_and_its_key(monkeypatch):
+    """A tolerance that does not reach the builder is a silent default.
+
+    It was absent from this module entirely: a likelihood could ask for any
+    tolerance and get 1e-4, and two epochs asking for different ones shared
+    one geometry, so the looser would have reported the tighter's accuracy.
+    """
+    from pycbc.tdi import inference
+
+    class Narrow:
+        harmonics = (2,)
+
+        def angular_frequency(self, harmonic, times):
+            return np.full_like(
+                np.asarray(times, dtype=float), 2 * np.pi * 1.5e-3)
+
+    clear_cache()
+    seen = []
+    monkeypatch.setattr(inference, '_build_source', lambda _: Narrow())
+    monkeypatch.setattr(
+        inference, 'prepare_sparse_tdi',
+        lambda *args, **kwargs: seen.append(
+            kwargs.get('relative_tolerance')) or object())
+    params = dict(tdi_source='lal', tdi_band_edges=[1e-3, 2e-3],
+                  t_obs_start=0.0, t_obs_end=1.0e7,
+                  eclipticlongitude=0.9, eclipticlatitude=-0.25,
+                  tdi_preparation_id='epoch')
+    terms, orbit = {'A': ()}, object()
+
+    inference._preparation(dict(params, tdi_relative_tolerance=1e-4),
+                           terms, orbit)
+    assert seen == [1e-4]
+
+    # A different tolerance is a different geometry, not a cache hit.
+    inference._preparation(dict(params, tdi_relative_tolerance=1e-6),
+                           terms, orbit)
+    assert seen == [1e-4, 1e-6]
+
+    # And the same one is.
+    inference._preparation(dict(params, tdi_relative_tolerance=1e-4),
+                           terms, orbit)
+    assert seen == [1e-4, 1e-6]
+
+    # None is a value, not a missing key: it asks for the uniform grid.
+    inference._preparation(dict(params, tdi_relative_tolerance=None),
+                           terms, orbit)
+    assert seen == [1e-4, 1e-6, None]
+
+    with pytest.raises(ValueError, match='tdi_relative_tolerance'):
+        inference._preparation(dict(params, tdi_relative_tolerance=0.0),
+                               terms, orbit)
