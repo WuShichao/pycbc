@@ -167,7 +167,10 @@ def test_prepared_geometry_is_model_scoped_and_keyed_on_numerical_knobs(
     assert inference._preparation(new_epoch, terms, orbit) is not first
     finer = dict(params, tdi_samples_per_cycle=16.0)
     assert inference._preparation(finer, terms, orbit) is not first
-    assert len(built) == 3
+    denser_geometry = dict(params, tdi_geometry_step=21600.0)
+    assert inference._preparation(denser_geometry, terms, orbit) is not first
+    assert len(built) == 4
+    assert built[-1]['geometry_step'] == 21600.0
 
 
 def test_two_harmonics_of_one_candidate_get_separate_geometries(monkeypatch):

@@ -165,6 +165,8 @@ def _preparation(params, terms, orbit):
            int(params.get('tdi_generation', 2)),
            float(params.get('tdi_delta_t', 5.0)),
            float(params.get('tdi_samples_per_cycle', 4.0)),
+           float(params.get('tdi_geometry_step', 86400.0)),
+           int(params.get('tdi_minimum_grid_points', 16)),
            float(params.get('tdi_band_overlap', 0.0)),
            bool(params.get('tdi_clip_bands', True)))
     if key not in _PREPARED:
@@ -215,6 +217,9 @@ def _preparation(params, terms, orbit):
             t_start=float(params['t_obs_start']),
             t_end=float(params['t_obs_end']),
             samples_per_cycle=float(params.get('tdi_samples_per_cycle', 4.0)),
+            geometry_step=float(params.get('tdi_geometry_step', 86400.0)),
+            minimum_grid_points=int(params.get(
+                'tdi_minimum_grid_points', 16)),
             overlap=float(params.get('tdi_band_overlap', 0.0)),
             coverage_sources=[RestrictedHarmonicSource(
                 source, tuple(sorted(common))) for source in coverage])
