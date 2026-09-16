@@ -1434,3 +1434,41 @@ def test_the_compact_interpolator_is_third_order_at_its_edges_too():
     # must fall back rather than read past its own data.
     short = _UniformCubicInterpolator(0.0, 1.0, np.array([1.0, 3.0]))
     assert np.allclose(short(np.array([0.0, 0.5, 1.0])), [1.0, 2.0, 3.0])
+
+
+def test_growth_not_delta_phi_bounds_the_largest_interval():
+    """Refining `delta_phi` does not close the gaps far from the anchor.
+
+    The step compounds by `growth` per step, so a smaller `delta_phi` buys
+    knots where they are already dense. This is what made an MBHB look as
+    though its residual would not converge: two hundred times the knots, and
+    the worst interval unchanged. `growth = 1.002` is the setting that takes
+    the Sangria MBHB inside their acceptance threshold, and this test exists
+    so it cannot quietly go back to the paper's 1.1.
+    """
+    from pycbc.tdi.onthefly import adaptive_time_grid
+
+    source = NewtonianChirp(3.0e4, 1e6)
+    start, stop = 0.0, 3.0e5
+
+    def largest_gap(**kwargs):
+        grid = adaptive_time_grid(source, 2, start, stop, dt_max=1e9,
+                                  **kwargs)
+        return float(np.max(np.diff(grid))), len(grid)
+
+    coarse_gap, coarse_knots = largest_gap(delta_phi=0.5, growth=1.1)
+    fine_gap, fine_knots = largest_gap(delta_phi=0.5 / 256, growth=1.1)
+    grown_gap, grown_knots = largest_gap(delta_phi=0.5, growth=1.002)
+
+    # Refining the phase step adds knots and leaves the worst interval where
+    # it was -- the whole point, and what an apparent non-convergence looks
+    # like from the outside.
+    assert fine_knots > coarse_knots
+    assert fine_gap > 0.9 * coarse_gap
+
+    # Lowering `growth` is what closes it.
+    assert grown_gap < 0.1 * coarse_gap
+
+    # And the median goes the other way, which is why a knot count hides
+    # this: the phase refinement crowds the dense region instead.
+    assert grown_knots > fine_knots

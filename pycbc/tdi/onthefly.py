@@ -89,7 +89,24 @@ def adaptive_time_grid(source, harmonic, t_start, t_end, delta_phi=0.5,
     Cornish & Littenberg's prescription (arXiv:2506.08093 Sec. III.2): anchor
     at the merger, step by ``delta_phi`` of carrier phase, and once the anchor
     is further than ``plateau`` away let ``delta_phi`` grow by ``growth`` per
-    step, with the step capped at ``dt_max``. Their published values are
+    step, with the step capped at ``dt_max``.
+
+    **``growth`` is what bounds the largest interval, and ``delta_phi`` is
+    not.** The step compounds geometrically with distance from the anchor, so
+    refining ``delta_phi`` adds knots where they are already dense and leaves
+    the far intervals where they were. Measured on a Sangria MBHB over the
+    four days before merger: lowering ``delta_phi`` from 0.125 to 0.000488
+    takes the grid from 481 knots to 105,983 and the median gap from 9.4 s to
+    0.0 s, while the **largest** gap moves only from 42,602 s to 41,490 s.
+    Lowering ``growth`` to 1.002 instead closes that gap with 2,872 knots and
+    is what takes all fifteen Sangria MBHB inside
+    :math:`\rho^2 R/2 < 0.1`; at the 1.1 default the loudest reads 0.163.
+
+    The default stays at the paper's 1.1 because a source that does not
+    concentrate its signal-to-noise near an anchor -- a galactic binary, a
+    stellar-origin binary -- would pay five to nine times the knots for
+    nothing. Choose it per source class, and see
+    `test_growth_not_delta_phi_bounds_the_largest_interval`. Their published values are
     ``delta_phi = 0.5``, ``growth = 1.1``, ``dt_max = 2e5`` (2.3 days) and a
     plateau of 100 M in seconds; those are the defaults here except for the
     plateau, which needs a total mass this layer does not have. Pass it.
