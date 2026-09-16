@@ -149,6 +149,19 @@ def _harmonic_band_edges(source, harmonic, edges, t_start, t_end,
     return [low] + inner + [high]
 
 
+def _label(harmonic):
+    """The hashable form of a harmonic label, or ``None``.
+
+    Configuration files hand a harmonic over as a list, the sources key
+    theirs with tuples, and a scalar label stays a scalar. Three call sites
+    normalised it in three places; they now share this one.
+    """
+    if harmonic is None:
+        return None
+    return (tuple(harmonic) if isinstance(harmonic, (list, tuple))
+            else harmonic)
+
+
 def _tolerance(params):
     """The bracket-interpolation tolerance the prepared geometry is built to.
 
@@ -175,7 +188,7 @@ def _preparation(params, terms, orbit):
     bounds = params.get('tdi_coverage_bounds') or {}
     key = (params.get('tdi_preparation_id', 'default'),
            params['tdi_source'], channels, edges,
-           params.get('tdi_harmonic'),
+           _label(params.get('tdi_harmonic')),
            tuple(sorted((name, float(low), float(high))
                         for name, (low, high) in bounds.items())),
            tuple(tuple(sorted(dict(corner).items()))
@@ -193,36 +206,56 @@ def _preparation(params, terms, orbit):
            float(params.get('tdi_band_overlap', 0.0)),
            bool(params.get('tdi_clip_bands', True)))
     if key not in _PREPARED:
-        fiducial = _narrow(_build_source(params), params)
-        coverage = [_narrow(source, params)
-                    for source in _coverage_sources(params)]
         # The live harmonic set is a function of the parameters: pyEFPEHM
         # keeps a harmonic while it carries more than `Amplitude_tol` of the
         # total, so a more eccentric candidate brings harmonics the fiducial
-        # never had and loses others. `project` refuses an unprepared harmonic
-        # rather than dropping it silently, and `prepare_sparse_tdi`
-        # partitions every coverage source against the primary's set, so
-        # neither the union nor the richest single source works -- only a set
-        # every source in play actually contains.
+        # never had and loses others.
         #
-        # So the sampling epoch gets one fixed set, the intersection over the
-        # fiducial and the prior corners, and what that costs is reported
-        # rather than absorbed. Widening it is a modelling choice: lower
-        # `Amplitude_tol` until the set stops moving across the prior.
+        # `'intersection'` gives the epoch one fixed set -- the harmonics
+        # every source in play contains -- and reports what that costs rather
+        # than absorbing it. `'union'` bins everything the prior carries, and
+        # then the source a harmonic is prepared from cannot be the fiducial,
+        # which does not have it. `harmonic_references` names the prior
+        # corner that stands in.
         combine = str(params.get('tdi_harmonic_combine', 'intersection'))
+        label = _label(params.get('tdi_harmonic'))
+        native = [(source, set(source.harmonics))
+                  for source in _coverage_sources(params)]
+        prepare_params = params
+        if label is not None and label not in set(
+                _build_source(params).harmonics):
+            overrides = harmonic_references(params).get(label)
+            if overrides is None:
+                raise ValueError(
+                    f"harmonic {label!r} is carried by neither the fiducial "
+                    "nor any prior corner")
+            prepare_params = dict(params, **overrides)
+        fiducial = _narrow(_build_source(prepare_params), prepare_params)
         common = set(fiducial.harmonics)
-        for source in coverage:
-            other = set(source.harmonics)
+        for _, other in native:
             common = common | other if combine == 'union' else common & other
-        if combine == 'union':
-            # Prepare only what this source actually carries; the harmonics
-            # the union has and it does not are served as zeros, by the
-            # early return in `sparse_tdi_fd_det_sequence`.
-            common &= set(fiducial.harmonics)
+        if label is not None:
+            common &= {label}
+        elif combine == 'union' and common - set(fiducial.harmonics):
+            # One preparation is built from one source, and that source
+            # cannot supply a harmonic it does not carry. Asking anyway used
+            # to intersect the union back to the fiducial in silence.
+            raise ValueError(
+                "tdi_harmonic_combine='union' needs the per-harmonic path: "
+                f"{sorted(common - set(fiducial.harmonics), key=repr)!r} "
+                "live in the prior but not in the fiducial. Ask for one "
+                "harmonic at a time with tdi_harmonic, as the harmonic "
+                "relative-binning model does.")
         if not common:
             raise ValueError(
                 "the fiducial and the prior corners share no harmonic; "
                 "lower Amplitude_tol or narrow tdi_coverage_bounds")
+        # Only a source that actually carries a harmonic can widen its
+        # coverage or train its grid. Narrowing one that does not would have
+        # it claim a support it has no samples over.
+        coverage = [RestrictedHarmonicSource(
+                        source, tuple(sorted(common & other)))
+                    for source, other in native if common & other]
         dropped = set(fiducial.harmonics) - common
         if dropped:
             logging.info(
@@ -253,8 +286,7 @@ def _preparation(params, terms, orbit):
             minimum_grid_points=int(params.get(
                 'tdi_minimum_grid_points', 16)),
             overlap=float(params.get('tdi_band_overlap', 0.0)),
-            coverage_sources=[RestrictedHarmonicSource(
-                source, tuple(sorted(common))) for source in coverage])
+            coverage_sources=coverage)
     return _PREPARED[key]
 
 
@@ -285,16 +317,14 @@ def _narrow(source, params):
     costs 0.88 s once and projecting them one at a time costs 27.6 ms against
     26.0 ms for the summed projection -- the work is the same either way.
     """
-    harmonic = params.get('tdi_harmonic')
+    harmonic = _label(params.get('tdi_harmonic'))
     if harmonic is None:
         return source
-    return SingleHarmonicSource(source, tuple(harmonic)
-                                if isinstance(harmonic, (list, tuple))
-                                else harmonic)
+    return SingleHarmonicSource(source, harmonic)
 
 
-def _coverage_sources(params):
-    """Sources at the prior's own edges, so the preparation covers them.
+def _coverage_overrides(params):
+    """Parameter overrides that place a source at the prior's own edges.
 
     `PreparedMultibandTDI.project` refuses a candidate whose band support
     leaves the prepared coverage rather than extrapolating into it, and a
@@ -307,20 +337,49 @@ def _coverage_sources(params):
     parameter that fails that has to be given as an explicit corner.
     """
     bounds = params.get('tdi_coverage_bounds') or {}
-    sources = []
+    overrides = []
     for name, (low, high) in bounds.items():
         for value in (float(low), float(high)):
-            edge = dict(params)
-            edge[name] = value
-            sources.append(_build_source(edge))
+            overrides.append({name: value})
     # Axial corners move one parameter and hold the rest, so they cannot
     # reach a corner of a multi-parameter tile -- and a harmonic set is not
     # a monotone function of one parameter at a time. `tdi_coverage_corners`
     # takes explicit joint corners, each a mapping of parameter to value,
     # for the case the docstring above names.
     for corner in params.get('tdi_coverage_corners') or ():
-        sources.append(_build_source(dict(params, **dict(corner))))
-    return sources
+        overrides.append(dict(corner))
+    return overrides
+
+
+def _coverage_sources(params):
+    """Build a source at each edge of the prior."""
+    return [_build_source(dict(params, **item))
+            for item in _coverage_overrides(params)]
+
+
+def harmonic_references(params):
+    """The source each harmonic is binned against, as parameter overrides.
+
+    Relative binning divides by its reference, so a harmonic whose reference
+    is identically zero has no bins at all -- it is listed, prepared as
+    zeros, and then skipped for having an empty fiducial, which is silent
+    truncation wearing a union's clothes. Under ``'union'`` the fiducial is
+    by construction missing some of the harmonics the prior carries, so each
+    of those is given the *first* prior corner that does carry it. An empty
+    mapping means the fiducial itself.
+
+    First, not cheapest or nearest: the order of `_coverage_overrides` is the
+    order the configuration declares, so the choice is reproducible from the
+    file rather than from whatever the search happened to visit.
+    """
+    references = {label: {} for label in _build_source(params).harmonics}
+    if str(params.get('tdi_harmonic_combine', 'intersection')) != 'union':
+        return references
+    for overrides in _coverage_overrides(params):
+        source = _build_source(dict(params, **overrides))
+        for label in source.harmonics:
+            references.setdefault(label, dict(overrides))
+    return references
 
 
 def _projection(params, prepared):
@@ -461,10 +520,8 @@ def sparse_tdi_fd_det_sequence(**params):
     # exactly zero, and saying so is the alternative to dropping it in
     # silence. Checked before anything is prepared, because preparing a
     # harmonic the source lacks is what would raise.
-    harmonic = params.get('tdi_harmonic')
-    if harmonic is not None:
-        label = (tuple(harmonic) if isinstance(harmonic, (list, tuple))
-                 else harmonic)
+    label = _label(params.get('tdi_harmonic'))
+    if label is not None:
         if label not in set(_build_source(params).harmonics):
             logging.info("tdi: candidate does not carry harmonic %s; it "
                          "contributes zero", (label,))
@@ -681,8 +738,13 @@ def harmonic_labels(params):
 
     ``'union'`` bins every harmonic any corner has. A candidate that does not
     carry one contributes zero for it, which is what a missing mode is worth,
-    and nothing is dropped unannounced. It costs the harmonics that only some
-    of the prior has.
+    and nothing is dropped unannounced. The fiducial is missing some of them
+    too, and those cannot be binned against it -- relative binning divides by
+    its reference. `harmonic_references` gives each one the first prior
+    corner that carries it, and preparing a harmonic is done from that source
+    rather than from the fiducial. It costs the harmonics that only some of
+    the prior has, and it works only on the per-harmonic path: one
+    preparation is built from one source.
     """
     combine = str(params.get('tdi_harmonic_combine', 'intersection'))
     if combine not in ('intersection', 'union'):

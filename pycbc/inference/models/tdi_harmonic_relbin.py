@@ -85,17 +85,49 @@ class HarmonicRelative(Relative):
                 "own detector response; the approximant is not in "
                 "fd_det_sequence")
         self.cross_terms = bool(cross_terms)
+        from pycbc.tdi.inference import harmonic_labels, harmonic_references
         if harmonics is None:
-            from pycbc.tdi.inference import harmonic_labels
             harmonics = harmonic_labels(self.fid_params)
         self.harmonics = tuple(harmonics)
         if len(self.harmonics) < 1:
             raise ValueError("the source carries no harmonics")
+        # Under `tdi_harmonic_combine='union'` the prior carries harmonics
+        # the fiducial does not, and those need a reference that is not
+        # identically zero -- relative binning divides by it. Every other
+        # mode bins against the fiducial throughout, which an empty mapping
+        # says, and asking for the references would need a TDI source this
+        # model does not otherwise require.
+        self.harmonic_reference = {}
+        if str(self.fid_params.get(
+                'tdi_harmonic_combine', 'intersection')) == 'union':
+            self.harmonic_reference = harmonic_references(self.fid_params)
+            unreferenced = [h for h in self.harmonics
+                            if h not in self.harmonic_reference]
+            if unreferenced:
+                raise ValueError(
+                    f"harmonics {unreferenced!r} have no reference source; "
+                    "they are carried by neither the fiducial nor any prior "
+                    "corner")
 
         self.hfedges, self.hedges, self.hquery = {}, {}, {}
         self.h00_h, self.sdat_h, self.cross = {}, {}, {}
         for ifo in self.data:
             self._prepare_channel(ifo)
+        # A harmonic with no bins in any channel never reaches `_loglr`, so
+        # leaving it in `self.harmonics` would advertise a mode the model
+        # does not evaluate. That is the shape of the bug this class had:
+        # the listed set was checked and the binned set was not.
+        binned = tuple(h for h in self.harmonics
+                       if any(h in self.hedges[ifo] for ifo in self.data))
+        if len(binned) != len(self.harmonics):
+            logging.warning(
+                "%s: %d of %d harmonics have no support in any channel's "
+                "band and are dropped from the model: %s", self.name,
+                len(self.harmonics) - len(binned), len(self.harmonics),
+                sorted(set(self.harmonics) - set(binned), key=repr))
+            self.harmonics = binned
+        if not self.harmonics:
+            raise ValueError("no harmonic has support in any channel's band")
         self._build_shared_query()
         logging.info("%s: %d harmonics, %d cross pairs per channel",
                      self.name, len(self.harmonics),
@@ -138,7 +170,13 @@ class HarmonicRelative(Relative):
                 self.utake[ifo][harmonic] = take
 
     def _fiducial_harmonic(self, ifo, harmonic, frequencies):
+        # Not always `fid_params`: a harmonic the fiducial does not carry is
+        # binned against the prior corner that does, named by
+        # `harmonic_references`. Binning it against the fiducial would
+        # divide by zero -- in practice it was skipped for being empty, so
+        # the harmonic was listed and never evaluated.
         params = dict(self.fid_params)
+        params.update(self.harmonic_reference.get(harmonic, {}))
         params['tdi_harmonic'] = harmonic
         wave = get_fd_det_waveform_sequence(
             ifos=ifo, sample_points=Array(frequencies.astype(numpy.float64)),
@@ -164,6 +202,11 @@ class HarmonicRelative(Relative):
             values[kmin:kmax + 1] = piece
             fiducials[harmonic] = values
             if not numpy.any(piece):
+                # Its reference carries this harmonic, so an empty fiducial
+                # here means the harmonic's whole frequency range sits
+                # outside this channel's analysis band. That is a fact about
+                # the band, not a missing reference, and `__init__` drops
+                # the harmonic outright if it holds in every channel.
                 logging.info("%s: harmonic %s is empty in this band",
                              ifo, harmonic)
                 continue
