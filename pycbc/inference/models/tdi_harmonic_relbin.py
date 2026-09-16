@@ -75,9 +75,43 @@ class HarmonicRelative(Relative):
         static_params = dict(kwargs.get('static_params', {}))
         static_params.setdefault(
             'tdi_preparation_id', f'harmonic-relative-{uuid.uuid4().hex}')
+        # `_prepare_channel` asks one channel at a time, and the preparation
+        # key carries the channel set, so without this each harmonic is
+        # prepared once per channel -- two complete geometries, and two
+        # passes over the prior corners, for one harmonic. Naming every
+        # channel up front is what the generator's own docstring intends.
+        static_params.setdefault('tdi_channels', tuple(data))
+        # ``Relative`` constructs a summed fiducial before this subclass can
+        # replace its summaries with one per harmonic.  A union epoch cannot
+        # construct that sum from a fiducial which lacks some union modes, and
+        # the TDI generator correctly refuses it.  Bootstrap the parent with
+        # one harmonic the fiducial really carries.  Its preparation is useful
+        # again below, while the parent's summed summaries are not.
+        bootstrap_harmonic = None
+        union_references = None
+        if (str(static_params.get(
+                'tdi_harmonic_combine', 'intersection')) == 'union'
+                and 'tdi_harmonic' not in static_params):
+            from pycbc.tdi.inference import harmonic_references
+            probe = dict(static_params)
+            probe.update(kwargs.get('fiducial_params', {}))
+            union_references = harmonic_references(probe)
+            native = sorted((label for label, override
+                             in union_references.items()
+                             if not override), key=repr)
+            if not native:
+                raise ValueError("the fiducial source carries no harmonic")
+            bootstrap_harmonic = native[0]
+            static_params['tdi_harmonic'] = bootstrap_harmonic
         kwargs['static_params'] = static_params
         super().__init__(variable_params, data, low_frequency_cutoff,
                          **kwargs)
+        if bootstrap_harmonic is not None:
+            # Candidate calls and the per-harmonic summaries choose their own
+            # label.  Leaving the bootstrap label in either mapping would pin
+            # the whole model to the parent's arbitrary first harmonic.
+            self.static_params.pop('tdi_harmonic', None)
+            self.fid_params.pop('tdi_harmonic', None)
         self.harmonic_epsilon = float(harmonic_epsilon)
         if not self.still_needs_det_response:
             raise ValueError(
@@ -87,7 +121,9 @@ class HarmonicRelative(Relative):
         self.cross_terms = bool(cross_terms)
         from pycbc.tdi.inference import harmonic_labels, harmonic_references
         if harmonics is None:
-            harmonics = harmonic_labels(self.fid_params)
+            harmonics = (tuple(sorted(union_references, key=repr))
+                         if union_references is not None
+                         else harmonic_labels(self.fid_params))
         self.harmonics = tuple(harmonics)
         if len(self.harmonics) < 1:
             raise ValueError("the source carries no harmonics")
@@ -100,7 +136,9 @@ class HarmonicRelative(Relative):
         self.harmonic_reference = {}
         if str(self.fid_params.get(
                 'tdi_harmonic_combine', 'intersection')) == 'union':
-            self.harmonic_reference = harmonic_references(self.fid_params)
+            self.harmonic_reference = (
+                union_references if union_references is not None
+                else harmonic_references(self.fid_params))
             unreferenced = [h for h in self.harmonics
                             if h not in self.harmonic_reference]
             if unreferenced:

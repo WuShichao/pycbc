@@ -26,6 +26,7 @@ preparation covers is refused rather than extrapolated, and since a chirp-mass
 change of one part in 1e5 moves t(f) by weeks, the prior's own boundary has to
 be declared through ``tdi_coverage_sources``.
 """
+import gc
 import logging
 
 import numpy as np
@@ -67,6 +68,19 @@ _PROJECTED_LIMIT = 16
 #: and enough allocation to exhaust a 3.5 GiB budget.
 _SOURCE_CACHE = {}
 _SOURCE_CACHE_LIMIT = 16
+
+#: Sources which own a prepared response must outlive the general LRU.  If
+#: ten coverage sources evict the fiducial, the next harmonic rebuilds that
+#: complete pyEFPEHM state while the previous prepared response still owns
+#: the old one; fourteen harmonics then retain fourteen identical copies.
+#: Keep one object per genuinely distinct harmonic reference instead.
+_REFERENCE_SOURCES = {}
+
+#: Coverage sources are reusable across harmonics with the same reference,
+#: but not across different reference corners.  Retaining several ten-source
+#: groups at once is pure memory cost, so a group change replaces the cache.
+_COVERAGE_SOURCES = {}
+_COVERAGE_SOURCE_GROUP = None
 
 #: One live candidate signature per inference-model epoch. A source or
 #: projected response can own large spline arrays, and floating-point sampler
@@ -193,6 +207,8 @@ def _preparation(params, terms, orbit):
                         for name, (low, high) in bounds.items())),
            tuple(tuple(sorted(dict(corner).items()))
                  for corner in params.get('tdi_coverage_corners') or ()),
+           tuple(tuple(sorted(dict(corner).items()))
+                 for corner in params.get('tdi_harmonic_corners') or ()),
            float(params['t_obs_start']), float(params['t_obs_end']),
            float(params.get('tdi_arm_length', DEFAULT_ARM)),
            int(params.get('tdi_generation', 2)),
@@ -219,8 +235,12 @@ def _preparation(params, terms, orbit):
         # corner that stands in.
         combine = str(params.get('tdi_harmonic_combine', 'intersection'))
         label = _label(params.get('tdi_harmonic'))
-        native = [(source, set(source.harmonics))
-                  for source in _coverage_sources(params)]
+        # Labels only. Which sources widen this harmonic's coverage is
+        # decided from cached metadata; the ones that do not are never built.
+        group = (params.get('tdi_preparation_id', 'default'),
+                 params['tdi_source'], _signature(params))
+        native = [(item, set(_probe_harmonics(dict(params, **item))))
+                  for item in _coverage_overrides(params)]
         prepare_params = params
         if label is not None and label not in set(
                 _build_source(params).harmonics):
@@ -230,7 +250,7 @@ def _preparation(params, terms, orbit):
                     f"harmonic {label!r} is carried by neither the fiducial "
                     "nor any prior corner")
             prepare_params = dict(params, **overrides)
-        fiducial = _narrow(_build_source(prepare_params), prepare_params)
+        fiducial = _narrow(_reference_source(prepare_params), prepare_params)
         common = set(fiducial.harmonics)
         for _, other in native:
             common = common | other if combine == 'union' else common & other
@@ -254,8 +274,9 @@ def _preparation(params, terms, orbit):
         # coverage or train its grid. Narrowing one that does not would have
         # it claim a support it has no samples over.
         coverage = [RestrictedHarmonicSource(
-                        source, tuple(sorted(common & other)))
-                    for source, other in native if common & other]
+                        _coverage_source(dict(params, **item), group),
+                        tuple(sorted(common & other)))
+                    for item, other in native if common & other]
         dropped = set(fiducial.harmonics) - common
         if dropped:
             logging.info(
@@ -271,7 +292,7 @@ def _preparation(params, terms, orbit):
             band = _harmonic_band_edges(
                 fiducial, fiducial.harmonics[0], edges,
                 params['t_obs_start'], params['t_obs_end'])
-        _PREPARED[key] = prepare_sparse_tdi(
+        prepared = prepare_sparse_tdi(
             fiducial, orbit, terms,
             float(params['eclipticlongitude']),
             float(params['eclipticlatitude']),
@@ -287,22 +308,108 @@ def _preparation(params, terms, orbit):
                 'tdi_minimum_grid_points', 16)),
             overlap=float(params.get('tdi_band_overlap', 0.0)),
             coverage_sources=coverage)
+        _PREPARED[key] = prepared
+        if params.get('tdi_log_preparation', False):
+            import resource
+            points = sum(
+                len(item.prepared.geometries[item.template.harmonic].grid)
+                for item in prepared.prepared_bands)
+            # Resident as well as peak. `ru_maxrss` is a high-water mark and
+            # never falls, so on its own it cannot separate a transient
+            # allocation from something the caches are holding on to. The
+            # three cache sizes next to it say which cache, if either.
+            with open('/proc/self/statm') as handle:
+                resident = int(handle.read().split()[1]) * 4096 / 2 ** 20
+            logging.warning(
+                "tdi preparation harmonic=%r epoch=%s channels=%r "
+                "bands=%d grid_points=%d rss=%.1f MiB peak_rss=%.1f MiB "
+                "prepared=%d references=%d coverage=%d sources=%d",
+                label, params.get('tdi_preparation_id', 'default'), channels,
+                len(prepared.prepared_bands), points, resident,
+                resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0,
+                len(_PREPARED), len(_REFERENCE_SOURCES),
+                len(_COVERAGE_SOURCES), len(_SOURCE_CACHE))
     return _PREPARED[key]
 
 
 def _build_source(params):
     """Build a source, reusing an identical one if it is still cached."""
     builder = params['tdi_source']
+    limit = int(params.get('tdi_source_cache_limit', _SOURCE_CACHE_LIMIT))
+    if limit < 1:
+        raise ValueError("tdi_source_cache_limit must be at least one")
     try:
         key = (params.get('tdi_preparation_id', 'default'),
                builder, _signature(params))
     except TypeError:
         return _SOURCES[builder](**params)
     if key not in _SOURCE_CACHE:
-        if len(_SOURCE_CACHE) >= _SOURCE_CACHE_LIMIT:
+        while len(_SOURCE_CACHE) >= limit:
             _SOURCE_CACHE.pop(next(iter(_SOURCE_CACHE)))
         _SOURCE_CACHE[key] = _SOURCES[builder](**params)
     return _SOURCE_CACHE[key]
+
+
+def _probe_source(params):
+    """Build a short-lived source for metadata without retaining it.
+
+    Harmonic discovery needs only ``source.harmonics``.  Sending 32 joint
+    prior corners through `_build_source` retained the last sixteen complete
+    pyEFPEHM evolutions and spline sets in `_SOURCE_CACHE`, so a metadata scan
+    alone exceeded a 2.4 GiB hard limit before any grid was prepared.  The
+    builder may keep its one intrinsic working state, but this wrapper is not
+    added to the general source cache and can die after its labels are read.
+    """
+    return _SOURCES[params['tdi_source']](**params)
+
+
+#: Harmonic labels are immutable metadata, a few tuples per prior point,
+#: and rediscovering them costs a complete pyEFPEHM evolution each time.
+#: Every preparation needs the same 42 answers, so they are cached apart
+#: from the sources that produced them.
+_HARMONIC_LABELS = {}
+
+
+def _probe_harmonics(params):
+    """Read one source's labels and release its intrinsic working state.
+
+    pyEFPEHM constructs a replacement before swapping its one-entry native
+    cache.  A metadata loop would therefore hold the previous probe, the new
+    probe, and the real fiducial simultaneously at the allocation peak.  Once
+    the immutable labels have been copied, the probe has no remaining job;
+    remove its native-cache ownership before the next corner is constructed.
+    Sources already owned by a reference or preparation keep their own strong
+    reference and are unaffected.
+    """
+    try:
+        key = (params.get('tdi_preparation_id', 'default'),
+               params['tdi_source'], _signature(params))
+    except TypeError:
+        key = None
+    if key is not None and key in _HARMONIC_LABELS:
+        return _HARMONIC_LABELS[key]
+    source = _probe_source(params)
+    labels = tuple(source.harmonics)
+    del source
+    _PYEFPEHM_NATIVE.pop(params.get('tdi_preparation_id', 'default'), None)
+    gc.collect()
+    if key is not None:
+        _HARMONIC_LABELS[key] = labels
+    return labels
+
+
+def _reference_source(params):
+    """A source shared by every preparation using the same reference."""
+    key = (params.get('tdi_preparation_id', 'default'),
+           params['tdi_source'], _signature(params))
+    if key not in _REFERENCE_SOURCES:
+        # Built through the ordinary path and then pinned. The pin is the
+        # point: the general cache is an LRU, and ten coverage sources evict
+        # a reference between two harmonics that share it, so the next one
+        # rebuilds a complete pyEFPEHM evolution while the previous prepared
+        # response still owns the old copy.
+        _REFERENCE_SOURCES[key] = _build_source(params)
+    return _REFERENCE_SOURCES[key]
 
 
 def _narrow(source, params):
@@ -342,18 +449,66 @@ def _coverage_overrides(params):
         for value in (float(low), float(high)):
             overrides.append({name: value})
     # Axial corners move one parameter and hold the rest, so they cannot
-    # reach a corner of a multi-parameter tile -- and a harmonic set is not
-    # a monotone function of one parameter at a time. `tdi_coverage_corners`
-    # takes explicit joint corners, each a mapping of parameter to value,
-    # for the case the docstring above names.
+    # reach a corner of a multi-parameter tile. `tdi_coverage_corners` takes
+    # explicit joint corners, each a mapping of parameter to value, when the
+    # response support or interpolation error is not bounded axially.
     for corner in params.get('tdi_coverage_corners') or ():
         overrides.append(dict(corner))
     return overrides
 
 
+def _harmonic_overrides(params):
+    """Prior points used to discover harmonics, without training the grid.
+
+    A source used to discover the union of a prior's harmonics need not also
+    refine every TDI bracket in every band.  Conflating those two jobs made a
+    32-corner harmonic audit consume more than 3.8 GiB.  Coverage points still
+    participate, because they are prior points too; ``tdi_harmonic_corners``
+    adds joint points solely for the non-monotone harmonic-set calculation.
+    Duplicate mappings are removed while preserving declaration order, which
+    also makes the choice of a per-harmonic reference reproducible.
+    """
+    items = list(_coverage_overrides(params))
+    items.extend(dict(corner)
+                 for corner in params.get('tdi_harmonic_corners') or ())
+    unique = []
+    seen = set()
+    for item in items:
+        key = tuple(sorted(item.items()))
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+    return unique
+
+
+def _coverage_source(params, group):
+    """One source at a prior edge, from a group shared across harmonics.
+
+    The group is shared by harmonics using the same reference.  When a union
+    harmonic uses another corner as its reference, replace the whole group:
+    completed preparations do not retain coverage sources, and keeping both
+    groups only retains large waveform states which can no longer be reused.
+
+    Only the sources a preparation will actually refine are built.  A
+    complete pyEFPEHM evolution is around 200 MiB, so building all ten for
+    every harmonic -- when a union harmonic is carried by one or two of them
+    -- is what put the resident set past 2.4 GiB with grids of fifty knots.
+    """
+    global _COVERAGE_SOURCE_GROUP
+    if group != _COVERAGE_SOURCE_GROUP:
+        _COVERAGE_SOURCES.clear()
+        _COVERAGE_SOURCE_GROUP = group
+    key = (params['tdi_source'], _signature(params))
+    if key not in _COVERAGE_SOURCES:
+        _COVERAGE_SOURCES[key] = _SOURCES[params['tdi_source']](**params)
+    return _COVERAGE_SOURCES[key]
+
+
 def _coverage_sources(params):
-    """Build a source at each edge of the prior."""
-    return [_build_source(dict(params, **item))
+    """Build every source at the prior's edges, in declaration order."""
+    group = (params.get('tdi_preparation_id', 'default'),
+             params['tdi_source'], _signature(params))
+    return [_coverage_source(dict(params, **item), group)
             for item in _coverage_overrides(params)]
 
 
@@ -375,9 +530,8 @@ def harmonic_references(params):
     references = {label: {} for label in _build_source(params).harmonics}
     if str(params.get('tdi_harmonic_combine', 'intersection')) != 'union':
         return references
-    for overrides in _coverage_overrides(params):
-        source = _build_source(dict(params, **overrides))
-        for label in source.harmonics:
+    for overrides in _harmonic_overrides(params):
+        for label in _probe_harmonics(dict(params, **overrides)):
             references.setdefault(label, dict(overrides))
     return references
 
@@ -487,8 +641,13 @@ def _analysis_time_window(params):
 
 def clear_cache():
     """Drop every prepared geometry and cached source."""
+    global _COVERAGE_SOURCE_GROUP
     _PREPARED.clear()
     _SOURCE_CACHE.clear()
+    _HARMONIC_LABELS.clear()
+    _REFERENCE_SOURCES.clear()
+    _COVERAGE_SOURCES.clear()
+    _COVERAGE_SOURCE_GROUP = None
     _PROJECTED.clear()
     _SAMPLED.clear()
     _RUNTIME_SIGNATURES.clear()
@@ -750,7 +909,7 @@ def harmonic_labels(params):
     if combine not in ('intersection', 'union'):
         raise ValueError("tdi_harmonic_combine is 'intersection' or 'union'")
     labels = set(_build_source(params).harmonics)
-    for source in _coverage_sources(params):
-        other = set(source.harmonics)
+    for overrides in _harmonic_overrides(params):
+        other = set(_probe_harmonics(dict(params, **overrides)))
         labels = labels | other if combine == 'union' else labels & other
     return tuple(sorted(labels))
