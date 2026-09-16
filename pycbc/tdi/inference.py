@@ -185,6 +185,7 @@ def _preparation(params, terms, orbit):
            float(params.get('tdi_samples_per_cycle', 4.0)),
            float(params.get('tdi_geometry_step', 86400.0)),
            _tolerance(params),
+           params.get('tdi_coverage_tolerance'),
            int(params.get('tdi_minimum_grid_points', 16)),
            float(params.get('tdi_band_overlap', 0.0)),
            bool(params.get('tdi_clip_bands', True)))
@@ -238,6 +239,7 @@ def _preparation(params, terms, orbit):
             samples_per_cycle=float(params.get('tdi_samples_per_cycle', 4.0)),
             geometry_step=float(params.get('tdi_geometry_step', 86400.0)),
             relative_tolerance=_tolerance(params),
+            coverage_tolerance=params.get('tdi_coverage_tolerance'),
             minimum_grid_points=int(params.get(
                 'tdi_minimum_grid_points', 16)),
             overlap=float(params.get('tdi_band_overlap', 0.0)),

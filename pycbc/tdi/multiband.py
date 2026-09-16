@@ -384,14 +384,17 @@ def prepare_sparse_tdi(
         t_start=None, t_end=None, samples_per_cycle=4.0,
         geometry_step=86400.0, minimum_grid_points=16, velocity_order=1,
         links=None, padding=None, harmonics=None, coverage_sources=None,
-        relative_tolerance=1e-4):
+        relative_tolerance=1e-4, coverage_tolerance=None):
     """Prepare one shared narrow-band geometry for a likelihood epoch.
 
     This cold-path constructor is intended for a likelihood epoch. The band
     windows determine their padded time coverage; ``relative_tolerance``
     adds knots wherever the one-shot path would, ``geometry_step`` sets the
     uniform floor, and ``minimum_grid_points`` floors the count in each live
-    block. ``relative_tolerance=None`` leaves the uniform grid alone.
+    block. ``relative_tolerance=None`` leaves the uniform grid alone, and
+    ``coverage_tolerance`` refines the prior corners to a looser one than the
+    fiducial: they exist to add knots where they need more than it does, not
+    to set the accuracy, and the cost is linear in their number.
 
     The tolerance is the same knob, with the same meaning, that
     :func:`sparse_tdi_response` takes: one grid policy serves a signal-to-
@@ -417,6 +420,13 @@ def prepare_sparse_tdi(
         if not np.isfinite(relative_tolerance) or relative_tolerance <= 0:
             raise ValueError(
                 "relative_tolerance must be positive and finite")
+    if coverage_tolerance is None:
+        coverage_tolerance = relative_tolerance
+    elif relative_tolerance is not None:
+        coverage_tolerance = float(coverage_tolerance)
+        if not np.isfinite(coverage_tolerance) or coverage_tolerance <= 0:
+            raise ValueError(
+                "coverage_tolerance must be positive and finite, or None")
     if minimum_grid_points < 4:
         raise ValueError("minimum_grid_points must be at least four")
     if t_start is None:
@@ -498,14 +508,22 @@ def prepare_sparse_tdi(
                     # gets only the uniform floor, which at a day's spacing
                     # cannot resolve a delay tail tens to hundreds of seconds
                     # long.
-                    for item in ensemble:
+                    for position, item in enumerate(ensemble):
                         if not item.support_blocks(harmonic):
                             continue
+                        # The fiducial sets the grid's accuracy; the prior
+                        # corners are there to add knots wherever they need
+                        # more than it does. Refining them to the same
+                        # tolerance repeats most of the fiducial's work, and
+                        # the cost is linear in the number of corners -- two
+                        # per coverage parameter.
+                        tolerance = (relative_tolerance if position == 0
+                                     else coverage_tolerance)
                         refined = adaptive_sparse_tdi_response(
                             item, orbit, channel_terms, lamb, beta,
                             t_start=low, t_end=high,
                             initial_step=geometry_step,
-                            relative_tolerance=relative_tolerance,
+                            relative_tolerance=tolerance,
                             support_padding=padding,
                             velocity_order=velocity_order, **prepare_options)
                         for entry in refined.responses:
