@@ -237,10 +237,10 @@ def _preparation(params, terms, orbit):
         label = _label(params.get('tdi_harmonic'))
         # Labels only. Which sources widen this harmonic's coverage is
         # decided from cached metadata; the ones that do not are never built.
-        group = (params.get('tdi_preparation_id', 'default'),
-                 params['tdi_source'], _signature(params))
-        native = [(item, set(_probe_harmonics(dict(params, **item))))
-                  for item in _coverage_overrides(params)]
+        base = _coverage_base(params)
+        group = _coverage_group(params)
+        native = [(item, set(_probe_harmonics(dict(base, **item))))
+                  for item in _coverage_overrides(base)]
         prepare_params = params
         if label is not None and label not in set(
                 _build_source(params).harmonics):
@@ -274,7 +274,7 @@ def _preparation(params, terms, orbit):
         # coverage or train its grid. Narrowing one that does not would have
         # it claim a support it has no samples over.
         coverage = [RestrictedHarmonicSource(
-                        _coverage_source(dict(params, **item), group),
+                        _coverage_source(dict(base, **item), group),
                         tuple(sorted(common & other)))
                     for item, other in native if common & other]
         dropped = set(fiducial.harmonics) - common
@@ -481,6 +481,33 @@ def _harmonic_overrides(params):
     return unique
 
 
+def _coverage_base(params):
+    """The parameters the prior's declared edges are measured from.
+
+    A union harmonic is prepared from a prior corner, and an edge override
+    applied on top of that corner is not the edge the configuration declared
+    -- it is a hybrid of two corners, and the axial envelope it spans is not
+    the one the prior asked for. ``tdi_coverage_base`` carries the fiducial
+    values of whatever the reference replaced, so the coverage starts from
+    the fiducial whichever source a harmonic happens to be prepared from.
+
+    It also keeps the coverage group stable. Keyed on the reference instead,
+    the group was discarded and rebuilt every time preparation moved between
+    a fiducial-native harmonic and a corner-referenced one.
+    """
+    restore = params.get('tdi_coverage_base')
+    if not restore:
+        return params
+    return dict(params, **dict(restore))
+
+
+def _coverage_group(params):
+    """Identify the coverage group, which the reference must not split."""
+    base = _coverage_base(params)
+    return (base.get('tdi_preparation_id', 'default'),
+            base['tdi_source'], _signature(base))
+
+
 def _coverage_source(params, group):
     """One source at a prior edge, from a group shared across harmonics.
 
@@ -506,10 +533,10 @@ def _coverage_source(params, group):
 
 def _coverage_sources(params):
     """Build every source at the prior's edges, in declaration order."""
-    group = (params.get('tdi_preparation_id', 'default'),
-             params['tdi_source'], _signature(params))
-    return [_coverage_source(dict(params, **item), group)
-            for item in _coverage_overrides(params)]
+    base = _coverage_base(params)
+    group = _coverage_group(params)
+    return [_coverage_source(dict(base, **item), group)
+            for item in _coverage_overrides(base)]
 
 
 def harmonic_references(params):
@@ -579,6 +606,36 @@ def _signature(params):
         and name not in ('ifos', 'tdi_harmonic')))
 
 
+#: Resolved on first use: the glibc trim entry point, or False if absent.
+_TRIM = None
+
+
+def _release_arenas():
+    """Return freed allocator arenas to the kernel, where glibc offers it.
+
+    Dropping a candidate's caches frees the Python objects but not always
+    the address space. A complete pyEFPEHM evolution is built and released
+    per proposal, and the many small allocations inside one leave glibc
+    holding arenas it will reuse only for a similarly shaped request. The
+    resident set then climbs across proposals while nothing is retained:
+    measured over a 182-point tile sweep it rose 2,086 -> 3,006 MiB and was
+    still rising, on a loop whose own bookkeeping is a few tuples per point.
+
+    `malloc_trim` is a glibc extension. Absent it this is a no-op, and the
+    only cost is headroom.
+    """
+    global _TRIM
+    if _TRIM is None:
+        try:
+            import ctypes
+            _TRIM = ctypes.CDLL('libc.so.6').malloc_trim
+            _TRIM.argtypes = [ctypes.c_size_t]
+        except (OSError, AttributeError):
+            _TRIM = False
+    if _TRIM:
+        _TRIM(0)
+
+
 def _begin_candidate(params):
     """Discard stale runtime objects when an inference candidate changes."""
     epoch = params.get('tdi_preparation_id', 'default')
@@ -601,6 +658,8 @@ def _begin_candidate(params):
             if key[0] == epoch:
                 cache.pop(key)
     _RUNTIME_SIGNATURES[epoch] = signature
+    gc.collect()
+    _release_arenas()
 
 
 def _analysis_time_window(params):

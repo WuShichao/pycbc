@@ -1,0 +1,12 @@
+### baseline
+.                                                                        [100%]
+1 passed in 3.86s
+### mutation: coverage built from the reference, not the fiducial
+FAILED test/test_tdi_harmonic_union.py::test_coverage_edges_are_measured_from_the_fiducial_not_the_reference
+1 failed in 4.07s
+### mutation: group keyed on the reference, splitting it
+FAILED test/test_tdi_harmonic_union.py::test_coverage_edges_are_measured_from_the_fiducial_not_the_reference
+1 failed in 3.99s
+### restored
+.                                                                        [100%]
+1 passed in 4.14s

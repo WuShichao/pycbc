@@ -214,7 +214,15 @@ class HarmonicRelative(Relative):
         # divide by zero -- in practice it was skipped for being empty, so
         # the harmonic was listed and never evaluated.
         params = dict(self.fid_params)
-        params.update(self.harmonic_reference.get(harmonic, {}))
+        overrides = self.harmonic_reference.get(harmonic, {})
+        if overrides:
+            params.update(overrides)
+            # The prior's edges are still the fiducial's edges. Without this
+            # a corner-referenced harmonic would have its coverage built at
+            # the corner, spanning a tile the configuration never declared.
+            params['tdi_coverage_base'] = tuple(
+                (name, self.fid_params.get(name))
+                for name in sorted(overrides))
         params['tdi_harmonic'] = harmonic
         wave = get_fd_det_waveform_sequence(
             ifos=ifo, sample_points=Array(frequencies.astype(numpy.float64)),

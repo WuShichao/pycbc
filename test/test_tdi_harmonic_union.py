@@ -274,3 +274,42 @@ def test_a_candidate_below_the_split_contributes_zero_for_the_union_harmonic(
 
     model.update(scale=candidate_scale)
     assert model.loglr == pytest.approx(exact, rel=2e-5)
+
+
+def test_coverage_edges_are_measured_from_the_fiducial_not_the_reference(
+        monkeypatch):
+    """A corner-referenced harmonic must not move the prior's own edges.
+
+    The reference *is* a prior corner. An edge override applied on top of it
+    is a hybrid of two corners, spanning a tile the configuration never
+    declared. It also splits the coverage-source group, so preparation
+    moving between a fiducial-native harmonic and a corner-referenced one
+    discards and rebuilds every coverage source -- around 200 MiB each for a
+    real waveform.
+    """
+    from pycbc.tdi import inference
+
+    clear_cache()
+    built = []
+
+    def builder(**params):
+        built.append((params['scale'], params['tilt']))
+        return types.SimpleNamespace(harmonics=((2, 2),))
+
+    monkeypatch.setitem(inference._SOURCES, 'mock-base', builder)
+    fiducial = {'tdi_source': 'mock-base', 'scale': 1.0, 'tilt': 0.0,
+                'tdi_coverage_bounds': {'scale': (0.5, 1.5)}}
+    # What the model sends for a harmonic whose reference sits at tilt 1.
+    referenced = dict(fiducial, tilt=1.0,
+                      tdi_coverage_base=(('tilt', 0.0),))
+
+    inference._coverage_sources(referenced)
+
+    # The declared edges, at the fiducial's tilt -- not at the reference's.
+    assert built == [(0.5, 0.0), (1.5, 0.0)]
+    assert (inference._coverage_group(referenced)
+            == inference._coverage_group(fiducial))
+
+    # So a fiducial-native harmonic asking next reuses them.
+    inference._coverage_sources(fiducial)
+    assert len(built) == 2
