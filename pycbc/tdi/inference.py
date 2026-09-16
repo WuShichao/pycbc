@@ -636,6 +636,46 @@ def _release_arenas():
         _TRIM(0)
 
 
+#: Candidates seen since the last full collection, per epoch.
+_SINCE_FULL = {}
+
+
+def _collect(params):
+    """Reclaim a dropped candidate's cycles without paying for a full sweep.
+
+    A source held by a reference cycle is not freed by refcounting, and
+    `malloc_trim` cannot return memory that is still referenced, so
+    something has to collect. Measured over one 182-point tile sweep,
+    identical in every other respect: no collection at all peaks at
+    2.87 GiB, a full collection every candidate holds 1.86 GiB and costs
+    116 ms of a 500 ms candidate.
+
+    Neither is the answer. A young-generation collection is cheap and
+    reclaims most of it, but survivors are *promoted*, so what it misses
+    accumulates -- 2.1 MiB per candidate at generation 0, and far worse at
+    generation 1, where survivors reach generation 2 and the automatic
+    collector stops looking at them. A full sweep every `interval`
+    candidates bounds that at a cost divided by the interval.
+
+    Eight, not thirty-two, although thirty-two gives the better p95: over
+    the same sweep it holds 936 -> 1,024 MiB while eight holds 940 -> 930.
+    A sampler runs for far longer than 182 candidates, so a creep of half a
+    megabyte each is not something to carry, and eight still leaves p95 at
+    327 ms against a 400 ms budget.
+    """
+    if not params.get('tdi_collect_on_candidate', True):
+        return
+    epoch = params.get('tdi_preparation_id', 'default')
+    interval = int(params.get('tdi_collect_full_interval', 8))
+    seen = _SINCE_FULL.get(epoch, 0) + 1
+    if interval > 0 and seen >= interval:
+        gc.collect()
+        _SINCE_FULL[epoch] = 0
+    else:
+        gc.collect(0)
+        _SINCE_FULL[epoch] = seen
+
+
 def _begin_candidate(params):
     """Discard stale runtime objects when an inference candidate changes."""
     epoch = params.get('tdi_preparation_id', 'default')
@@ -658,15 +698,7 @@ def _begin_candidate(params):
             if key[0] == epoch:
                 cache.pop(key)
     _RUNTIME_SIGNATURES[epoch] = signature
-    if params.get('tdi_collect_on_candidate', True):
-        # Trimming alone does not do it. A source that a reference cycle
-        # keeps alive is not freed by refcounting, and `malloc_trim` cannot
-        # return memory that is still referenced. Measured over one 182-
-        # point tile sweep, identical otherwise: with this collection the
-        # run peaks at 1.86 GiB and a candidate takes 504 ms, without it
-        # 2.87 GiB and 431 ms. Seventy-three milliseconds for a gigabyte,
-        # and the likelihoods agree to every digit printed.
-        gc.collect()
+    _collect(params)
     _release_arenas()
 
 
@@ -712,6 +744,7 @@ def clear_cache():
     _PREPARED.clear()
     _SOURCE_CACHE.clear()
     _HARMONIC_LABELS.clear()
+    _SINCE_FULL.clear()
     _REFERENCE_SOURCES.clear()
     _COVERAGE_SOURCES.clear()
     _COVERAGE_SOURCE_GROUP = None
