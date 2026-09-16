@@ -593,6 +593,60 @@ def test_a_prior_corner_places_knots_and_not_only_widens_the_interval():
     assert with_it < without
 
 
+def test_the_corners_can_refine_more_loosely_than_the_fiducial():
+    """`coverage_tolerance` is what keeps preparation inside its budget.
+
+    Every corner refines against the grid in every band and there are two
+    per coverage parameter, so the cost is linear in them. The corners exist
+    to add knots where they need more than the fiducial does, not to set the
+    accuracy, so they can be refined more loosely -- but only if the
+    parameter actually reaches them.
+    """
+    orbit = LisaEqualArmOrbit(t0=0.0)
+    terms = {"X": PyTDICombinationAdapter(
+        "X2", get_pytdi_combination("X2"), delta_t=25.0).terms()}
+    common = dict(band_edges=[1e-3, 5e-3, 1e-2], overlap=1e-3,
+                  samples_per_cycle=4, t_start=800.0, t_end=3200.0,
+                  geometry_step=400.0, minimum_grid_points=8,
+                  relative_tolerance=2e-5, velocity_order=1)
+    fiducial = _CompactChirpSource()
+
+    class _Corner(_CompactChirpSource):
+        def amplitude(self, harmonic, time):
+            time = np.asarray(time)
+            plus, cross = super().amplitude(harmonic, time)
+            wobble = 1 + 0.5 * np.sin(2 * np.pi * time / 250.0)
+            return plus * wobble, cross * wobble
+
+    corner = _Corner()
+    tight = prepare_sparse_tdi(fiducial, orbit, terms, 1.1, -0.4,
+                               coverage_sources=[corner], **common)
+    loose = prepare_sparse_tdi(fiducial, orbit, terms, 1.1, -0.4,
+                               coverage_sources=[corner],
+                               coverage_tolerance=1e-2, **common)
+    alone = prepare_sparse_tdi(fiducial, orbit, terms, 1.1, -0.4, **common)
+
+    knots_tight = sum(len(g) for g in _prepared_grids(tight))
+    knots_loose = sum(len(g) for g in _prepared_grids(loose))
+    knots_alone = sum(len(g) for g in _prepared_grids(alone))
+
+    # A looser corner tolerance buys fewer knots than a tight one ...
+    assert knots_loose < knots_tight
+    # ... and still more than ignoring the corner altogether, which is the
+    # whole point: it must not silently become `coverage_sources=None`.
+    assert knots_loose > knots_alone
+
+    # Default is the fiducial's own tolerance, so nothing moves unless asked.
+    assert sum(len(g) for g in _prepared_grids(prepare_sparse_tdi(
+        fiducial, orbit, terms, 1.1, -0.4, coverage_sources=[corner],
+        coverage_tolerance=None, **common))) == knots_tight
+
+    with pytest.raises(ValueError, match="coverage_tolerance"):
+        prepare_sparse_tdi(fiducial, orbit, terms, 1.1, -0.4,
+                           coverage_sources=[corner],
+                           coverage_tolerance=0.0, **common)
+
+
 def test_the_refinement_resolves_the_delay_tail_past_the_support():
     """Without `support_padding` the tail falls to the uniform floor.
 
