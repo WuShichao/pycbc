@@ -2062,10 +2062,50 @@ def adaptive_sparse_tdi_response(
                 probes = (active_left[:, None]
                           + fractions[None, :]
                           * (active_right - active_left)[:, None])
-                if np.any((probes == active_left[:, None])
-                          | (probes == active_right[:, None])):
-                    raise RuntimeError(
-                        "response refinement reached floating-point spacing")
+                # Two ways an interval runs out of floats, and both have
+                # to be caught here: a probe landing on an endpoint, and
+                # two probes landing on each other. The second leaves the
+                # probe array non-monotone, which `sample_constellation`
+                # rejects further down with a message about the time grid
+                # rather than about the refinement that produced it.
+                collapsed = (
+                    np.any((probes == active_left[:, None])
+                           | (probes == active_right[:, None]), axis=1)
+                    | np.any(np.diff(probes, axis=1) <= 0.0, axis=1))
+                if np.any(collapsed):
+                    # The extreme of the stall the block below handles, and
+                    # it arrives the other way round. There the error stops
+                    # falling; here it keeps falling while the criterion
+                    # falls with it, because `local` shrinks toward the
+                    # amplitude floor as the bracket approaches a zero, so
+                    # splitting reaches float spacing before it wins.
+                    # Measured on the last mission window of an 8.3-year
+                    # source: harmonic (2, 2, 6), depth 20, an interval
+                    # 6e-08 s wide at 4.3e-07 of the channel peak.
+                    #
+                    # Account for it as stalling rather than raising. The
+                    # refusal threshold below already says how much of this
+                    # a grid may carry, and a stated tolerance is a better
+                    # answer than a crash at one mission epoch.
+                    index = np.flatnonzero(collapsed)
+                    worst = index[np.argmax(active_error[index])]
+                    if active_error[worst] > stalled_error:
+                        stalled_error = float(active_error[worst])
+                        stalled_location = float(
+                            0.5 * (active_left[worst] + active_right[worst]))
+                        stalled_width = float(
+                            active_right[worst] - active_left[worst])
+                    stalled_count += int(len(index))
+                    keep = ~collapsed
+                    active_left, active_right = (active_left[keep],
+                                                 active_right[keep])
+                    active_error, active_stall = (active_error[keep],
+                                                  active_stall[keep])
+                    if not len(active_left):
+                        break
+                    probes = (active_left[:, None]
+                              + fractions[None, :]
+                              * (active_right - active_left)[:, None])
                 probes = probes.reshape(-1)
                 owners = np.repeat(np.arange(len(active_left)), 3)
                 exact = evaluate(harmonic, probes)
