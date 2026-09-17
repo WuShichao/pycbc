@@ -125,8 +125,84 @@ class TestPSD(unittest.TestCase):
                                 msg='seg_len=%d max_len=%d -> rms=%.3f' \
                                 % (seg_len, max_len, err_rms))
 
+
+class TestSpacePSD(unittest.TestCase):
+    """Network-free checks of the space-borne analytical PSD models."""
+
+    def setUp(self):
+        self.length = 3001
+        self.delta_f = 1e-5
+        self.low_freq_cutoff = 1e-4
+
+    def test_extragalactic_dwd_amplitude(self):
+        """Each paper's fit must reproduce its own Omega_gw at 1 mHz."""
+        from pycbc.cosmology import get_cosmology
+        from pycbc.psd.analytical_space import extragalactic_dwd_fit_lisa
+
+        h0 = get_cosmology(None).H0.si.value
+        # hofman2024 quotes ~4e-12 at 1 mHz; the boileau_md_default fit
+        # evaluates to 2.08e-12 there.
+        for model, expect in (('hofman2024', 4.0e-12),
+                              ('boileau_md_default', 2.08e-12)):
+            sh = extragalactic_dwd_fit_lisa(self.length, self.delta_f,
+                                            self.low_freq_cutoff, model)
+            freq = sh.sample_frequencies.numpy()
+            idx = int(numpy.argmin(numpy.abs(freq - 1e-3)))
+            omega = (sh.numpy()[idx] * 4 * numpy.pi**2 * freq[idx]**3
+                     / (3 * h0**2))
+            self.assertTrue(abs(omega / expect - 1) < 0.05,
+                            msg='%s: Omega(1 mHz) = %.3e' % (model, omega))
+
+    def test_omega_gw_to_strain_psd_roundtrip(self):
+        from pycbc.cosmology import get_cosmology
+        from pycbc.psd.analytical_space import omega_gw_to_strain_psd
+
+        h0 = get_cosmology(None).H0.si.value
+        freq = numpy.array([1e-4, 1e-3, 1e-2])
+        omega = numpy.array([1e-11, 4e-12, 1e-12])
+        sh = omega_gw_to_strain_psd(freq, omega)
+        back = sh * 4 * numpy.pi**2 * freq**3 / (3 * h0**2)
+        self.assertTrue(numpy.allclose(back, omega, rtol=1e-12))
+
+    def test_extragalactic_dwd_all_models(self):
+        """Every registered model must evaluate, and the amplitude must be
+        recovered at the break frequency."""
+        from pycbc.psd import analytical_space as space
+
+        for name, (form, par) in space.EXTRAGALACTIC_DWD_MODELS.items():
+            freq = numpy.logspace(-4, -1.5, 200)
+            omega = space.omega_gw_extragalactic_dwd(freq, name)
+            self.assertTrue(numpy.all(numpy.isfinite(omega)), msg=name)
+            self.assertTrue(numpy.all(omega > 0), msg=name)
+            if form == 'smooth':
+                # the smoothly broken power law equals A at the break
+                at_break = space.omega_gw_extragalactic_dwd(par[1], name)
+                self.assertTrue(abs(at_break/par[0] - 1) < 1e-12, msg=name)
+
+    def test_extragalactic_dwd_unknown_model(self):
+        from pycbc.psd.analytical_space import omega_gw_extragalactic_dwd
+
+        self.assertRaises(ValueError, omega_gw_extragalactic_dwd,
+                          numpy.array([1e-3]), 'not_a_model')
+
+    def test_extragalactic_dwd_amplitude_scaling(self):
+        """The strain PSD must be linear in the Omega amplitude."""
+        from pycbc.psd.analytical_space import extragalactic_dwd_fit_lisa
+
+        one = extragalactic_dwd_fit_lisa(self.length, self.delta_f,
+                                         self.low_freq_cutoff,
+                                         amplitude=1.72e-11).numpy()
+        two = extragalactic_dwd_fit_lisa(self.length, self.delta_f,
+                                         self.low_freq_cutoff,
+                                         amplitude=3.44e-11).numpy()
+        self.assertTrue(numpy.any(one > 0))
+        keep = one > 0
+        self.assertTrue(numpy.allclose(two[keep] / one[keep], 2, rtol=1e-10))
+
+
 suite = unittest.TestSuite()
 suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestPSD))
+suite.addTest(unittest.TestLoader().loadTestsFromTestCase(TestSpacePSD))
 
 if __name__ == '__main__':
     results = unittest.TextTestRunner(verbosity=2).run(suite)
