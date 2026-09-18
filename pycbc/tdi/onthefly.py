@@ -994,6 +994,33 @@ def _expanded_source(source, harmonic, geometry, delay, order, offset):
     because it multiplies the stencil roundoff in the second derivative of
     omega by ``d^3``: on one of those harmonics that noise sends the
     refinement past 30,000 points where second order converges at 3,240.
+
+    Reach for ``delay_expansion=None`` to check a truncation, not to check a
+    number. It applies each delay exactly, so it is the reference the two
+    expansion orders are validated against, and on that basis it is also the
+    default everywhere in this module -- but it asks the source for
+    ``Phi(t - d)`` and ``Phi(t)`` separately and subtracts. At a mission
+    epoch of 1e7 s and 1 mHz those are 5.6e4 rad apart by 0.05 rad, so the
+    difference keeps about nine digits fewer than the two phases did. The
+    expansion never evaluates the phase at a delayed time and carries none
+    of it. Roughness of the T bracket against a smooth local fit, in units
+    of the source amplitude, on a monochromatic galactic binary:
+
+        epoch       order 2 or 3      None
+        8.4e6 s     4.1e-15           2.2e-11
+        1.0e8 s     1.1e-14           1.8e-10
+
+    The gap grows with the epoch because the floor is set by the size of
+    the phases, not by the delay. Adding a constant to the source phase
+    cannot change the bracket; it leaves order 2 bit-identical and costs
+    ``None`` five more orders at 1e10 rad, which is what identifies the
+    cancellation rather than a truncation.
+
+    Removing that floor means asking the source for the phase difference
+    across a delay instead of the phase at two epochs. That is a change to
+    the source protocol and to every adapter -- for pyEFPEHM the phase
+    comes from integration and splines, so it would have to be evaluated
+    in a locally shifted variable -- and it is not attempted here.
     """
     anchor = geometry.grid if offset is None else geometry.grid - offset
     (amp_p, slope_p, bend_p, amp_c, slope_c, bend_c,
@@ -1985,7 +2012,13 @@ def adaptive_sparse_tdi_response(
         Expand the source about each grid point in the link and TDI delays
         instead of evaluating it at every delayed time, to second or third
         order. See `_expanded_source`. Both orders read one stencil, so 3
-        costs no extra source calls. ``None``, the default, is exact.
+        costs no extra source calls. ``None``, the default, carries no
+        truncation error, which is not the same as being the accurate
+        choice: it builds the bracket's phase by subtracting two
+        evaluations of order ``2 pi f t`` to obtain their ``2 pi f tau``
+        difference, and at mission epochs that runs 5e3 to 2e4 times
+        rougher than either expansion order. `_expanded_source` carries
+        the measurement.
     reference_delay : bool, optional
         Reduce the bracket against the delay every term shares, the light
         time to the constellation barycentre, and carry that delay in the
