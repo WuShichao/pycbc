@@ -635,7 +635,7 @@ class TermGeometry:
     """
 
     def __init__(self, orbit, grid, terms, links=LINK_ORDER,
-                 velocity_order=1, delay_expansion=None,
+                 velocity_order=1, delay_expansion=2,
                  reference_delay=False, threads=1):
         self.threads = max(1, int(threads))
         if delay_expansion not in (None, 2, 3):
@@ -722,7 +722,7 @@ class MultiChannelTermGeometry(TermGeometry):
     """
 
     def __init__(self, orbit, grid, channel_terms, links=LINK_ORDER,
-                 velocity_order=1, delay_expansion=None,
+                 velocity_order=1, delay_expansion=2,
                  reference_delay=False, threads=1):
         self.channel_names = tuple(channel_terms)
         if not self.channel_names:
@@ -997,8 +997,7 @@ def _expanded_source(source, harmonic, geometry, delay, order, offset):
 
     Reach for ``delay_expansion=None`` to check a truncation, not to check a
     number. It applies each delay exactly, so it is the reference the two
-    expansion orders are validated against, and on that basis it is also the
-    default everywhere in this module -- but it asks the source for
+    expansion orders are validated against -- but it asks the source for
     ``Phi(t - d)`` and ``Phi(t)`` separately and subtracts. At a mission
     epoch of 1e7 s and 1 mHz those are 5.6e4 rad apart by 0.05 rad, so the
     difference keeps about nine digits fewer than the two phases did. The
@@ -1015,6 +1014,16 @@ def _expanded_source(source, harmonic, geometry, delay, order, offset):
     cannot change the bracket; it leaves order 2 bit-identical and costs
     ``None`` five more orders at 1e10 rad, which is what identifies the
     cancellation rather than a truncation.
+
+    That floor is what moved the default here from ``None`` to second
+    order. A 1 mHz galactic binary over a year, refined to 1e-3, exhausts
+    ``max_grid_points`` under ``None`` at either setting of
+    ``reference_delay``, and converges in 439 knots and 0.4 s at either
+    expansion order. What the expansion costs in exchange is the truncation
+    above: measured against ``None`` on a Newtonian chirp, 2.1e-07 to
+    3.3e-07 of the channel peak at second order and 7.1e-10 to 2.8e-08 at
+    third, both well under the tolerances the refinement is asked for.
+    Second rather than third for the stencil reason already given.
 
     Removing that floor means asking the source for the phase difference
     across a delay instead of the phase at two epochs. That is a change to
@@ -1874,7 +1883,7 @@ class PreparedSparseTDI:
     """
 
     def __init__(self, orbit, channel_terms, grids, velocity_order=1,
-                 links=LINK_ORDER, delay_expansion=None,
+                 links=LINK_ORDER, delay_expansion=2,
                  reference_delay=False, threads=1, interpolation_order=3):
         self.interpolation_order = interpolation_order
         self.channel_terms = channel_terms
@@ -1961,7 +1970,7 @@ def adaptive_sparse_tdi_response(
         initial_step=86400.0, relative_tolerance=1e-4,
         amplitude_floor=1e-3, max_refinements=24, velocity_order=1,
         links=LINK_ORDER, support_padding=0.0, max_grid_points=1000000,
-        delay_expansion=None, reference_delay=False, threads=1,
+        delay_expansion=2, reference_delay=False, threads=1,
         interpolation_order=3, stall_refusal_factor=100.0,
         stall_patience=3, evaluation_chunk_size=16384):
     """Build an error-controlled response-envelope representation.
@@ -2012,9 +2021,9 @@ def adaptive_sparse_tdi_response(
         Expand the source about each grid point in the link and TDI delays
         instead of evaluating it at every delayed time, to second or third
         order. See `_expanded_source`. Both orders read one stencil, so 3
-        costs no extra source calls. ``None``, the default, carries no
-        truncation error, which is not the same as being the accurate
-        choice: it builds the bracket's phase by subtracting two
+        costs no extra source calls. Second order is the default. ``None``
+        applies every delay exactly and carries no truncation error, which
+        is not the same as being the accurate choice: it builds the bracket's phase by subtracting two
         evaluations of order ``2 pi f t`` to obtain their ``2 pi f tau``
         difference, and at mission epochs that runs 5e3 to 2e4 times
         rougher than either expansion order. `_expanded_source` carries

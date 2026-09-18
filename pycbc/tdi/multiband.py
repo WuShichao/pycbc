@@ -1109,7 +1109,7 @@ def multiband_sparse_tdi_response(
         initial_step=86400.0, relative_tolerance=1e-4,
         amplitude_floor=1e-3, max_refinements=24, velocity_order=1,
         links=None, padding=None, harmonics=None, max_grid_points=None,
-        delay_expansion=None, reference_delay=False, threads=1,
+        delay_expansion=2, reference_delay=False, threads=1,
         interpolation_order=3, stall_refusal_factor=100.0,
         stall_patience=3, evaluation_chunk_size=16384):
     """Build independently sampled time-domain TDI frequency bands.
