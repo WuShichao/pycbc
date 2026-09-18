@@ -657,7 +657,7 @@ class TermGeometry:
             raise ValueError("a TDI term uses a link absent from links")
         cache = {}
         gathered = {key: [None] * len(terms) for key in (
-            'shifted', 'ltt', 'n_hat', 'r_emit', 'r_recv')}
+            'shifted', 'chain_delay', 'ltt', 'n_hat', 'r_emit', 'r_recv')}
         if velocity_order:
             gathered.update(v_emit=[None] * len(terms),
                             v_recv=[None] * len(terms))
@@ -672,8 +672,9 @@ class TermGeometry:
                         if term.operators == chain]
             used_links = tuple(dict.fromkeys(tuple(term.link)
                                              for _, term in selected))
-            shifted = self.grid - chain_delay(
+            net_shift = chain_delay(
                 orbit, self.grid, chain, links, cache=cache)
+            shifted = self.grid - net_shift
             order = np.argsort(shifted)
             inverse = np.argsort(order)
             sample = sample_constellation(
@@ -684,6 +685,7 @@ class TermGeometry:
                 column = index[link]
                 receiver, emitter = link[0] - 1, link[1] - 1
                 gathered['shifted'][row] = shifted
+                gathered['chain_delay'][row] = net_shift
                 gathered['ltt'][row] = sample.ltt[inverse, column]
                 gathered['n_hat'][row] = sample.n_hat[inverse, column]
                 gathered['r_emit'][row] = sample.r_emit[inverse, column]
@@ -768,8 +770,23 @@ def barycentre_delay(orbit, times, lamb, beta):
     return (np.mean(position, axis=1) @ k_hat) / C_SI
 
 
-def _sparse_term_projection(geometry, lamb, beta):
-    """Return delayed queries and polarization weights for sparse terms."""
+def _sparse_term_projection(geometry, lamb, beta, offset=None):
+    """Return delayed queries, delays and polarization weights.
+
+    The delay is returned rather than left to be recovered downstream as
+    ``anchor - query``. Both of those are absolute mission epochs of order
+    1e7 s while their difference is at most 570 s, so differencing them
+    discards nine significant digits and leaves the delay quantised at
+    ULP(1e7 s) = 1.9e-9 s. The carrier turns that into 2 pi f = 6e-12 rad of
+    jitter per term, invisible in A/E but 1e-6 of the T channel's peak, which
+    is a cancellation residual four orders smaller. It is not an
+    interpolation error, so refinement never removes it: measured on a 1 mHz
+    galactic binary, the grid error stops falling at 1e-34 and 64x refinement
+    changes nothing, and the adaptive grid then exhausts max_grid_points
+    rather than converging. Composing the delay from the chain shift, the
+    light-cone term and the reference delay keeps every quantity below 600 s
+    and puts the floor back on float64 epsilon.
+    """
     u_hat, v_hat, k_hat = polarization_basis(lamb, beta)
     n_dot_u = geometry._project(geometry.n_hat, u_hat)
     n_dot_v = geometry._project(geometry.n_hat, v_hat)
@@ -798,13 +815,17 @@ def _sparse_term_projection(geometry, lamb, beta):
 
     query = np.concatenate((geometry.shifted - tau_emit,
                             geometry.shifted - tau_recv))
+    shift = geometry.chain_delay
+    if offset is not None:
+        shift = shift - offset
+    delay = np.concatenate((shift + tau_emit, shift + tau_recv))
     weight = np.concatenate((np.broadcast_to(w1, geometry.shape),
                              -np.broadcast_to(w2, geometry.shape)))
     plus = np.concatenate((pref_plus, pref_plus))
     cross = np.concatenate((pref_cross, pref_cross))
     coefficient = np.concatenate((geometry.coefficient,
                                   geometry.coefficient))
-    return (query, coefficient * weight * plus,
+    return (query, delay, coefficient * weight * plus,
             coefficient * weight * cross)
 
 
@@ -947,7 +968,7 @@ def expansion_coefficients(source, harmonic, anchor, order=3):
             np.ascontiguousarray(curve))
 
 
-def _expanded_source(source, harmonic, geometry, query, order, offset):
+def _expanded_source(source, harmonic, geometry, delay, order, offset):
     """Delayed amplitudes and relative phase, expanded about the grid.
 
     Every delayed time the channel asks for lies within one `delay_padding` of
@@ -961,6 +982,10 @@ def _expanded_source(source, harmonic, geometry, query, order, offset):
     it, whatever the channel term count. Both derivatives come off that same
     stencil, so third order costs no more source calls than second.
 
+    `delay` arrives already composed from the chain shift, the light-cone
+    term and the reference delay. It is deliberately not recovered here as
+    ``anchor - query``: see `_sparse_term_projection` for what that costs.
+
     Where the expansion is centred matters more than how far it is carried.
     With `_reference_delay` on, the centre moves to ``t - tau_0`` and the
     parameter becomes ``d - tau_0``, at most 80 s where ``d`` reaches 570, so
@@ -971,7 +996,6 @@ def _expanded_source(source, harmonic, geometry, query, order, offset):
     refinement past 30,000 points where second order converges at 3,240.
     """
     anchor = geometry.grid if offset is None else geometry.grid - offset
-    delay = anchor[None, :] - query
     (amp_p, slope_p, bend_p, amp_c, slope_c, bend_c,
      omega, rate, curve) = expansion_coefficients(
          source, harmonic, anchor, order=order)
@@ -989,9 +1013,10 @@ def _expanded_source(source, harmonic, geometry, query, order, offset):
 
 def _sparse_term_contributions(source, harmonic, geometry, lamb, beta):
     """Return each gathered term before reducing it into output channels."""
-    query, plus, cross = _sparse_term_projection(geometry, lamb, beta)
     order = getattr(geometry, "delay_expansion", None)
     offset = _reference_delay(geometry, lamb, beta)
+    query, delay, plus, cross = _sparse_term_projection(
+        geometry, lamb, beta, offset if order is not None else None)
     if order is None:
         amp_p, amp_c = source.amplitude(harmonic, query)
         anchor = (geometry.grid if offset is None
@@ -1000,7 +1025,7 @@ def _sparse_term_contributions(source, harmonic, geometry, lamb, beta):
         phase -= source.carrier_phase(harmonic, anchor)[None, :]
     else:
         amp_p, amp_c, phase = _expanded_source(
-            source, harmonic, geometry, query, order, offset)
+            source, harmonic, geometry, delay, order, offset)
     return ((plus * amp_p + cross * amp_c)
             * np.exp(1j * phase))
 
@@ -1046,6 +1071,10 @@ def _fused_channels(source, harmonic, geometry, lamb, beta):
     offset = _reference_delay(geometry, lamb, beta)
     anchor = np.ascontiguousarray(
         geometry.grid if offset is None else geometry.grid - offset)
+    # The kernel composes the delay from small quantities; `anchor` stays an
+    # absolute epoch because the source has to be evaluated there.
+    reference = np.ascontiguousarray(
+        np.zeros(len(geometry.grid)) if offset is None else offset)
     coefficients = expansion_coefficients(
         source, harmonic, anchor, order=order)
     u_hat, v_hat, k_hat = polarization_basis(lamb, beta)
@@ -1063,10 +1092,10 @@ def _fused_channels(source, harmonic, geometry, lamb, beta):
         geometry.v_recv if boosted else _EMPTY,
         geometry.n_dot_v_recv if boosted else _EMPTY[0],
         geometry.n_dot_v_mix if boosted else _EMPTY[0],
-        geometry.ltt, geometry.shifted,
+        geometry.ltt, np.ascontiguousarray(geometry.chain_delay),
         np.ascontiguousarray(geometry.coefficient[:, 0]),
         np.ascontiguousarray(geometry.term_channel, dtype=np.int64),
-        anchor,
+        reference,
         np.ascontiguousarray(u_hat), np.ascontiguousarray(v_hat),
         np.ascontiguousarray(k_hat),
         *coefficients, int(order), int(boosted), C_SI, out,
@@ -1138,10 +1167,10 @@ def sparse_windowed_channels_terms(sources, harmonics, geometries,
             _sparse_term_projection(geometries[index], lamb, beta)
             for index in positions
         ]
-        query_sizes = [query.size for query, _, _ in projections]
+        query_sizes = [query.size for query, _, _, _ in projections]
         grid_sizes = [len(geometries[index].grid) for index in positions]
         all_query = np.concatenate([
-            query.reshape(-1) for query, _, _ in projections])
+            query.reshape(-1) for query, _, _, _ in projections])
         all_grids = np.concatenate([
             geometries[index].grid for index in positions])
         combined = getattr(base, "harmonic_components", None)
@@ -1161,7 +1190,7 @@ def sparse_windowed_channels_terms(sources, harmonics, geometries,
         query_offset = grid_offset = 0
         for position, projection, query_size, grid_size in zip(
                 positions, projections, query_sizes, grid_sizes, strict=True):
-            query, plus, cross = projection
+            query, _, plus, cross = projection
             query_slice = slice(query_offset, query_offset + query_size)
             grid_slice = slice(grid_offset, grid_offset + grid_size)
             shape = query.shape
@@ -1215,7 +1244,7 @@ def frequency_response_factors(geometry, frequencies, lamb, beta):
     else:
         w1 = w2 = 1.0
 
-    chain_delay_value = geometry.grid[None, :] - geometry.shifted
+    chain_delay_value = geometry.chain_delay
     omega = 2 * np.pi * frequencies[None, :]
     transfer = geometry.coefficient * (
         w1 * np.exp(-1j * omega * (chain_delay_value + tau_emit))

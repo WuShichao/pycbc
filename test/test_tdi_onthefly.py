@@ -1472,3 +1472,58 @@ def test_growth_not_delta_phi_bounds_the_largest_interval():
     # And the median goes the other way, which is why a knot count hides
     # this: the phase refinement crowds the dense region instead.
     assert grown_knots > fine_knots
+
+
+def test_the_bracket_does_not_inherit_the_epoch_quantisation():
+    """The delay must not be recovered by differencing two mission epochs.
+
+    A null channel is a cancellation residual four orders below A/E, so it
+    resolves whatever jitter the delay carries. Recovering the delay as
+    ``anchor - query`` subtracts two epochs of order 1e8 s to get at most
+    570 s, leaving it quantised at ULP(1e8 s) = 1.5e-8 s; the carrier turns
+    that into 2 pi f of phase jitter per term. That is not an interpolation
+    error, so the adaptive grid cannot refine it away -- it exhausts
+    max_grid_points instead. Measured on this fixture, rebuilding the
+    compiled kernel both ways: 1.29e-12 of the source amplitude with the
+    delay differenced, 1.08e-14 composed from the chain shift and the
+    light-cone term, so the threshold below sits 9x above the composed value
+    and 13x under the differenced one.
+    """
+    from pycbc.tdi.onthefly import (MultiChannelTermGeometry,
+                                    sparse_channels_terms)
+    orbit = LisaEqualArmOrbit()
+    amplitude = 1.0e-21
+    frequency = 1.0613e-3
+
+    class Monochromatic:
+        harmonics = (2,)
+
+        def amplitude(self, harmonic, t):
+            t = np.asarray(t, dtype=float)
+            return np.full(t.shape, amplitude), np.zeros(t.shape)
+
+        def carrier_phase(self, harmonic, t):
+            return 2 * np.pi * frequency * np.asarray(t, dtype=float)
+
+        def angular_frequency(self, harmonic, t):
+            return np.full(np.shape(t), 2 * np.pi * frequency)
+
+        def support(self, harmonic):
+            return (-1.0e10, 1.0e10)
+
+    centre = 1.0e8
+    grid = centre + np.arange(-200, 201) * 1.0
+    from pycbc.tdi.inference import channel_terms
+    terms = channel_terms(("A", "E", "T"), generation=2, delta_t=5.0)
+    geometry = MultiChannelTermGeometry(orbit, grid, terms,
+                                        delay_expansion=2,
+                                        reference_delay=True)
+    brackets = sparse_channels_terms(Monochromatic(), 2, geometry, 0.9, -0.25)
+    null = brackets["T"]
+
+    # The bracket varies on the orbital timescale, so over 400 s it is a
+    # low-order polynomial to far below any jitter of interest.
+    offsets = grid - centre
+    smooth = np.polyval(np.polyfit(offsets, null, 6), offsets)
+    roughness = np.max(np.abs(null - smooth)) / amplitude
+    assert roughness < 1.0e-13, roughness
