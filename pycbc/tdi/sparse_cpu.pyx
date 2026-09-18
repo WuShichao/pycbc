@@ -44,10 +44,10 @@ cpdef int sparse_brackets(
         double[:, ::1] n_dot_v_recv,
         double[:, ::1] n_dot_v_mix,
         double[:, ::1] ltt,
-        double[:, ::1] shifted,
+        double[:, ::1] chain_delay,
         double[::1] coefficient,
         long[::1] channel,
-        double[::1] anchor,
+        double[::1] reference,
         double[::1] u_hat,
         double[::1] v_hat,
         double[::1] k_hat,
@@ -151,10 +151,10 @@ cpdef int sparse_brackets(
 
                     for side in range(2):
                         if side == 0:
-                            delay = anchor[g] - (shifted[t, g] - tau_emit)
+                            delay = chain_delay[t, g] + tau_emit - reference[g]
                             weight = coef * weight_emit
                         else:
-                            delay = anchor[g] - (shifted[t, g] - tau_recv)
+                            delay = chain_delay[t, g] + tau_recv - reference[g]
                             weight = -coef * weight_recv
                         phase = delay * (0.5 * rate[g] * delay - omega[g])
                         real = amp_p[g].real - delay * slope_p[g].real
