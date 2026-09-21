@@ -139,6 +139,31 @@ def register_source(name, builder):
     _SOURCES[str(name)] = builder
 
 
+def source_from_parameters(source_name, /, **parameters):
+    """Construct a registered TDI source from physical parameters.
+
+    This is the public, uncached counterpart of the inference-only
+    :func:`_build_source` helper. It gives tutorials and direct response
+    calculations the same source conventions as the likelihood path without
+    depending on a private builder.
+
+    Parameters
+    ----------
+    source_name : str
+        Name previously registered with :func:`register_source`.
+    **parameters
+        Parameters forwarded to that source builder.
+    """
+    try:
+        builder = _SOURCES[str(source_name)]
+    except KeyError as exc:
+        choices = ", ".join(sorted(_SOURCES))
+        raise ValueError(
+            f"unknown TDI source {source_name!r}; registered sources: "
+            f"{choices or 'none'}") from exc
+    return builder(**parameters)
+
+
 def _harmonic_band_edges(source, harmonic, edges, t_start, t_end,
                          probe=256, margin=1.05):
     """Band edges clipped to where this harmonic actually lives.
@@ -215,6 +240,7 @@ def _preparation(params, terms, orbit):
            float(params.get('tdi_delta_t', 5.0)),
            float(params.get('tdi_samples_per_cycle', 4.0)),
            float(params.get('tdi_geometry_step', 86400.0)),
+           params.get('tdi_delay_expansion', 2),
            str(params.get('tdi_harmonic_combine', 'intersection')),
            _tolerance(params),
            params.get('tdi_coverage_tolerance'),
@@ -307,7 +333,8 @@ def _preparation(params, terms, orbit):
             minimum_grid_points=int(params.get(
                 'tdi_minimum_grid_points', 16)),
             overlap=float(params.get('tdi_band_overlap', 0.0)),
-            coverage_sources=coverage)
+            coverage_sources=coverage,
+            delay_expansion=params.get('tdi_delay_expansion', 2))
         _PREPARED[key] = prepared
         if params.get('tdi_log_preparation', False):
             import resource
@@ -775,6 +802,11 @@ def sparse_tdi_fd_det_sequence(**params):
     served = tuple(params.get('tdi_channels', requested))
     if not set(requested) <= set(served):
         served = tuple(dict.fromkeys(served + requested))
+    # Evict the preceding proposal before constructing any object for this
+    # one.  Doing this after the harmonic-membership check discarded the
+    # source that check had just built, so the projection rebuilt its wrapper
+    # (and a source without a separate native cache rebuilt everything).
+    _begin_candidate(params)
     # A harmonic the union bins but this candidate does not carry is worth
     # exactly zero, and saying so is the alternative to dropping it in
     # silence. Checked before anything is prepared, because preparing a
@@ -809,7 +841,6 @@ def sparse_tdi_fd_det_sequence(**params):
         return {name: Array(np.zeros(len(sample_points), dtype=complex))
                 for name in requested}
 
-    _begin_candidate(params)
     response = _projection(params, prepared)
     delta_f = float(params['tdi_delta_f'])
     # Absolute zero on the mission clock, not the start of the observation.
