@@ -148,6 +148,51 @@ def test_frequency_window_support_is_refined_to_band_edges():
     assert np.allclose(blocks[0], (3.0, 7.5), rtol=0, atol=2e-13)
 
 
+def test_adjacent_frequency_windows_share_the_support_probe():
+    """Band count must not multiply the expensive frequency-track scan."""
+    class CountedFrequencySource(_LinearFrequencySource):
+        def __init__(self):
+            self.probes = 0
+
+        def angular_frequency(self, harmonic, time):
+            if np.asarray(time).size == 64:
+                self.probes += 1
+            return super().angular_frequency(harmonic, time)
+
+    source = CountedFrequencySource()
+    bands = frequency_partition_sources(
+        source, [1.0, 4.0, 7.0, 9.0, 11.0], overlap=0.5)[2]
+    supports = [band.support_blocks(2, n_probe=64) for band in bands]
+    assert all(supports)
+    assert source.probes == 1
+
+
+def test_prepared_fourier_limit_is_checked_before_allocation(monkeypatch):
+    """The advertised memory guard must reject before calling ``exp``."""
+    source = _CompactChirpSource()
+    orbit = LisaEqualArmOrbit(t0=0.0)
+    terms = {"X": PyTDICombinationAdapter(
+        "X2", get_pytdi_combination("X2"), delta_t=25.0).terms()}
+    response = multiband_sparse_tdi_response(
+        source, orbit, terms, 1.1, -0.4,
+        band_edges=[1e-3, 5e-3, 1e-2], t_start=800.0, t_end=3200.0,
+        initial_step=25.0)
+    called = False
+    original = np.exp
+
+    def watched(value):
+        nonlocal called
+        called = True
+        return original(value)
+
+    monkeypatch.setattr(np, 'exp', watched)
+    with pytest.raises(MemoryError, match="max_matrix_bytes=1"):
+        response.prepare_frequency_sampler(
+            {'X': np.array([5 / 2400.0])}, delta_f={'X': 1 / 2400.0},
+            max_matrix_bytes=1)
+    assert not called
+
+
 def test_frequency_partition_rejects_overlapping_taper_centres():
     source = _LinearFrequencySource()
     try:
@@ -178,6 +223,7 @@ def test_multiband_tdi_sum_reconstructs_full_time_domain_response():
         initial_step=200.0,
         relative_tolerance=2e-5,
         velocity_order=1,
+        delay_expansion=None,
     )
     full = adaptive_sparse_tdi_response(
         source, orbit, channel_terms, 1.1, -0.4, **common)
@@ -246,7 +292,6 @@ def test_prepared_multiband_unions_training_source_coverage():
     scale = np.max(np.abs(np.asarray(expected)[interior]))
     assert np.max(np.abs(
         actual[interior] - np.asarray(expected)[interior])) / scale < 2e-4
-
 
 def test_prepared_multiband_rejects_unprepared_harmonic():
     source = _CompactChirpSource()
@@ -546,7 +591,8 @@ def test_a_prior_corner_places_knots_and_not_only_widens_the_interval():
     common = dict(band_edges=[1e-3, 5e-3, 1e-2], overlap=1e-3,
                   samples_per_cycle=4, t_start=800.0, t_end=3200.0,
                   geometry_step=400.0, minimum_grid_points=8,
-                  relative_tolerance=2e-5, velocity_order=1)
+                  relative_tolerance=2e-5, velocity_order=1,
+                  delay_expansion=None)
     fiducial = _CompactChirpSource()
 
     class _Corner(_CompactChirpSource):
@@ -583,7 +629,8 @@ def test_a_prior_corner_places_knots_and_not_only_widens_the_interval():
         overlap=common["overlap"], samples_per_cycle=4,
         t_start=common["t_start"], t_end=common["t_end"],
         initial_step=400.0, relative_tolerance=2e-5,
-        velocity_order=1).sample(times)["X"]
+        velocity_order=1,
+        delay_expansion=None).sample(times)["X"]
     scale = max(np.max(np.abs(truth)), np.finfo(float).tiny)
     without = np.max(np.abs(
         alone.project(corner, 1.1, -0.4).sample(times)["X"] - truth)) / scale

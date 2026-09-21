@@ -449,7 +449,8 @@ def test_cached_geometries_agree_with_the_direct_path():
     # roundoff draw rather than a different calculation.
     from pycbc.tdi.onthefly import _sparse_term_contributions
     rows = _sparse_term_contributions(
-        source, 2, TermGeometry(orbit, grid, terms), 0.9, -0.25)
+        source, 2, TermGeometry(
+            orbit, grid, terms, delay_expansion=None), 0.9, -0.25)
     cancellation = float(np.max(np.abs(rows).sum(axis=0)
                                 / np.maximum(np.abs(rows.sum(axis=0)), 1e-300)))
     phase_scale = float(np.max(np.abs(source.carrier_phase(2, grid))))
@@ -460,7 +461,11 @@ def test_cached_geometries_agree_with_the_direct_path():
             (SparseGeometry, sparse_channel_cached, 0.0),
             (StackedGeometry, sparse_channel_stacked, tolerance),
             (TermGeometry, sparse_channel_terms, tolerance)):
-        got = evaluate(source, 2, builder(orbit, grid, terms), 0.9, -0.25)
+        options = ({'delay_expansion': None}
+                   if builder is TermGeometry else {})
+        got = evaluate(
+            source, 2, builder(orbit, grid, terms, **options),
+            0.9, -0.25)
         assert np.max(np.abs(got - direct)) / scale <= allowed
 
 
@@ -1305,6 +1310,45 @@ def test_the_delay_expansion_matches_evaluating_every_delayed_time():
 
     with pytest.raises(ValueError, match="delay_expansion"):
         project(4)
+
+
+def test_second_order_is_the_default_and_ignores_absolute_phase_offset():
+    """The default must avoid subtracting two large absolute phases.
+
+    A constant added to the carrier phase cannot change a response.  At a
+    late mission epoch the exact delayed-evaluation route loses digits in
+    that subtraction, while the delay expansion never reads absolute phase.
+    This is the numerical reason second order is the production default.
+    """
+    from pycbc.tdi.onthefly import PreparedSparseTDI
+
+    class OffsetCarrier(_LinearCarrier):
+        def __init__(self, offset):
+            super().__init__(frequency=1.06e-3)
+            self.offset = float(offset)
+
+        def carrier_phase(self, harmonic, time):
+            return super().carrier_phase(harmonic, time) + self.offset
+
+    orbit = LisaEqualArmOrbit()
+    grid = np.linspace(1.0e8, 1.0e8 + 400.0, 81)
+    terms = {"X": _terms("X2")}
+
+    def project(source, order="default"):
+        options = {} if order == "default" else {"delay_expansion": order}
+        return PreparedSparseTDI(
+            orbit, terms, {2: grid}, **options).project(
+                source, 0.9, -0.25).responses[0]["brackets"]["X"]
+
+    baseline = project(OffsetCarrier(0.0))
+    shifted = project(OffsetCarrier(1.0e10))
+    explicit = project(OffsetCarrier(0.0), 2)
+    np.testing.assert_array_equal(baseline, explicit)
+    np.testing.assert_array_equal(baseline, shifted)
+
+    exact = project(OffsetCarrier(0.0), None)
+    exact_shifted = project(OffsetCarrier(1.0e10), None)
+    assert np.max(np.abs(exact - exact_shifted)) / np.max(np.abs(exact)) > 1e-5
 
 
 def test_the_compiled_kernel_agrees_with_numpy_and_with_itself():

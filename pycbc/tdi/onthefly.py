@@ -1944,8 +1944,17 @@ class PreparedSparseTDI:
         records = []
         for harmonic in source.harmonics:
             geometry = self.geometries[harmonic]
-            brackets = sparse_channels_terms(
-                source, harmonic, geometry, lamb, beta)
+            support = harmonic_windows(
+                source, harmonic, float(geometry.grid[0]),
+                float(geometry.grid[-1]), padding=support_padding)
+            if support:
+                brackets = sparse_channels_terms(
+                    source, harmonic, geometry, lamb, beta)
+            else:
+                brackets = {
+                    name: np.zeros(len(geometry.grid), dtype=complex)
+                    for name in self.channels
+                }
             if matrix is not None:
                 native = np.stack([
                     brackets[name] for name in self.channels])
@@ -1956,9 +1965,7 @@ class PreparedSparseTDI:
                 'harmonic': harmonic,
                 'grid': geometry.grid,
                 'brackets': brackets,
-                'support': harmonic_windows(
-                    source, harmonic, float(geometry.grid[0]),
-                    float(geometry.grid[-1]), padding=support_padding),
+                'support': support,
                 'reference_delay': _reference_delay(geometry, lamb, beta),
             })
         return SparseTDIResponse(

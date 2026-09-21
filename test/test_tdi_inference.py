@@ -183,8 +183,11 @@ def test_prepared_geometry_is_model_scoped_and_keyed_on_numerical_knobs(
     assert inference._preparation(finer, terms, orbit) is not first
     denser_geometry = dict(params, tdi_geometry_step=21600.0)
     assert inference._preparation(denser_geometry, terms, orbit) is not first
-    assert len(built) == 4
-    assert built[-1]['geometry_step'] == 21600.0
+    exact_delay = dict(params, tdi_delay_expansion=None)
+    assert inference._preparation(exact_delay, terms, orbit) is not first
+    assert len(built) == 5
+    assert built[-2]['geometry_step'] == 21600.0
+    assert built[-1]['delay_expansion'] is None
 
 
 def test_two_harmonics_of_one_candidate_get_separate_geometries(monkeypatch):
@@ -240,6 +243,62 @@ def test_runtime_source_cache_has_a_small_candidate_bound(monkeypatch):
     for value in range(inference._SOURCE_CACHE_LIMIT + 3):
         inference._build_source(dict(tdi_source='cache-test', value=value))
     assert len(inference._SOURCE_CACHE) == inference._SOURCE_CACHE_LIMIT
+
+
+def test_candidate_eviction_precedes_the_harmonic_source_check(monkeypatch):
+    """A new proposal's membership check and projection share one source."""
+    from pycbc.tdi import inference
+
+    class Source:
+        harmonics = (2,)
+
+    class Response:
+        def frequency_samples(self, frequencies, **kwargs):
+            return {name: np.ones(len(values), dtype=complex)
+                    for name, values in frequencies.items()}
+
+    built = []
+    clear_cache()
+    monkeypatch.setitem(
+        inference._SOURCES, 'order-test',
+        lambda **params: built.append(params['mass1']) or Source())
+    monkeypatch.setattr(inference, '_preparation',
+                        lambda params, terms, orbit: object())
+    monkeypatch.setattr(
+        inference, '_projection',
+        lambda params, prepared: (
+            inference._build_source(params) and Response()))
+    monkeypatch.setattr(inference, 'channel_terms',
+                        lambda *args, **kwargs: {'A': ()})
+    monkeypatch.setattr(inference, 'LisaEqualArmOrbit', lambda **kwargs: None)
+
+    base = dict(
+        ifos=('A',), sample_points=np.array([1e-3, 2e-3]),
+        approximant='TDISparse', tdi_source='order-test',
+        tdi_harmonic=2, tdi_band_edges=[1e-3, 2e-3], tdi_delta_f=1e-4,
+        t_obs_start=0.0, t_obs_end=1000.0,
+        eclipticlongitude=0.0, eclipticlatitude=0.0,
+        tdi_preparation_id='order-test')
+    inference.sparse_tdi_fd_det_sequence(**dict(base, mass1=30.0))
+    inference.sparse_tdi_fd_det_sequence(**dict(base, mass1=31.0))
+    assert built == [30.0, 31.0]
+
+
+def test_public_source_builder_dispatches_without_using_inference_cache(
+        monkeypatch):
+    """Direct calculations may use a registered source without private APIs."""
+    from pycbc.tdi import inference
+
+    clear_cache()
+    monkeypatch.setitem(
+        inference._SOURCES, 'public-test',
+        lambda **params: ('source', params['value']))
+    assert inference.source_from_parameters(
+        'public-test', tdi_source='outer', value=3.0) == ('source', 3.0)
+    assert not inference._SOURCE_CACHE
+
+    with pytest.raises(ValueError, match="unknown TDI source 'missing'"):
+        inference.source_from_parameters('missing')
 
 
 def test_new_candidate_releases_previous_runtime_objects(monkeypatch):

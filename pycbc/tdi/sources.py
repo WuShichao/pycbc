@@ -472,7 +472,8 @@ class FrequencyWindowedHarmonicSource:
 
     def __init__(self, source, harmonic, f_lower, f_upper,
                  lower_overlap=0.0, upper_overlap=0.0,
-                 include_below=False, include_above=False):
+                 include_below=False, include_above=False,
+                 _support_probe_cache=None):
         self.source = source
         self.harmonic = harmonic
         self.harmonics = (harmonic,)
@@ -492,6 +493,12 @@ class FrequencyWindowedHarmonicSource:
         self.t_start = float(source.t_start)
         self.t_end = float(source.t_end)
         self._support_cache = {}
+        # Adjacent windows of one harmonic inspect the same time/frequency
+        # track.  ``frequency_partition_sources`` gives them one private
+        # cache so the 8192-point support probe is evaluated once, not once
+        # per band.  Root refinement remains band-specific.
+        self._support_probe_cache = (
+            {} if _support_probe_cache is None else _support_probe_cache)
 
     def _check_harmonic(self, harmonic):
         if harmonic != self.harmonic:
@@ -583,8 +590,15 @@ class FrequencyWindowedHarmonicSource:
             block_high = min(self.t_end, float(block_high))
             if block_high <= block_low:
                 continue
-            probe = np.linspace(block_low, block_high, n_probe)
-            frequency = self.angular_frequency(harmonic, probe) / (2 * np.pi)
+            key = (n_probe, block_low, block_high)
+            cached = self._support_probe_cache.get(key)
+            if cached is None:
+                probe = np.linspace(block_low, block_high, n_probe)
+                frequency = (
+                    self.angular_frequency(harmonic, probe) / (2 * np.pi))
+                self._support_probe_cache[key] = (probe, frequency)
+            else:
+                probe, frequency = cached
             live = (frequency >= lower) & (frequency <= upper)
             for start, stop in _boolean_runs(live):
                 low = float(probe[start])
@@ -652,6 +666,7 @@ def frequency_partition_sources(source, band_edges, overlap=0.0,
     output = {}
     for harmonic in selected:
         bands = []
+        support_probe_cache = {}
         for index, (lower, upper) in enumerate(
                 zip(edges[:-1], edges[1:], strict=True)):
             lower_overlap = overlaps[index - 1] if index else 0.0
@@ -661,7 +676,8 @@ def frequency_partition_sources(source, band_edges, overlap=0.0,
                 lower_overlap=lower_overlap,
                 upper_overlap=upper_overlap,
                 include_below=index == 0,
-                include_above=index == len(widths) - 1))
+                include_above=index == len(widths) - 1,
+                _support_probe_cache=support_probe_cache))
         output[harmonic] = tuple(bands)
     return output
 

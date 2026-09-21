@@ -342,11 +342,26 @@ class PreparedMultibandTDI:
         ]
 
         def evaluate_group(group):
-            return sparse_windowed_channels_terms(
-                [windowed for _, windowed, _, _ in group],
-                [item.template.harmonic for item, _, _, _ in group],
-                [geometry for _, _, _, geometry in group],
-                lamb, beta, source_batch_size=len(group))
+            outputs = [None] * len(group)
+            live = [
+                index for index, (_, _, support, _) in enumerate(group)
+                if support
+            ]
+            if live:
+                brackets = sparse_windowed_channels_terms(
+                    [group[index][1] for index in live],
+                    [group[index][0].template.harmonic for index in live],
+                    [group[index][3] for index in live],
+                    lamb, beta, source_batch_size=len(live))
+                for index, value in zip(live, brackets, strict=True):
+                    outputs[index] = value
+            for index in set(range(len(group))) - set(live):
+                geometry = group[index][3]
+                outputs[index] = {
+                    name: np.zeros(len(geometry.grid), dtype=complex)
+                    for name in geometry.channel_names
+                }
+            return tuple(outputs)
 
         if source_workers == 1 or len(groups) < 2:
             grouped_brackets = tuple(evaluate_group(group) for group in groups)
@@ -378,13 +393,13 @@ class PreparedMultibandTDI:
             source, bands, self.padding,
             t_start=self.t_start, t_end=self.t_end)
 
-
 def prepare_sparse_tdi(
         source, orbit, channel_terms, lamb, beta, band_edges, overlap=0.0,
         t_start=None, t_end=None, samples_per_cycle=4.0,
         geometry_step=86400.0, minimum_grid_points=16, velocity_order=1,
         links=None, padding=None, harmonics=None, coverage_sources=None,
-        relative_tolerance=1e-4, coverage_tolerance=None):
+        relative_tolerance=1e-4, coverage_tolerance=None,
+        delay_expansion=2):
     """Prepare one shared narrow-band geometry for a likelihood epoch.
 
     This cold-path constructor is intended for a likelihood epoch. The band
@@ -408,6 +423,10 @@ def prepare_sparse_tdi(
     window supports are unioned into that coverage.  Validate both the source
     ensemble and the grid settings against held-out dense responses before
     using the returned preparation for candidates.
+
+    ``delay_expansion`` is forwarded to both adaptive refinement and the
+    reusable geometry. Set it to ``None`` when an exact delayed-source
+    evaluation is required as an oracle.
     """
     if samples_per_cycle <= 2:
         raise ValueError("samples_per_cycle must exceed the Nyquist minimum")
@@ -525,7 +544,9 @@ def prepare_sparse_tdi(
                             initial_step=geometry_step,
                             relative_tolerance=tolerance,
                             support_padding=padding,
-                            velocity_order=velocity_order, **prepare_options)
+                            velocity_order=velocity_order,
+                            delay_expansion=delay_expansion,
+                            **prepare_options)
                         for entry in refined.responses:
                             grid = np.asarray(entry['grid'], dtype=float)
                             if len(grid) > 1:
@@ -538,7 +559,8 @@ def prepare_sparse_tdi(
             grid = np.unique(np.concatenate(pieces))
             prepared = PreparedSparseTDI(
                 orbit, channel_terms, {harmonic: grid},
-                velocity_order=velocity_order, **prepare_options)
+                velocity_order=velocity_order,
+                delay_expansion=delay_expansion, **prepare_options)
             projected = prepared.project(
                 windowed, lamb, beta, support_padding=padding)
             highest = windowed.f_upper + 0.5 * windowed.upper_overlap
@@ -942,6 +964,14 @@ class PreparedMultibandFrequencySampler:
                     )
                     kernel = shared_kernels.get(key)
                     if kernel is None:
+                        required = (len(positions) * len(times)
+                                    * np.dtype(complex).itemsize)
+                        if matrix_bytes + required > max_matrix_bytes:
+                            raise MemoryError(
+                                "prepared Fourier kernels exceed "
+                                f"max_matrix_bytes={max_matrix_bytes}; use "
+                                "more frequency bands or a smaller relbin "
+                                "grid")
                         kernel = np.exp(
                             -2j * np.pi
                             * requested[positions, None] * relative_times)
@@ -949,12 +979,6 @@ class PreparedMultibandFrequencySampler:
                                    * weights[None, :])
                         matrix_bytes += kernel.nbytes
                         kernel_count += 1
-                        if matrix_bytes > max_matrix_bytes:
-                            raise MemoryError(
-                                "prepared Fourier kernels exceed "
-                                f"max_matrix_bytes={max_matrix_bytes}; use "
-                                "more frequency bands or a smaller relbin "
-                                "grid")
                         shared_kernels[key] = kernel
                     channel_tasks[name] = (positions, kernel)
                 tasks.append({
