@@ -1015,7 +1015,30 @@ def _expanded_source(source, harmonic, geometry, delay, order, offset):
     ``None`` five more orders at 1e10 rad, which is what identifies the
     cancellation rather than a truncation.
 
-    That floor is what moved the default here from ``None`` to second
+    The expansion is a series in the delay, so it holds only while the
+    source varies slowly across one. That is a condition on the source, not
+    on the grid, and no refinement detects it: splitting an interval leaves
+    the delays untouched. `_CompactChirpSource` with a 250 s amplitude
+    wobble makes the point. Its largest delay is 209 s without
+    `_reference_delay` and 66 s with, against that 250 s period, and the
+    bracket it produces differs from the exact route by
+
+        reference_delay   order 2   order 3
+        False             1.91      3.75
+        True              0.305     0.153
+
+    of the bracket's own peak. Third order is worse than second wherever
+    ``d`` is a sizeable fraction of the period, because the cubic term
+    carries ``d^3``. Comparing the two orders is the cheap self-check: they
+    differ by that cubic term, so a large disagreement means the series has
+    not converged and the source needs ``delay_expansion=None``.
+
+    Real inspiral envelopes vary on the inspiral timescale and are nowhere
+    near this, but a windowed or sharply tapered source can be, since
+    `FrequencyWindowedHarmonicSource` multiplies the amplitude by a band
+    taper.
+
+    The floor below is what moved the default here from ``None`` to second
     order. A 1 mHz galactic binary over a year, refined to 1e-3, exhausts
     ``max_grid_points`` under ``None`` at either setting of
     ``reference_delay``, and converges in 439 knots and 0.4 s at either
