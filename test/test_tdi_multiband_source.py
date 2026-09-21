@@ -293,6 +293,7 @@ def test_prepared_multiband_unions_training_source_coverage():
     assert np.max(np.abs(
         actual[interior] - np.asarray(expected)[interior])) / scale < 2e-4
 
+
 def test_prepared_multiband_rejects_unprepared_harmonic():
     source = _CompactChirpSource()
     prepared = prepare_sparse_tdi(
@@ -571,6 +572,56 @@ def _prepared_grids(prepared):
     """Every band's time grid, as the preparation actually stored it."""
     return [band.prepared.geometries[band.template.harmonic].grid
             for band in prepared.prepared_bands]
+
+
+def test_the_delay_expansion_needs_a_slowly_varying_envelope():
+    """The series is in the delay, so the source must be slow across one.
+
+    No refinement detects this: splitting an interval leaves the delays
+    untouched. The corner source below wobbles its amplitude on 250 s, and
+    the delays here reach 209 s without `reference_delay` and 66 s with, so
+    the expansion is being asked to reach most of a period. It is why
+    `test_a_prior_corner_places_knots_and_not_only_widens_the_interval`
+    pins the exact route: under the default every quantity it compares is
+    swamped by this, not by the knots it means to measure.
+
+    Third order is worse than second here, because the cubic term carries
+    ``d^3``. That the two orders disagree at all is the cheap self-check a
+    caller has.
+    """
+    from pycbc.tdi.onthefly import (MultiChannelTermGeometry,
+                                    sparse_channels_terms)
+
+    class _Wobbling(_CompactChirpSource):
+        def amplitude(self, harmonic, time):
+            time = np.asarray(time)
+            plus, cross = super().amplitude(harmonic, time)
+            wobble = 1 + 0.5 * np.sin(2 * np.pi * time / 250.0)
+            return plus * wobble, cross * wobble
+
+    orbit = LisaEqualArmOrbit(t0=0.0)
+    terms = {"X": PyTDICombinationAdapter(
+        "X2", get_pytdi_combination("X2"), delta_t=25.0).terms()}
+    grid = np.linspace(1000.0, 3000.0, 201)
+
+    def bracket(expansion, reference):
+        geometry = MultiChannelTermGeometry(
+            orbit, grid, terms, delay_expansion=expansion,
+            reference_delay=reference)
+        return sparse_channels_terms(_Wobbling(), 2, geometry, 1.1, -0.4)["X"]
+
+    for reference, floor in ((False, 1.0), (True, 0.1)):
+        exact = bracket(None, reference)
+        peak = np.max(np.abs(exact))
+        second = np.max(np.abs(bracket(2, reference) - exact)) / peak
+        third = np.max(np.abs(bracket(3, reference) - exact)) / peak
+        assert second > floor, (reference, second)
+        # The orders disagree with each other, which is what a caller can
+        # see without an exact reference to compare against.
+        cross = np.max(np.abs(bracket(3, reference)
+                              - bracket(2, reference))) / peak
+        assert cross > floor, (reference, cross)
+        assert third > second if not reference else third < second
 
 
 def test_a_prior_corner_places_knots_and_not_only_widens_the_interval():

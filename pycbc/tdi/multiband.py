@@ -393,6 +393,7 @@ class PreparedMultibandTDI:
             source, bands, self.padding,
             t_start=self.t_start, t_end=self.t_end)
 
+
 def prepare_sparse_tdi(
         source, orbit, channel_terms, lamb, beta, band_edges, overlap=0.0,
         t_start=None, t_end=None, samples_per_cycle=4.0,
