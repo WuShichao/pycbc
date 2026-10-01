@@ -840,12 +840,10 @@ def test_lal_imrphenomd_inverse_spa_reproduces_native_fd_waveform():
     assert np.max(np.abs(np.angle(ratio))) < 1e-6
     cross_ratio = np.asarray(native_cross) / np.asarray(native_plus)
     assert np.max(np.abs(amp_cross / amp_plus - cross_ratio)) < 1e-12
-    # The endpoint is noise-limited, not implementation-limited: the local
-    # stationary-time measurement carries an rms of 38 s here (max 127 s),
-    # unchanged whether it is smoothed with a degree 6, 12 or 24 fit, so a
-    # difference of two of them scatters by tens of seconds on a three-day
-    # duration. Anything much tighter would be fitting one draw.
-    assert abs(source.t_end - 3 * 86400.0) < 200.0
+    # The demodulated local fit resolves the clock without the tens-of-
+    # seconds floor of the narrow-window fit. Check the duration as well as
+    # the native spectrum so a noisy upper-frequency solve cannot pass.
+    assert abs(source.t_end - 3 * 86400.0) < 0.1
 
 
 @pytest.mark.skipif(_NO_LAL is not None, reason=str(_NO_LAL))
@@ -916,6 +914,7 @@ def test_lal_source_generalises_beyond_imrphenomd():
         ratio = reconstructed / (np.asarray(native) * shift)
         assert np.max(np.abs(np.abs(ratio) - 1)) < 1e-9, approximant
         assert np.max(np.abs(np.angle(ratio))) < 1e-5, approximant
+        assert abs(source.t_end - 3 * 86400.0) < 0.1, approximant
         checked += 1
     assert checked >= 2
 
