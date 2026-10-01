@@ -46,6 +46,29 @@ def test_stationary_time_keeps_the_physical_mass_derivative():
     assert np.min(np.abs(derivatives[1])) > 1e6
 
 
+@pytest.mark.parametrize("approximant", ["IMRPhenomD", "IMRPhenomXAS",
+                                         "TaylorF2"])
+def test_extrinsic_parameters_do_not_change_the_intrinsic_clock(approximant):
+    pytest.importorskip("lalsimulation")
+    params = _parameters()
+    source = LALFDSource(approximant=approximant, **params)
+    times = np.linspace(0, source.t_end, 301)
+    base_plus, base_cross = source.amplitude(2, times)
+    for phase in (0.0, 1.5, 3.2):
+        candidate = LALFDSource(approximant=approximant,
+                                **dict(params, coa_phase=phase, distance=200))
+        np.testing.assert_array_equal(source.stationary_times,
+                                       candidate.stationary_times)
+        np.testing.assert_array_equal(source.carrier_phase(2, times),
+                                       candidate.carrier_phase(2, times))
+        factor = 0.5 * np.exp(2j * (phase - params["coa_phase"]))
+        plus, cross = candidate.amplitude(2, times)
+        np.testing.assert_allclose(plus, factor * base_plus, rtol=1e-14,
+                                   atol=0)
+        np.testing.assert_allclose(cross, factor * base_cross, rtol=1e-14,
+                                   atol=0)
+
+
 def test_local_fit_measures_the_waveform_not_the_newtonian_surrogate():
     # A quadratic FD phase has an analytic stationary time and curvature.
     # Its large linear slope represents an inspiral decades from merger.

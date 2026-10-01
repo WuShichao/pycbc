@@ -893,6 +893,9 @@ class LALFDSource:
     waveform_options : keyword arguments
         Passed to :func:`pycbc.waveform.get_fd_waveform_sequence`;
         ``sample_points`` is supplied by the adapter and must not appear.
+        Distance and the orbital coalescence phase are applied as an exact
+        complex scale of the single carrier's amplitudes. They do not enter
+        the intrinsic clock fit.
     """
 
     TAU_SUN = 4.925490947e-6
@@ -921,6 +924,18 @@ class LALFDSource:
         self._parameters = dict(waveform_options)
         self._parameters.update(approximant=str(approximant),
                                 mass1=float(mass1), mass2=float(mass2))
+        distance = float(self._parameters.get("distance", 1.0))
+        coa_phase = float(self._parameters.get("coa_phase", 0.0))
+        if not np.isfinite(distance) or distance <= 0:
+            raise ValueError("distance must be positive and finite")
+        if not np.isfinite(coa_phase):
+            raise ValueError("coa_phase must be finite")
+        self._extrinsic_factor = np.exp(2j * coa_phase) / distance
+        # Adding a constant orbital phase inside a very large native phase
+        # loses its low bits, which then enter the numerical time derivative.
+        # For this adapter's single (2, 2) carrier the exact rotation is
+        # exp(2j * coa_phase); retain it in the complex envelope instead.
+        self._parameters.update(distance=1.0, coa_phase=0.0)
         self.approximant = str(approximant)
         self.f_lower = float(f_lower)
         self.t_start = float(t_start)
@@ -1114,7 +1129,8 @@ class LALFDSource:
         cross = np.where(inside, self._amplitude_cross_real(sample), 0.0)
         cross = cross + 1j * np.where(
             inside, self._amplitude_cross_imag(sample), 0.0)
-        return plus, cross
+        return (self._extrinsic_factor * plus,
+                self._extrinsic_factor * cross)
 
     def carrier_phase(self, harmonic, t):
         self._check_harmonic(harmonic)
