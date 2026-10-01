@@ -853,8 +853,10 @@ class LALFDSource:
         t(f) = -\frac{1}{2\pi}\frac{d\arg \tilde h}{df},\qquad
         \Phi(f) = \arg \tilde h + 2\pi f t + \frac{\pi}{4}.
 
-    The derivative comes from close pairs of native LAL frequency-sequence
-    evaluations. Unwrapping a mission-resolution Fourier grid would not do:
+    The derivative comes from local native LAL frequency-sequence
+    evaluations. A narrow first pass estimates the slope, which is removed
+    before a wider second fit resolves it above phase roundoff.
+    Unwrapping a mission-resolution Fourier grid would not do:
     for a stellar-mass LISA binary decades from merger, adjacent mission bins
     differ by many cycles.
 
@@ -934,12 +936,9 @@ class LALFDSource:
                                  int(n_frequency))
         h_plus, h_cross = self._fd_waveform(frequency)
         stationary = self._stationary_time(frequency)
-        # dt/df comes from the main grid. The local windows of
-        # _local_phase_derivatives span ~1e-10 Hz, over which the curvature
-        # contributes (1/2) phi'' eps^2 ~ 2e-8 rad against a phase of ~1e8
-        # rad, so a second derivative read there is roundoff. The same
-        # windows also smooth t(f), whose measured values stop being strictly
-        # increasing on a fine grid while CubicSpline needs knots that are.
+        # Take dt/df from the main grid for a consistent interpolated clock.
+        # Overlapping windows also suppress the remaining native phase
+        # roundoff before CubicSpline receives its increasing time knots.
         stationary, dt_df = _windowed_derivative(frequency, stationary)
         stationary_start = stationary[0]
         relative_time = stationary - stationary_start
@@ -1021,18 +1020,20 @@ class LALFDSource:
     def _local_phase_derivatives(self, frequency):
         """``(t, dt/df)`` from local fits, with no global phase unwrapping.
 
-        Fits nine nearby native phase values, spanning about 2.4 rad: wide
-        enough to suppress roundoff, narrow enough to unwrap safely. Every
-        window uses the same nine offsets, so rescaling to
-        ``x = (f - f_i)/epsilon_i`` gives them all one design matrix and the
-        whole set becomes a single least-squares solve.
+        A nine-point fit spanning about 2.4 rad first estimates the slope.
+        That slope only demodulates a wider second window: it does not set
+        the final clock. The wider window is sized by a Newtonian curvature
+        estimate, not by the much faster linear phase, so native phase
+        roundoff is not divided by a sub-nanohertz interval. The waveform
+        itself still supplies both derivatives for every approximant.
 
-        The second derivative also returned is diagnostic. The window is too
-        narrow to see curvature above roundoff; the caller takes ``dt/df``
-        from the main grid.
+        Both fits use a quartic polynomial at the same nine scaled offsets.
+        The returned curvature is diagnostic; the constructor differentiates
+        the smoothed stationary-time track for a consistent amplitude map.
         """
         frequency = np.atleast_1d(np.asarray(frequency, dtype=float))
-        epsilon = 1.2 / (2 * np.pi * self._newtonian_time(frequency))
+        newtonian = self._newtonian_time(frequency)
+        epsilon = 1.2 / (2 * np.pi * newtonian)
         epsilon = np.minimum(epsilon, frequency * 1e-7)
         offsets = np.linspace(-1.0, 1.0, 9)
         local_frequency = frequency[:, None] + epsilon[:, None] * offsets
@@ -1041,9 +1042,25 @@ class LALFDSource:
             np.angle(h_plus.reshape(len(frequency), -1)), axis=1)
         design = np.polynomial.polynomial.polyvander(offsets, 4)
         coefficients = np.linalg.lstsq(design, local_phase.T, rcond=None)[0]
+        coarse = -coefficients[1] / (2 * np.pi * epsilon)
+
+        curvature = (8 / 3) * newtonian / frequency
+        epsilon = np.minimum(np.sqrt(4 / (2 * np.pi * curvature)),
+                             frequency * 1e-3)
+        local_frequency = frequency[:, None] + epsilon[:, None] * offsets
+        h_plus, _ = self._fd_waveform(local_frequency.reshape(-1))
+        # Use the represented frequency displacement, rather than epsilon
+        # times offsets: the native waveform was evaluated at these doubles.
+        correction = (2 * np.pi * coarse[:, None]
+                      * (local_frequency - frequency[:, None]))
+        residual = h_plus.reshape(len(frequency), -1) * np.exp(1j * correction)
+        local_phase = np.unwrap(np.angle(residual), axis=1)
+        if np.any(np.abs(np.diff(local_phase, axis=1)) > 0.5 * np.pi):
+            raise ValueError("local phase slope cannot be resolved safely")
+        coefficients = np.linalg.lstsq(design, local_phase.T, rcond=None)[0]
         first = coefficients[1] / epsilon
         second = 2 * coefficients[2] / epsilon ** 2
-        return -first / (2 * np.pi), -second / (2 * np.pi)
+        return coarse - first / (2 * np.pi), -second / (2 * np.pi)
 
     def _stationary_time(self, frequency):
         """``-d arg(H)/2pi df``; see `_local_phase_derivatives`."""
