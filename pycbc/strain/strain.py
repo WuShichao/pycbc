@@ -204,6 +204,23 @@ def from_cli(opt, dyn_range_fac=1, precision='single',
     """
     gating_info = {}
 
+    # The padding is removed as a whole number of samples. At the low sample
+    # rates of space-borne detectors -- 0.2 Hz is a 5 s step -- the default
+    # 8 s is not one, and the series came out starting 3 or 5 s before
+    # gps_start_time. Rounding the padding up to whole samples puts the grid
+    # on gps_start_time.
+    if opt.pad_data and opt.sample_rate:
+        rates = [opt.sample_rate]
+        if getattr(opt, 'fake_strain_sample_rate', None):
+            rates.append(opt.fake_strain_sample_rate)
+        step = max(1.0 / float(rate) for rate in rates)
+        whole = numpy.ceil(opt.pad_data / step - 1e-9) * step
+        if abs(whole - opt.pad_data) > 1e-9 * step:
+            whole = int(whole) if float(whole).is_integer() else float(whole)
+            logger.info("Padding %s s is not a whole number of %s s "
+                        "samples; using %s s", opt.pad_data, step, whole)
+            opt.pad_data = whole
+
     injector = InjectionSet.from_cli(opt)
 
     if opt.frame_cache or opt.frame_files or opt.frame_type or opt.hdf_store:
