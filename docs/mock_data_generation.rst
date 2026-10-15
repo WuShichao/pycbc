@@ -135,11 +135,13 @@ Signals from the sparse TDI response
 Approximants that carry the detector response in the time domain are
 injected by evaluating each TDI channel directly at the sample times of the
 strain, with no Fourier transform in between. ``TDISparse`` is one: it
-projects a LAL approximant (``tdi_source = lal``) or pyEFPEHM
-(``tdi_source = pyefpehm``) through PyCBC's sparse TDI response, so
-stellar-origin binaries, eccentric or precessing, can be injected with the
-same commands as above. The injection file needs, besides the source
-parameters and ``tc``:
+projects a LAL approximant (``tdi_source = lal``), pyEFPEHM
+(``tdi_source = pyefpehm``) or a galactic binary in LDC's ``gb_fdot`` form
+(``tdi_source = gb``, with ``amplitude``, ``frequency``, ``fdot``,
+``inclination``, ``polarization`` and ``initial_phase``) through PyCBC's
+sparse TDI response, so stellar-origin binaries, eccentric or precessing,
+and double white dwarfs can be injected with the same commands as above.
+The injection file needs, besides the source parameters and ``tc``:
 
 * ``approximant = TDISparse`` and ``tdi_source``;
 * ``tdi_band_edges``, the frequency bands of the response;

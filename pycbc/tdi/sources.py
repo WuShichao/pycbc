@@ -805,6 +805,83 @@ class NewtonianChirp:
         return np.real(amp_p * carrier), np.real(amp_c * carrier)
 
 
+class GalacticBinarySource:
+    r"""A galactic binary as LDC writes it (``gb_fdot``), one harmonic.
+
+    LDC's source-frame polarizations are
+
+        h_+ = -A (1 + cos^2 iota) cos Phi,   h_x = -2 A cos iota sin Phi,
+        Phi(t) = -phi_0 + pi (2 f t + fdot t^2).
+
+    Matching the evaluator's h = Re[A_p e^{i Phi}] gives a real plus
+    amplitude and a purely imaginary cross amplitude, both constant, and the
+    polarization rotation is folded into them here rather than applied by a
+    wrapper.
+
+    Parameters
+    ----------
+    amplitude : float
+        LDC's ``Amplitude``, A.
+    frequency : float
+        GW frequency at t = 0, in Hz.
+    fdot : float
+        Its derivative, in Hz/s.
+    inclination, polarization : float
+        In radians.
+    phase : float
+        LDC's ``InitialPhase``, phi_0.
+    t_start, t_end : float
+        Where the source is defined, on the orbit's clock. It is analytic
+        everywhere; the support only bounds where the sparse grid is built.
+    """
+
+    harmonics = ('gb',)
+
+    def __init__(self, amplitude, frequency, fdot, inclination, polarization,
+                 phase, t_start, t_end):
+        cos_inc = np.cos(float(inclination))
+        angle = 2.0 * float(polarization)
+        cosine, sine = np.cos(angle), np.sin(angle)
+        plus = -float(amplitude) * (1.0 + cos_inc ** 2)
+        cross = 2j * float(amplitude) * cos_inc
+        self._plus = cosine * plus - sine * cross
+        self._cross = sine * plus + cosine * cross
+        self.frequency = float(frequency)
+        self.drift = float(fdot)
+        self.phi0 = float(phase)
+        self.t_start, self.t_end = float(t_start), float(t_end)
+
+    def support(self, harmonic):
+        return self.t_start, self.t_end
+
+    def support_blocks(self, harmonic):
+        return ((self.t_start, self.t_end),)
+
+    def amplitude(self, harmonic, t):
+        shape = np.shape(np.asarray(t, dtype=float))
+        return np.full(shape, self._plus), np.full(shape, self._cross)
+
+    def carrier_phase(self, harmonic, t):
+        t = np.asarray(t, dtype=float)
+        return -self.phi0 + np.pi * (2 * t * self.frequency
+                                     + t * t * self.drift)
+
+    def angular_frequency(self, harmonic, t):
+        t = np.asarray(t, dtype=float)
+        return 2 * np.pi * (self.frequency + t * self.drift)
+
+    def harmonic_components(self, harmonic, t):
+        plus, cross = self.amplitude(harmonic, t)
+        return (plus, cross, self.carrier_phase(harmonic, t),
+                self.angular_frequency(harmonic, t))
+
+    def polarizations(self, t):
+        """Dense-path interface: the real strain at ``t``."""
+        amp_p, amp_c = self.amplitude('gb', t)
+        carrier = np.exp(1j * self.carrier_phase('gb', t))
+        return np.real(amp_p * carrier), np.real(amp_c * carrier)
+
+
 def _windowed_derivative(x, y, window=256, degree=6):
     """``(y_smooth, dy/dx)`` from overlapping polynomial windows.
 

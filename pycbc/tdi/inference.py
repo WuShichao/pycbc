@@ -1055,8 +1055,29 @@ def _pyefpehm(**params):
         shifted, float(params.get('polarization', 0.0)))
 
 
+def _galactic_binary(**params):
+    """LDC's ``gb_fdot`` galactic binary, one harmonic.
+
+    Takes ``amplitude``, ``frequency``, ``fdot``, ``inclination``,
+    ``polarization`` and ``initial_phase`` (LDC's ``InitialPhase``). It is
+    defined over the observation padded by ``tdi_support_padding`` (one day
+    unless given), which covers the arm delays at the segment edges.
+    """
+    from pycbc.tdi.sources import GalacticBinarySource
+    pad = float(params.get('tdi_support_padding', 86400.0))
+    return GalacticBinarySource(
+        amplitude=float(params['amplitude']),
+        frequency=float(params['frequency']), fdot=float(params['fdot']),
+        inclination=float(params['inclination']),
+        polarization=float(params.get('polarization', 0.0)),
+        phase=float(params.get('initial_phase', 0.0)),
+        t_start=float(params['t_obs_start']) - pad,
+        t_end=float(params['t_obs_end']) + pad)
+
+
 register_source('lal', _lal_dominant)
 register_source('pyefpehm', _pyefpehm)
+register_source('gb', _galactic_binary)
 
 
 class RestrictedHarmonicSource:
