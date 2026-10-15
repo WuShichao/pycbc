@@ -20,15 +20,24 @@ def add_custom_waveform(approximant, function, domain,
         equal-spaced grid).
     has_det_response : bool, False
         Check if waveform generator has built-in detector response.
+        In the time domain this is only supported together with
+        ``sequence``: the generator is then evaluated at requested times
+        and returns the detector channels.
     """
     from pycbc.waveform.waveform import (cpu_fd, cpu_td, fd_sequence,
                                          fd_det, fd_det_sequence,
+                                         td_det_sequence,
                                          td_fd_waveform_transform)
 
     used = RuntimeError("Can't load plugin waveform {}, the name is"
                         " already in use.".format(approximant))
 
     if domain == 'time':
+        if sequence and has_det_response:
+            if not force and (approximant in td_det_sequence):
+                raise used
+            td_det_sequence[approximant] = function
+            return
         if not force and (approximant in cpu_td):
             raise used
         cpu_td[approximant] = function
@@ -168,6 +177,11 @@ def retrieve_waveform_plugins():
     # Check for td waveforms
     for plugin in entry_points(group='pycbc.waveform.td'):
         add_custom_waveform(plugin.name, plugin.load(), 'time')
+
+    # Check for td sequence waveforms (has detector response)
+    for plugin in entry_points(group='pycbc.waveform.td_det_sequence'):
+        add_custom_waveform(plugin.name, plugin.load(), 'time',
+                            sequence=True, has_det_response=True)
 
     # Check for mode-by-mode fd waveforms (feed get_fd_waveform_modes)
     for plugin in entry_points(group='pycbc.waveform.fd_modes'):

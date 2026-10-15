@@ -893,11 +893,98 @@ sparse_tdi_fd_det_sequence.required = (
     't_obs_start', 't_obs_end', 'eclipticlongitude', 'eclipticlatitude')
 
 
+def _channel(name):
+    """``LISA_A`` -> ``A``: PyCBC's space detectors prefix the TDI channel."""
+    return str(name).rsplit('_', 1)[-1]
+
+
+def sparse_tdi_td_det_sequence(**params):
+    """TDI channels at requested times, for ``td_det_sequence``.
+
+    The sparse response is a time-domain object: every band is evaluated at
+    the mission times asked for, which is what an injection into a strain
+    series needs. Going through `sparse_tdi_fd_det_sequence` instead would
+    mean sampling a whole rfft grid and transforming back, with the wrap
+    and the edge taper that brings, to recover numbers this has directly.
+
+    ``ifos`` may name the channels either way, ``A`` or ``LISA_A``; the
+    returned keys are the names asked for. ``t_obs_start`` and
+    ``t_obs_end`` default to the first and last sample time, so an injection
+    covers the strain it is added to unless the caller says otherwise.
+
+    Returns
+    -------
+    dict
+        Name to `Array` of the real channel at ``sample_times``.
+    """
+    requested = params['ifos']
+    if isinstance(requested, str):
+        requested = (requested,)
+    requested = tuple(requested)
+    times = np.asarray(params['sample_times'], dtype=float)
+    params = dict(params)
+    if params.get('t_obs_start') is None:
+        params['t_obs_start'] = float(times[0])
+    if params.get('t_obs_end') is None:
+        params['t_obs_end'] = float(times[-1])
+    served = tuple(dict.fromkeys(_channel(name) for name in requested))
+
+    def zeros():
+        return {name: Array(np.zeros(len(times))) for name in requested}
+
+    # The same two empty cases as the frequency-domain generator: a harmonic
+    # the candidate lacks, and a harmonic with no support in the band.
+    label = _label(params.get('tdi_harmonic'))
+    if label is not None:
+        if label not in set(_build_source(params).harmonics):
+            logging.info("tdi: candidate does not carry harmonic %s; it "
+                         "contributes zero", (label,))
+            return zeros()
+    orbit = LisaEqualArmOrbit(
+        armlength=float(params.get('tdi_arm_length', DEFAULT_ARM)), t0=0.0)
+    terms = channel_terms(
+        served, generation=int(params.get('tdi_generation', 2)),
+        delta_t=float(params.get('tdi_delta_t', 5.0)))
+    try:
+        prepared = _preparation(params, terms, orbit)
+    except ValueError as error:
+        if 'at least one live band' not in str(error):
+            raise
+        logging.info("tdi: harmonic %s has no support in the requested band; "
+                     "returning zeros", params.get('tdi_harmonic'))
+        return zeros()
+
+    _begin_candidate(params)
+    response = _projection(params, prepared)
+    values = response.sample(times, channels=served)
+    window = _analysis_time_window(params)
+    taper = 1.0 if window is None else window(times)
+    return {name: Array(np.asarray(values[_channel(name)], dtype=float) * taper)
+            for name in requested}
+
+
+sparse_tdi_td_det_sequence.required = (
+    'approximant', 'tdi_source', 'tdi_band_edges', 'sample_times', 'ifos',
+    'eclipticlongitude', 'eclipticlatitude')
+
+
 def register(approximant='TDISparse', force=False):
-    """Add the generator to PyCBC's detector-response sequence registry."""
+    """Add the generators to PyCBC's detector-response sequence registries.
+
+    The frequency-domain one serves likelihoods (`Relative` asks for
+    channels at chosen frequencies); the time-domain one serves injections
+    into strain.
+    """
     from pycbc.waveform.plugin import add_custom_waveform
-    add_custom_waveform(approximant, sparse_tdi_fd_det_sequence, 'frequency',
-                        sequence=True, has_det_response=True, force=force)
+    from pycbc.waveform.waveform import fd_det_sequence, td_det_sequence
+    for registry, generator, domain in (
+            (fd_det_sequence, sparse_tdi_fd_det_sequence, 'frequency'),
+            (td_det_sequence, sparse_tdi_td_det_sequence, 'time')):
+        # `pycbc.waveform` registers TDISparse lazily; replacing that is not a
+        # name clash
+        lazy = getattr(registry.get(approximant), 'lazy_sparse_tdi', False)
+        add_custom_waveform(approximant, generator, domain, sequence=True,
+                            has_det_response=True, force=force or lazy)
     return approximant
 
 

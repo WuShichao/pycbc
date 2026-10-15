@@ -498,6 +498,34 @@ def props_sgburst(obj, **kwargs):
 fd_sequence = {}
 fd_det_sequence = {}
 fd_det = {}
+td_det_sequence = {}
+
+
+def _sparse_tdi(name, required):
+    """A sparse TDI generator that imports its module on first use.
+
+    `pycbc.tdi.inference` needs the optional PyTDI backend, so importing it
+    with `pycbc.waveform` would break every installation without it. This
+    keeps ``TDISparse`` known to tools that never call
+    `pycbc.tdi.inference.register` -- `pycbc_condition_strain`, for one --
+    and costs nothing until it is asked for.
+    """
+    def generator(**params):
+        from pycbc.tdi import inference
+        return getattr(inference, name)(**params)
+    generator.required = required
+    generator.lazy_sparse_tdi = True
+    return generator
+
+
+fd_det_sequence['TDISparse'] = _sparse_tdi(
+    'sparse_tdi_fd_det_sequence',
+    ('approximant', 'tdi_source', 'tdi_band_edges', 'tdi_delta_f',
+     't_obs_start', 't_obs_end', 'eclipticlongitude', 'eclipticlatitude'))
+td_det_sequence['TDISparse'] = _sparse_tdi(
+    'sparse_tdi_td_det_sequence',
+    ('approximant', 'tdi_source', 'tdi_band_edges', 'sample_times', 'ifos',
+     'eclipticlongitude', 'eclipticlatitude'))
 
 def _lalsim_fd_sequence(**p):
     """ Shim to interface to lalsimulation SimInspiralChooseFDWaveformSequence
@@ -587,6 +615,44 @@ def get_fd_det_waveform_sequence(template=None, **kwds):
         required = wav_gen.required
     else:
         required = parameters.fd_det_sequence_required
+    check_args(input_params, required)
+    return wav_gen(**input_params)
+
+def get_td_det_waveform_sequence(template=None, **kwds):
+    """Return a waveform with detector response evaluated at a sequence of
+    times.
+
+    The time-domain counterpart of `get_fd_det_waveform_sequence`, for
+    generators whose response is native to time -- the sparse TDI response,
+    for one, samples each channel directly at mission times. Nothing is
+    transformed, so there is no wrap-around and no padding to choose.
+
+    Parameters
+    ----------
+    template: object
+        An object that has attached properties. This can be used to substitute
+        for keyword arguments. A common example would be a row in an xml table.
+    sample_times: array
+        The times at which to evaluate the channels, on the generator's
+        clock.
+    ifos: str or sequence of str
+        The data channels to return.
+
+    Returns
+    -------
+    dict
+        Channel name to an `Array` of the detector-frame strain at
+        ``sample_times``.
+    """
+    input_params = props(template, **kwds)
+    if input_params['approximant'] not in td_det_sequence:
+        raise ValueError("Approximant %s not available" %
+                            (input_params['approximant']))
+    wav_gen = td_det_sequence[input_params['approximant']]
+    if hasattr(wav_gen, 'required'):
+        required = wav_gen.required
+    else:
+        required = ('approximant', 'sample_times', 'ifos')
     check_args(input_params, required)
     return wav_gen(**input_params)
 
@@ -1443,6 +1509,7 @@ def get_waveform_filter_length_in_time(approximant, template=None, **kwargs):
 __all__ = ["get_td_waveform", "get_td_det_waveform_from_fd_det",
            "get_fd_waveform", "get_fd_waveform_sequence",
            "get_fd_det_waveform", "get_fd_det_waveform_sequence",
+           "get_td_det_waveform_sequence",
            "get_fd_waveform_from_td",
            "print_td_approximants", "print_fd_approximants",
            "td_approximants", "fd_approximants",
@@ -1454,4 +1521,5 @@ __all__ = ["get_td_waveform", "get_td_det_waveform_from_fd_det",
            "td_waveform_to_fd_waveform", "get_two_pol_waveform_filter",
            "NoWaveformError", "FailedWaveformError", "get_td_waveform_from_fd",
            'cpu_fd', 'cpu_td', 'fd_sequence', 'fd_det_sequence', 'fd_det',
+           'td_det_sequence',
            '_filter_time_lengths']

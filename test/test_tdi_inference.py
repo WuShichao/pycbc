@@ -424,3 +424,14 @@ def test_the_tolerance_reaches_the_preparation_and_its_key(monkeypatch):
     with pytest.raises(ValueError, match='tdi_relative_tolerance'):
         inference._preparation(dict(params, tdi_relative_tolerance=0.0),
                                terms, orbit)
+
+
+def test_registration_also_serves_injections():
+    """Injections into strain ask the time-domain registry."""
+    from pycbc.tdi.inference import _channel, sparse_tdi_td_det_sequence
+    from pycbc.waveform.waveform import td_det_sequence
+    name = register(approximant='TDISparseTest', force=True)
+    assert td_det_sequence[name] is sparse_tdi_td_det_sequence
+    assert 'sample_times' in sparse_tdi_td_det_sequence.required
+    assert _channel('LISA_A') == 'A'
+    assert _channel('E') == 'E'
