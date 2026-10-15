@@ -36,8 +36,9 @@ from igwn_ligolw import utils as ligolw_utils, ligolw, lsctables
 
 from pycbc import waveform, frame, libutils
 from pycbc.opt import LimitedSizeDict
-from pycbc.waveform import (get_td_waveform, fd_det,
-                            get_td_det_waveform_from_fd_det)
+from pycbc.waveform import (get_td_waveform, fd_det, td_det_sequence,
+                            get_td_det_waveform_from_fd_det,
+                            get_td_det_waveform_sequence)
 from pycbc.waveform import utils as wfutils
 from pycbc.waveform import ringdown_td_approximants
 from pycbc.types import float64, float32, TimeSeries, load_timeseries
@@ -593,7 +594,8 @@ class CBCHDFInjectionSet(_HDFInjectionSet):
             raise TypeError("Strain dtype must be float32 or float64, not " \
                     + str(strain.dtype))
 
-        if self.table[0]['approximant'] in fd_det:
+        approximant = self.table[0]['approximant']
+        if approximant in fd_det or approximant in td_det_sequence:
             t0 = float(strain.start_time)
             t1 = float(strain.end_time)
         else:
@@ -616,18 +618,29 @@ class CBCHDFInjectionSet(_HDFInjectionSet):
         if simulation_ids:
             injections = injections[list(simulation_ids)]
 
+        # A time-domain detector-response generator is evaluated on the
+        # strain's own sample times; it returns zeros where the source has no
+        # support, so the overlap estimate below is not needed for it.
+        sample_times = None
+        if approximant in td_det_sequence:
+            n_samples = int(round(float(strain.duration) / delta_t))
+            sample_times = float(strain.start_time) + \
+                np.arange(n_samples) * delta_t
+
         injected_ids = []
         for ii, inj in enumerate(injections):
             f_l = inj.f_lower if f_lower is None else f_lower
-            # roughly estimate if the injection may overlap with the segment
-            # Add 2s to end_time to account for ringdown and light-travel delay
-            end_time = inj.tc + 2
-            inj_length = tau0_from_mass1_mass2(inj.mass1, inj.mass2, f_l)
-            # Start time is taken as twice approx waveform length with a 1s
-            # safety buffer
-            start_time = inj.tc - 2 * (inj_length + 1)
-            if end_time < t0 or start_time > t1:
-                continue
+            if sample_times is None:
+                # roughly estimate if the injection may overlap with the
+                # segment. Add 2s to end_time to account for ringdown and
+                # light-travel delay
+                end_time = inj.tc + 2
+                inj_length = tau0_from_mass1_mass2(inj.mass1, inj.mass2, f_l)
+                # Start time is taken as twice approx waveform length with a
+                # 1s safety buffer
+                start_time = inj.tc - 2 * (inj_length + 1)
+                if end_time < t0 or start_time > t1:
+                    continue
             if must_make_injections:
                 signal = self.make_strain_from_inj_object(
                     inj,
@@ -635,6 +648,7 @@ class CBCHDFInjectionSet(_HDFInjectionSet):
                     detector_name,
                     f_lower=f_l,
                     distance_scale=distance_scale,
+                    sample_times=sample_times,
                 )
                 signal = resample_to_delta_t(
                     signal,
@@ -670,7 +684,8 @@ class CBCHDFInjectionSet(_HDFInjectionSet):
         return injected
 
     def make_strain_from_inj_object(self, inj, delta_t, detector_name,
-                                    f_lower=None, distance_scale=1):
+                                    f_lower=None, distance_scale=1,
+                                    sample_times=None):
         """Make a h(t) strain time-series from an injection object.
 
         Parameters
@@ -689,6 +704,10 @@ class CBCHDFInjectionSet(_HDFInjectionSet):
         distance_scale: {1, float}, optional
             Factor to scale the distance of an injection with. The default is
             no scaling.
+        sample_times: {None, array}, optional
+            Times at which a time-domain detector-response approximant is
+            evaluated, spaced by ``delta_t``. Required for those, ignored
+            otherwise.
 
         Returns
         --------
@@ -700,7 +719,18 @@ class CBCHDFInjectionSet(_HDFInjectionSet):
         else:
             f_l = f_lower
 
-        if inj['approximant'] in fd_det:
+        if inj['approximant'] in td_det_sequence:
+            if sample_times is None:
+                raise ValueError("Approximant %s is evaluated at given times; "
+                                 "provide sample_times" % inj['approximant'])
+            channels = get_td_det_waveform_sequence(
+                inj, sample_times=sample_times, ifos=detector_name,
+                **self.extra_args)
+            strain = TimeSeries(np.asarray(channels[detector_name]),
+                                delta_t=delta_t,
+                                epoch=float(sample_times[0]))
+            strain /= distance_scale
+        elif inj['approximant'] in fd_det:
             strain = get_td_det_waveform_from_fd_det(
                         inj, delta_t=delta_t, f_lower=f_l,
                         ifos=detector_name, **self.extra_args)[detector_name]
@@ -724,6 +754,7 @@ class CBCHDFInjectionSet(_HDFInjectionSet):
             for key in d:
                 all_apprxs.extend(d[key])
         all_apprxs.extend(waveform.waveform.fd_det)
+        all_apprxs.extend(waveform.waveform.td_det_sequence)
         return list(set(all_apprxs))
 
 

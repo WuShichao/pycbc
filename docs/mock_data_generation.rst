@@ -124,6 +124,33 @@ signal-only datasets for the LISA TDI channels A, E, and T.
    2. **BBHx waveform plugin**  
       https://github.com/gwastro/BBHX-waveform-model
 
+   BBHx is needed only for its approximants. Signals from the native sparse
+   TDI response (``approximant = TDISparse``) need PyTDI instead, and are
+   described below.
+
+---------------------------------------------------------
+Signals from the sparse TDI response
+---------------------------------------------------------
+
+Approximants that carry the detector response in the time domain are
+injected by evaluating each TDI channel directly at the sample times of the
+strain, with no Fourier transform in between. ``TDISparse`` is one: it
+projects a LAL approximant (``tdi_source = lal``) or pyEFPEHM
+(``tdi_source = pyefpehm``) through PyCBC's sparse TDI response, so
+stellar-origin binaries, eccentric or precessing, can be injected with the
+same commands as above. The injection file needs, besides the source
+parameters and ``tc``:
+
+* ``approximant = TDISparse`` and ``tdi_source``;
+* ``tdi_band_edges``, the frequency bands of the response;
+* ``eclipticlongitude`` and ``eclipticlatitude``.
+
+``t_obs_start`` and ``t_obs_end`` default to the span of the strain being
+generated, and the channel is taken from the detector name (``LISA_A`` is
+TDI channel ``A``). Other approximants with a time-domain detector response
+can be registered through the ``pycbc.waveform.td_det_sequence`` entry point
+group.
+
 ---------------------------------------------------------
 Noise-only LISA mock data
 ---------------------------------------------------------
