@@ -562,6 +562,7 @@ def create_multidim_plot(parameters, samples, labels=None,
                          marginal_title=True, marginal_linestyle='-',
                          zvals=None, show_colorbar=True, cbar_label=None,
                          vmin=None, vmax=None, scatter_cmap='plasma',
+                         scatter_markersize=5,
                          scatter_log_cmap=False, log_parameters=None,
                          plot_density=False, plot_contours=True,
                          density_cmap='viridis',
@@ -632,6 +633,11 @@ def create_multidim_plot(parameters, samples, labels=None,
         zvals.
     scatter_cmap : {'plasma', string}
         The color map to use for the scatter points. Default is 'plasma'.
+    scatter_markersize : {5, float}
+        The marker area in points squared passed to ``scatter`` as ``s``.  The
+        default of 5 is the value this function has always used; a dense
+        posterior (hundreds of thousands of draws) needs a smaller marker so
+        that the points do not merge into a solid block.
     scatter_log_cmap : boolean
         Should the scatter point coloring be on a log scale? Default False
     log_parameters : list or None
@@ -779,7 +785,8 @@ def create_multidim_plot(parameters, samples, labels=None,
             else:
                 cmap_norm = colors.Normalize(vmin=vmin, vmax=vmax)
 
-            plt = ax.scatter(x=samples[px], y=samples[py], c=zvals, s=5,
+            plt = ax.scatter(x=samples[px], y=samples[py], c=zvals,
+                             s=scatter_markersize,
                              edgecolors='none', norm=cmap_norm,
                              cmap=scatter_cmap, alpha=alpha, zorder=2)
 

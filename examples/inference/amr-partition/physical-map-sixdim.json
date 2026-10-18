@@ -1,0 +1,153 @@
+{
+ "what": "Exact projection from the AMR shape coordinates eta to PyCBC's physical parameters, with the two sky directions switched on, for the reduced-patch SSB template family in the companion repository.  xi = E diag(1/sqrt(lam)) eta and p = p_ref + sigma_p xi_p, where xi is the offset from the reference point in the research's shape units (multiples of sigma) and eta is the chart the sampler refines in.  The six columns are all sampled in amr-sixdim.ini; eta_4 and eta_5 are constant in the stored partition, so the six-column file is rank four and the two sky columns below are the chart image of the four refined directions.  See notes/2026/10/2026-10-18-six-dimensional-posterior.md.",
+ "geometry": {
+  "file": "/mnt/d/lisa_tests_with_cc/results/2026-10-15/ssb_search/geometry.json",
+  "md5": "fa77251b99986bb2a61650696c3d777d",
+  "note": "The geometry the sampler actually used: its first-level widths reproduce results/2026-10-18/amr_sampler/validate.json and the map reproduces the recorded injection.  The files under results/2026-10-16/adaptive_refs/windowed_amr/ and results/2026-10-17/ hold a different windowed metric (lam_0 = 4.05e-4, stiff = 0 1 2) and do not reproduce it.",
+  "lam": [
+   0.0033457762619004197,
+   0.0005164128220343864,
+   0.00044058178208447455,
+   0.00027227443245691487,
+   3.78914527516739e-09,
+   8.109531549539056e-13
+  ],
+  "E": [
+   [
+    -0.8098735686542875,
+    -0.03799959356582476,
+    -0.02354454428913621,
+    -0.04682420909255478,
+    0.5830209773698979,
+    -0.0007221549171855275
+   ],
+   [
+    -0.5741727160219119,
+    -0.0955602211079478,
+    -0.08758467103100467,
+    0.14092864201774558,
+    -0.796027624445919,
+    0.001414459696633822
+   ],
+   [
+    -0.06521786603404146,
+    0.23002610742102444,
+    0.24294426488030893,
+    -0.6086070467580912,
+    -0.11379347467548394,
+    0.7074328319877006
+   ],
+   [
+    -0.06559994636050093,
+    0.2300884557646217,
+    0.24301804662579685,
+    -0.6088395455086916,
+    -0.11608755480484198,
+    -0.7067787956777818
+   ],
+   [
+    0.01271382330206808,
+    -0.71049518843568,
+    0.7035038882916453,
+    0.010808653554528359,
+    0.0006309302126020429,
+    -8.55994917712379e-07
+   ],
+   [
+    -0.07557863888493851,
+    0.6154414307381026,
+    0.6154487567369783,
+    0.48656104937756106,
+    -0.0009421960602182451,
+    1.198113133974524e-06
+   ]
+  ]
+ },
+ "eta_columns": [
+  0,
+  1,
+  2,
+  3,
+  4,
+  5
+ ],
+ "eta_static": {},
+ "reference_file": "/mnt/d/lisa_tests_with_cc/results/2026-10-04/stage1/predictions/middle.json",
+ "scale_file": "/mnt/d/lisa_tests_with_cc/results/2026-10-04/cell/phase1.json",
+ "parameters": [
+  {
+   "name": "mchirp",
+   "xi_index": 0,
+   "kind": "identity",
+   "reference": 31.831389387890596,
+   "scale": 7.5192646323511136e-06,
+   "units": "Msun",
+   "convention": "Chirp mass (m1 m2)^(3/5)/(m1+m2)^(1/5) in solar masses; the same quantity in the project and in PyCBC (pycbc.waveform.parameters.mchirp, pycbc.conversions.mchirp_from_mass1_mass2)."
+  },
+  {
+   "name": "q",
+   "xi_index": 1,
+   "kind": "reciprocal",
+   "reference": 0.48281911542435463,
+   "scale": 0.002031360113305413,
+   "units": "dimensionless",
+   "convention": "The project's linear coordinate is q_proj = m2/m1 <= 1 (experiments/ratio_cells/coordinates.py); PyCBC's q is m1/m2 >= 1 (pycbc.waveform.parameters.q, pycbc.conversions.q_from_mass1_mass2).  kind = reciprocal stores 1/(q_ref + sigma xi), i.e. PyCBC's q."
+  },
+  {
+   "name": "spin1z",
+   "xi_index": 2,
+   "kind": "identity",
+   "reference": -0.1493668476836033,
+   "scale": 0.003328712548697416,
+   "units": "dimensionless",
+   "convention": "z component of the first component's dimensionless spin; the same in the project and in PyCBC (pycbc.waveform.parameters.spin1z)."
+  },
+  {
+   "name": "spin2z",
+   "xi_index": 3,
+   "kind": "identity",
+   "reference": -0.7820976081717529,
+   "scale": 0.007929074204399622,
+   "units": "dimensionless",
+   "convention": "z component of the second component's dimensionless spin; the same in the project and in PyCBC (pycbc.waveform.parameters.spin2z)."
+  },
+  {
+   "name": "eclipticlongitude",
+   "xi_index": 4,
+   "kind": "identity",
+   "reference": 3.5763564997428436,
+   "scale": 0.0011220029412220653,
+   "units": "rad",
+   "convention": "Ecliptic longitude of the source, the coordinate the research family moves with xi_4 in its linear response exponent R ~ R0 exp(xi_4 L_0 + xi_5 L_1).  The patch centre is 3.5763564997 rad; the prior half-width is 0.015 rad."
+  },
+  {
+   "name": "eclipticlatitude",
+   "xi_index": 5,
+   "kind": "identity",
+   "reference": 0.3429283438977949,
+   "scale": 0.0023231311178311103,
+   "units": "rad",
+   "convention": "Ecliptic latitude of the source; xi_5 is the second sky shape unit of the linear response exponent.  The patch centre is 0.3429283439 rad; the prior half-width is 0.015 rad."
+  }
+ ],
+ "injection": {
+  "xi": [
+   3.0,
+   -2.0,
+   1.5,
+   -1.0,
+   0.0,
+   0.0
+  ],
+  "eta": [
+   -0.07597649036819468,
+   0.004364790431613383,
+   0.004742364969953559,
+   -0.01198615324186687,
+   0.00020230486007902216,
+   1.5875726457617145e-06
+  ],
+  "rho": 16.0,
+  "note": "Recorded by results/2026-10-18/amr_sampler/amr_sampler.py: xi_int = [3, -2, 1.5, -1] in shape units and eta = sqrt(lam) (E^T xi) from the same geometry.  The map is checked against this pair on load; the round trip returns xi to 9e-16.  The fifth and sixth eta components are small but their 1/sqrt(lam) is 1.6e4 and 1.1e6, so they carry order-unity contributions to xi and must not be dropped."
+ }
+}

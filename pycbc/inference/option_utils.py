@@ -310,6 +310,12 @@ def add_scatter_option_group(parser):
     scatter_group.add_argument(
         "--scatter-cmap", type=str, default='plasma',
         help="Specify the colormap to use for points. Default is plasma.")
+    scatter_group.add_argument(
+        "--scatter-markersize", type=float, default=5,
+        help="Marker area in points squared for the scatter points (the "
+             "matplotlib 's' argument). Default is 5. Use a smaller value, "
+             "e.g. 0.3, when plotting hundreds of thousands of draws so the "
+             "points show density instead of forming a solid block.")
 
     return scatter_group
 

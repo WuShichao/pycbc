@@ -143,15 +143,26 @@ samples = samples if isinstance(samples, list) else [samples]
 # if a z-arg is specified, load samples for it
 if opts.z_arg is not None:
     logging.info("Getting samples for colorbar")
-    z_arg = 'loglikelihood' if opts.z_arg == 'snr' else opts.z_arg
+    z_arg = opts.z_arg
     zlbl = opts.z_arg_labels[opts.z_arg]
     zvals = []
     for fp in fps:
-        zsamples = fp.samples_from_cli(opts, parameters=z_arg)
-        if opts.z_arg == 'snr':
-            loglr = zsamples[z_arg] - zsamples.lognl
-            zsamples[z_arg] = conversions.snr_from_loglr(loglr)
-        zvals.append(zsamples[z_arg])
+        # Prefer an ``snr`` that the file stores explicitly (the AMR adapter
+        # writes one per cell); only derive it from loglikelihood - lognl
+        # for files that do not have it.  A text file has no samples group,
+        # so the lookup is guarded.
+        try:
+            stored_snr = z_arg == 'snr' and 'snr' in fp[fp.samples_group]
+        except (AttributeError, KeyError, TypeError):
+            stored_snr = False
+        if z_arg == 'snr' and not stored_snr:
+            zsamples = fp.samples_from_cli(opts, parameters='loglikelihood')
+            loglr = zsamples['loglikelihood'] - zsamples.lognl
+            zsamples['loglikelihood'] = conversions.snr_from_loglr(loglr)
+            zvals.append(zsamples['loglikelihood'])
+        else:
+            zsamples = fp.samples_from_cli(opts, parameters=z_arg)
+            zvals.append(zsamples[z_arg])
 else:
     zvals = None
     zlbl = None
@@ -328,6 +339,7 @@ for (i, s) in enumerate(samples):
                     cbar_label=zlbl,
                     vmin=opts.vmin, vmax=opts.vmax,
                     scatter_cmap=opts.scatter_cmap,
+                    scatter_markersize=opts.scatter_markersize,
                     plot_density=opts.plot_density,
                     plot_contours=opts.plot_contours,
                     contour_percentiles=opts.contour_percentiles,

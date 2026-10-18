@@ -28,6 +28,7 @@ from .refine import RefineSampler
 from .snowline import SnowlineSampler
 from .nautilus import NautilusSampler
 from .games import GameSampler
+from .amr import AmrSampler
 
 # list of available samplers
 samplers = {cls.name: cls for cls in (
@@ -38,6 +39,7 @@ samplers = {cls.name: cls for cls in (
     SnowlineSampler,
     NautilusSampler,
     GameSampler,
+    AmrSampler,
 )}
 
 try:
