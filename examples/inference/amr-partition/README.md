@@ -37,12 +37,29 @@ PYTHONPATH=/home/nightwing/src/pycbc \
     --output-file /tmp/amr.hdf --force --verbose
 ```
 
-This takes about a second: the physics already ran.  It writes 33,065 weighted
-cells (refinement level 6) and `log_evidence = 111.8022`, the Riemann sum over
-the covered partition (see the note listed below for the constant offset to
-the evidence normalised by the exact prior ellipsoid).
+This takes about half a minute: the physics already ran, and the only new work
+is reading the archived sufficient statistics and building the amplitude
+marginal.  It writes 33,065 weighted cells (refinement level 6) and the Riemann
+sum evidence over the covered partition (see the note listed below for the
+constant offset to the evidence normalised by the exact prior ellipsoid).
 
-To run the research AMR live instead, set `enable-research = true` and point
+The demo config also sets `sufficient-file`, so the file holds the restored
+columns `inclination`, `polarization` and `delta_tc` beside the `eta` and
+physical columns.  With `amplitude-ceiling = 5` (the registered value) the
+stored cell Bayes factors are used unchanged; with the default `20` they are
+recomputed from the archive at the wider prior ceiling.  The two files are
+directly comparable:
+
+```bash
+PYTHONPATH=/home/nightwing/src/pycbc \
+  python bin/inference/pycbc_inference \
+    --config-file examples/inference/amr-partition/amr.ini \
+    --config-overrides sampler-amr:amplitude-ceiling:5 \
+    --output-file /tmp/amr_ceiling5.hdf --force
+```
+
+To run the research AMR live instead, set `enable-research = true`, remove
+`sufficient-file` (the live path produces no archive to restore from), and point
 `amr-root` at the companion repository.  That path needs `cupy`, a CUDA GPU and
 about five minutes, and it loads the research implementation by file path
 rather than copying it.
@@ -76,11 +93,14 @@ exact projection,
 xi = E diag(1/sqrt(lam)) eta ,     p = p_ref + sigma_p xi_p ,
 ```
 
-and the adapter writes `mchirp`, `q`, `spin1z` and `spin2z` beside the `eta`
-columns.  The map carries the geometry (`lam`, `E`), the four reference values,
-the four shape scales and the recorded injection; on load it is checked by
-requiring `E diag(1/sqrt(lam)) eta_injection` to return the recorded
-`xi_injection`, and by re-reading the geometry file it names.
+and the adapter writes `mchirp`, `q`, `spin1z`, `spin2z`,
+`eclipticlongitude` and `eclipticlatitude` beside the `eta` columns.  The map
+carries the geometry (`lam`, `E`), the reference values, the shape scales and
+the recorded injection; on load it is checked by requiring
+`E diag(1/sqrt(lam)) eta_injection` to return the recorded `xi_injection`, and
+by re-reading the geometry file it names.  The two sky columns are the chart
+image of the four refined coordinates, not independent sky measurements: the
+partition holds one cell across the sky.
 
 `q` is the one convention that differs from the research chart, which uses
 `q_proj = m2/m1 <= 1`: PyCBC's `q` is `m1/m2 >= 1`, so the stored column is
@@ -101,12 +121,55 @@ PYTHONPATH=/home/nightwing/src/pycbc \
                           spin1z:-0.14437378 spin2z:-0.79002668
 ```
 
+## Recovered columns
+
+The orientation (16 Gauss-Legendre nodes in `cos(iota)` times 8 in
+`polarization`) and the arrival time (the lag grid) are enumerated inside the
+cell Bayes factor and then reduced to a scalar.  With `sufficient-file`, the
+adapter restores them from the archived `(D, Gram)` as ordinary samples columns:
+
+| column | units | meaning |
+|---|---|---|
+| `inclination` | rad | `arccos(cos iota)` of a drawn orientation node |
+| `polarization` | rad | `psi` of the same node, on `[0, pi/2)` |
+| `delta_tc` | s | the cell's strongest arrival-time lag |
+
+`inclination` and `polarization` are one conditional draw per cell from that
+cell's own 128-node orientation posterior (the same conditional restoration
+`DistMarg.reconstruct` does for a distance); `delta_tc` is the cell's peak lag.
+They are **not sampled dimensions**: they do not enter the prior, the evidence
+or the cell weight.  The names are PyCBC's own, so the plotter labels them
+without a `--labels` option.
+
+The amplitude marginal is the one genuine integral.  Its prior ceiling is an
+option: the registered `5` truncates this injection's likelihood (mode near
+`u = 7.15`), and the default `20` contains it.  The file records
+`amr_amplitude_ceiling`, `amr_amplitude_prior`, `amr_recovered_kind` and the
+peak-lag residual.
+
+The full posterior, in two readable corners:
+
+```bash
+PYTHONPATH=/home/nightwing/src/pycbc \
+  python bin/inference/pycbc_inference_plot_posterior \
+    --input-file /tmp/amr.hdf \
+    --output-file /tmp/amr_demarg_intrinsic.png \
+    --parameters mchirp q spin1z spin2z inclination polarization delta_tc \
+    --plot-marginal --plot-scatter --plot-contours \
+    --contour-percentiles 68 90 95 --z-arg snr:SNR \
+    --expected-parameters mchirp:31.83141195 q:2.08874494 \
+                          spin1z:-0.14437378 spin2z:-0.79002668 \
+                          inclination:1.0 polarization:0.7 delta_tc:0.0
+```
+
 ## Prior
 
 The four stiff eta coordinates have a flat prior over the ellipsoid
 `eta^T M eta <= 1`; `amr.ini` expresses it as uniform boxes plus the
-`[constraint-region]` quadratic.  The amplitude/orientation prior and the
-arrival-time prior are integrated inside the Bayes factor and have no sample
-column, so they cannot be written as `pycbc.distributions` priors.  The note
+`[constraint-region]` quadratic.  The amplitude and orientation priors are
+inside the Bayes factor, and the arrival-time prior is the lag grid, so none of
+them can be written as a `pycbc.distributions` prior on the samples.  What the
+restored columns carry is the conditional posterior under those priors, not a
+new prior dimension.  The note
 `notes/2026/10/2026-10-18-amr-sampler-pycbc-integration.md` in the research
 repository has the full mapping.

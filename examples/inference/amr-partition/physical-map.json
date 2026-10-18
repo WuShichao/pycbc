@@ -111,6 +111,24 @@
    "scale": 0.007929074204399622,
    "units": "dimensionless",
    "convention": "z component of the second component's dimensionless spin; the same in the project and in PyCBC (pycbc.waveform.parameters.spin2z)."
+  },
+  {
+   "name": "eclipticlongitude",
+   "xi_index": 4,
+   "kind": "identity",
+   "reference": 3.5763564997428436,
+   "scale": 0.0011220029412220653,
+   "units": "rad",
+   "convention": "SSB/LISA ecliptic longitude, the same parameter pycbc.waveform.parameters.eclipticlongitude describes.  The chart's fifth shape coordinate is the longitude offset in sigma, xi_4 = (lambda - lambda_ref)/sigma_lambda, so the column is lambda_ref + sigma_lambda xi_4.  The partition holds one cell across the sky, so this column is the chart image of the four refined coordinates, not an independent sky measurement."
+  },
+  {
+   "name": "eclipticlatitude",
+   "xi_index": 5,
+   "kind": "identity",
+   "reference": 0.3429283438977949,
+   "scale": 0.0023231311178311103,
+   "units": "rad",
+   "convention": "SSB/LISA ecliptic latitude, the same parameter pycbc.waveform.parameters.eclipticlatitude describes; xi_5 = (beta - beta_ref)/sigma_beta.  Like the longitude column it is the chart image of the refined coordinates, not a sampled sky dimension."
   }
  ],
  "injection": {
@@ -131,6 +149,13 @@
    1.5875726457617145e-06
   ],
   "rho": 16.0,
-  "note": "Recorded by results/2026-10-18/amr_sampler/amr_sampler.py: xi_int = [3, -2, 1.5, -1] in shape units and eta = sqrt(lam) (E^T xi) from the same geometry.  The map is checked against this pair on load; the round trip returns xi to 9e-16.  The fifth and sixth eta components are small but their 1/sqrt(lam) is 1.6e4 and 1.1e6, so they carry order-unity contributions to xi and must not be dropped."
+  "orientation": {
+   "inclination": 1.0,
+   "polarization": 0.7,
+   "coa_phase": 0.3,
+   "delta_tc": 0.0,
+   "note": "The research prototype's fixed_signal orientation, recorded in results/2026-10-18/amr_sampler/validate.json.  Not the LAL ini's 1.2870182448496255, 0.5011808775099882, 2.2688697243830247."
+  },
+  "note": "Recorded by results/2026-10-18/amr_sampler/amr_sampler.py: xi_int = [3, -2, 1.5, -1] in shape units and eta = sqrt(lam) (E^T xi) from the same geometry.  The map is checked against this pair on load; the round trip returns xi to 9e-16.  The fifth and sixth eta components are small but their 1/sqrt(lam) is 1.6e4 and 1.1e6, so they carry order-unity contributions to xi and must not be dropped.  The six xi components are (mchirp, q, spin1z, spin2z, eclipticlongitude, eclipticlatitude), the order ssb_family.INTRINSIC and the chart use."
  }
 }

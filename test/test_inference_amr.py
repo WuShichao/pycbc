@@ -372,3 +372,57 @@ def test_a_map_that_disagrees_with_eta_columns_is_refused(tmp_path):
     with pytest.raises(ValueError, match="eta columns"):
         AmrSampler.from_config(
             cp, make_model(), output_file=str(tmp_path / "amr.hdf"))
+
+
+def test_unrefined_columns_are_recorded_as_a_rank_deficiency(tmp_path):
+    """A six-column partition that only subdivides four of them is rank four.
+
+    The research covering grid refines only the stiff directions and leaves
+    one cell across the others, so a six-column file can be a four-dimensional
+    posterior.  The adapter must say so, in the sampler and in the file,
+    rather than letting a reader take the column count as the dimension.
+    """
+    eta = numpy.zeros((4, 6))
+    eta[:, 0] = [0.0, 1.0, 0.0, 1.0]
+    eta[:, 1] = [0.0, 0.0, 1.0, 1.0]
+    eta[:, 2] = [0.0, 1.0, 1.0, 0.0]
+    eta[:, 3] = [1.0, 0.0, 1.0, 0.0]
+    # eta_4 and eta_5 are the unrefined directions: one centre, one width
+    widths = numpy.full((4, 6), 0.5)
+    lnb = numpy.log(numpy.arange(1.0, 5.0))
+    path = tmp_path / "posteriors_six.npz"
+    numpy.savez(path, eta_L6=eta, w_L6=widths, lnB_L6=lnb)
+
+    cp = WorkflowConfigParser()
+    cp.read_string("""
+[model]
+name = test_normal
+
+[sampler]
+name = amr
+
+[sampler-amr]
+enable-research = false
+partition-file = {}
+partition-level = last
+evidence = quadrature
+eta-columns = 0 1 2 3 4 5
+""".format(path))
+    names = ("eta_0", "eta_1", "eta_2", "eta_3", "eta_4", "eta_5")
+    sampler = AmrSampler.from_config(
+        cp, make_model(names), output_file=str(tmp_path / "amr.hdf"))
+    sampler.run()
+
+    assert sampler.column_info["rank"] == 4
+    assert sampler.column_info["refined"] == [0, 1, 2, 3]
+    assert sampler.column_info["degenerate"] == [4, 5]
+    assert sampler.level_info["posterior_rank"] == 4
+    with loadfile(str(sampler.checkpoint_file), "r") as fp:
+        assert int(fp.attrs["amr_posterior_rank"]) == 4
+        numpy.testing.assert_array_equal(
+            numpy.asarray(fp.attrs["amr_degenerate_columns"]), [4, 5])
+        numpy.testing.assert_array_equal(
+            numpy.asarray(fp.attrs["amr_refined_columns"]), [0, 1, 2, 3])
+        numpy.testing.assert_array_equal(
+            numpy.asarray(fp.attrs["amr_column_n_centres"]),
+            [2, 2, 2, 2, 1, 1])

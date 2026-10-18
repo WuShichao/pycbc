@@ -34,13 +34,23 @@ likelihood), ``logprior`` is the log of the cell's prior *mass*
 ``logwt`` is the log posterior mass of the cell and ``logsumexp(logwt)`` is the
 Riemann-sum evidence of the partition.
 
-When the sampler is given a ``physical-map``, the file also holds the four
-physical parameters (``mchirp``, ``q``, ``spin1z``, ``spin2z``) computed from
-the ``eta`` columns through the exact inverse of the shape chart.  They are a
-linear recombination of the ``eta`` columns, not independent entries, and the
+When the sampler is given a ``physical-map``, the file also holds the physical
+parameters (``mchirp``, ``q``, ``spin1z``, ``spin2z`` and, when the map carries
+them, ``eclipticlongitude`` and ``eclipticlatitude``) computed from the ``eta``
+columns through the exact inverse of the shape chart.  They are a linear
+recombination of the ``eta`` columns, not independent entries, and the
 attributes ``amr_shape_matrix``, ``amr_shape_lam``, ``amr_shape_reference``,
 ``amr_shape_scale`` and ``amr_injection_eta`` let a reader reproduce them from
 the ``eta`` columns alone.
+
+When the sampler is given a ``sufficient-file``, the file also holds the
+restored conditional columns ``inclination``, ``polarization`` and
+``delta_tc``.  They are not extra dimensions: ``inclination`` and
+``polarization`` are one draw per cell from that cell's 128-node orientation
+posterior and ``delta_tc`` is the cell's strongest arrival-time lag.  The
+attributes ``amr_recovered_kind``, ``amr_amplitude_ceiling``,
+``amr_amplitude_prior`` and ``amr_nonpeak_lag_mass_median`` say what they are
+and what they leave out.
 
 Reading the file
 ----------------
@@ -64,9 +74,22 @@ file records which columns those are (``amr_unrefined_columns``,
 ``amr_degenerate_columns``) and the number of sampled columns that actually
 carry refinement (``amr_posterior_rank``), so a six-column file that is rank
 four cannot be read as a six-dimensional posterior.
+
+When the physical map records an injection, the truth is written both as the
+``amr_injection_physical`` attribute and as a top-level ``injections`` group
+with one dataset per physical parameter.  When the restored columns are
+written, their injected values (inclination, polarization, delta_tc) are added
+to the same group.  The group is what
+``pycbc_inference_plot_posterior --plot-injection-parameters`` and
+``pycbc_inference_plot_pp`` read; it holds only the parameters the file
+actually carries, and :meth:`AmrFile.read_injections` reads it directly rather
+than through the CBC injection reader, which requires ``tc`` because it is
+built for waveform generation.
 """
 
 import numpy
+
+from pycbc.io import FieldArray
 
 from .base_nested_sampler import BaseNestedSamplerFile
 from .dynesty import CommonNestedMetadataIO
@@ -201,6 +224,20 @@ class AmrFile(CommonNestedMetadataIO, BaseNestedSamplerFile):
         if physical is not None:
             for key, value in physical().items():
                 self.attrs[key] = value
+        # the restored conditional columns: the amplitude ceiling, the prior,
+        # the seed and the fact that they are conditionals, not dimensions
+        recovered = getattr(sampler, "recovered_metadata", None)
+        if recovered is not None:
+            for key, value in recovered().items():
+                self.attrs[key] = _attr_value(value)
+        # the recorded injection's orientation, used by the injections group
+        for option, key in (("injection_inclination", "amr_injection_inclination"),
+                            ("injection_polarization",
+                             "amr_injection_polarization"),
+                            ("injection_coa_phase", "amr_injection_coa_phase"),
+                            ("injection_delta", "amr_injection_delta_tc")):
+            if hasattr(sampler, option):
+                self.attrs[key] = float(getattr(sampler, option))
         level_info = getattr(sampler, "level_info", None) or {}
         for key in ("level", "n_cells", "n_eval", "finest_width",
                     "log_total_mass"):
@@ -226,6 +263,102 @@ class AmrFile(CommonNestedMetadataIO, BaseNestedSamplerFile):
                     column_info[key], dtype=float)
         if "rank" in column_info:
             self.attrs["amr_posterior_rank"] = int(column_info["rank"])
+        # the truth the map recorded is also written as the group the inference
+        # plot tools read.  Skipped when the file has no recorded injection or
+        # already carries the group; no existing dataset is touched.
+        self.write_injections_group()
+
+    def write_injections_group(self):
+        """Writes the recorded truth as an ``injections`` group.
+
+        PyCBC's ``pycbc_inference_plot_posterior --plot-injection-parameters``
+        and ``pycbc_inference_plot_pp`` obtain the truth through
+        :py:meth:`read_injections`, whose convention is a top-level
+        ``injections`` group with one dataset per parameter.  The physical map
+        records the physical truth in ``attrs['amr_injection_physical']`` and
+        the restored columns record theirs in ``amr_injection_inclination``,
+        ``amr_injection_polarization`` and ``amr_injection_delta_tc``; this
+        copies both sets into that group so the plot tools read the file
+        unchanged.
+
+        Only the parameters the file actually carries are written.  A file with
+        no recorded injection, or one that already has the group, is left
+        untouched.
+
+        Returns
+        -------
+        bool
+            True if the group was created, False if it was skipped.
+        """
+        if self.injections_group in self:
+            return False
+        values = {}
+        try:
+            physical = numpy.asarray(
+                self.attrs["amr_injection_physical"], dtype=float)
+            names = self.attrs["amr_physical_params"]
+        except KeyError:
+            physical = None
+            names = None
+        if names is not None:
+            if isinstance(names, bytes):
+                names = names.decode()
+            names = str(names).split()
+            if names and len(names) == physical.size:
+                values.update(zip(names, physical.tolist()))
+        for name, key in (("inclination", "amr_injection_inclination"),
+                          ("polarization", "amr_injection_polarization"),
+                          ("delta_tc", "amr_injection_delta_tc")):
+            if key in self.attrs:
+                values[name] = float(self.attrs[key])
+        if not values:
+            return False
+        group = self.create_group(self.injections_group)
+        for name, value in values.items():
+            group[name] = numpy.atleast_1d(value)
+        # The generic reader takes the injection type from the *file's* root
+        # attributes, where its absence already means 'cbc'; the group
+        # attribute is written so the table describes itself.
+        group.attrs["injtype"] = "cbc"
+        return True
+
+    def read_injections(self, group=None):
+        """Reads the injection truth recorded in the ``injections`` group.
+
+        The base implementation builds the table with
+        :class:`pycbc.inject.InjectionSet`, which defaults to the CBC reader
+        and therefore requires a ``tc`` column, because it is meant for
+        generating waveforms.  An AMR file's truth is the physical point the
+        partition was built around: the parameters of the map and, when the
+        restored columns are present, their injected values
+        (``inclination``, ``polarization`` and ``delta_tc``).  Reading the
+        datasets directly keeps an absolute ``tc`` out of the file instead of
+        inventing one, and returns the same :class:`pycbc.io.FieldArray` the
+        plot tools expect.
+
+        Parameters
+        ----------
+        group : str, optional
+            Group that the ``injections`` group is in.  Default (None) is the
+            top level, matching the base reader.
+
+        Returns
+        -------
+        FieldArray
+            One row per injection, with one field per recorded parameter.
+        """
+        if group is None or group == "/":
+            path = self.injections_group
+        else:
+            path = group.rstrip("/") + "/" + self.injections_group
+        if path not in self:
+            raise KeyError(
+                "no {} group in {}; the AMR writer records the truth only "
+                "when a physical map with an injection is configured".format(
+                    path, self.filename))
+        table = self[path]
+        return FieldArray.from_kwargs(
+            **{name: table[name][()] for name in table})
 
     @staticmethod
     def extra_args_parser(parser=None, skip_args=None, **kwargs):
