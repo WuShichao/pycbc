@@ -184,23 +184,23 @@ unrefined and degenerate columns and the posterior rank in the file, and logs
 a warning when a sampled column is unrefined.  This is what a request to "add
 the two sky coordinates" runs into: switching on the two soft columns produces
 a six-column file of rank four, and the two added columns are constant.
-* **The amplitude and orientation.**  The amplitude is the one genuine
-  integral of the statistic: the amplitude table, the phase marginalisation
-  (``I0``) and the ``u^-4`` amplitude prior are inside ``B``.  The orientation
-  is not an integral but an enumerated axis -- 16 Gauss-Legendre nodes in
-  ``cos(iota)`` times 8 in ``polarization`` -- whose 128 summands the kernel
-  forms and discards.  They are restored here from the archived sufficient
-  statistics as **conditional columns**, not as sampled dimensions; see
+* **The amplitude, orientation and arrival time.**  The amplitude is the one
+  genuine integral of the statistic: the amplitude table, the phase
+  marginalisation (``I0``) and the ``u^-power`` amplitude prior are inside
+  ``B``.  The orientation is an enumerated axis -- 16 Gauss-Legendre nodes in
+  ``cos(iota)`` times 8 in ``polarization`` -- and the arrival time is
+  enumerated on the lag grid; the kernel forms both sums and then discards the
+  summands.  All three are restored here, from the archived sufficient
+  statistics, as **one joint draw per cell** from ``p(lag, node, u | cell)``.
+  They are conditional columns, not sampled dimensions, but they are drawn
+  jointly: the inclination stays correlated with the amplitude, and the
+  arrival time is a sample rather than the cell's peak lag.  See
   :ref:`the recovered columns <amr-recovered-columns>` below.
-* **The arrival time.**  Enumerated on the lag grid and then reduced by the
-  per-segment log-sum-exp.  The restored ``delta_tc`` column is the cell's
-  single strongest lag, in seconds; the non-peak lag residual is measured and
-  recorded, not guessed.
 
 .. _amr-recovered-columns:
 
-The recovered columns: inclination, polarization and delta_tc
--------------------------------------------------------------
+The recovered columns: a joint draw over lag, orientation and amplitude
+----------------------------------------------------------------------
 The amplitude-marginalised Bayes factor enumerates 128 orientation nodes per
 lag:
 
@@ -208,61 +208,96 @@ lag:
                       psi the j-th of 8 nodes at (j + 1/2) pi/16 on [0, pi/2),
 
 with weights ``w_i / 16``.  The kernel evaluates ``ln w_g + Lbar(s, y)`` for
-every node and then sums the 128 values away.  Given the archived ``(D, Gram)``
-per (cell, lag), the summands are computable again, and the adapter writes
+every node, sums the 128 values into one number per lag, and then sums the lags
+into one number per cell.  Given the archived ``(D, Gram)`` per (cell, lag),
+both sets of summands are computable again, and the amplitude integrand is the
+same function ``AmplitudeMarginal`` already evaluates.  The adapter therefore
+draws one sample per cell from the joint
 
-===============  =========  ==============================================
-column           units      meaning
-===============  =========  ==============================================
-``inclination``  rad        ``arccos(cos iota)`` of a drawn node
-``polarization`` rad        ``psi`` of the same node, on ``[0, pi/2)``
-``delta_tc``     s          the cell's strongest arrival-time lag
-===============  =========  ==============================================
+    p(lag, node, u | cell) = p(lag, node | cell) p(u | lag, node, cell) ,
 
-The names are PyCBC's own: ``inclination``, ``polarization`` and ``delta_tc``
-are declared in :mod:`pycbc.waveform.parameters` with those labels, so
-``pycbc_inference_plot_posterior`` labels the axes without a ``--labels``
-option.  ``delta_tc`` is the coalescence-time *offset*, which is exactly what
-the lag grid measures: the archive's arrival-time reference is the injected
-zero, so the column is a shift in seconds, not an absolute GPS time.  An
-absolute ``tc`` would require a reference epoch the partition does not record,
-and inventing one would be a fiction.
+not from a marginal.  ``p(lag, node | cell)`` is proportional to
+``w_g Lbar(s, y)``, and ``u`` is drawn from the amplitude integrand at the pair
+that was selected.  The draw is a proper joint sample: the amplitude is never
+integrated out before the orientation is chosen, and the arrival time is never
+reported as the peak lag.  It is the semantics of
+:py:meth:`pycbc.inference.models.tools.DistMarg.reconstruct` -- a draw from
+``p(theta_aux | theta_sampled)`` -- applied to the whole reduced axis.
 
-``inclination`` and ``polarization`` are one **conditional draw per cell**, from
-that cell's own 128-node orientation posterior.  This is the semantics of
-:py:meth:`pycbc.inference.models.tools.DistMarg.reconstruct` for a
-marginalised distance: draw the auxiliary parameter from
-``p(theta_aux | theta_sampled)``.  The resulting column is a valid draw from
-the joint posterior of the cell centre and the restored parameter, and its
-equal-weight-resampled histogram is the recovered marginal.  It is **not a
-sampled dimension**: it does not enter the prior, the evidence or the cell
-weight, and it cannot feed back on the four stiff coordinates.  ``delta_tc`` is
-not a draw at all: the cell contributes its strongest lag, which is what the
-recovery's arrival-time posterior does.
+================  =========  ==============================================
+column            units      meaning
+================  =========  ==============================================
+``inclination``   rad        ``arccos(cos iota)`` of the drawn node
+``polarization``  rad        ``psi`` of the same node, on ``[0, pi/2)``
+``delta_tc``      s          the drawn lag
+``amplitude_u``   --         ``u = A/A_min`` of the drawn amplitude
+``distance_ratio`` --        ``d/d_best = u_best/u`` of the same draw
+================  =========  ==============================================
+
+The orientation names are PyCBC's own: ``inclination``, ``polarization`` and
+``delta_tc`` are declared in :mod:`pycbc.waveform.parameters` with those
+labels, so ``pycbc_inference_plot_posterior`` labels the axes without a
+``--labels`` option.  ``delta_tc`` is the coalescence-time *offset*, which is
+exactly what the lag grid measures: the archive's arrival-time reference is the
+injected zero, so the column is a shift in seconds, not an absolute GPS time.
+An absolute ``tc`` would require a reference epoch the partition does not
+record, and inventing one would be a fiction.
+
+``amplitude_u`` is ``u = A/A_min``, dimensionless, and ``distance_ratio`` is
+``d/d_best = u_best / u``, where ``u_best`` is the amplitude that maximises the
+likelihood at the highest-weight (cell, lag, node) of the partition.  **No
+distance in megaparsecs is available**: converting ``u`` to a distance needs
+the source's intrinsic amplitude normalisation, which the partition does not
+carry, so only ``u`` and ``d/d_best`` are written and the metadata says so.
+
+The columns are one joint draw per cell from that cell's own reduced
+posterior.  The resulting column is a valid draw from the joint posterior of
+the cell centre and the restored parameters, and its equal-weight-resampled
+histogram is the recovered marginal.  The columns are **not sampled
+dimensions**: they do not enter the prior, the evidence or the cell weight, and
+they cannot feed back on the four stiff coordinates.
+
+The joint is the object to quote, not the inclination marginal.  The amplitude
+prior is registered as ``u^-4`` on ``[1, 5]`` and that window truncates the
+controlled injection (its amplitude is ``u = 6.717`` and its likelihood mode is
+near ``u = 7.15``).  At the registered ceiling the ``(cos iota, ln u)``
+correlation is only about -0.36 because the prior wall stops the ridge before
+it develops; at the corrected ceiling 20 it is -0.94 and under a flat amplitude
+prior -0.95.  The inclination *marginal* is therefore prior-dominated through
+the amplitude prior: at ceiling 20 its 68 per cent interval is about 0.40 to
+0.92 rad and excludes the injected 1.0 rad, while conditional on the amplitude
+the inclination is determined with a width of about 0.055 rad.  A reader who
+takes the marginal as a measurement is wrong by about four sigma on that
+injection (more than ten at the registered ceiling).  Quote the joint, or the
+amplitude-conditional, not the marginal.
 
 The restoration needs the archived sufficient statistics, because the stored
 partition keeps only a scalar Bayes factor per cell.  The option is
 ``sufficient-file``; it applies to the partition path only (the live research
 path returns no archive to read).  Without it, no recovered column is written.
 
-The amplitude ceiling
----------------------
+The amplitude ceiling and power
+-------------------------------
 The registered amplitude prior is ``p(u) ~ u^-4`` on ``u = A/A_min in [1, 5]``.
 For the stored injection about 89 per cent of the amplitude likelihood lies
 above ``u = 5`` (its mode is near 7.15), so the registered window corresponds to
 an optimal signal-to-noise of 2.3 to 11.3 while the injection is at 16.1.  That
 truncation drives the recovered orientation to the face-on corner, which is why
 the registered prior's inclination excludes the injected value.  ``amplitude-
-ceiling`` sets ``U``; the prior shape (``u^-4``) is unchanged.  The registered
-value ``5`` is still reachable, and ``20`` is the default because at that point
-the recovered marginal is insensitive to further widening (10, 20 and 50 agree
-to better than 1e-3 in the node masses).  Both ceilings are reproducible from
-the same archive.
+ceiling`` sets ``U`` and ``amplitude-power`` sets the exponent; ``power = 4``
+and ``ceiling = 5`` are the registered pair and remain reachable.  ``20`` is
+the default ceiling because at that point the recovered marginal is insensitive
+to further widening (10, 20 and 50 agree to better than 1e-3 in the node
+masses).  ``power = 0`` is a flat amplitude prior and is a diagnostic, not a
+measurement.  Both values are recorded in the file metadata as
+``amr_amplitude_ceiling`` and ``amr_amplitude_power``, and the prior string is
+``amr_amplitude_prior``.
 
-Changing the ceiling changes the cell Bayes factor, so the amplitude columns
-(``loglikelihood``, ``logwt``, ``snr`` and the evidence) are recomputed when the
-ceiling is not the registered one.  At the registered ceiling the stored Bayes
-factors are used unchanged, so a file regenerated with ``amplitude-ceiling = 5``
+Changing the ceiling or the power changes the cell Bayes factor, so the
+amplitude columns (``loglikelihood``, ``logwt``, ``snr`` and the evidence) are
+recomputed from the archive when the pair is not the registered one.  At the
+registered pair the stored Bayes factors are used unchanged, so a file
+regenerated with ``amplitude-ceiling = 5`` and ``amplitude-power = 4``
 reproduces the earlier file's amplitude columns exactly.
 
 Configuration
@@ -299,16 +334,17 @@ Configuration
     physical-map = examples/inference/amr-partition/physical-map.json
 
     # the archived sufficient statistics, (D, Gram) per (cell, lag).  When set,
-    # inclination, polarization and delta_tc are written as conditional columns.
+    # inclination, polarization, delta_tc, amplitude_u and distance_ratio are
+    # written as one joint draw per cell.
     sufficient-file = /path/to/sufficient_full.npz
 
-    # the amplitude prior ceiling U in u = A/A_min, p(u) ~ u^-4 on [1, U].
-    # 5 is the registered value and reproduces the stored Bayes factors; 20 is
-    # the corrected default.
+    # the amplitude prior p(u) ~ u^-power on [1, U], u = A/A_min.  4 and 5 are
+    # the registered pair and reproduce the stored Bayes factors; 20 is the
+    # corrected default ceiling and 0 would be a flat (diagnostic) prior.
     amplitude-ceiling = 20
+    amplitude-power = 4
 
-    # the seed of the conditional orientation draw, so the columns are
-    # reproducible
+    # the seed of the joint draw, so the columns are reproducible
     recovered-seed = 20261018
 
     # the recorded injection of the partition, used for the truth attributes
@@ -341,9 +377,11 @@ import re
 import numpy
 
 from .base import BaseSampler, setup_output
-from .amr_demarg import (AMPLITUDE_POWER, DEFAULT_CEILING,
+from .amr_demarg import (AMPLITUDE_COLUMN, AMPLITUDE_POWER,
+                         DEFAULT_CEILING, DISTANCE_RATIO_COLUMN,
                          RECOVERED_PARAMETERS, REGISTERED_CEILING,
-                         SufficientStatistics)
+                         SufficientStatistics, weighted_correlation,
+                         weighted_quantile)
 from ..io import AmrFile, loadfile
 
 
@@ -370,8 +408,8 @@ _ALLOWED_OPTIONS = frozenset([
     "refinement", "eps", "n-fmax", "max-cells", "max-level", "evidence",
     "eta-columns", "physical-map", "injection-xi", "injection-rho",
     "injection-seed", "injection-delta", "batch", "sufficient-file",
-    "amplitude-ceiling", "recovered-seed", "injection-inclination",
-    "injection-polarization", "injection-coa-phase",
+    "amplitude-ceiling", "amplitude-power", "recovered-seed",
+    "injection-inclination", "injection-polarization", "injection-coa-phase",
 ])
 
 
@@ -838,15 +876,21 @@ class AmrSampler(BaseSampler):
         partition path; the live research path does not produce an archive.
     amplitude_ceiling : float, optional
         The upper limit ``U`` of ``u = A / A_min`` in the amplitude prior
-        ``p(u) ~ u^-4``.  The registered value is 5.  When ``sufficient-file``
-        is given the default is 20, wide enough that the recovered orientation
-        is insensitive to further widening; without the archive the default is
-        the registered 5, because a different ceiling cannot be applied to the
-        stored Bayes factors.  Changing it recomputes the cell Bayes factors
-        from the archive; at 5 the stored Bayes factors are used unchanged.
+        ``p(u) ~ u^-power``.  The registered value is 5.  When
+        ``sufficient-file`` is given the default is 20, wide enough that the
+        recovered orientation is insensitive to further widening; without the
+        archive the default is the registered 5, because a different ceiling
+        cannot be applied to the stored Bayes factors.  Changing it recomputes
+        the cell Bayes factors from the archive; at 5 the stored Bayes factors
+        are used unchanged.
+    amplitude_power : float, optional
+        The exponent of the amplitude prior, 4 by default (the registered
+        volumetric prior).  ``0`` is a flat prior and is a diagnostic.  The
+        registered pair is ``power = 4`` and ``ceiling = 5``; any other pair
+        needs the archive.
     recovered_seed : int, optional
-        Seed of the conditional orientation draw, so a file is reproducible.
-        Default is 20261018.
+        Seed of the joint draw over (lag, node, amplitude), so a file is
+        reproducible.  Default is 20261018.
     injection_inclination, injection_polarization, injection_coa_phase :
         The recorded injection's orientation, written as truth attributes and
         into the ``injections`` group.  Defaults are the research prototype's
@@ -864,7 +908,8 @@ class AmrSampler(BaseSampler):
                  eps=3e-4, n_fmax=100, max_cells=45000, max_level=6,
                  evidence="quadrature", eta_columns=None, physical_map=None,
                  sufficient_file=None, amplitude_ceiling=None,
-                 recovered_seed=20261018, injection_inclination=1.0,
+                 amplitude_power=AMPLITUDE_POWER, recovered_seed=20261018,
+                 injection_inclination=1.0,
                  injection_polarization=0.7, injection_coa_phase=0.3,
                  injection_xi=(3.0, -2.0, 1.5, -1.0), injection_rho=16.0,
                  injection_seed=20261018, injection_delta=0.0, batch=16,
@@ -901,6 +946,7 @@ class AmrSampler(BaseSampler):
                                  if self.sufficient_file is not None
                                  else REGISTERED_CEILING)
         self.amplitude_ceiling = float(amplitude_ceiling)
+        self.amplitude_power = float(amplitude_power)
         self.recovered_seed = int(recovered_seed)
         self.injection_inclination = float(injection_inclination)
         self.injection_polarization = float(injection_polarization)
@@ -990,6 +1036,14 @@ class AmrSampler(BaseSampler):
             raise ValueError(
                 "amplitude-ceiling is the upper limit of u = A/A_min and must "
                 "exceed 1, got {}".format(self.amplitude_ceiling))
+        if (not numpy.isfinite(self.amplitude_power)
+                or self.amplitude_power < 0):
+            raise ValueError(
+                "amplitude-power must be a finite non-negative number, got "
+                "{}".format(self.amplitude_power))
+        registered_prior = (
+            abs(self.amplitude_ceiling - REGISTERED_CEILING) <= 1e-12
+            and abs(self.amplitude_power - AMPLITUDE_POWER) <= 1e-12)
         if self.sufficient_file is not None:
             if self.enable_research:
                 raise ValueError(
@@ -1001,13 +1055,14 @@ class AmrSampler(BaseSampler):
                 raise OSError(
                     "sufficient-file does not exist: {}".format(
                         self.sufficient_file))
-        elif abs(self.amplitude_ceiling - REGISTERED_CEILING) > 1e-12:
+        elif not registered_prior:
             raise ValueError(
-                "amplitude-ceiling = {} differs from the registered ceiling "
-                "{}; the stored Bayes factors were computed with the "
-                "registered ceiling, so a different one needs the archived "
-                "sufficient statistics (sufficient-file)".format(
-                    self.amplitude_ceiling, REGISTERED_CEILING))
+                "amplitude-ceiling = {} and amplitude-power = {} differ from "
+                "the registered pair ({}, {}); the stored Bayes factors were "
+                "computed with the registered prior, so a different one needs "
+                "the archived sufficient statistics (sufficient-file)".format(
+                    self.amplitude_ceiling, self.amplitude_power,
+                    REGISTERED_CEILING, AMPLITUDE_POWER))
 
     @classmethod
     def from_config(cls, cp, model, output_file=None, nprocesses=1,
@@ -1077,6 +1132,7 @@ class AmrSampler(BaseSampler):
             sufficient_file=get("sufficient-file", None),
             amplitude_ceiling=(None if get("amplitude-ceiling", None) is None
                                else float(get("amplitude-ceiling"))),
+            amplitude_power=float(get("amplitude-power", AMPLITUDE_POWER)),
             recovered_seed=int(get("recovered-seed", 20261018)),
             injection_inclination=float(get("injection-inclination", 1.0)),
             injection_polarization=float(
@@ -1121,11 +1177,12 @@ class AmrSampler(BaseSampler):
         posterior expressed in the parameters a reader wants.
 
         When a ``sufficient-file`` is configured the restored ``inclination``,
-        ``polarization`` and ``delta_tc`` columns are present too.  They are
-        conditional restoration, not sampled dimensions; see the module
-        docstring.  ``inclination`` and ``polarization`` are one draw per cell
-        from that cell's orientation posterior and ``delta_tc`` is the cell's
-        strongest arrival-time lag.
+        ``polarization``, ``delta_tc``, ``amplitude_u`` and ``distance_ratio``
+        columns are present too.  They are one joint draw per cell from
+        ``p(lag, node, u | cell)``, not sampled dimensions; see the module
+        docstring.  ``inclination`` and ``polarization`` are drawn with the
+        amplitude, so they stay correlated with ``amplitude_u``, and
+        ``delta_tc`` is a drawn lag rather than the cell's peak.
         """
         if self._samples is None:
             return {}
@@ -1167,37 +1224,61 @@ class AmrSampler(BaseSampler):
         eta, widths, lnb = self._partition()
         recovered = None
         if self.sufficient_file is not None:
-            recovered, lnb = self._restore(eta, lnb)
+            recovered, lnb = self._restore(eta, widths, lnb)
         self._set_samples(eta, widths, lnb, recovered=recovered)
         for filename in [self.checkpoint_file, self.backup_file]:
             self.write_results(filename)
 
-    def _restore(self, eta, lnb):
-        """Restores the reduced axes and applies the amplitude ceiling.
+    def _restore(self, eta, widths, lnb):
+        """Draws the joint reduced axis and applies the amplitude prior.
 
         Returns the recovered columns (in the partition's cell order) and the
-        cell Bayes factors to use.  At the registered ceiling those are the
-        stored Bayes factors, unchanged; at any other ceiling they are
-        recomputed from the archived sufficient statistics at that ceiling.
+        cell Bayes factors to use.  At the registered prior those are the
+        stored Bayes factors, unchanged; at any other ceiling or power they are
+        recomputed from the archived sufficient statistics, summing over every
+        retained lag rather than taking the peak lag.
         """
         statistics = self._sufficient_statistics(eta, lnb)
-        conditional = statistics.conditional(
-            self.amplitude_ceiling, power=AMPLITUDE_POWER)
-        columns = statistics.columns(conditional["probability"],
-                                     self.recovered_seed)
-        if abs(self.amplitude_ceiling - REGISTERED_CEILING) <= 1e-12:
+        result = statistics.columns(
+            self.amplitude_ceiling, power=self.amplitude_power,
+            seed=self.recovered_seed)
+        columns = result["columns"]
+        diagnostics = result["diagnostics"]
+        registered_prior = (
+            abs(self.amplitude_ceiling - REGISTERED_CEILING) <= 1e-12
+            and abs(self.amplitude_power - AMPLITUDE_POWER) <= 1e-12)
+        if registered_prior:
             used = numpy.asarray(lnb, dtype=float).copy()
-            source = "stored Bayes factors at the registered ceiling"
+            source = "stored Bayes factors at the registered prior"
         else:
             used = numpy.empty(len(lnb))
-            used[statistics.cells] = conditional["lnb"]
+            used[statistics.cells] = diagnostics["lnb"]
             source = ("recomputed from the sufficient statistics at "
-                      "amplitude-ceiling = {}".format(self.amplitude_ceiling))
-        residual = conditional["residual"]
-        delta_lnb = conditional["delta_lnb"]
-        metadata = statistics.metadata(self.amplitude_ceiling,
-                                       self.recovered_seed)
-        metadata.update(conditional["table"].metadata())
+                      "amplitude-ceiling = {}, amplitude-power = {}".format(
+                          self.amplitude_ceiling, self.amplitude_power))
+        delta_lnb = diagnostics["lnb"] - statistics.lnb_stored
+        residual_raw = 1.0 - numpy.exp(numpy.clip(delta_lnb, -700.0, 700.0))
+        residual = numpy.clip(residual_raw, 0.0, 1.0)
+        # the correlations are reported with the posterior cell weights the
+        # file will carry, so they describe the written ensemble
+        volume = numpy.prod(widths[:, self.eta_columns], axis=1)
+        logmass = used + numpy.log(volume)
+        weights = numpy.exp(logmass - _logsumexp(logmass))
+        diagnostics["corr_inclination_amplitude"] = weighted_correlation(
+            columns["inclination"], columns[AMPLITUDE_COLUMN], weights)
+        diagnostics["corr_cos_lnu"] = weighted_correlation(
+            numpy.cos(columns["inclination"]),
+            numpy.log(columns[AMPLITUDE_COLUMN]), weights)
+        # the quantiles describe the written ensemble, so they carry logwt
+        quantile_levels = (0.05, 0.16, 0.5, 0.84, 0.95)
+        diagnostics["amplitude_quantiles"] = weighted_quantile(
+            columns[AMPLITUDE_COLUMN], weights, quantile_levels)
+        diagnostics["inclination_quantiles"] = weighted_quantile(
+            columns["inclination"], weights, quantile_levels)
+        metadata = statistics.metadata(
+            self.amplitude_ceiling, self.amplitude_power,
+            self.recovered_seed, diagnostics)
+        metadata.update(result["table"].metadata())
         metadata.update({
             "amr_recovered_lnb_source": source,
             "amr_lnb_peak_vs_stored_median": float(numpy.median(delta_lnb)),
@@ -1207,6 +1288,18 @@ class AmrSampler(BaseSampler):
             "amr_nonpeak_lag_mass_p99": float(
                 numpy.percentile(residual, 99)),
             "amr_nonpeak_lag_mass_max": float(numpy.max(residual)),
+            "amr_drawn_corr_note": (
+                "the weighted correlation of the drawn cos(iota) with the "
+                "drawn ln u, and of the drawn inclination with the drawn "
+                "amplitude_u, over the written posterior cell weights.  The "
+                "archived joint posterior has about -0.95 for cos(iota) "
+                "against ln u at a corrected or flat amplitude prior and "
+                "about -0.36 at the registered one, because the registered "
+                "prior wall truncates the ridge before it develops.  A draw "
+                "from the joint has to reproduce whichever of those applies; "
+                "a draw from the orientation marginal would give about zero "
+                "and would be the defect this column set was written to "
+                "remove."),
         })
         if self.physical_map is not None and statistics.truth is not None:
             expected = numpy.asarray(self.physical_map.injection["eta"],
@@ -1219,10 +1312,14 @@ class AmrSampler(BaseSampler):
                         statistics.truth.tolist(), expected.tolist()))
         self._recovered_metadata = metadata
         logging.info(
-            "AMR: restored %s from %s at amplitude-ceiling %.6g (%s); "
-            "peak-lag lnB against stored: median %+.2e, max |d| %.2e",
+            "AMR: drew the joint (lag, node, u) columns %s from %s at "
+            "amplitude-ceiling %.6g, amplitude-power %.6g (%s); "
+            "corr(cos iota, ln u) %+.3f, %d distinct lags, %d cells off the "
+            "peak lag; lnB against stored: median %+.2e, max |d| %.2e",
             ", ".join(RECOVERED_PARAMETERS), self.sufficient_file,
-            self.amplitude_ceiling, source, numpy.median(delta_lnb),
+            self.amplitude_ceiling, self.amplitude_power, source,
+            diagnostics["corr_cos_lnu"], diagnostics["distinct_lags"],
+            diagnostics["cells_not_at_peak_lag"], numpy.median(delta_lnb),
             numpy.max(numpy.abs(delta_lnb)))
         return columns, used
 
@@ -1470,8 +1567,9 @@ class AmrSampler(BaseSampler):
         mass of the cell and ``logwt = loglikelihood + logprior`` is its log
         posterior mass, so the file is internally consistent and the evidence
         is their log-sum.  ``recovered`` is an optional dict of restored
-        columns (``inclination``, ``polarization``, ``delta_tc``) written as
-        ordinary samples beside the physical ones.
+        columns (``inclination``, ``polarization``, ``delta_tc``,
+        ``amplitude_u``, ``distance_ratio``) written as ordinary samples
+        beside the physical ones.
         """
         eta = numpy.asarray(eta, dtype=float)
         widths = numpy.asarray(widths, dtype=float)
@@ -1544,10 +1642,10 @@ class AmrSampler(BaseSampler):
                 self.physical_map.source)
         if recovered:
             logging.info(
-                "AMR: added the restored conditional columns %s; inclination "
-                "and polarization are one draw per cell from that cell's "
-                "orientation posterior and delta_tc is its strongest lag, so "
-                "they are not sampled dimensions",
+                "AMR: added the restored joint-draw columns %s; they are one "
+                "draw per cell from p(lag, node, u | cell), so inclination "
+                "and polarization are correlated with amplitude_u and "
+                "delta_tc is a drawn lag, but they are not sampled dimensions",
                 ", ".join(sorted(recovered)))
 
         if self.evidence == "quadrature":
@@ -1599,14 +1697,23 @@ class AmrSampler(BaseSampler):
         try:
             with loadfile(self.checkpoint_file, "r") as fp:
                 stored_ceiling = fp.attrs.get("amr_amplitude_ceiling")
-                if (self.sufficient_file is not None
-                        and stored_ceiling is not None
-                        and abs(float(stored_ceiling)
-                                - self.amplitude_ceiling) > 1e-12):
-                    raise ValueError(
-                        "the checkpoint was written with amplitude-ceiling "
-                        "{} but the configured value is {}".format(
-                            stored_ceiling, self.amplitude_ceiling))
+                stored_power = fp.attrs.get("amr_amplitude_power")
+                if self.sufficient_file is not None:
+                    if (stored_ceiling is not None
+                            and abs(float(stored_ceiling)
+                                    - self.amplitude_ceiling) > 1e-12):
+                        raise ValueError(
+                            "the checkpoint was written with "
+                            "amplitude-ceiling {} but the configured value "
+                            "is {}".format(
+                                stored_ceiling, self.amplitude_ceiling))
+                    if (stored_power is not None
+                            and abs(float(stored_power)
+                                    - self.amplitude_power) > 1e-12):
+                        raise ValueError(
+                            "the checkpoint was written with amplitude-power "
+                            "{} but the configured value is {}".format(
+                                stored_power, self.amplitude_power))
                 samples = fp.read_raw_samples(fields, raw_samples=True)
                 if not len(samples["logwt"]):
                     raise ValueError("empty samples group")

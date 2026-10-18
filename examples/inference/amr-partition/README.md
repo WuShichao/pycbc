@@ -37,15 +37,18 @@ PYTHONPATH=/home/nightwing/src/pycbc \
     --output-file /tmp/amr.hdf --force --verbose
 ```
 
-This takes about half a minute: the physics already ran, and the only new work
-is reading the archived sufficient statistics and building the amplitude
-marginal.  It writes 33,065 weighted cells (refinement level 6) and the Riemann
+This takes a few minutes: the physics already ran, and the new work is reading
+the archived sufficient statistics, rebuilding the per-(cell, lag, node)
+statistic and drawing the joint over (lag, node, u).  The pass streams all
+2,116,160 (cell, lag) rows in chunks, so its memory stays at a few hundred
+megabytes.  It writes 33,065 weighted cells (refinement level 6) and the Riemann
 sum evidence over the covered partition (see the note listed below for the
 constant offset to the evidence normalised by the exact prior ellipsoid).
 
-The demo config also sets `sufficient-file`, so the file holds the restored
-columns `inclination`, `polarization` and `delta_tc` beside the `eta` and
-physical columns.  With `amplitude-ceiling = 5` (the registered value) the
+The demo config also sets `sufficient-file`, so the file holds one joint draw
+per cell in `inclination`, `polarization`, `delta_tc`, `amplitude_u` and
+`distance_ratio` beside the `eta` and physical columns.  With
+`amplitude-ceiling = 5` and `amplitude-power = 4` (the registered pair) the
 stored cell Bayes factors are used unchanged; with the default `20` they are
 recomputed from the archive at the wider prior ceiling.  The two files are
 directly comparable:
@@ -55,6 +58,7 @@ PYTHONPATH=/home/nightwing/src/pycbc \
   python bin/inference/pycbc_inference \
     --config-file examples/inference/amr-partition/amr.ini \
     --config-overrides sampler-amr:amplitude-ceiling:5 \
+                        sampler-amr:amplitude-power:4 \
     --output-file /tmp/amr_ceiling5.hdf --force
 ```
 
@@ -124,28 +128,50 @@ PYTHONPATH=/home/nightwing/src/pycbc \
 ## Recovered columns
 
 The orientation (16 Gauss-Legendre nodes in `cos(iota)` times 8 in
-`polarization`) and the arrival time (the lag grid) are enumerated inside the
-cell Bayes factor and then reduced to a scalar.  With `sufficient-file`, the
-adapter restores them from the archived `(D, Gram)` as ordinary samples columns:
+`polarization`), the arrival time (the lag grid) and the amplitude are reduced
+to a scalar inside the cell Bayes factor.  With `sufficient-file`, the adapter
+rebuilds the per-(cell, lag, node) statistic and draws **one sample per cell
+from the joint** `p(lag, node, u | cell)`, writing:
 
 | column | units | meaning |
 |---|---|---|
-| `inclination` | rad | `arccos(cos iota)` of a drawn orientation node |
+| `inclination` | rad | `arccos(cos iota)` of the drawn orientation node |
 | `polarization` | rad | `psi` of the same node, on `[0, pi/2)` |
-| `delta_tc` | s | the cell's strongest arrival-time lag |
+| `delta_tc` | s | the drawn arrival-time lag |
+| `amplitude_u` | dimensionless | `u = A/A_min` of the drawn amplitude |
+| `distance_ratio` | dimensionless | `d/d_best = u_best/u` of the same draw |
 
-`inclination` and `polarization` are one conditional draw per cell from that
-cell's own 128-node orientation posterior (the same conditional restoration
-`DistMarg.reconstruct` does for a distance); `delta_tc` is the cell's peak lag.
-They are **not sampled dimensions**: they do not enter the prior, the evidence
-or the cell weight.  The names are PyCBC's own, so the plotter labels them
+The draw factorises as `p(lag, node | cell) p(u | lag, node, cell)`: the pair is
+weighted by `w_g` times the amplitude marginal, and `u` is drawn from the
+amplitude integrand at the chosen pair.  It is a proper joint sample, the same
+conditional restoration `DistMarg.reconstruct` does for a distance, applied to
+the whole reduced axis; the amplitude is never integrated out before the
+orientation is chosen, so `inclination` stays correlated with `amplitude_u`.
+`delta_tc` is now a sample rather than the cell's peak lag.  The columns are
+**not sampled dimensions**: they do not enter the prior, the evidence or the
+cell weight.  The orientation names are PyCBC's own, so the plotter labels them
 without a `--labels` option.
 
-The amplitude marginal is the one genuine integral.  Its prior ceiling is an
-option: the registered `5` truncates this injection's likelihood (mode near
-`u = 7.15`), and the default `20` contains it.  The file records
-`amr_amplitude_ceiling`, `amr_amplitude_prior`, `amr_recovered_kind` and the
-peak-lag residual.
+The joint, not the inclination marginal, is the object to quote.  The amplitude
+prior is registered as `u^-4` on `[1, 5]`, and that window truncates this
+injection (`u = 6.717`, likelihood mode near `u = 7.15`).  At the registered
+ceiling the `(cos iota, ln u)` correlation is only about -0.36 because the prior
+wall stops the ridge before it develops; at the corrected ceiling 20 it is -0.94
+and under a flat amplitude prior -0.95.  The marginal inclination is therefore
+prior-dominated through the amplitude prior: at ceiling 20 its 68 per cent
+interval is about 0.40 to 0.92 rad and excludes the injected 1.0 rad, while
+conditional on the amplitude the inclination is determined with a width of about
+0.055 rad.
+
+`amplitude_u` and `distance_ratio` are the only amplitude statements the
+partition supports.  An absolute distance needs the source's intrinsic
+amplitude normalisation, which the partition does not carry, so no distance in
+megaparsecs is written or implied.  The amplitude prior itself is configurable:
+`amplitude-ceiling` sets `U` and `amplitude-power` sets the exponent, both are
+reachable at the registered pair, and both are recorded in the file as
+`amr_amplitude_ceiling` and `amr_amplitude_power` (with `amr_amplitude_prior`,
+`amr_amplitude_units`, `amr_distance_note` and the drawn correlations beside
+them).
 
 The full posterior, in two readable corners:
 
@@ -154,12 +180,12 @@ PYTHONPATH=/home/nightwing/src/pycbc \
   python bin/inference/pycbc_inference_plot_posterior \
     --input-file /tmp/amr.hdf \
     --output-file /tmp/amr_demarg_intrinsic.png \
-    --parameters mchirp q spin1z spin2z inclination polarization delta_tc \
+    --parameters mchirp q spin1z spin2z inclination amplitude_u delta_tc \
     --plot-marginal --plot-scatter --plot-contours \
     --contour-percentiles 68 90 95 --z-arg snr:SNR \
     --expected-parameters mchirp:31.83141195 q:2.08874494 \
                           spin1z:-0.14437378 spin2z:-0.79002668 \
-                          inclination:1.0 polarization:0.7 delta_tc:0.0
+                          inclination:1.0 amplitude_u:6.717 delta_tc:0.0
 ```
 
 ## Prior

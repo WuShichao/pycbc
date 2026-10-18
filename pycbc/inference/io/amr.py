@@ -44,13 +44,16 @@ attributes ``amr_shape_matrix``, ``amr_shape_lam``, ``amr_shape_reference``,
 the ``eta`` columns alone.
 
 When the sampler is given a ``sufficient-file``, the file also holds the
-restored conditional columns ``inclination``, ``polarization`` and
-``delta_tc``.  They are not extra dimensions: ``inclination`` and
-``polarization`` are one draw per cell from that cell's 128-node orientation
-posterior and ``delta_tc`` is the cell's strongest arrival-time lag.  The
-attributes ``amr_recovered_kind``, ``amr_amplitude_ceiling``,
-``amr_amplitude_prior`` and ``amr_nonpeak_lag_mass_median`` say what they are
-and what they leave out.
+restored columns ``inclination``, ``polarization``, ``delta_tc``,
+``amplitude_u`` and ``distance_ratio``.  They are one joint draw per cell from
+``p(lag, node, u | cell)``, not extra dimensions: ``inclination`` and
+``polarization`` are the drawn orientation node, ``delta_tc`` the drawn lag and
+``amplitude_u`` the drawn ``u = A/A_min``, so the inclination and the amplitude
+stay correlated.  No absolute distance is written: the partition does not carry
+the source's intrinsic amplitude normalisation.  The attributes
+``amr_recovered_kind``, ``amr_amplitude_ceiling``, ``amr_amplitude_power``,
+``amr_amplitude_prior``, ``amr_amplitude_units``, ``amr_distance_note`` and the
+drawn correlations say what they are and what they leave out.
 
 Reading the file
 ----------------
