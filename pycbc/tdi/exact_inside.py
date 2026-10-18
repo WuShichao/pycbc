@@ -150,7 +150,11 @@ def bounds_at(x, lo, hi, M, lam):
     lb = q.copy()
     for a in act:
         ga = g[:, a]
-        d = np.clip(-ga / (2.0 * lam), lo[:, a] - x[:, a], hi[:, a] - x[:, a])
+        if lam > 0:
+            d = np.clip(-ga / (2.0 * lam), lo[:, a] - x[:, a], hi[:, a] - x[:, a])
+        else:
+            # Convexity still supplies a linear lower bound when M is singular.
+            d = np.where(ga >= 0, lo[:, a] - x[:, a], hi[:, a] - x[:, a])
         lb += lam * d * d + ga * d
     return q, lb
 
@@ -173,7 +177,8 @@ def smallest_eig(M):
     act = _active(M)
     if act.size == 0:
         return 0.0
-    return float(np.linalg.eigvalsh(M[np.ix_(act, act)])[0])
+    # A roundoff-negative eigenvalue of A.T @ A supplies no positive curvature.
+    return max(0.0, float(np.linalg.eigvalsh(M[np.ix_(act, act)])[0]))
 
 
 def certified(c, half, M, tol=1e-13, block=32, max_sweeps=4096, lam=None):
@@ -187,8 +192,25 @@ def certified(c, half, M, tol=1e-13, block=32, max_sweeps=4096, lam=None):
     """
     c = np.atleast_2d(np.asarray(c, float))
     h = _half_matrix(half, c.shape)
+    M = np.asarray(M, float)
+    if M.shape != (c.shape[1], c.shape[1]) or np.any(h < 0):
+        raise ValueError("invalid box metric or half width")
+    if not np.all(np.isfinite(M)):
+        unresolved = np.ones(len(c), dtype=bool)
+        return dict(keep=unresolved.copy(), keep_value=~unresolved,
+                    q_ub=np.full(len(c), np.nan), q_lb=np.full(len(c), np.nan),
+                    unresolved=unresolved, sweeps=0, n_disputed=len(c))
+    if not np.allclose(M, M.T, rtol=0, atol=tol):
+        raise ValueError("the metric must be symmetric")
+    eigen_min = float(np.linalg.eigvalsh(M)[0])
+    if eigen_min < -tol * max(1.0, np.linalg.norm(M, ord=2)):
+        raise ValueError("the metric must be positive semidefinite")
     if lam is None:
         lam = smallest_eig(M)
+    if not np.isfinite(lam) or lam < 0:
+        raise ValueError("invalid curvature lower bound")
+    if lam > smallest_eig(M) + tol:
+        raise ValueError("curvature exceeds the smallest metric eigenvalue")
     q_ub, q_lb, x = interval_bounds(c, h, M, sweeps=block, lam=lam)
     used = block
     todo = np.nonzero(q_ub - q_lb > tol)[0]
@@ -197,10 +219,13 @@ def certified(c, half, M, tol=1e-13, block=32, max_sweeps=4096, lam=None):
         q_ub[todo], q_lb[todo] = bounds_at(x[todo], lo, hi, M, lam)
         used += block
         todo = np.nonzero(q_ub - q_lb > tol)[0]
-    keep = q_lb <= 1.0
+    unresolved = ~np.isfinite(q_lb) | ~np.isfinite(q_ub)
+    # An unresolved lower bound cannot certify that a box is outside.
+    keep = unresolved | (q_lb <= 1.0 + tol)
     keep_value = q_ub <= 1.0
     return dict(keep=keep, keep_value=keep_value, q_ub=q_ub, q_lb=q_lb,
-                sweeps=int(used), n_disputed=int(np.sum(keep != keep_value)))
+                unresolved=unresolved, sweeps=int(used),
+                n_disputed=int(np.sum(keep != keep_value)))
 
 
 def inside_exact(A, c, half, **kw):

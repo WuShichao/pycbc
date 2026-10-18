@@ -70,12 +70,11 @@ BCC_U = BCC_COVOL * BCC_MEAN2
 BCC_G = 19.0 / (192.0 * 2.0 ** (1.0 / 3.0))
 BCC_THETA = 1.4635                 # Allen's Table I, five figures
 # the 24 Voronoi vertices of bcc: every permutation of (+-1/2, +-1/4, 0), all at |x| = R
-BCC_HOLES = np.array([[0.5 * a, 0.25 * b, 0.0]
-                      for a in (1.0, -1.0) for b in (1.0, -1.0)]
-                     + [[0.5 * a, 0.0, 0.25 * b]
-                        for a in (1.0, -1.0) for b in (1.0, -1.0)]
-                     + [[0.0, 0.5 * a, 0.25 * b]
-                        for a in (1.0, -1.0) for b in (1.0, -1.0)])
+BCC_HOLES = np.array(sorted({
+    tuple(np.asarray(vertex) * sign)
+    for vertex in itertools.permutations((0.5, 0.25, 0.0))
+    for sign in itertools.product((-1.0, 1.0), repeat=3)
+}))
 Z3_THETA = (0.75 * math.pi) ** 1.5 / math.gamma(2.5)   # Allen Eq. (4.2), = 2.7207
 Z4_THETA = math.pi ** 2 / 2.0      # = 4.9348
 A4S_THETA = 1.7655                 # Allen's Table I, five figures

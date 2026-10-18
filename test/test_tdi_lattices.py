@@ -3,6 +3,8 @@
 import numpy as np
 
 from pycbc.tdi.lattices import (
+    BCC_HOLES,
+    BCC_R,
     D4_HOLES,
     D4_R,
     d4_brute,
@@ -40,3 +42,15 @@ def test_all_twenty_four_deep_holes_sit_at_the_covering_radius():
     # independently: brute force reaches the same covering radius at every hole
     _, brute_distance, _ = d4_brute(D4_HOLES, span=2)
     assert np.allclose(brute_distance, D4_R, atol=1e-12)
+
+
+def test_bcc_all_vertices_include_each_coordinate_permutation():
+    assert BCC_HOLES.shape == (24, 3)
+    assert len(np.unique(BCC_HOLES, axis=0)) == 24
+    assert np.allclose(np.linalg.norm(BCC_HOLES, axis=1), BCC_R, atol=1e-12)
+    for vertex in BCC_HOLES:
+        assert np.any(np.all(BCC_HOLES == -vertex, axis=1))
+    # Omitting the permutations with the large component on axis 2 misses this.
+    quadratic = np.einsum("ni,ij,nj->n", BCC_HOLES,
+                          np.diag([1.0, 1.0, 100.0]), BCC_HOLES)
+    assert np.isclose(quadratic.max(), 25.0625)

@@ -53,3 +53,20 @@ def test_dropped_boxes_contain_no_sampled_point():
         x = c[row] + rng.uniform(-1.0, 1.0, (2000, 3)) * half[row]
         q = np.einsum("ni,ij,nj->n", x, M, x)
         assert q.min() > 1.0
+
+
+def test_singular_metric_keeps_box_containing_a_zero():
+    A = np.array([[1.0, 1.0]])
+    out = certified([[0.5, -0.5]], [0.2, 0.2], metric(A))
+    assert out["keep"][0]
+    assert np.isfinite(out["q_lb"][0])
+    assert not out["unresolved"][0]
+
+
+def test_nonfinite_bound_is_kept_unresolved():
+    out = certified([[np.inf, 0.0]], [0.2, 0.2], np.eye(2))
+    assert out["keep"][0]
+    assert out["unresolved"][0]
+    out = certified([[0.0, 0.0]], [0.2, 0.2], np.full((2, 2), np.nan))
+    assert out["keep"][0]
+    assert out["unresolved"][0]
