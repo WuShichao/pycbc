@@ -251,3 +251,27 @@ def interpolate_in_frequency(values, coarse, fine):
     i = numpy.clip(numpy.floor(x).astype(int), 0, len(coarse) - 2)
     w = numpy.clip(x - i, 0, 1)
     return values[..., i] * (1 - w) + values[..., i + 1] * w
+
+
+def ssb_data_spectrum(grid, bins, orbit, longitude, latitude, xp=numpy):
+    """The SSB-time spectrum of whitened detector-frame data, normalised so
+    that a signal appears as its whitened spectrum on the grid's
+    frequencies, and the per-component variance of its noise.
+
+    ``bins`` are the data times ``sqrt(4 delta_f / S_n)``, whose noise has
+    unit variance per real component (see :func:`resample_to_ssb`). The FFT
+    of the resampled series carries a signal ``n_in`` times its whitened
+    spectrum, ``n_in`` being the grid samples inside the data. Its noise
+    power, ``2 N nbins n_in`` in all, fills the ``N nbins / n_in`` bins of
+    the band, so dividing by ``n_in`` leaves the signal as the template
+    family models it and noise of unit variance per component in the band.
+
+    Returns
+    -------
+    spectrum : array, shape ``(nchannels, grid.size)``
+    noise_variance : float
+    """
+    series = resample_to_ssb(grid, bins, orbit, longitude, latitude)
+    n_in = int(grid.in_data.sum())
+    spectrum = xp.fft.fft(xp.asarray(series), axis=-1) / n_in
+    return spectrum, 1.0

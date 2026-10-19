@@ -137,3 +137,46 @@ def test_frequency_interpolation_is_exact_for_linear_values():
     fine = numpy.linspace(0.01, 0.02, 97)
     assert numpy.allclose(interpolate_in_frequency(values, coarse, fine),
                           (1 + 2j) * fine - 3j)
+
+
+class _StillOrbit(object):
+    """A constellation at the SSB: detector time is SSB time."""
+    def compute_position(self, t, sc=(1, 2, 3)):
+        return numpy.zeros((len(numpy.atleast_1d(t)), len(sc), 3))
+
+
+def test_ssb_spectrum_noise_has_the_stated_variance():
+    pytest.importorskip('finufft')
+    from pycbc.tdi.ssb_yearly_harmonics import ssb_data_spectrum
+    start, days, nbins = 0.0, 30.0, 200
+    grid = SSBGrid(start, start + days * DAY, 0.0151, nbins,
+                   1 / (days * DAY), periods=1)
+    rng = numpy.random.default_rng(6)
+    noise = rng.normal(size=(40, nbins)) + 1j * rng.normal(size=(40, nbins))
+    spectrum, variance = ssb_data_spectrum(grid, noise, ORBIT, *SKY)
+    # away from the band edges, where the resampled band is fully covered
+    middle = slice(grid.size // 10, grid.size - grid.size // 10)
+    measured = 0.5 * numpy.mean(numpy.abs(spectrum[:, middle]) ** 2)
+    assert measured == pytest.approx(variance, rel=0.03)
+
+
+def test_ssb_spectrum_of_a_signal_is_its_whitened_spectrum():
+    pytest.importorskip('finufft')
+    from pycbc.tdi.ssb_yearly_harmonics import ssb_data_spectrum
+    start, days, nbins = 0.0, 60.0, 600
+    delta_f = 1 / (days * DAY)
+    grid = SSBGrid(start, start + days * DAY, 0.0151, nbins, delta_f,
+                   periods=1)
+
+    def chirp(f):
+        u = (f - 0.0151) / (nbins * delta_f)
+        t0 = (0.3 + 0.4 * u) * days * DAY
+        phase = 2 * numpy.pi * (0.3 * days * DAY * (f - 0.0151)
+                                + 0.2 * days * DAY * nbins * delta_f * u ** 2)
+        return numpy.exp(-0.5 * ((u - 0.5) / 0.1) ** 2 - 1j * phase), t0
+    data_f = 0.0151 + numpy.arange(nbins) * delta_f
+    bins, _ = chirp(data_f)
+    spectrum, _ = ssb_data_spectrum(grid, bins[None, :], _StillOrbit(), *SKY)
+    model, _ = chirp(grid.frequencies)
+    assert numpy.abs(spectrum[0] - model).max() \
+        < 1e-2 * numpy.abs(model).max()
