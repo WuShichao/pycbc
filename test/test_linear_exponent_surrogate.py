@@ -1,4 +1,4 @@
-"""The linear-exponent template family of pycbc.tdi.linear_exponent_surrogate."""
+"""The linear-exponent family of pycbc.tdi.linear_exponent_surrogate."""
 import numpy
 import pytest
 
@@ -128,3 +128,53 @@ def test_daily_gram_approaches_the_windowed_gram():
     short, long = gram_error(30), gram_error(240)
     assert long < 3e-3
     assert long < short / 5
+
+
+def test_builder_reproduces_the_research_family():
+    """Against ssb_family's Setup and Cell (sandbox results/2026-10-19/
+    pycbc_port/make_surrogate_fixture.py) on 80 fine and 12 coarse bins."""
+    import json
+    import os
+    from types import SimpleNamespace
+    from pycbc.coordinates.space_orbit import LisaEqualArmOrbit
+    from pycbc.tdi.inference import channel_terms
+    from pycbc.tdi.linear_exponent_surrogate import surrogate_from_source
+    ref = numpy.load(os.path.join(os.path.dirname(__file__), 'data',
+                                  'ssb_family_reference.npz'))
+    base, point = json.loads(str(ref['params'])), json.loads(str(ref['point']))
+    sigma = json.loads(str(ref['sigma']))
+
+    def to_source(p):
+        # the research coordinates: q = m2 / m1 <= 1, fiducial masses kept
+        out = dict(base)
+        if (p['mchirp'], p['q']) != (point['mchirp'], point['q']):
+            m1 = p['mchirp'] * (1 + p['q']) ** 0.2 / p['q'] ** 0.6
+            out['mass1'], out['mass2'] = m1, p['q'] * m1
+        out.update(spin1z=p['spin1z'], spin2z=p['spin2z'])
+        return out
+
+    freqs = ref['freqs']
+    grid = SimpleNamespace(frequencies=freqs, start=float(ref['start']),
+                           size=len(freqs), harmonic_shift=5)
+    names = ('mchirp', 'q', 'spin1z', 'spin2z')
+    family = surrogate_from_source(
+        grid, ref['sw'], LisaEqualArmOrbit(armlength=2.5e9, t0=0.0),
+        channel_terms(('A', 'E'), generation=2, delta_t=10.0),
+        dict(base, **point), {n: sigma[n] for n in names},
+        (sigma['eclipticlongitude'], sigma['eclipticlatitude']),
+        ref['coarse'][ref['columns']], to_source=to_source,
+        step=float(ref['step']))
+    scale = numpy.abs(ref['b0']).max()
+    assert numpy.abs(family.b0 - ref['b0']).max() < 1e-12 * scale
+    assert numpy.allclose(family.t0, ref['t0'], rtol=0, atol=1e-6)
+    assert numpy.allclose(family.D.real, ref['D'].real, rtol=0, atol=1e-12)
+    # the phase columns agree up to the unwrapping's whole turns
+    turns = (family.D.imag - ref['D'].imag) * 2 * float(ref['step'])
+    assert numpy.allclose(numpy.exp(1j * turns), 1, atol=1e-12)
+    assert numpy.allclose(family.T, ref['Tt'], rtol=0, atol=1e-6)
+    # the response times are staggered by 1 ms per coarse bin, of which the
+    # reference had 60
+    r0 = numpy.abs(ref['R0']).max()
+    assert numpy.abs(family.R0 - ref['R0']).max() < 1e-7 * r0
+    assert numpy.abs(family.L - ref['L']).max() \
+        < 2e-6 * numpy.abs(ref['L']).max()

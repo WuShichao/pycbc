@@ -243,3 +243,106 @@ class DailyGram(object):
         j, fr = self._lag_j, self._lag_fr
         j1 = (j + 1) % self.size
         return tuple(g[j] * (1 - fr) + g[j1] * fr for g in gram)
+
+
+def lal_plus_source(params, frequencies, epoch):
+    """The plus polarisation at inclination 0, unit distance and zero phase
+    on ``frequencies``, referenced to ``epoch``, and its stationary time.
+
+    The clock is the sparse-TDI source's: frequency ``params['f_lower']``
+    is reached at ``params['tdi_t_start']``.
+    """
+    from pycbc.tdi.sources import LALFDSource
+    from pycbc.waveform import get_fd_waveform_sequence
+    approximant = params.get('approximant', 'IMRPhenomD')
+    if approximant == 'TDISparse':
+        approximant = params.get('tdi_approximant', 'IMRPhenomD')
+    shape = {k: params[k] for k in ('mass1', 'mass2', 'spin1z', 'spin2z')}
+    frequencies = numpy.asarray(frequencies, dtype=float)
+    hp, _ = get_fd_waveform_sequence(
+        approximant=approximant, distance=1.0, inclination=0.0,
+        coa_phase=0.0, sample_points=numpy.concatenate(
+            [[params['f_lower']], frequencies]), **shape)
+    hp = numpy.asarray(hp)[1:]
+    source = LALFDSource(f_lower=params['f_lower'],
+                         f_upper=params['tdi_f_upper'], distance=1.0,
+                         inclination=0.0, coa_phase=0.0,
+                         t_start=params.get('tdi_t_start', 0.0), **shape)
+    first = source.stationary_times[0]
+    time = numpy.interp(frequencies, source.sample_frequencies,
+                        source.stationary_times - first + source.t_start)
+    clock = 2 * numpy.pi * frequencies * (first - source.t_start)
+    return hp * numpy.exp(1j * clock + 2j * numpy.pi * frequencies
+                          * epoch), time
+
+
+def surrogate_from_source(grid, whitening, orbit, terms, params, intrinsic,
+                          sky_scales, coarse_frequencies, to_source=None,
+                          source=lal_plus_source, step=0.5, kmax=4,
+                          samples=32, dtype=numpy.complex128):
+    """Build the linear-exponent family around a reference source.
+
+    Parameters
+    ----------
+    grid : SSBGrid
+        The SSB time grid.
+    whitening : array_like
+        ``sqrt(4 delta_f / S_n)`` on the grid's frequencies.
+    orbit, terms
+        The orbit and TDI channel terms of the response.
+    params : dict
+        The reference point, in the coordinates named by ``intrinsic`` plus
+        the source parameters ``to_source`` needs, including
+        ``eclipticlongitude`` and ``eclipticlatitude``.
+    intrinsic : dict
+        Intrinsic coordinate names and their shape units, in order.
+    sky_scales : tuple
+        Shape units of the longitude and latitude offsets, rad.
+    coarse_frequencies : array_like
+        Uniform frequencies of the response samples.
+    to_source : callable, optional
+        Maps a point to the parameters of ``source``; default the identity.
+    source : callable
+        ``source(params, frequencies, epoch) -> (h, t)``.
+    step : float
+        Central-difference step of the derivative columns, shape units.
+    kmax, samples : int
+        Yearly harmonics kept and response samples per orbit.
+    dtype : numpy dtype
+        Complex type of the family's arrays.
+    """
+    from pycbc.tdi.ssb_yearly_harmonics import (sky_log_derivatives,
+                                                yearly_response_samples)
+    to_source = (lambda point: dict(point)) if to_source is None \
+        else to_source
+    f = grid.frequencies
+    whitening = numpy.asarray(whitening, dtype=float)
+
+    def evaluate(point):
+        h, t = source(to_source(point), f, grid.start)
+        return h * whitening, t
+
+    b0, t0 = evaluate(params)
+    log_derivatives, time_derivatives = [], []
+    for name, scale in intrinsic.items():
+        moved = []
+        for sign in (1, -1):
+            point = dict(params)
+            point[name] = point[name] + sign * step * scale
+            moved.append(evaluate(point))
+        (bp, tp), (bm, tm) = moved
+        ok = (numpy.abs(bp) > 0) & (numpy.abs(bm) > 0)
+        ratio = numpy.where(ok, bp / numpy.where(ok, bm, 1), 1.0)
+        log_derivatives.append((numpy.log(numpy.abs(ratio)) + 1j
+                                * numpy.unwrap(numpy.angle(ratio)))
+                               / (2 * step))
+        time_derivatives.append((tp - tm) / (2 * step))
+    lon, lat = params['eclipticlongitude'], params['eclipticlatitude']
+    response = yearly_response_samples(orbit, terms, coarse_frequencies, lon,
+                                       lat, lon, lat, samples=samples)
+    sky = sky_log_derivatives(orbit, terms, coarse_frequencies, lon, lat,
+                              scales=sky_scales, samples=samples)
+    return LinearExponentSurrogate(
+        grid, coarse_frequencies, response, sky, b0, t0,
+        numpy.array(log_derivatives), numpy.array(time_derivatives),
+        kmax=kmax, dtype=dtype)
