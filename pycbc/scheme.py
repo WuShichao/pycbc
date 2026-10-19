@@ -236,6 +236,16 @@ scheme_prefix[DefaultScheme] = _default_scheme_prefix
 def current_prefix():
     return scheme_prefix[type(mgr.state)]
 
+
+def array_module():
+    """The array module of the current scheme: cupy under a CUPYScheme,
+    numpy otherwise. Code written against it runs on either."""
+    if isinstance(mgr.state, CUPYScheme):
+        import cupy
+        return cupy
+    import numpy
+    return numpy
+
 _import_cache = {}
 def schemed(prefix):
 
