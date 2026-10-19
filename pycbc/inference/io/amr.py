@@ -31,9 +31,9 @@ class AMRFile(DynestyFile):
         if self.sampler_group not in self.keys():
             self.create_group(self.sampler_group)
         group = self[self.sampler_group]
-        for key in ('initial_divisions', 'max_level', 'loglikelihood_step',
-                    'mass_fraction', 'max_evaluations', 'posterior_samples',
-                    'seed'):
+        for key in ('initial_divisions', 'max_level', 'pilot_evaluations',
+                    'loglikelihood_step', 'mass_fraction', 'max_evaluations',
+                    'posterior_samples', 'seed'):
             group.attrs[key] = getattr(sampler, key)
         sampler.model.write_metadata(self)
 

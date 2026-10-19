@@ -157,3 +157,26 @@ nlive = 100
     with pytest.raises(ValueError, match="unknown option"):
         AMRSampler.from_config(cp, model,
                                output_file=str(tmp_path / 'out.hdf'))
+
+
+def test_a_whitened_frame_follows_a_ridge_with_fewer_evaluations():
+    plain = AMRSampler(ridge_model(0.01), mass_fraction=1e-5,
+                       max_evaluations=400000, posterior_samples=20000,
+                       seed=1)
+    plain.run()
+    framed = AMRSampler(ridge_model(0.01), mass_fraction=1e-5,
+                        pilot_evaluations=2000, max_evaluations=400000,
+                        posterior_samples=20000, seed=1)
+    framed.run()
+    error = framed.logz + math.log((2 * HALF) ** 2)
+    assert abs(error) < 3 * framed.logz_err < 0.05
+    assert framed.nevaluations < plain.nevaluations / 3
+    x = framed.samples['x']
+    assert numpy.mean(x) == pytest.approx(0.3, abs=0.02)
+    assert numpy.std(x) == pytest.approx(math.sqrt(0.75), rel=0.03)
+    # the frame's boxes map into the cube
+    cells = framed.cells
+    centre = cells['frame_origin'] + (cells['lower'] + 0.5 * cells['width']) \
+        @ cells['frame_matrix'].T
+    inside = numpy.all((centre >= 0) & (centre <= 1), axis=1)
+    assert inside.any()

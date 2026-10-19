@@ -21,7 +21,8 @@ box centre. A box is bisected along its widest side when either
 
 * its error estimate exceeds ``mass-fraction`` of the evidence. The error of
   a box is how much the midpoint mass of its region changed when its parent
-  was split; a box of the starting grid has its own mass as its error.
+  was split; a box of the starting grid has its own mass as its error. This
+  stops refining where the integral has converged.
 * it is more than twice as coarse as a face neighbour, and would hold more
   than ``mass-fraction`` of the evidence at that neighbour's likelihood. This
   carries the refinement along a narrow ridge, whose continuation a coarse
@@ -33,6 +34,15 @@ box centre. A box is bisected along its widest side when either
 
 Refinement stops when no box qualifies, the boxes reach ``max-level``
 bisections, or ``max-evaluations`` is spent.
+
+Boxes aligned with the cube's axes follow a ridge oblique to them only by
+becoming small. With ``pilot-evaluations`` set, a first refinement of that
+many evaluations gives the posterior's mean and covariance, and the cube is
+partitioned again in the affine frame that whitens them: boxes there are
+parallelepipeds in the cube, about one standard deviation wide around the
+mean to start with. The frame's boxes cover the cube; their prior mass is
+their volume in the cube, and a box whose centre lies outside the cube has
+none.
 
 The evidence is the midpoint sum over the boxes; its error estimate is the
 summed error of the final boxes. Posterior samples are drawn by choosing
@@ -70,6 +80,9 @@ class AMRSampler(BaseSampler):
         Divisions per parameter of the starting grid. Default 4.
     max_level : int, optional
         Maximum number of bisections of any box. Default 30.
+    pilot_evaluations : int, optional
+        Evaluations of the pilot refinement that sets the whitened frame.
+        Default 0, no pilot: the boxes stay aligned with the cube.
     loglikelihood_step : float, optional
         A box holding more than ``mass_fraction`` of the evidence is refined
         while its log likelihood differs from a face neighbour's by more
@@ -96,13 +109,14 @@ class AMRSampler(BaseSampler):
     _io = AMRFile
 
     def __init__(self, model, initial_divisions=4, max_level=30,
-                 loglikelihood_step=1.0, mass_fraction=1e-4,
-                 max_evaluations=100000,
+                 pilot_evaluations=0, loglikelihood_step=1.0,
+                 mass_fraction=1e-4, max_evaluations=100000,
                  posterior_samples=10000, seed=0, nprocesses=1,
                  use_mpi=False, loglikelihood_function=None):
         super().__init__(model)
         self.initial_divisions = int(initial_divisions)
         self.max_level = int(max_level)
+        self.pilot_evaluations = int(pilot_evaluations)
         self.loglikelihood_step = float(loglikelihood_step)
         self.mass_fraction = float(mass_fraction)
         self.max_evaluations = int(max_evaluations)
@@ -122,6 +136,12 @@ class AMRSampler(BaseSampler):
         # _children, so the final boxes are the leaves of a tree
         self._lower = self._width = self._logl = self._level = None
         self._logerr = self._children = None
+        # the box coordinates s map to the cube as origin + matrix @ s; scale
+        # is the length of each axis of s in the frame that sizes the boxes
+        self._origin = numpy.zeros(self.ndim)
+        self._matrix = numpy.eye(self.ndim)
+        self._scale = numpy.ones(self.ndim)
+        self._logdet = 0.0
         self._logz = self._dlogz = None
         self._samples = {}
 
@@ -152,29 +172,43 @@ class AMRSampler(BaseSampler):
 
     @property
     def cells(self):
-        """The final boxes: lower corner and width in the unit cube, the log
-        likelihood at the centre, and the number of bisections."""
+        """The final boxes: lower corner and width in the box coordinates
+        ``s``, the log likelihood at the centre, and the number of
+        bisections. The point ``s`` of the unit cube is ``frame_origin +
+        frame_matrix @ s``."""
         leaf = self._leaves()
         return {'lower': self._lower[leaf], 'width': self._width[leaf],
-                'loglikelihood': self._logl[leaf], 'level': self._level[leaf]}
+                'loglikelihood': self._logl[leaf], 'level': self._level[leaf],
+                'frame_origin': self._origin, 'frame_matrix': self._matrix}
 
     def _leaves(self):
         return numpy.nonzero(self._children[:, 0] < 0)[0]
 
+    def _to_cube(self, s):
+        return self._origin + s @ self._matrix.T
+
     def _evaluate(self, index):
-        cube = self._lower[index] + 0.5 * self._width[index]
-        points = [self._prior_transform(c) for c in cube]
-        self._logl[index] = self.pool.map(self._loglikelihood, points)
-        self.nevaluations += len(index)
+        cube = self._to_cube(self._lower[index] + 0.5 * self._width[index])
+        inside = numpy.all((cube >= 0) & (cube <= 1), axis=1)
+        logl = numpy.full(len(index), -numpy.inf)
+        if inside.any():
+            points = [self._prior_transform(c) for c in cube[inside]]
+            logl[inside] = self.pool.map(self._loglikelihood, points)
+        self.nevaluations += int(inside.sum())
+        self._logl[index] = logl
 
     def _log_mass(self, index):
-        logvol = numpy.sum(numpy.log(self._width[index]), axis=1)
+        logvol = (numpy.sum(numpy.log(self._width[index]), axis=1)
+                  + self._logdet)
         with numpy.errstate(invalid='ignore'):
             return numpy.where(numpy.isfinite(self._logl[index]),
                                self._logl[index] + logvol, -numpy.inf)
 
     def run(self):
         self._grid()
+        if self.pilot_evaluations > 0:
+            self._refine(min(self.pilot_evaluations, self.max_evaluations))
+            self._whiten()
         leaves, logmass, logz, refine = self._refine(self.max_evaluations)
         self._logz = logz
         logerr = self._logerr[leaves]
@@ -186,8 +220,8 @@ class AMRSampler(BaseSampler):
                             "still to refine", len(refine))
         self._draw_posterior(leaves, logmass)
 
-    def _grid(self):
-        """Starts the tree from a regular grid over the cube."""
+    def _grid(self, evaluate=True):
+        """Starts the tree from a regular grid over the box coordinates."""
         n = self.initial_divisions
         axes = [numpy.arange(n) / n] * self.ndim
         self._lower = numpy.array(numpy.meshgrid(*axes, indexing='ij'))
@@ -197,7 +231,8 @@ class AMRSampler(BaseSampler):
         self._children = numpy.full((len(self._lower), 2), -1)
         self._logl = numpy.full(len(self._lower), numpy.nan)
         self._logerr = numpy.full(len(self._lower), numpy.nan)
-        self._evaluate_leaves()
+        if evaluate:
+            self._evaluate_leaves()
 
     def _evaluate_leaves(self):
         leaves = self._leaves()
@@ -227,6 +262,50 @@ class AMRSampler(BaseSampler):
                 refine = refine[numpy.argsort(-priority)[:room]]
             self._bisect(refine)
 
+    def _whiten(self, radius=4.0):
+        """Partitions the cube again in the frame that whitens the current
+        posterior, with boxes about one standard deviation wide out to
+        ``radius`` standard deviations from its mean."""
+        leaves = self._leaves()
+        logmass = self._log_mass(leaves)
+        weight = numpy.exp(logmass - logsumexp(logmass))
+        centre = self._to_cube(self._lower[leaves]
+                               + 0.5 * self._width[leaves])
+        width = self._width[leaves] @ numpy.abs(self._matrix.T)
+        mean = weight @ centre
+        offset = centre - mean
+        cov = (offset.T @ (weight[:, None] * offset)
+               + numpy.diag(weight @ width ** 2) / 12)
+        chol = numpy.linalg.cholesky(cov)
+        inverse = numpy.linalg.inv(chol)
+        # the bounding box of the cube in the whitened frame
+        middle = inverse @ (0.5 - mean)
+        half = 0.5 * numpy.abs(inverse).sum(axis=1)
+        low, span = middle - half, 2 * half
+        self._origin = mean + chol @ low
+        self._matrix = chol * span
+        self._scale = span
+        self._logdet = float(numpy.sum(numpy.log(numpy.diag(chol)))
+                             + numpy.sum(numpy.log(span)))
+        logging.info("AMR: whitened frame from %d pilot evaluations",
+                     self.nevaluations)
+        self._grid(evaluate=False)
+        # unit boxes near the mean, unless that would take a tenth of the
+        # budget
+        target = max(1.0, 2 * radius / (0.1 * self.max_evaluations)
+                     ** (1.0 / self.ndim))
+        while True:
+            leaves = self._leaves()
+            zlow = low + span * self._lower[leaves]
+            zwidth = span * self._width[leaves]
+            nearest = numpy.clip(0, zlow, zlow + zwidth)
+            near = numpy.linalg.norm(nearest, axis=1) <= radius
+            split = leaves[near & (zwidth.max(axis=1) > target)]
+            if len(split) == 0:
+                break
+            self._split(split)
+        self._evaluate_leaves()
+
     def _locate(self, points):
         """The leaf holding each point of the unit cube."""
         n = self.initial_divisions
@@ -253,13 +332,14 @@ class AMRSampler(BaseSampler):
         flag_significant = numpy.zeros(len(self._lower), dtype=bool)
         flag_significant[leaves[significant]] = True
         # a neighbour is at most as large as a box of the starting grid
-        largest = -self.ndim * numpy.log(self.initial_divisions)
+        largest = (-self.ndim * numpy.log(self.initial_divisions)
+                   + self._logdet)
         source = leaves[(self._logl[leaves] + largest > logbound)
                         | significant]
         if len(source) == 0:
             return numpy.zeros(len(leaves), dtype=bool)
         centre = self._lower[source] + 0.5 * self._width[source]
-        size = self._width[source].max(axis=1)
+        size = (self._width[source] * self._scale).max(axis=1)
         for axis in range(self.ndim):
             for sign in (-1, 1):
                 probe = centre.copy()
@@ -267,9 +347,10 @@ class AMRSampler(BaseSampler):
                     1 + 1e-9)
                 inside = (probe[:, axis] > 0) & (probe[:, axis] < 1)
                 found = self._locate(probe[inside])
-                logvol = numpy.sum(numpy.log(self._width[found]), axis=1)
+                logvol = (numpy.sum(numpy.log(self._width[found]), axis=1)
+                          + self._logdet)
                 origin = source[inside]
-                coarseness = self._width[found].max(axis=1)
+                coarseness = (self._width[found] * self._scale).max(axis=1)
                 coarse = ((coarseness > 2 * size[inside])
                           & (self._logl[origin] + logvol > logbound))
                 flag[found[coarse]] = True
@@ -287,7 +368,7 @@ class AMRSampler(BaseSampler):
         """Halves boxes along their widest side, without evaluating them;
         returns the indices of the lower and the upper halves."""
         lower, width = self._lower[index], self._width[index]
-        axis = numpy.argmax(width, axis=1)
+        axis = numpy.argmax(width * self._scale, axis=1)
         rows = numpy.arange(len(index))
         half = width.copy()
         half[rows, axis] /= 2
@@ -314,7 +395,8 @@ class AMRSampler(BaseSampler):
         first, second = self._split(index)
         self._evaluate(numpy.concatenate([first, second]))
         # the change in the region's midpoint mass, carried by both halves
-        logvol = numpy.sum(numpy.log(self._width[first]), axis=1)
+        logvol = (numpy.sum(numpy.log(self._width[first]), axis=1)
+                  + self._logdet)
         with numpy.errstate(invalid='ignore'):
             parent, a, b = (numpy.where(numpy.isfinite(self._logl[i]),
                                         self._logl[i] + logvol, -numpy.inf)
@@ -335,8 +417,16 @@ class AMRSampler(BaseSampler):
         weights /= weights.sum()
         boxes = leaves[rng.choice(len(weights), size=self.posterior_samples,
                                   p=weights)]
-        cube = (self._lower[boxes]
-                + rng.random((len(boxes), self.ndim)) * self._width[boxes])
+        cube = numpy.empty((len(boxes), self.ndim))
+        todo = numpy.arange(len(boxes))
+        # a box straddling the cube's surface is drawn from where it is inside
+        while len(todo):
+            box = boxes[todo]
+            cube[todo] = self._to_cube(
+                self._lower[box]
+                + rng.random((len(box), self.ndim)) * self._width[box])
+            todo = todo[~numpy.all((cube[todo] >= 0) & (cube[todo] <= 1),
+                                   axis=1)]
         points = numpy.array([self._prior_transform(c) for c in cube])
         samples = {p: points[:, i]
                    for i, p in enumerate(self.model.variable_params)}
@@ -371,8 +461,8 @@ class AMRSampler(BaseSampler):
 
         * ``name = amr``
         * ``initial-divisions = INT``, ``max-level = INT``,
-          ``loglikelihood-step = FLOAT``, ``mass-fraction = FLOAT``,
-          ``max-evaluations = INT``,
+          ``pilot-evaluations = INT``, ``loglikelihood-step = FLOAT``,
+          ``mass-fraction = FLOAT``, ``max-evaluations = INT``,
           ``posterior-samples = INT``, ``seed = INT``: optional, see the
           class docstring.
         * ``loglikelihood-function = STR``: optional, the model attribute to
@@ -382,8 +472,9 @@ class AMRSampler(BaseSampler):
         assert cp.get(section, 'name') == cls.name, (
             "name in section [sampler] must match mine")
         types = {'initial-divisions': int, 'max-level': int,
-                 'loglikelihood-step': float, 'mass-fraction': float,
-                 'max-evaluations': int, 'posterior-samples': int, 'seed': int,
+                 'pilot-evaluations': int, 'loglikelihood-step': float,
+                 'mass-fraction': float, 'max-evaluations': int,
+                 'posterior-samples': int, 'seed': int,
                  'loglikelihood-function': str}
         unknown = set(cp.options(section)) - set(types) - {'name'}
         if unknown:
