@@ -386,9 +386,16 @@ Configuration
     # which eta columns are the variable parameters
     eta-columns = 0 1 2 3
 
-    # the exact projection from eta to the physical parameters.  When set, the
-    # physical columns named in the file are written beside the eta ones.
-    physical-map = examples/inference/amr-partition/physical-map.json
+    # the exact projection from eta to the physical parameters: a JSON file
+    # holding the six chart eigenvalues lam and orthogonal eigenvectors E, the
+    # sampled eta columns and the static values of the others, one entry per
+    # physical parameter (name, xi_index, reference, scale and the identity or
+    # reciprocal kind), and the recorded injection as xi and eta.  On load the
+    # file is checked by requiring E diag(1/sqrt(lam)) eta to return the
+    # recorded xi; a map that does not reproduce it is refused.  When set, the
+    # physical columns are computed from the eta ones and written beside them.
+    # See ShapeToPhysicalMap for the chart and the conventions.
+    physical-map = /path/to/physical-map.json
 
     # the archived sufficient statistics, (D, Gram) per (cell, lag).  When set,
     # inclination, polarization, delta_tc, amplitude_u, distance and

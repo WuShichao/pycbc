@@ -31,6 +31,7 @@ that the drawn ``(cos iota, ln u)`` correlation reproduces the archived -0.94
 at the corrected ceiling.
 """
 
+import json
 import os
 
 import numpy
@@ -49,9 +50,43 @@ from pycbc.inference.sampler.amr_demarg import (
 from pycbc.workflow import WorkflowConfigParser
 
 
-MAP = os.path.abspath(os.path.join(
-    os.path.dirname(__file__), "..", "examples", "inference",
-    "amr-partition", "physical-map.json"))
+def make_physical_map(tmp_path, eta_columns=(0, 1, 2, 3)):
+    """A small physical map with a hand-computable projection.
+
+    ``E`` is the identity and ``lam = (4, 1, 1, 1, 1, 1)``, so
+    ``M = diag(1/2, 1, 1, 1, 1, 1)`` and ``xi = (eta_0/2, eta_1, ..., eta_5)``.
+    The six parameters cover both map kinds (identity and reciprocal ``q``)
+    and the two sky columns, so the same fixture exercises a six-column
+    partition; the injection is the ``eta`` that ``M`` maps back to the
+    recorded ``xi``.
+    """
+    spec = {
+        "eta_columns": list(eta_columns),
+        "eta_static": {"4": 0.0, "5": 0.0},
+        "lam": [4.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        "E": numpy.eye(6).tolist(),
+        "parameters": [
+            {"name": "mchirp", "xi_index": 0, "kind": "identity",
+             "reference": 10.0, "scale": 0.1},
+            {"name": "q", "xi_index": 1, "kind": "reciprocal",
+             "reference": 2.0, "scale": 0.01},
+            {"name": "spin1z", "xi_index": 2, "kind": "identity",
+             "reference": 0.05, "scale": 0.02},
+            {"name": "spin2z", "xi_index": 3, "kind": "identity",
+             "reference": -0.05, "scale": 0.02},
+            {"name": "eclipticlongitude", "xi_index": 4, "kind": "identity",
+             "reference": 1.0, "scale": 0.1},
+            {"name": "eclipticlatitude", "xi_index": 5, "kind": "identity",
+             "reference": 0.3, "scale": 0.1},
+        ],
+        "injection": {
+            "xi": [1.0, 0.5, -1.0, 0.25, -0.5, 0.75],
+            "eta": [2.0, 0.5, -1.0, 0.25, -0.5, 0.75]},
+    }
+    path = tmp_path / "physical-map.json"
+    path.write_text(json.dumps(spec))
+    return str(path)
+
 
 #: The A_min of the stored run, so the synthetic s = A_min sqrt(n) lands in the
 #: production table's ln s range.
@@ -867,13 +902,15 @@ def test_the_archive_cannot_be_combined_with_the_research_path(tmp_path):
 
 
 def test_the_physical_and_sky_columns_and_the_injections_group(tmp_path):
-    shape_map = ShapeToPhysicalMap.from_file(MAP)
+    map_path = make_physical_map(tmp_path)
+    shape_map = ShapeToPhysicalMap.from_file(map_path)
     partition, eta, widths, lnb = make_partition(
         tmp_path, truth=shape_map.injection["eta"], ncells=4)
     archive = make_archive(tmp_path, eta, lnb, truth=shape_map.injection["eta"])
     cp = make_config(
         partition,
-        "sufficient-file = {}\nphysical-map = {}\n".format(archive, MAP),
+        "sufficient-file = {}\nphysical-map = {}\n".format(
+            archive, map_path),
         eta_columns="0 1 2 3")
     sampler = run_sampler(
         tmp_path, cp,

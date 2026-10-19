@@ -22,7 +22,7 @@ and the geometry re-check are the other half and are exercised by
 ``test_inference_amr.py``.
 """
 
-import os
+import json
 
 import numpy
 import pytest
@@ -30,9 +30,43 @@ import pytest
 from pycbc.inference.models.analytic import TestNormal
 from pycbc.inference.sampler.amr import AmrSampler, ShapeToPhysicalMap
 
-MAP = os.path.abspath(os.path.join(
-    os.path.dirname(__file__), "..", "examples", "inference",
-    "amr-partition", "physical-map.json"))
+
+def make_physical_map(tmp_path, eta_columns=(0, 1, 2, 3)):
+    """A small physical map with a hand-computable projection.
+
+    ``E`` is the identity and ``lam = (4, 1, 1, 1, 1, 1)``, so
+    ``M = diag(1/2, 1, 1, 1, 1, 1)`` and ``xi = (eta_0/2, eta_1, ..., eta_5)``.
+    The six parameters cover both map kinds (identity and reciprocal ``q``)
+    and the two sky columns, so the same fixture exercises a six-column
+    partition; the injection is the ``eta`` that ``M`` maps back to the
+    recorded ``xi``.
+    """
+    spec = {
+        "eta_columns": list(eta_columns),
+        "eta_static": {"4": 0.0, "5": 0.0},
+        "lam": [4.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        "E": numpy.eye(6).tolist(),
+        "parameters": [
+            {"name": "mchirp", "xi_index": 0, "kind": "identity",
+             "reference": 10.0, "scale": 0.1},
+            {"name": "q", "xi_index": 1, "kind": "reciprocal",
+             "reference": 2.0, "scale": 0.01},
+            {"name": "spin1z", "xi_index": 2, "kind": "identity",
+             "reference": 0.05, "scale": 0.02},
+            {"name": "spin2z", "xi_index": 3, "kind": "identity",
+             "reference": -0.05, "scale": 0.02},
+            {"name": "eclipticlongitude", "xi_index": 4, "kind": "identity",
+             "reference": 1.0, "scale": 0.1},
+            {"name": "eclipticlatitude", "xi_index": 5, "kind": "identity",
+             "reference": 0.3, "scale": 0.1},
+        ],
+        "injection": {
+            "xi": [1.0, 0.5, -1.0, 0.25, -0.5, 0.75],
+            "eta": [2.0, 0.5, -1.0, 0.25, -0.5, 0.75]},
+    }
+    path = tmp_path / "physical-map.json"
+    path.write_text(json.dumps(spec))
+    return str(path)
 
 
 def make_model(params=("eta_0", "eta_1", "eta_2", "eta_3")):
@@ -56,18 +90,19 @@ def make_partition(tmp_path, truth=None):
     return path, eta, widths, lnb
 
 
-def test_the_inverse_returns_the_recorded_injection():
+def test_the_inverse_returns_the_recorded_injection(tmp_path):
     """p -> xi must undo p = p_ref + sigma xi, including the q convention."""
-    shape_map = ShapeToPhysicalMap.from_file(MAP)
+    shape_map = ShapeToPhysicalMap.from_file(make_physical_map(tmp_path))
     xi = shape_map.xi_from_physical(shape_map.truth())
     numpy.testing.assert_allclose(xi, shape_map.injection["xi"], atol=1e-8)
 
 
 def test_the_physical_columns_are_the_map_applied_to_eta(tmp_path):
-    shape_map = ShapeToPhysicalMap.from_file(MAP)
+    map_path = make_physical_map(tmp_path)
+    shape_map = ShapeToPhysicalMap.from_file(map_path)
     path, eta, widths, lnb = make_partition(tmp_path)
     sampler = AmrSampler(make_model(), partition_file=path,
-                         physical_map=MAP, eta_columns=[0, 1, 2, 3])
+                         physical_map=map_path, eta_columns=[0, 1, 2, 3])
     sampler._set_samples(eta, widths, lnb)
     expected = shape_map.physical(eta[:, [0, 1, 2, 3]])
     for name in shape_map.physical_names():
@@ -75,21 +110,23 @@ def test_the_physical_columns_are_the_map_applied_to_eta(tmp_path):
 
 
 def test_a_map_from_another_run_is_refused(tmp_path):
-    shape_map = ShapeToPhysicalMap.from_file(MAP)
+    map_path = make_physical_map(tmp_path)
+    shape_map = ShapeToPhysicalMap.from_file(map_path)
     truth = numpy.asarray(shape_map.injection["eta"]) + 1e-3
     path, _, _, _ = make_partition(tmp_path, truth=truth)
     sampler = AmrSampler(make_model(), partition_file=path,
-                         physical_map=MAP, eta_columns=[0, 1, 2, 3])
+                         physical_map=map_path, eta_columns=[0, 1, 2, 3])
     with pytest.raises(ValueError, match="different geometry or run"):
         sampler._load_partition()
 
 
 def test_a_matching_partition_is_accepted(tmp_path):
-    shape_map = ShapeToPhysicalMap.from_file(MAP)
+    map_path = make_physical_map(tmp_path)
+    shape_map = ShapeToPhysicalMap.from_file(map_path)
     path, eta, widths, lnb = make_partition(
         tmp_path, truth=shape_map.injection["eta"])
     sampler = AmrSampler(make_model(), partition_file=path,
-                         physical_map=MAP, eta_columns=[0, 1, 2, 3])
+                         physical_map=map_path, eta_columns=[0, 1, 2, 3])
     got_eta, got_widths, got_lnb = sampler._load_partition()
     numpy.testing.assert_array_equal(got_eta, eta)
     numpy.testing.assert_array_equal(got_widths, widths)
