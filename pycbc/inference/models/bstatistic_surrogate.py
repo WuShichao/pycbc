@@ -154,8 +154,9 @@ class BStatisticSurrogate(BaseModel):
 
         Returns ``rec`` (a new dict by default) with ``delta_tc``,
         ``inclination``, ``polarization`` in ``[0, 2 pi)``, ``distance``,
-        ``signal_phase`` (the overall phase of the signal) and
-        ``loglikelihood``.
+        ``signal_phase`` (the overall phase of the signal), ``loglr`` and
+        ``snr``, the matched-filter log likelihood ratio of the drawn signal
+        and ``sqrt(2 loglr)``, and ``loglikelihood``, the marginal one.
         """
         rng = numpy.random.default_rng(seed)
         rec = {} if rec is None else rec
@@ -182,9 +183,13 @@ class BStatisticSurrogate(BaseModel):
                            self.distance_prior, rng)
         X = complex(numpy.conj(w) @ z)
         phase = draw_phase(h, X, rng)
+        # the matched-filter log likelihood ratio of the drawn signal
+        loglr = h * numpy.real(numpy.exp(-1j * phase) * X) \
+            - 0.5 * h * h * float(gg[0, 0])
         # psi + k pi / 2 with phase + k pi is the same signal
         quarter = rng.integers(4)
-        rec.update(delta_tc=float(delay),
+        rec.update(delta_tc=float(delay), loglr=float(loglr),
+                   snr=float(numpy.sqrt(max(2 * loglr, 0.0))),
                    inclination=float(numpy.arccos(cos_iota)),
                    polarization=float(psi + quarter * numpy.pi / 2),
                    distance=float(self.distance_prior.scale / h),
