@@ -147,3 +147,99 @@ class LinearExponentSurrogate(object):
             y += self.fine(rho[i]) * phase
         shift = xp.asarray(self.grid.frequencies - self.grid.first_frequency)
         return y * xp.exp(-2j * numpy.pi * shift * delta).astype(self.dtype)
+
+
+class DailyGram(object):
+    """The Gram matrix ``G_ab(Delta)`` of a surrogate's bases over the data
+    window, on a daily grid of arrival times.
+
+    In the stationary-phase picture frequency ``f`` sits at SSB time
+    ``t(f) + Delta``, so binning the template power by day gives
+
+        G_ab(Delta) = sum_m sum_tau Q_ab,m(tau) W_m(tau + Delta),
+        Q_ab,m(tau) = sum_{t(f) in day tau} |b(f)|^2
+                      sum_{k' - k = m} conj(rho_k,a) . rho_k',b (fbar_tau),
+        W_m(t) = W(t) exp(i m Omega t),
+
+    with ``W`` the data window and the response read at each day's mean
+    frequency. ``G`` is in the units of the correlation: with ``W = 1`` it
+    is ``sum_f conj(y_a) y_b``.
+
+    Parameters
+    ----------
+    surrogate : LinearExponentSurrogate
+        The family; its reference stationary time sizes the grid.
+    day : float
+        The bin width, s.
+    window : callable, optional
+        ``W(t)`` on SSB times; default one inside the grid's data span.
+    """
+    def __init__(self, surrogate, day=86400.0, window=None):
+        xp = self.xp = surrogate.xp
+        self.surrogate = surrogate
+        grid = surrogate.grid
+        self.day = float(day)
+        t0 = surrogate.t0
+        t_min, t_max = float(xp.min(t0)), float(xp.max(t0))
+        self.t_lo = min(t_min, grid.start) - 2 * self.day
+        if window is None:
+            def window(t):
+                return ((t >= grid.start) & (t < grid.stop)).astype(float)
+        span = int(numpy.ceil((max(t_max, grid.stop) - self.t_lo) / self.day))
+        days = self.t_lo + (numpy.arange(span) + 0.5) * self.day
+        need = span + int(numpy.sum(window(days) > 0)) + 2
+        self.size = 1 << int(numpy.ceil(numpy.log2(need)))
+        days = self.t_lo + (numpy.arange(self.size) + 0.5) * self.day
+        w = window(days)
+        kmax = int(surrogate.orders[-1])
+        self.harmonics = numpy.arange(-2 * kmax, 2 * kmax + 1)
+        omega = ORBITAL_ANGULAR_FREQUENCY
+        self._Wm = xp.asarray(numpy.array([
+            numpy.fft.fft(w * numpy.exp(1j * m * omega * days))
+            for m in self.harmonics]))
+        nk = len(surrogate.orders)
+        mmap = numpy.zeros((len(self.harmonics), nk * nk))
+        for k in range(nk):
+            for l in range(nk):
+                mmap[l - k + 2 * kmax, k * nk + l] = 1.0
+        self._mmap = xp.asarray(mmap.astype(complex))
+        lag = numpy.arange(grid.size)
+        delta = numpy.where(lag < grid.size // 2, lag, lag - grid.size) \
+            * grid.delta_t
+        x = numpy.mod(delta, self.day * self.size) / self.day - 0.5
+        self._lag_j = xp.asarray(numpy.floor(x).astype(int) % self.size)
+        self._lag_fr = xp.asarray(x - numpy.floor(x))
+        self._freqs = xp.asarray(grid.frequencies)
+
+    def __call__(self, b, t, rho):
+        """``(g00, g11, g01)`` on the daily grid for one template."""
+        xp, s = self.xp, self.surrogate
+        power = xp.abs(b.astype(xp.complex128)) ** 2
+        tau = xp.floor((t - self.t_lo) / self.day).astype(xp.int64)
+        ok = (tau >= 0) & (tau < self.size)
+        tau = xp.where(ok, tau, 0)
+        power = xp.where(ok, power, 0)
+        pw = xp.bincount(tau, weights=power, minlength=self.size)
+        fbar = xp.bincount(tau, weights=power * self._freqs,
+                           minlength=self.size) / xp.maximum(pw, 1e-300)
+        coarse = s.coarse_frequencies
+        x = (fbar - coarse[0]) / (coarse[1] - coarse[0])
+        i = xp.clip(xp.floor(x).astype(xp.int64), 0, len(coarse) - 2)
+        w = xp.clip(x - i, 0, 1)
+        r = rho.astype(xp.complex128)
+        rk = r[..., i] * (1 - w) + r[..., i + 1] * w
+        nk = len(s.orders)
+        pk = xp.einsum('kacd,lbcd->klabd', xp.conj(rk), rk).reshape(
+            nk * nk, 2, 2, self.size)
+        q = xp.tensordot(self._mmap, pk, axes=([1], [0])) * pw
+        # sum_tau Q(tau) W_m(tau + lag), Q complex: conjugate it first
+        g = xp.fft.ifft(xp.conj(xp.fft.fft(xp.conj(q), axis=-1))
+                        * self._Wm[:, None, None, :], axis=-1).sum(axis=0)
+        return g[0, 0].real, g[1, 1].real, g[0, 1]
+
+    def at_lags(self, gram):
+        """The daily ``(g00, g11, g01)`` interpolated to every arrival time
+        of the surrogate's grid, in its FFT order."""
+        j, fr = self._lag_j, self._lag_fr
+        j1 = (j + 1) % self.size
+        return tuple(g[j] * (1 - fr) + g[j1] * fr for g in gram)
