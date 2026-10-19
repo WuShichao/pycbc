@@ -124,6 +124,14 @@ class LinearExponentSurrogate(object):
         arrival time ``Delta = j delta_t`` of the grid; ``data`` is the
         SSB-time data spectrum, shape ``(nchannels, N)``. Returns shape
         ``(2, N)``."""
+        spectrum = self.correlation_spectrum(data, b, t, rho)
+        return self.xp.fft.ifft(spectrum, axis=-1) * self.size
+
+    def correlation_spectrum(self, data, b, t, rho):
+        """The spectrum ``a_m`` of the correlation, ``z(Delta) = sum_m a_m
+        exp(2 pi i m Delta / T)`` with ``T`` the grid's duration: evaluated
+        at any ``Delta``, see
+        :mod:`pycbc.filter.subsample_arrival_time`."""
         xp = self.xp
         acc = xp.zeros((2, self.size), dtype=self.dtype)
         for i, k in enumerate(self.orders):
@@ -134,7 +142,7 @@ class LinearExponentSurrogate(object):
                     prod += xp.conj(self.fine(rho[i, a, c]) * phase) * data[c]
                 # the k-th harmonic is a shift of k bins per orbital period
                 acc[a] += xp.roll(prod, -int(k) * self.shift)
-        return xp.fft.ifft(acc, axis=-1) * self.size
+        return acc
 
     def template(self, b, t, rho, delta):
         """The template ``y_ac(f; Delta)`` on the fine grid, shape
@@ -241,6 +249,17 @@ class DailyGram(object):
         """The daily ``(g00, g11, g01)`` interpolated to every arrival time
         of the surrogate's grid, in its FFT order."""
         j, fr = self._lag_j, self._lag_fr
+        j1 = (j + 1) % self.size
+        return tuple(g[j] * (1 - fr) + g[j1] * fr for g in gram)
+
+    def at_delays(self, gram, delays):
+        """The daily ``(g00, g11, g01)`` interpolated to arbitrary arrival
+        times ``delays``, s."""
+        xp = self.xp
+        x = xp.mod(xp.asarray(delays, dtype=xp.float64),
+                   self.day * self.size) / self.day - 0.5
+        j = xp.floor(x).astype(xp.int64) % self.size
+        fr = x - xp.floor(x)
         j1 = (j + 1) % self.size
         return tuple(g[j] * (1 - fr) + g[j1] * fr for g in gram)
 
