@@ -41,7 +41,6 @@ from .snowline import SnowlineFile
 from .nessai import NessaiFile
 from .nautilus import NautilusFile
 from .posterior import PosteriorFile
-from .amr import AmrFile
 from .txt import InferenceTXTFile
 
 filetypes = {
@@ -52,7 +51,6 @@ filetypes = {
     MultinestFile.name: MultinestFile,
     DynestyFile.name: DynestyFile,
     PosteriorFile.name: PosteriorFile,
-    AmrFile.name: AmrFile,
     UltranestFile.name: UltranestFile,
     NessaiFile.name: NessaiFile,
     NautilusFile.name: NautilusFile,
