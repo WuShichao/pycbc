@@ -173,3 +173,114 @@ def draw_phase(h, X, rng):
     von Mises distribution about ``arg X``, in ``[0, 2 pi)``."""
     phi = rng.vonmises(numpy.angle(X), h * abs(X))
     return float(numpy.mod(phi, 2 * numpy.pi))
+
+
+class OrientationNodes(object):
+    """Quadrature over an isotropic orientation: Gauss-Legendre in
+    ``cos(iota)`` on ``[-1, 1]`` and the midpoint rule in ``psi`` over its
+    period, ``pi / 2`` once the phase is marginalised (a quarter turn of
+    ``psi`` only flips the sign of the weights). The weights sum to one.
+    """
+    def __init__(self, n_cos=16, n_psi=8):
+        from pycbc.tmpltbank.fstatistic_metric import orientation_weights
+        t, w = roots_legendre(int(n_cos))
+        psi = (numpy.arange(int(n_psi)) + 0.5) * (numpy.pi / 2) / n_psi
+        cos_iota, psi = numpy.meshgrid(t, psi, indexing='ij')
+        self.cos_iota, self.psi = cos_iota.ravel(), psi.ravel()
+        self.weights = numpy.repeat(0.5 * w, int(n_psi)) / n_psi
+        self.vectors = orientation_weights(numpy.arccos(self.cos_iota),
+                                           self.psi).T
+        self.n_cos, self.n_psi = int(n_cos), int(n_psi)
+        # cell edges for drawing inside a node's share of the sphere
+        edges = numpy.concatenate([[-1], numpy.cumsum(w) - 1])
+        self._cos_edges = edges
+        self._psi_step = (numpy.pi / 2) / n_psi
+
+
+def _project(z, g00, g11, g01, vectors, xp):
+    """``|w^H z|`` and ``w^H G w`` for every sample and orientation."""
+    v = xp.asarray(vectors)
+    x = xp.abs(xp.conj(v[:, 0])[None, :] * z[0][:, None]
+               + xp.conj(v[:, 1])[None, :] * z[1][:, None])
+    g = (xp.abs(v[:, 0]) ** 2 * g00[:, None]
+         + xp.abs(v[:, 1]) ** 2 * g11[:, None]
+         + 2 * xp.real(xp.conj(v[:, 0]) * v[:, 1] * g01[:, None]))
+    return x, g
+
+
+def log_orientation_marginal(z, g00, g11, g01, prior, nodes, order=64,
+                             xp=numpy):
+    """``ln B`` at each sample, marginalised over phase, amplitude and an
+    isotropic orientation: ``ln sum_n weight_n B(w_n)``.
+
+    ``z`` has shape ``(2, n)`` and the Gram elements ``(n,)``; see
+    :func:`pycbc.filter.fstatistic.twof` for their meaning.
+    """
+    x, g = _project(z, g00, g11, g01, nodes.vectors, xp)
+    lnb = log_amplitude_marginal(x, g, prior, order=order, xp=xp)
+    terms = lnb + xp.log(xp.asarray(nodes.weights))[None, :]
+    top = xp.max(terms, axis=1, keepdims=True)
+    return top[:, 0] + xp.log(xp.sum(xp.exp(terms - top), axis=1))
+
+
+def draw_orientation(z, gram, prior, nodes, rng, proposals=256):
+    """Draw ``(cos(iota), psi)`` from their posterior given one sample's
+    ``z`` (shape ``(2,)``) and Gram matrix ``(g00, g11, g01)``.
+
+    Proposals are drawn uniformly inside the quadrature cells, a cell being
+    chosen in proportion to its node's posterior mass, and one is kept with
+    probability proportional to its posterior over its proposal density
+    (sampling-importance resampling), so the draw is continuous and its
+    error falls with ``proposals``.
+    """
+    from pycbc.tmpltbank.fstatistic_metric import orientation_weights
+    g00, g11, g01 = (numpy.atleast_1d(numpy.asarray(v)) for v in gram)
+    zz = numpy.asarray(z).reshape(2, 1)
+    node = log_orientation_terms(zz, g00, g11, g01, prior, nodes)
+    mass = numpy.exp(node - node.max())
+    mass /= mass.sum()
+    cells = rng.choice(len(mass), size=proposals, p=mass)
+    i, j = numpy.divmod(cells, nodes.n_psi)
+    lo, hi = nodes._cos_edges[i], nodes._cos_edges[i + 1]
+    cos_iota = lo + (hi - lo) * rng.random(proposals)
+    psi = (j + rng.random(proposals)) * nodes._psi_step
+    vectors = orientation_weights(numpy.arccos(cos_iota), psi).T
+    x, g = _project(zz, g00, g11, g01, vectors, numpy)
+    target = log_amplitude_marginal(x[0], g[0], prior)
+    # proposal density: the cell's mass over its area
+    area = (hi - lo) * nodes._psi_step
+    log_w = target - numpy.log(mass[cells] / area)
+    keep = rng.choice(proposals, p=numpy.exp(log_w - log_w.max())
+                      / numpy.sum(numpy.exp(log_w - log_w.max())))
+    return float(cos_iota[keep]), float(psi[keep])
+
+
+def log_orientation_terms(z, g00, g11, g01, prior, nodes, order=64):
+    """``ln (weight_n B(w_n))`` of every node for one sample, the terms
+    whose log-sum is :func:`log_orientation_marginal`."""
+    x, g = _project(z, g00, g11, g01, nodes.vectors, numpy)
+    return (log_amplitude_marginal(x[0], g[0], prior, order=order)
+            + numpy.log(nodes.weights))
+
+
+def converged_orientation_marginal(z, g00, g11, g01, prior, n_cos=16,
+                                   n_psi=8, tolerance=1e-3, max_doublings=4,
+                                   xp=numpy):
+    """:func:`log_orientation_marginal`, doubling both node counts until
+    no sample changes by more than ``tolerance``. Returns the values and
+    the nodes reached; raises if ``max_doublings`` do not converge.
+
+    The posterior over orientation narrows as the signal strengthens, so a
+    fixed grid that suffices at low SNR does not at high SNR.
+    """
+    nodes = OrientationNodes(n_cos, n_psi)
+    value = log_orientation_marginal(z, g00, g11, g01, prior, nodes, xp=xp)
+    for _ in range(max_doublings):
+        finer = OrientationNodes(2 * nodes.n_cos, 2 * nodes.n_psi)
+        new = log_orientation_marginal(z, g00, g11, g01, prior, finer, xp=xp)
+        change = float(xp.max(xp.abs(new - value)))
+        nodes, value = finer, new
+        if change <= tolerance:
+            return value, nodes
+    raise RuntimeError("orientation marginal did not converge to {} in {} "
+                       "doublings".format(tolerance, max_doublings))

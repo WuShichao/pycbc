@@ -115,3 +115,98 @@ def test_log_i0_is_continuous_at_the_switch_to_the_series():
     x = numpy.array([699.999999, 700.0, 700.000001, 1e4, 1e8])
     exact = x + numpy.log(i0e(x))
     assert numpy.allclose(log_i0(x), exact, rtol=0, atol=1e-11)
+
+
+def loud_case(snr=12.0, cos_iota=0.4, psi=0.9, seed=3):
+    """z and G of a noise-free signal of the given orientation."""
+    from pycbc.tmpltbank.fstatistic_metric import orientation_weights
+    rng = numpy.random.default_rng(seed)
+    a = rng.normal(size=(2, 2)) + 1j * rng.normal(size=(2, 2))
+    gram = a @ a.conj().T + numpy.eye(2)
+    w = orientation_weights(numpy.arccos(cos_iota), psi)
+    h = snr / numpy.sqrt(numpy.real(w.conj() @ gram @ w))
+    z = (gram @ w) * h * numpy.exp(0.7j)
+    return z.reshape(2, 1), (numpy.array([gram[0, 0].real]),
+                             numpy.array([gram[1, 1].real]),
+                             numpy.array([gram[0, 1]]))
+
+
+def brute_orientation(z, gram, prior, n=400):
+    from pycbc.filter.bstatistic import OrientationNodes, _project
+    from pycbc.tmpltbank.fstatistic_metric import orientation_weights
+    c = numpy.linspace(-1, 1, n + 1)
+    c = 0.5 * (c[1:] + c[:-1])
+    p = (numpy.arange(n) + 0.5) * numpy.pi / n        # over a full pi
+    cc, pp = numpy.meshgrid(c, p, indexing='ij')
+    v = orientation_weights(numpy.arccos(cc.ravel()), pp.ravel()).T
+    x, g = _project(z, *gram, v, numpy)
+    lnb = log_amplitude_marginal(x[0], g[0], prior)
+    return numpy.log(numpy.mean(numpy.exp(lnb - lnb.max()))) + lnb.max()
+
+
+def test_orientation_weights_sum_to_one_and_psi_has_period_quarter_turn():
+    from pycbc.filter.bstatistic import OrientationNodes, _project
+    from pycbc.tmpltbank.fstatistic_metric import orientation_weights
+    nodes = OrientationNodes(8, 4)
+    assert nodes.weights.sum() == pytest.approx(1.0)
+    z, gram = loud_case()
+    w0 = orientation_weights(1.0, 0.3)
+    w1 = orientation_weights(1.0, 0.3 + numpy.pi / 2)
+    assert numpy.allclose(w1, -w0)
+
+
+@pytest.mark.parametrize('snr', [0.0, 4.0, 12.0])
+def test_orientation_marginal_converges_to_the_sphere_integral(snr):
+    from pycbc.filter.bstatistic import (OrientationNodes,
+                                         log_orientation_marginal)
+    z, gram = loud_case(snr)
+    exact = brute_orientation(z, gram, PRIOR)
+    coarse = log_orientation_marginal(z, *gram, PRIOR,
+                                      OrientationNodes(16, 8))[0]
+    fine = log_orientation_marginal(z, *gram, PRIOR,
+                                    OrientationNodes(64, 32))[0]
+    assert fine == pytest.approx(exact, abs=1e-3)
+    assert abs(fine - exact) <= abs(coarse - exact) + 1e-6
+
+
+def test_orientation_draws_follow_the_marginal_posterior():
+    from pycbc.filter.bstatistic import (OrientationNodes, _project,
+                                         draw_orientation)
+    from pycbc.tmpltbank.fstatistic_metric import orientation_weights
+    z, gram = loud_case(snr=8.0, cos_iota=0.4)
+    nodes = OrientationNodes(16, 8)
+    rng = numpy.random.default_rng(21)
+    draws = numpy.array([draw_orientation(z[:, 0], gram, PRIOR, nodes, rng)
+                         for _ in range(1500)])
+    # the cos(iota) marginal on a fine grid
+    c = numpy.linspace(-1, 1, 801)
+    p = (numpy.arange(200) + 0.5) * (numpy.pi / 2) / 200
+    cc, pp = numpy.meshgrid(c, p, indexing='ij')
+    v = orientation_weights(numpy.arccos(cc.ravel()), pp.ravel()).T
+    x, g = _project(z, *gram, v, numpy)
+    lnb = log_amplitude_marginal(x[0], g[0], PRIOR).reshape(cc.shape)
+    density = numpy.exp(lnb - lnb.max()).mean(axis=1)
+    cdf = numpy.concatenate([[0], numpy.cumsum(
+        0.5 * (density[1:] + density[:-1]) * numpy.diff(c))])
+    cdf /= cdf[-1]
+    assert stats.kstest(draws[:, 0], lambda q: numpy.interp(q, c, cdf)) \
+        .pvalue > 1e-3
+    assert numpy.all((draws[:, 1] >= 0) & (draws[:, 1] < numpy.pi / 2))
+
+
+@pytest.mark.parametrize('snr', [4.0, 12.0, 30.0])
+def test_doubling_converges_where_a_fixed_grid_does_not(snr):
+    from pycbc.filter.bstatistic import (OrientationNodes,
+                                         converged_orientation_marginal,
+                                         log_orientation_marginal)
+    z, gram = loud_case(snr)
+    value, nodes = converged_orientation_marginal(z, *gram, PRIOR,
+                                                  tolerance=1e-4)
+    finest = log_orientation_marginal(z, *gram, PRIOR,
+                                      OrientationNodes(128, 64))[0]
+    assert value[0] == pytest.approx(finest, abs=2e-4)
+    fixed = log_orientation_marginal(z, *gram, PRIOR,
+                                     OrientationNodes(16, 8))[0]
+    if snr >= 30:
+        # the search's 16 x 8 grid loses a third of a nat at SNR 30
+        assert finest - fixed > 0.1
