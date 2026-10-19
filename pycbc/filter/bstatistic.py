@@ -209,18 +209,48 @@ def _project(z, g00, g11, g01, vectors, xp):
 
 
 def log_orientation_marginal(z, g00, g11, g01, prior, nodes, order=64,
-                             xp=numpy):
+                             margin=None, xp=numpy):
     """``ln B`` at each sample, marginalised over phase, amplitude and an
     isotropic orientation: ``ln sum_n weight_n B(w_n)``.
 
     ``z`` has shape ``(2, n)`` and the Gram elements ``(n,)``; see
     :func:`pycbc.filter.fstatistic.twof` for their meaning.
+
+    With ``margin``, terms that cannot matter to the sum over all samples
+    and nodes are skipped. A normalised amplitude prior gives
+    ``ln B(w) <= max (h x - h^2 g / 2)`` over the prior's support, since
+    ``ln I0(y) <= y``; the term with the largest bound is evaluated
+    exactly, which bounds the total from below, and
+    every term whose bound falls ``margin`` below that, less the log of
+    the number of terms, is dropped. The dropped terms together are less
+    than ``exp(-margin)`` of the total, so the sum over samples (an
+    arrival-time marginal) keeps that relative accuracy; a sample all of
+    whose terms are dropped gets ``-inf``.
     """
     x, g = _project(z, g00, g11, g01, nodes.vectors, xp)
-    lnb = log_amplitude_marginal(x, g, prior, order=order, xp=xp)
-    terms = lnb + xp.log(xp.asarray(nodes.weights))[None, :]
+    logw = xp.log(xp.asarray(nodes.weights))[None, :]
+    if margin is None:
+        terms = log_amplitude_marginal(x, g, prior, order=order, xp=xp) \
+            + logw
+    else:
+        with numpy.errstate(divide='ignore', invalid='ignore'):
+            h = xp.clip(x / g, prior.hmin, prior.hmax)
+            bound = xp.where(g > 0, h * x - 0.5 * h * h * g, -numpy.inf) \
+                + logw
+        best = int(xp.argmax(bound))
+        i, j = divmod(best, bound.shape[1])
+        lower = float(log_amplitude_marginal(x[i, j], g[i, j], prior,
+                                             order=order, xp=xp)) \
+            + float(logw[0, j])
+        keep = bound >= lower - margin - numpy.log(bound.size)
+        terms = xp.full(bound.shape, -numpy.inf)
+        terms[keep] = log_amplitude_marginal(x[keep], g[keep], prior,
+                                             order=order, xp=xp) \
+            + xp.broadcast_to(logw, bound.shape)[keep]
     top = xp.max(terms, axis=1, keepdims=True)
-    return top[:, 0] + xp.log(xp.sum(xp.exp(terms - top), axis=1))
+    with numpy.errstate(invalid='ignore'):
+        out = top[:, 0] + xp.log(xp.sum(xp.exp(terms - top), axis=1))
+    return xp.where(xp.isfinite(top[:, 0]), out, -numpy.inf)
 
 
 def draw_orientation(z, gram, prior, nodes, rng, proposals=256):

@@ -210,3 +210,25 @@ def test_doubling_converges_where_a_fixed_grid_does_not(snr):
     if snr >= 30:
         # the search's 16 x 8 grid loses a third of a nat at SNR 30
         assert finest - fixed > 0.1
+
+
+def test_pruning_keeps_the_total_to_the_margin():
+    from pycbc.filter.bstatistic import (OrientationNodes,
+                                         log_orientation_marginal)
+    rng = numpy.random.default_rng(31)
+    # a loud peak among many arrival times of noise
+    n = 300
+    z = rng.normal(size=(2, n)) + 1j * rng.normal(size=(2, n))
+    zl, gram = loud_case(snr=15.0)
+    z[:, 140] = zl[:, 0]
+    g00 = numpy.full(n, gram[0][0])
+    g11 = numpy.full(n, gram[1][0])
+    g01 = numpy.full(n, gram[2][0])
+    nodes = OrientationNodes(16, 8)
+    full = log_orientation_marginal(z, g00, g11, g01, PRIOR, nodes)
+    pruned = log_orientation_marginal(z, g00, g11, g01, PRIOR, nodes,
+                                      margin=20.0)
+    total = lambda v: numpy.log(numpy.sum(numpy.exp(v - v.max()))) + v.max()
+    assert abs(total(pruned) - total(full)) < numpy.exp(-20.0)
+    assert numpy.isneginf(pruned).sum() > n // 2
+    assert pruned[140] == pytest.approx(full[140], abs=1e-12)
