@@ -187,14 +187,18 @@ a six-column file of rank four, and the two added columns are constant.
 * **The amplitude, orientation and arrival time.**  The amplitude is the one
   genuine integral of the statistic: the amplitude table, the phase
   marginalisation (``I0``) and the ``u^-power`` amplitude prior are inside
-  ``B``.  The orientation is an enumerated axis -- 16 Gauss-Legendre nodes in
-  ``cos(iota)`` times 8 in ``polarization`` -- and the arrival time is
-  enumerated on the lag grid; the kernel forms both sums and then discards the
-  summands.  All three are restored here, from the archived sufficient
-  statistics, as **one joint draw per cell** from ``p(lag, node, u | cell)``.
-  They are conditional columns, not sampled dimensions, but they are drawn
-  jointly: the inclination stays correlated with the amplitude, and the
-  arrival time is a sample rather than the cell's peak lag.  See
+  ``B``.  The orientation is reduced to 16 Gauss-Legendre nodes in
+  ``cos(iota)`` times 8 in ``polarization``, and the arrival time is
+  enumerated on the lag grid; the kernel forms both sums and then discards
+  the summands.  All three are restored here, from the archived sufficient
+  statistics, as **one joint draw per cell** from ``p(lag, orientation, u |
+  cell)``.  The orientation is drawn from the cubic interpolant onto a fine
+  256 x 64 grid, the amplitude from its exact integrand, and the arrival time
+  from the enumerated lag grid -- the three axes are not the same kind of
+  object, so they are not recovered the same way (see below).  They are
+  conditional columns, not sampled dimensions, but they are drawn jointly:
+  the inclination stays correlated with the amplitude, and the arrival time
+  is a sample rather than the cell's peak lag.  See
   :ref:`the recovered columns <amr-recovered-columns>` below.
 
 .. _amr-recovered-columns:
@@ -214,26 +218,64 @@ both sets of summands are computable again, and the amplitude integrand is the
 same function ``AmplitudeMarginal`` already evaluates.  The adapter therefore
 draws one sample per cell from the joint
 
-    p(lag, node, u | cell) = p(lag, node | cell) p(u | lag, node, cell) ,
+    p(lag, orientation, u | cell) =
+        p(lag, orientation | cell) p(u | lag, orientation, cell) ,
 
-not from a marginal.  ``p(lag, node | cell)`` is proportional to
-``w_g Lbar(s, y)``, and ``u`` is drawn from the amplitude integrand at the pair
-that was selected.  The draw is a proper joint sample: the amplitude is never
-integrated out before the orientation is chosen, and the arrival time is never
-reported as the peak lag.  It is the semantics of
+not from a marginal.  ``p(lag, orientation | cell)`` is proportional to the
+orientation prior times ``Lbar(s, y)``, evaluated on the fine 256 x 64 grid
+when ``orientation-interpolation`` is true, and ``u`` is drawn from the
+amplitude integrand at the selected fine node.  The draw is a proper joint
+sample: the amplitude is never integrated out before the orientation is
+chosen, and the arrival time is never reported as the peak lag.  It is the
+semantics of
 :py:meth:`pycbc.inference.models.tools.DistMarg.reconstruct` -- a draw from
 ``p(theta_aux | theta_sampled)`` -- applied to the whole reduced axis.
 
-================  =========  ==============================================
-column            units      meaning
-================  =========  ==============================================
-``inclination``   rad        ``arccos(cos iota)`` of the drawn node
-``polarization``  rad        ``psi`` of the same node, on ``[0, pi/2)``
-``delta_tc``      s          the drawn lag
-``amplitude_u``   --         ``u = A/A_min`` of the drawn amplitude
-``distance``      Mpc        ``d = K/u`` of the same draw
-``distance_ratio`` --        ``d/d_best = u_best/u`` of the same draw
-================  =========  ==============================================
+================  =========  ============================  ===============================
+column            units      meaning                       resolution
+================  =========  ============================  ===============================
+``inclination``   rad        ``arccos(cos iota)`` of the    256 uniform ``cos(iota)`` nodes,
+                             drawn fine node               spacing 0.0078125
+``polarization``  rad        ``psi`` of the same fine       64 uniform ``psi`` nodes,
+                             node, on ``[0, pi/2)``        spacing 0.02454 rad
+``delta_tc``      s          the drawn lag                 enumerated, 142.678 s lag grid,
+                                                           not interpolated
+``amplitude_u``   --         ``u = A/A_min`` of the          continuous, 2001-node ``u`` grid
+                             drawn amplitude
+``distance``      Mpc        ``d = K/u`` of the same       ``K/u`` on the same grid
+                             draw
+``distance_ratio`` --        ``d/d_best = u_best/u`` of     ``u_best/u`` on the same grid
+                             the same draw
+================  =========  ============================  ===============================
+
+Why the three reduced axes are treated differently.
+
+The orientation is INTERPOLATED.  ``Lbar`` is a smooth function of
+``(cos iota, psi)`` and the search already forms its values at the 16 x 8
+nodes, so a not-a-knot cubic spline in ``cos iota`` and a periodic cubic spline
+of period ``pi/2`` in ``psi`` recover the between-node likelihood at no extra
+likelihood cost.  The fine 256 x 64 grid reproduces the converged density with
+L1 0.0081 and a divergence from the prior of 1.350 nats against a converged
+1.369, at zero additional likelihood evaluations.  The drawn node is then
+dithered uniformly inside its grid cell, which renders the piecewise-constant
+fine-grid density as a continuous column without changing the node masses or
+the resolution.
+
+The amplitude is SAMPLED FROM ITS OWN INTEGRAND.  It is the one genuine
+integral inside the statistic, so it is drawn from ``p(u | s, y)`` on the
+production 2001-node ``u`` grid at the exact ``(s, y)`` of the drawn fine
+orientation node.  That conditional draw is what keeps the amplitude correlated
+with the orientation.
+
+The arrival time is ENUMERATED, NOT INTERPOLATED.  The lag axis is a GRID
+problem, not a resolution one: a local quadratic through the retained lags
+misses its held-out lag by 7.87 nats median (19.5 at the 90th percentile and
+28.4 worst), so no interpolant in lag is valid on this grid.  The fix is
+oversampling the transform -- an FFT oversampling factor -- which changes the
+grid rather than smoothing it, and that is not something a posterior pass can
+do after the archive has been written.  ``delta_tc`` is therefore a draw from
+the enumerated lag set and its marginal is a histogram on that grid.
+
 
 The orientation names are PyCBC's own: ``inclination``, ``polarization`` and
 ``delta_tc`` are declared in :mod:`pycbc.waveform.parameters` with those
@@ -353,6 +395,13 @@ Configuration
     # distance_ratio are written as one joint draw per cell.
     sufficient-file = /path/to/sufficient_full.npz
 
+    # draw the orientation from the cubic interpolant onto the fine
+    # 256 x 64 grid instead of from the enumerated 16 x 8 node set.  The
+    # amplitude and the arrival time are unaffected: the amplitude is a
+    # continuous integral and the arrival time is a grid that cannot be
+    # interpolated.
+    orientation-interpolation = true
+
     # the amplitude prior p(u) ~ u^-power on [1, U], u = A/A_min.  4 and 5 are
     # the registered pair and reproduce the stored Bayes factors; 20 is the
     # corrected default ceiling and 0 would be a flat prior, which is the prior
@@ -431,7 +480,7 @@ _ALLOWED_OPTIONS = frozenset([
     "eta-columns", "physical-map", "injection-xi", "injection-rho",
     "injection-seed", "injection-delta", "batch", "sufficient-file",
     "amplitude-ceiling", "amplitude-power", "distance-constant",
-    "recovered-seed",
+    "recovered-seed", "orientation-interpolation",
     "injection-inclination", "injection-polarization", "injection-coa-phase",
 ])
 
@@ -904,9 +953,11 @@ class AmrSampler(BaseSampler):
     sufficient_file : str, optional
         The archived ``(D, Gram)`` sufficient statistics, one row per
         (cell, lag), written by the research demarginalisation pass.  When
-        given, the restored ``inclination``, ``polarization`` and ``delta_tc``
-        columns are written as conditional columns.  Supported only on the
-        partition path; the live research path does not produce an archive.
+        given, the restored ``inclination``, ``polarization``, ``delta_tc``,
+        ``amplitude_u``, ``distance`` and ``distance_ratio`` columns are
+        written as conditional columns, one joint draw per cell.  Supported
+        only on the partition path; the live research path does not produce
+        an archive.
     amplitude_ceiling : float, optional
         The upper limit ``U`` of ``u = A / A_min`` in the amplitude prior
         ``p(u) ~ u^-power``.  The registered value is 5.  When
@@ -932,6 +983,14 @@ class AmrSampler(BaseSampler):
     recovered_seed : int, optional
         Seed of the joint draw over (lag, node, amplitude), so a file is
         reproducible.  Default is 20261018.
+    orientation_interpolation : bool, optional
+        When true (the default) the orientation node is drawn from the
+        cubic interpolant of the per-node log-likelihood onto the fine
+        256 x 64 grid in (cos iota, psi) instead of from the enumerated
+        16 x 8 node set.  The amplitude and the lag keep their own
+        treatment: the amplitude is a continuous integral and the
+        arrival time is a grid that cannot be interpolated.  Set false
+        to reproduce the old enumerated (comb) orientation draw.
     injection_inclination, injection_polarization, injection_coa_phase :
         The recorded injection's orientation, written as truth attributes and
         into the ``injections`` group.  Defaults are the research prototype's
@@ -952,6 +1011,7 @@ class AmrSampler(BaseSampler):
                  amplitude_power=AMPLITUDE_POWER,
                  distance_constant=DEFAULT_DISTANCE_CONSTANT_MPC,
                  recovered_seed=20261018,
+                 orientation_interpolation=True,
                  injection_inclination=1.0,
                  injection_polarization=0.7, injection_coa_phase=0.3,
                  injection_xi=(3.0, -2.0, 1.5, -1.0), injection_rho=16.0,
@@ -993,6 +1053,7 @@ class AmrSampler(BaseSampler):
         self.distance_constant = (None if distance_constant is None
                                   else float(distance_constant))
         self.recovered_seed = int(recovered_seed)
+        self.orientation_interpolation = bool(orientation_interpolation)
         self.injection_inclination = float(injection_inclination)
         self.injection_polarization = float(injection_polarization)
         self.injection_coa_phase = float(injection_coa_phase)
@@ -1194,6 +1255,9 @@ class AmrSampler(BaseSampler):
             distance_constant=_as_distance(
                 get("distance-constant", DEFAULT_DISTANCE_CONSTANT_MPC)),
             recovered_seed=int(get("recovered-seed", 20261018)),
+            orientation_interpolation=_as_bool(
+                get("orientation-interpolation", "true"),
+                "orientation-interpolation"),
             injection_inclination=float(get("injection-inclination", 1.0)),
             injection_polarization=float(
                 get("injection-polarization", 0.7)),
@@ -1305,7 +1369,8 @@ class AmrSampler(BaseSampler):
         result = statistics.columns(
             self.amplitude_ceiling, power=self.amplitude_power,
             seed=self.recovered_seed,
-            distance_constant=self.distance_constant)
+            distance_constant=self.distance_constant,
+            orientation_interpolation=self.orientation_interpolation)
         columns = result["columns"]
         diagnostics = result["diagnostics"]
         registered_prior = (

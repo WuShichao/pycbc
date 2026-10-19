@@ -46,10 +46,18 @@ the ``eta`` columns alone.
 When the sampler is given a ``sufficient-file``, the file also holds the
 restored columns ``inclination``, ``polarization``, ``delta_tc``,
 ``amplitude_u``, ``distance`` and ``distance_ratio``.  They are one joint draw
-per cell from ``p(lag, node, u | cell)``, not extra dimensions: ``inclination``
-and ``polarization`` are the drawn orientation node, ``delta_tc`` the drawn lag
-and ``amplitude_u`` the drawn ``u = A/A_min``, so the inclination and the
-amplitude stay correlated.  ``distance`` is the same draw in megaparsecs,
+per cell from ``p(lag, orientation, u | cell)``, not extra dimensions:
+``inclination`` and ``polarization`` are the drawn fine-grid orientation
+point (a sample from the cubic interpolant of the per-node log-likelihood
+onto a 256 x 64 uniform grid, dithered inside the node cell so the column is
+continuous, not one of the enumerated 16 x 8 nodes),
+``delta_tc`` is the drawn lag on the enumerated arrival-time grid, and
+``amplitude_u`` is the drawn ``u = A/A_min``.  The amplitude is drawn from its
+exact integrand at the selected fine node, so the inclination and the
+amplitude stay correlated.  The arrival time is deliberately NOT interpolated:
+a local quadratic misses its held-out lag by 7.87 nats median, so the fix is
+oversampling the transform, not smoothing the lag grid; ``amr_arrival_time_note``
+says so in the file.  ``distance`` is the same draw in megaparsecs,
 ``d = K / u``, where ``K`` is the measured distance at which a face-on signal
 has optimal SNR 4; ``K`` is recorded as ``amr_distance_constant_mpc`` and it is
 an option (``distance-constant``), defaulting to the measured 542.1006 Mpc.
@@ -62,7 +70,14 @@ whose support exceeds ``u`` of about 7 and which is flat over five to nine.
 The attributes ``amr_recovered_kind``, ``amr_amplitude_ceiling``,
 ``amr_amplitude_power``, ``amr_amplitude_units``, ``amr_distance_units`` and
 ``amr_amplitude_distance_relation`` say what the columns are and what they
-leave out.
+leave out.  Every recovered quantity also carries its own resolution
+beside it: ``amr_inclination_resolution`` and
+``amr_polarization_resolution`` state the fine grid and its node spacing,
+``amr_amplitude_resolution`` and ``amr_distance_resolution`` the amplitude
+grid, ``amr_delta_tc_resolution`` and ``amr_arrival_time_grid_s`` the lag
+grid and that it is enumerated, and
+``amr_orientation_interpolation_error_*`` the measured interpolation error
+in nats.
 
 Reading the file
 ----------------

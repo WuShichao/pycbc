@@ -42,9 +42,10 @@ from pycbc.inference.models.analytic import TestNormal
 from pycbc.inference.sampler.amr import AmrSampler, ShapeToPhysicalMap
 from pycbc.inference.sampler.amr_demarg import (
     AMPLITUDE_COLUMN, AMPLITUDE_POWER, DEFAULT_DISTANCE_CONSTANT_MPC,
-    DISTANCE_COLUMN, DISTANCE_RATIO_COLUMN, REGISTERED_CEILING,
-    AmplitudeMarginal, SufficientStatistics, orientation_grid,
-    weighted_correlation)
+    DISTANCE_COLUMN, DISTANCE_RATIO_COLUMN, N_CI_FINE, N_PSI_FINE,
+    REGISTERED_CEILING, AmplitudeMarginal, OrientationInterpolation,
+    SufficientStatistics, fine_orientation_grid, mu_weights,
+    orientation_grid, psi_weights, weighted_correlation)
 from pycbc.workflow import WorkflowConfigParser
 
 
@@ -324,7 +325,14 @@ def test_the_restored_columns_are_ordinary_samples(tmp_path):
         assert fp.attrs["amr_recovered_params"] == \
             "inclination polarization delta_tc amplitude_u distance distance_ratio"
         assert "joint draw" in fp.attrs["amr_recovered_kind"]
-        assert "lag, node, u" in fp.attrs["amr_joint_components"]
+        assert "lag" in fp.attrs["amr_joint_components"]
+        assert "node" in fp.attrs["amr_joint_components"]
+        assert fp.attrs["amr_orientation_fine_nodes"] == \
+            N_CI_FINE * N_PSI_FINE
+        assert "NOT interpolated" in fp.attrs[
+            "amr_delta_tc_resolution"]
+        assert fp.attrs[
+            "amr_orientation_interpolation_error_median_nats"] >= 0.0
         assert "dimensionless" in fp.attrs["amr_amplitude_units"]
         assert fp.attrs["amr_distance_column"] == DISTANCE_COLUMN
         assert fp.attrs["amr_distance_units"] == "Mpc"
@@ -560,45 +568,168 @@ def test_the_joint_draw_reproduces_the_archive_correlation(tmp_path):
     assert drawn_cos_lnu == pytest.approx(expected_cos_lnu, abs=0.10)
 
 
-def test_the_inclination_marginal_matches_the_old_marginal(tmp_path):
-    """Summing the joint over u reproduces the orientation marginal, and the
-    drawn inclination follows it to resampling noise."""
+def test_the_fine_orientation_grid_is_uniform_and_carries_equal_mass():
+    """The draw grid is uniform in both angles, with 1/N prior mass per node."""
+    coefficients, mu, psi, mu_axis, psi_axis = fine_orientation_grid()
+    n = N_CI_FINE * N_PSI_FINE
+    assert coefficients.shape == (n, 2)
+    assert mu_axis.shape == (N_CI_FINE,)
+    assert psi_axis.shape == (N_PSI_FINE,)
+    numpy.testing.assert_allclose(
+        mu_axis, numpy.linspace(-1.0, 1.0, N_CI_FINE))
+    numpy.testing.assert_allclose(
+        psi_axis, (numpy.arange(N_PSI_FINE) + 0.5) * numpy.pi
+        / (2 * N_PSI_FINE))
+    numpy.testing.assert_allclose(mu, numpy.repeat(mu_axis, N_PSI_FINE))
+    numpy.testing.assert_allclose(psi, numpy.tile(psi_axis, N_CI_FINE))
+    interpolator = OrientationInterpolation()
+    weights = numpy.exp(interpolator.log_weights(numpy.zeros((1, 128))))
+    numpy.testing.assert_allclose(weights, numpy.full((1, n), 1.0 / n),
+                                  rtol=1e-12, atol=0.0)
+    # grid and node spacing are the resolution the columns are drawn at
+    assert interpolator.mu_spacing == pytest.approx(
+        2.0 / (N_CI_FINE - 1))
+    assert interpolator.psi_spacing == pytest.approx(
+        0.5 * numpy.pi / N_PSI_FINE)
+
+
+def test_the_splines_are_exact_at_their_own_nodes():
+    """The weights are an interpolant: identity at the production nodes."""
+    ci = numpy.polynomial.legendre.leggauss(16)[0]
+    numpy.testing.assert_allclose(mu_weights(ci, ci), numpy.eye(16),
+                                  atol=1e-12)
+    psi = (numpy.arange(8) + 0.5) * numpy.pi / 16.0
+    numpy.testing.assert_allclose(psi_weights(psi, 8), numpy.eye(8),
+                                  atol=1e-12)
+
+
+def test_the_interpolation_preserves_the_inclination_expectation(tmp_path):
+    """E[cos iota] on the interpolated grid equals the exact fine-grid value.
+
+    This is the test the interpolation has to pass: it may smooth between the
+    nodes, but it must not move the first moment of the orientation marginal.
+    The exact comparison evaluates Lbar at the fine nodes directly, so the
+    difference is the interpolation error alone, not the quadrature difference
+    between the 16 Gauss-Legendre nodes and the fine uniform grid.
+    """
+    eta = numpy.zeros((1, 6))
+    partition, eta, widths, lnb = make_partition(tmp_path, eta=eta)
+    coefficients, _, _, _, _, _, _ = orientation_grid()
+    direction = coefficients[12 * 8 + 3]
+    archive = make_archive(tmp_path, eta, lnb, d_scale=numpy.array([12.0]),
+                           direction=direction)
+    statistics = SufficientStatistics(archive, eta, lnb)
+    rows = numpy.array([int(statistics.ptr[0])])
+    node_s, node_y = statistics._statistics(rows)
+    s_lo, s_hi, y_lo, y_hi = statistics._table_bounds()
+    table = AmplitudeMarginal.from_bounds(
+        s_lo, s_hi, y_lo, y_hi, 20.0, power=0.0, n_u=201)
+    coarse = table(node_s, node_y)
+    interpolator = statistics.interpolation
+    interpolated = interpolator.conditional(coarse)[0]
+    mu_mass = interpolated.reshape(N_CI_FINE, N_PSI_FINE).sum(axis=1)
+    interpolated_mu = float(mu_mass @ interpolator.mu_axis)
+    interpolated_iota = float(
+        mu_mass @ numpy.arccos(interpolator.mu_axis))
+
+    exact_s, exact_y = statistics._statistics_at(
+        interpolator.coefficients, rows)
+    exact = table(exact_s, exact_y)[0]
+    exact = numpy.exp(exact - exact.max())
+    exact /= exact.sum()
+    exact_mu_mass = exact.reshape(N_CI_FINE, N_PSI_FINE).sum(axis=1)
+    exact_mu = float(exact_mu_mass @ interpolator.mu_axis)
+    exact_iota = float(exact_mu_mass @ numpy.arccos(interpolator.mu_axis))
+
+    assert abs(interpolated_mu - exact_mu) < 2e-3
+    assert abs(interpolated_iota - exact_iota) < 2e-3
+
+
+def test_the_drawn_inclination_follows_the_fine_grid(tmp_path):
+    """The empirical inclination CDF follows the interpolated fine marginal.
+
+    The cells are identical, so there is one expected distribution and 4000
+    independent draws from it.  This checks the draw, not the interpolation:
+    the expected conditional is the one the draw was taken from.
+    """
     ncells = 4000
     eta = numpy.zeros((ncells, 6))
     partition, eta, widths, lnb = make_partition(tmp_path, eta=eta)
-    archive = make_archive(tmp_path, eta, lnb)
+    coefficients, _, _, _, _, _, _ = orientation_grid()
+    direction = coefficients[12 * 8 + 3]
+    archive = make_archive(tmp_path, eta, lnb,
+                           d_scale=numpy.full(ncells, 12.0),
+                           direction=direction)
     statistics = SufficientStatistics(archive, eta, lnb)
-    result = statistics.columns(20.0, power=4.0, seed=20261018, n_u=201,
-                                return_marginal=True)
-    marginal = result["orientation_marginal"]
-    # every cell is identical, so the old orientation marginal is one row
-    numpy.testing.assert_allclose(
-        marginal, numpy.broadcast_to(marginal[0], marginal.shape), atol=1e-12)
-
-    # independent evaluation: sum over u first, then read the node marginal
-    rows = numpy.arange(int(statistics.ptr[0]), int(statistics.ptr[1]))
-    s, y = statistics._statistics(rows)
-    table = AmplitudeMarginal.from_bounds(
-        float(s.min()) * 0.9, float(s.max()) * 1.1, 0.0, float(y.max()) * 1.1,
-        20.0, power=4.0, n_u=201)
-    old = table.log_marginal(s[0], y[0]) + numpy.log(statistics.weights)
-    old = numpy.exp(old - old.max())
-    old /= old.sum()
-    numpy.testing.assert_allclose(marginal[0], old, atol=5e-3,
-                                  rtol=0.0)
-
-    # the empirical inclination CDF follows the expected atom CDF
+    result = statistics.columns(20.0, power=0.0, seed=20261018, n_u=201)
     inclination = result["columns"]["inclination"]
-    ci = numpy.polynomial.legendre.leggauss(16)[0]
-    p_cos = old.reshape(16, 8).sum(axis=1)
-    atoms = numpy.arccos(ci)
+    rows = numpy.array([int(statistics.ptr[0])])
+    node_s, node_y = statistics._statistics(rows)
+    s_lo, s_hi, y_lo, y_hi = statistics._table_bounds()
+    table = AmplitudeMarginal.from_bounds(
+        s_lo, s_hi, y_lo, y_hi, 20.0, power=0.0, n_u=201)
+    probability = statistics.interpolation.conditional(
+        table(node_s, node_y))[0]
+    mu_mass = probability.reshape(N_CI_FINE, N_PSI_FINE).sum(axis=1)
+    atoms = numpy.arccos(statistics.interpolation.mu_axis)
     order = numpy.argsort(atoms)
     atoms = atoms[order]
-    expected_cdf = numpy.cumsum(p_cos[order])
+    expected_cdf = numpy.cumsum(mu_mass[order])
     empirical_cdf = numpy.searchsorted(
         numpy.sort(inclination), atoms, side="right") / ncells
-    d_statistic = numpy.max(numpy.abs(empirical_cdf - expected_cdf))
-    assert d_statistic < 0.04
+    d_statistic = float(numpy.max(numpy.abs(empirical_cdf - expected_cdf)))
+    assert d_statistic < 0.05
+    # the column is no longer an eight-bar comb
+    assert numpy.unique(numpy.round(inclination, 10)).size > 50
+
+
+def test_the_interpolation_error_is_recorded(tmp_path):
+    """The recovery measures and records the interpolation error."""
+    partition, eta, widths, lnb = make_partition(tmp_path)
+    archive = make_archive(tmp_path, eta, lnb)
+    statistics = SufficientStatistics(archive, eta, lnb)
+    result = statistics.columns(20.0, power=0.0, seed=20261018, n_u=201)
+    error = result["diagnostics"]["interpolation_error"]
+    assert error is not None
+    for key in ("median_abs", "p95_abs", "max_abs", "n_cells", "n_points"):
+        assert key in error
+    assert 0.0 <= error["median_abs"] <= error["p95_abs"] \
+        <= error["max_abs"]
+    assert error["n_cells"] > 0 and error["n_points"] > 0
+    assert result["diagnostics"]["orientation_interpolation"] is True
+    assert result["diagnostics"]["orientation_fine_grid"] == (
+        N_CI_FINE, N_PSI_FINE)
+
+    info = statistics.metadata(20.0, 0.0, 20261018,
+                               result["diagnostics"],
+                               distance_constant=DISTANCE_CONSTANT)
+    assert info["amr_orientation_interpolation_error_median_nats"] == \
+        pytest.approx(error["median_abs"], rel=0.0, abs=0.0)
+    assert info["amr_orientation_interpolation_error_p95_nats"] == \
+        pytest.approx(error["p95_abs"], rel=0.0, abs=0.0)
+    assert info["amr_orientation_interpolation_error_max_nats"] == \
+        pytest.approx(error["max_abs"], rel=0.0, abs=0.0)
+    assert info["amr_orientation_fine_nodes"] == N_CI_FINE * N_PSI_FINE
+    assert "0.007843" in info["amr_orientation_node_spacing"]
+    assert "NOT interpolated" in info["amr_delta_tc_resolution"]
+    assert "OVERSAMPLING" in info["amr_arrival_time_note"]
+    assert info["amr_arrival_time_grid_s"] == pytest.approx(DT)
+
+
+def test_the_enumerated_draw_can_still_be_selected(tmp_path):
+    """orientation-interpolation = false restores the old comb, and says so."""
+    partition, eta, widths, lnb = make_partition(tmp_path)
+    archive = make_archive(tmp_path, eta, lnb)
+    statistics = SufficientStatistics(archive, eta, lnb)
+    result = statistics.columns(20.0, power=0.0, seed=20261018, n_u=201,
+                                orientation_interpolation=False)
+    assert result["diagnostics"]["orientation_interpolation"] is False
+    assert result["diagnostics"]["interpolation_error"] is None
+    info = statistics.metadata(20.0, 0.0, 20261018,
+                               result["diagnostics"],
+                               distance_constant=DISTANCE_CONSTANT)
+    assert "ENUMERATED" in info["amr_orientation_axis_note"]
+    assert "comb" in info["amr_inclination_resolution"]
 
 
 def test_the_amplitude_column_matches_the_archived_posterior(tmp_path):

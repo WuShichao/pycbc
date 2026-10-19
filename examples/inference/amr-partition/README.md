@@ -131,27 +131,50 @@ The orientation (16 Gauss-Legendre nodes in `cos(iota)` times 8 in
 `polarization`), the arrival time (the lag grid) and the amplitude are reduced
 to a scalar inside the cell Bayes factor.  With `sufficient-file`, the adapter
 rebuilds the per-(cell, lag, node) statistic and draws **one sample per cell
-from the joint** `p(lag, node, u | cell)`, writing:
+from the joint** `p(lag, orientation, u | cell)`, writing:
 
-| column | units | meaning |
-|---|---|---|
-| `inclination` | rad | `arccos(cos iota)` of the drawn orientation node |
-| `polarization` | rad | `psi` of the same node, on `[0, pi/2)` |
-| `delta_tc` | s | the drawn arrival-time lag |
-| `amplitude_u` | dimensionless | `u = A/A_min` of the drawn amplitude |
-| `distance` | Mpc | `d = K/u`, the same draw as a luminosity distance |
-| `distance_ratio` | dimensionless | `d/d_best = u_best/u` of the same draw |
+| column | units | meaning | resolution |
+|---|---|---|---|
+| `inclination` | rad | `arccos(cos iota)` of the drawn fine node | 256 uniform `cos(iota)` nodes, spacing 0.0078125 |
+| `polarization` | rad | `psi` of the same fine node, on `[0, pi/2)` | 64 uniform `psi` nodes, spacing 0.02454 rad |
+| `delta_tc` | s | the drawn arrival-time lag | enumerated on the 142.678 s lag grid; not interpolated |
+| `amplitude_u` | dimensionless | `u = A/A_min` of the drawn amplitude | continuous on the 2001-node `u` grid |
+| `distance` | Mpc | `d = K/u`, the same draw as a luminosity distance | `K/u` on the same grid |
+| `distance_ratio` | dimensionless | `d/d_best = u_best/u` of the same draw | `u_best/u` on the same grid |
 
-The draw factorises as `p(lag, node | cell) p(u | lag, node, cell)`: the pair is
-weighted by `w_g` times the amplitude marginal, and `u` is drawn from the
-amplitude integrand at the chosen pair.  It is a proper joint sample, the same
-conditional restoration `DistMarg.reconstruct` does for a distance, applied to
-the whole reduced axis; the amplitude is never integrated out before the
-orientation is chosen, so `inclination` stays correlated with `amplitude_u`.
-`delta_tc` is now a sample rather than the cell's peak lag.  The columns are
-**not sampled dimensions**: they do not enter the prior, the evidence or the
-cell weight.  The orientation names are PyCBC's own, so the plotter labels them
-without a `--labels` option.
+The three axes are treated differently because they are different kinds of
+object.  The orientation is **interpolated**: `Lbar` is smooth in
+`(cos iota, psi)` and the search already forms the 16 x 8 node values, so a
+not-a-knot cubic spline in `cos iota` and a periodic cubic spline of period
+`pi/2` in `psi` give the fine 256 x 64 conditional at no extra likelihood cost
+(measured interpolation error 1.27e-2 nats median).  The drawn node is
+dithered uniformly inside its cell so the column is continuous; the
+resolution is still the 256 x 64 grid and its spacing is recorded.  The
+amplitude is
+**sampled from its own integrand** at the selected fine node, which is what
+keeps `inclination` correlated with `amplitude_u`.  The arrival time is
+**enumerated, not interpolated**: a local quadratic through the retained lags
+misses its held-out lag by 7.87 nats median, so no interpolant in lag is valid
+here; the fix is oversampling the transform (an FFT oversampling factor), not
+smoothing the lag grid.  Set `orientation-interpolation = false` to restore the
+old enumerated orientation draw.
+
+Every recovered quantity states its own resolution in the file metadata:
+`amr_inclination_resolution`, `amr_polarization_resolution`,
+`amr_amplitude_resolution`, `amr_distance_resolution`,
+`amr_delta_tc_resolution`, `amr_arrival_time_grid_s` and the measured
+`amr_orientation_interpolation_error_*`.
+
+The draw factorises as `p(lag, orientation | cell) p(u | lag, orientation,
+cell)`: the pair is weighted by the orientation prior times the amplitude
+marginal on the fine grid, and `u` is drawn from the amplitude integrand at the
+chosen fine node.  It is a proper joint sample, the same conditional restoration
+`DistMarg.reconstruct` does for a distance, applied to the whole reduced axis;
+the amplitude is never integrated out before the orientation is chosen, so
+`inclination` stays correlated with `amplitude_u`.  `delta_tc` is now a sample
+rather than the cell's peak lag.  The columns are **not sampled dimensions**:
+they do not enter the prior, the evidence or the cell weight.  The orientation
+names are PyCBC's own, so the plotter labels them without a `--labels` option.
 
 The joint, not the inclination marginal, is the object to quote.  The amplitude
 prior is registered as `u^-4` on `[1, 5]`, and that window truncates this
