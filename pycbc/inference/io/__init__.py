@@ -40,6 +40,7 @@ from .ultranest import UltranestFile
 from .snowline import SnowlineFile
 from .nessai import NessaiFile
 from .nautilus import NautilusFile
+from .amr import AMRFile
 from .posterior import PosteriorFile
 from .txt import InferenceTXTFile
 
@@ -54,6 +55,7 @@ filetypes = {
     UltranestFile.name: UltranestFile,
     NessaiFile.name: NessaiFile,
     NautilusFile.name: NautilusFile,
+    AMRFile.name: AMRFile,
     SnowlineFile.name: SnowlineFile,
 }
 

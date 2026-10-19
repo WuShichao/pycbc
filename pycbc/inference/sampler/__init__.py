@@ -24,6 +24,7 @@ from .base import (initial_dist_from_config, create_new_output_file)
 from .multinest import MultinestSampler
 from .ultranest import UltranestSampler
 from .dummy import DummySampler
+from .amr import AMRSampler
 from .refine import RefineSampler
 from .snowline import SnowlineSampler
 from .nautilus import NautilusSampler
@@ -34,6 +35,7 @@ samplers = {cls.name: cls for cls in (
     MultinestSampler,
     UltranestSampler,
     DummySampler,
+    AMRSampler,
     RefineSampler,
     SnowlineSampler,
     NautilusSampler,
