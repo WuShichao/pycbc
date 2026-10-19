@@ -164,3 +164,90 @@ def resample_to_ssb(grid, bins, orbit, longitude, latitude, epsilon=1e-10):
         out[ch, :n_in] = finufft.nufft1d2(x, modes, isign=1,
                                           eps=epsilon) * carrier
     return out
+
+
+def ssb_frame_response(orbit, terms, times, frequencies, longitude, latitude,
+                       ref_longitude, ref_latitude):
+    """The adiabatic response at paired ``(times, frequencies)`` with the
+    reference sky's SSB delay removed, shape ``(2, nchannels, n)`` for the
+    plus and cross bases.
+
+    ``terms`` maps channel names to TDI terms, as
+    :func:`pycbc.tdi.inference.channel_terms` returns; ``times`` must
+    increase.
+    """
+    from pycbc.tdi.onthefly import (MultiChannelTermGeometry,
+                                    frequency_response_factors)
+    times = numpy.asarray(times, dtype=float)
+    frequencies = numpy.asarray(frequencies, dtype=float)
+    geometry = MultiChannelTermGeometry(orbit, times, terms)
+    factors = frequency_response_factors(geometry, frequencies, longitude,
+                                         latitude)
+    response = numpy.array([[factors[c][a] for c in geometry.channel_names]
+                            for a in range(2)])
+    delay = ssb_delay(orbit, times, ref_longitude, ref_latitude)
+    return response * numpy.exp(-2j * numpy.pi * frequencies * delay)
+
+
+def yearly_response_samples(orbit, terms, frequencies, longitude, latitude,
+                            ref_longitude, ref_latitude, samples=32,
+                            period=ORBITAL_PERIOD):
+    """The SSB-frame response at ``samples`` equally spaced times over one
+    period, shape ``(samples, 2, nchannels, nfrequencies)``."""
+    frequencies = numpy.asarray(frequencies, dtype=float)
+    # times one millisecond apart keep the geometry's grid increasing
+    stagger = 1e-3 * numpy.arange(len(frequencies))
+    return numpy.array([
+        ssb_frame_response(orbit, terms, j * period / samples + stagger,
+                           frequencies, longitude, latitude, ref_longitude,
+                           ref_latitude)
+        for j in range(samples)])
+
+
+def harmonic_coefficients(samples, kmax):
+    """Harmonics ``-kmax..kmax`` of response samples over one period:
+    ``rho_k = (1/N) sum_j R(t_j) exp(-i k Omega t_j)``. Returns the orders
+    and the coefficients, shape ``(2 kmax + 1,) + samples.shape[1:]``."""
+    samples = numpy.asarray(samples)
+    n = samples.shape[0]
+    if 2 * kmax + 1 > n:
+        raise ValueError("{} samples cannot resolve {} harmonics".format(
+            n, 2 * kmax + 1))
+    orders = numpy.arange(-kmax, kmax + 1)
+    return orders, (numpy.fft.fft(samples, axis=0) / n)[orders % n]
+
+
+def sky_log_derivatives(orbit, terms, frequencies, longitude, latitude,
+                        scales=(1.0, 1.0), step=1e-4, samples=32,
+                        period=ORBITAL_PERIOD):
+    """Derivatives of the log response samples with respect to longitude
+    and latitude, times ``scales``, at a reference sky equal to the source
+    sky; shape ``(2, samples, 2, nchannels, nfrequencies)``.
+
+    A small sky offset ``delta`` then multiplies the samples by
+    ``exp(delta . L)``.
+    """
+    out = []
+    for axis, scale in enumerate(scales):
+        offset = numpy.zeros(2)
+        offset[axis] = step
+        plus = yearly_response_samples(
+            orbit, terms, frequencies, longitude + offset[0],
+            latitude + offset[1], longitude, latitude, samples, period)
+        minus = yearly_response_samples(
+            orbit, terms, frequencies, longitude - offset[0],
+            latitude - offset[1], longitude, latitude, samples, period)
+        out.append(numpy.log(plus / minus) / (2 * step) * scale)
+    return numpy.array(out)
+
+
+def interpolate_in_frequency(values, coarse, fine):
+    """Linear interpolation of complex ``values`` on the uniformly spaced
+    ``coarse`` frequencies (last axis) to the ``fine`` ones, real and
+    imaginary parts separately; constant beyond the ends."""
+    coarse = numpy.asarray(coarse, dtype=float)
+    x = (numpy.asarray(fine, dtype=float) - coarse[0]) \
+        / (coarse[1] - coarse[0])
+    i = numpy.clip(numpy.floor(x).astype(int), 0, len(coarse) - 2)
+    w = numpy.clip(x - i, 0, 1)
+    return values[..., i] * (1 - w) + values[..., i + 1] * w

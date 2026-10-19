@@ -70,3 +70,70 @@ def test_resampling_evaluates_the_signal_at_detector_time():
         * numpy.exp(-2j * numpy.pi * f0 * (ssb - start))[None, :]
     assert numpy.allclose(series[:, :n_in], expected, rtol=0, atol=1e-7)
     assert numpy.all(series[:, n_in:] == 0)
+
+
+def _terms():
+    from pycbc.tdi.inference import channel_terms
+    return channel_terms(('A', 'E'), generation=2, delta_t=10.0)
+
+
+def test_low_harmonics_reproduce_the_ssb_frame_response():
+    from pycbc.tdi.ssb_yearly_harmonics import (harmonic_coefficients,
+                                                ssb_frame_response,
+                                                yearly_response_samples)
+    from pycbc.tdi.ssb_yearly_harmonics import ORBITAL_ANGULAR_FREQUENCY
+    terms = _terms()
+    freqs = numpy.linspace(0.0135, 0.0205, 40)
+    samples = yearly_response_samples(ORBIT, terms, freqs, *SKY, *SKY)
+    rng = numpy.random.default_rng(4)
+    times = rng.uniform(0, ORBITAL_PERIOD, 3)
+    direct = [ssb_frame_response(ORBIT, terms,
+                                 t + 1e-3 * numpy.arange(len(freqs)), freqs,
+                                 *SKY, *SKY) for t in times]
+    worst = []
+    for kmax in (2, 4, 6):
+        orders, rho = harmonic_coefficients(samples, kmax)
+        loss = []
+        for t, d in zip(times, direct):
+            phase = numpy.exp(1j * orders * ORBITAL_ANGULAR_FREQUENCY * t)
+            m = numpy.tensordot(phase, rho, axes=1)
+            match = abs(numpy.vdot(m, d)) / (numpy.linalg.norm(m)
+                                             * numpy.linalg.norm(d))
+            loss.append(1 - match)
+        worst.append(max(loss))
+    # the K = 4 expansion of the SSB-search cards loses under 1e-6
+    assert worst[1] < 1e-6
+    assert worst[2] < worst[1] < worst[0]
+
+
+def test_sky_log_derivative_predicts_a_small_offset():
+    from pycbc.tdi.ssb_yearly_harmonics import (sky_log_derivatives,
+                                                yearly_response_samples)
+    terms = _terms()
+    freqs = numpy.linspace(0.0135, 0.0205, 20)
+    base = yearly_response_samples(ORBIT, terms, freqs, *SKY, *SKY,
+                                   samples=8)
+    L = sky_log_derivatives(ORBIT, terms, freqs, *SKY, scales=(2.0, 0.5),
+                            samples=8)
+    delta = numpy.array([1e-3, -2e-3])        # in the scaled units
+    moved = yearly_response_samples(ORBIT, terms, freqs,
+                                    SKY[0] + 2.0 * delta[0],
+                                    SKY[1] + 0.5 * delta[1], *SKY, samples=8)
+    model = base * numpy.exp(numpy.tensordot(delta, L, axes=1))
+    first_order = numpy.abs(moved - base).max()
+    assert numpy.abs(model - moved).max() < 0.02 * first_order
+
+
+def test_harmonics_need_enough_samples():
+    from pycbc.tdi.ssb_yearly_harmonics import harmonic_coefficients
+    with pytest.raises(ValueError):
+        harmonic_coefficients(numpy.zeros((8, 2)), 4)
+
+
+def test_frequency_interpolation_is_exact_for_linear_values():
+    from pycbc.tdi.ssb_yearly_harmonics import interpolate_in_frequency
+    coarse = numpy.linspace(0.01, 0.02, 11)
+    values = (1 + 2j) * coarse - 3j
+    fine = numpy.linspace(0.01, 0.02, 97)
+    assert numpy.allclose(interpolate_in_frequency(values, coarse, fine),
+                          (1 + 2j) * fine - 3j)
