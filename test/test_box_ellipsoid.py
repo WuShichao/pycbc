@@ -1,8 +1,8 @@
-"""Tests for the exact box-ellipsoid containment test in ``pycbc.tdi.exact_inside``."""
+"""The certified box-ellipsoid test of pycbc.tmpltbank.box_ellipsoid."""
 
 import numpy as np
 
-from pycbc.tdi.exact_inside import (
+from pycbc.tmpltbank.box_ellipsoid import (
     active_set_min,
     certified,
     diagonal_clamp,
@@ -25,7 +25,7 @@ def test_exact_inside_agrees_with_active_set_brute_force():
     M = metric(A)
 
     keep = inside_exact(A, c, half)
-    q_min = active_set_min(c, half, M)          # independent 3^n enumeration
+    q_min = active_set_min(c, half, M)  # independent 3^n enumeration
     assert np.array_equal(keep, q_min <= 1.0)
 
     out = certified(c, half, M)
@@ -40,8 +40,12 @@ def test_diagonal_closed_form_agrees_with_exact_minimum():
     M = metric(A)
     c = rng.uniform(-2.0, 2.0, (32, 3))
     half = rng.uniform(0.05, 0.6, (32, 3))
-    assert np.allclose(diagonal_clamp(c, half, M),
-                       active_set_min(c, half, M), rtol=1e-12, atol=1e-12)
+    assert np.allclose(
+        diagonal_clamp(c, half, M),
+        active_set_min(c, half, M),
+        rtol=1e-12,
+        atol=1e-12,
+    )
 
 
 def test_dropped_boxes_contain_no_sampled_point():
