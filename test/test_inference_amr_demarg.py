@@ -485,7 +485,8 @@ def test_the_registered_prior_keeps_the_stored_bayes_factors(tmp_path):
     registered = run_sampler(
         tmp_path, make_config(
             partition, "sufficient-file = {}\namplitude-ceiling = 5"
-            "\namplitude-power = 4\n".format(archive)))
+            "\namplitude-power = 4\nallow-truncated-amplitude = true\n"
+            .format(archive)))
     numpy.testing.assert_array_equal(registered.samples["loglikelihood"], lnb)
     widened = run_sampler(
         tmp_path, make_config(
@@ -519,6 +520,87 @@ def test_the_amplitude_power_is_configurable(tmp_path):
     with pytest.raises(ValueError, match="amplitude-power"):
         AmrSampler(make_model(), partition_file=partition, amplitude_power=0.0,
                    amplitude_ceiling=REGISTERED_CEILING)
+
+
+def test_a_truncating_amplitude_ceiling_is_refused(tmp_path):
+    """A prior-dominated orientation column cannot be written silently.
+
+    The registered ceiling u = 5 puts the flat-prior maximum-likelihood
+    amplitude u* = y/s above the ceiling on 9.4 per cent of the peak-row nodes
+    of the synthetic archive, so the amplitude marginal is set by the prior
+    boundary and the recovered polarisation would be the prior.  The adapter
+    refuses to write the columns, and the explicit override writes them with
+    the truncation recorded beside them.
+    """
+    partition, eta, widths, lnb = make_partition(tmp_path)
+    archive = make_archive(tmp_path, eta, lnb)
+    config = "sufficient-file = {}\namplitude-ceiling = 5\n" \
+             "amplitude-power = 4\n".format(archive)
+    with pytest.raises(ValueError, match="truncates the amplitude likelihood"):
+        run_sampler(tmp_path, make_config(partition, config),
+                    name="refused.hdf")
+    allowed = run_sampler(
+        tmp_path, make_config(
+            partition, config + "allow-truncated-amplitude = true\n"),
+        name="allowed.hdf")
+    info = allowed.recovered_metadata()
+    assert info["amr_amplitude_truncated_fraction_peak"] > 0.05
+    assert info["amr_amplitude_ml_u_max_over_ceiling"] > 1.0
+    assert "prior boundary" in info["amr_amplitude_truncation_note"]
+
+
+def test_the_recovered_polarization_carries_information(tmp_path):
+    """A per-node statistic with a known spread gives a non-zero divergence.
+
+    The synthetic data vector is psi-independent, so the per-node statistic
+    varies only through the node coefficients.  With d = 12 the eight psi
+    nodes span 32.2 in two-F.  At the corrected ceiling u = 20 nothing is
+    truncated and the recovered polarisation marginal must carry information
+    (KL from the uniform prior of order a nat);
+    at the registered ceiling u = 5 the same archive is truncated on 59 per
+    cent of its peak-row nodes and the divergence collapses by an order of
+    magnitude.  This is the regression that let a flat column be read as a
+    measurement, and the assertion is on the divergence itself.
+    """
+    partition, eta, widths, lnb = make_partition(tmp_path)
+    archive = make_archive(tmp_path, eta, lnb,
+                           d_scale=numpy.full(len(eta), 12.0))
+    statistics = SufficientStatistics(archive, eta, lnb)
+    prior_sigma = 0.5 * numpy.pi / numpy.sqrt(12.0)
+
+    def marginal(ceiling):
+        result = statistics.columns(
+            ceiling, power=0.0, distance_constant=DISTANCE_CONSTANT,
+            return_marginal=True, measure_interpolation_error=False,
+            allow_truncated_amplitude=True)
+        psi = result["orientation_fine_axis"][1]
+        fine = result["orientation_marginal"]
+        pooled = fine.mean(axis=0).reshape(
+            N_CI_FINE, N_PSI_FINE).sum(axis=0)
+        pooled = pooled / pooled.sum()
+        divergence = float(numpy.sum(pooled * numpy.log(pooled * len(psi))))
+        shape = float(pooled.max() / pooled.mean())
+        return divergence, shape, result["diagnostics"]
+
+    # the known spread: the eight psi nodes span 32.2 in two-F
+    coefficients, _, _, _, _, _, _ = orientation_grid()
+    # D = d sqrt(NORM) (1, 0) and Gram = NORM I, so y = d |c_0| / |c|
+    y = (12.0 * numpy.abs(coefficients[:, 0])
+         / numpy.sqrt(numpy.sum(numpy.abs(coefficients) ** 2, axis=1)))
+    spread = (y ** 2).reshape(16, 8).mean(axis=0)
+    assert spread.max() - spread.min() == pytest.approx(32.2, abs=0.5)
+
+    divergence, shape, diagnostics = marginal(20.0)
+    assert diagnostics["amplitude_truncated_fraction_peak"] == 0.0
+    # a 2.2 nat divergence and a marginal far from uniform: the statistic
+    # measures psi, and the recovered column must show it
+    assert divergence > 0.5
+    assert shape > 10.0
+    assert prior_sigma > 0.0
+
+    truncated, _, diagnostics = marginal(5.0)
+    assert diagnostics["amplitude_truncated_fraction_peak"] > 0.5
+    assert truncated < 0.1 * divergence
 
 
 def test_the_draw_is_reproducible_and_seeded(tmp_path):

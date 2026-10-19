@@ -215,6 +215,20 @@ DEFAULT_CEILING = 20.0
 #: The registered power of the volumetric amplitude prior, p(u) ~ u^-power.
 AMPLITUDE_POWER = 4.0
 
+#: Above this fraction of the peak-row orientation nodes the flat-prior
+#: maximum-likelihood amplitude ``u* = y/s`` lies above the amplitude-prior
+#: ceiling ``U``.  The amplitude integral is then dominated by its upper
+#: boundary and the per-node ``y`` information is absorbed by the amplitude
+#: marginalisation, so the recovered orientation carries nothing beyond its
+#: prior.  This is what the registered ceiling ``U = 5`` does to the stored
+#: archive: 40.5 per cent of the peak-row node entries have ``u* > 5`` and the
+#: eight-node polarisation marginal is the prior to 0.0015 nats, while at the
+#: corrected ``U = 20`` no peak-row entry is truncated and the same archive
+#: gives a 0.88 nat spread.  The adapter refuses to write the recovered columns
+#: above this limit unless the truncation is explicitly allowed, so a
+#: prior-dominated column can no longer be read as a measurement.
+AMPLITUDE_TRUNCATION_LIMIT = 0.05
+
 #: The number of u nodes of the production amplitude table.
 N_U = 2001
 
@@ -806,6 +820,29 @@ class AmplitudeMarginal(object):
         value = self.u[numpy.argmax(logp, axis=-1)]
         return value if numpy.ndim(s) else float(value[0])
 
+    def ml_amplitude(self, s, y):
+        """The flat-prior maximum-likelihood amplitude ``u* = y / s``.
+
+        The likelihood at one orientation node is
+        ``exp(-u^2 s^2 / 2 + u s y)``, whose maximum is at ``u* = y / s``
+        exactly, so this is the amplitude the data prefer before the prior is
+        applied.  It is the quantity that decides whether the amplitude
+        integral is contained by the prior or truncated by it: ``u* > U``
+        means the integrand is still rising at the ceiling.
+        """
+        s = numpy.asarray(s, dtype=float)
+        y = numpy.asarray(y, dtype=float)
+        return y / s
+
+    def truncated(self, s, y):
+        """Whether the amplitude integrand is rising at the ceiling.
+
+        ``True`` where ``u* = y / s`` exceeds ``self.ceiling``: the amplitude
+        marginal there is set by the prior boundary rather than by the data,
+        so the node's ``y`` no longer moves the evidence.
+        """
+        return self.ml_amplitude(s, y) > self.ceiling
+
     def metadata(self):
         """The attributes that describe the table in the samples file."""
         return {
@@ -1084,7 +1121,8 @@ class SufficientStatistics(object):
                 distance_constant=DEFAULT_DISTANCE_CONSTANT_MPC,
                 weights=None, chunk=16384, n_u=N_U, return_marginal=False,
                 orientation_interpolation=True,
-                measure_interpolation_error=True):
+                measure_interpolation_error=True,
+                allow_truncated_amplitude=False):
         """Draws the joint ``(lag, orientation, u)`` columns, one per cell.
 
         This is the same joint draw as before -- one sample per cell from
@@ -1136,6 +1174,16 @@ class SufficientStatistics(object):
             Measure exact minus interpolated ``ln Lbar`` at held-out points on
             the archive being drawn and record it in the diagnostics.  The
             value is written into the file metadata by the adapter.
+        allow_truncated_amplitude : bool, optional
+            When false (the default) a ceiling that truncates the amplitude
+            likelihood on more than :data:`AMPLITUDE_TRUNCATION_LIMIT` of the
+            peak-row orientation nodes raises: the amplitude marginal there is
+            set by the prior boundary, so the drawn orientation and
+            polarisation are the prior rather than a measurement.  ``True``
+            restores the old behaviour and is meant only for reproducing a
+            file that was written that way (the registered ceiling ``u = 5``
+            truncates 40.5 per cent of the stored archive's peak-row nodes and
+            flattens the polarisation marginal to 0.0015 nats).
 
         Returns
         -------
@@ -1161,6 +1209,23 @@ class SufficientStatistics(object):
         s_lo, s_hi, y_lo, y_hi = self._table_bounds()
         table = AmplitudeMarginal.from_bounds(
             s_lo, s_hi, y_lo, y_hi, ceiling, power=power, n_u=n_u)
+        truncated_peak = float(numpy.mean(
+            table.ml_amplitude(self.s, self.y) > ceiling))
+        if (truncated_peak > AMPLITUDE_TRUNCATION_LIMIT
+                and not allow_truncated_amplitude):
+            raise ValueError(
+                "the amplitude-prior ceiling u = {} truncates the amplitude "
+                "likelihood on {:.1f} per cent of the peak-row orientation "
+                "nodes (maximum u*/U = {:.2f}): the amplitude marginal is set "
+                "by the prior boundary, so the recovered orientation and "
+                "polarisation would be the prior and not a measurement.  "
+                "Raise amplitude-ceiling to the corrected {} (the stored "
+                "injection's mode is at u = 7.15), or set "
+                "allow-truncated-amplitude = true to write the "
+                "prior-dominated columns deliberately.".format(
+                    ceiling, 100.0 * truncated_peak,
+                    float(numpy.max(table.ml_amplitude(self.s, self.y)))
+                    / float(ceiling), DEFAULT_CEILING))
         rng = numpy.random.default_rng(int(seed))
         interpolator = (self.interpolation
                         if orientation_interpolation else None)
@@ -1183,12 +1248,23 @@ class SufficientStatistics(object):
         chunk_cells = max(1, int(chunk) // max_lag)
         far_nats = (FINE_LAG_TRUNCATION_NATS if interpolator is None
                     else interpolator.far_nats)
+        # the amplitude-prior truncation, measured over every archived
+        # (row, node) entry and over the peak rows: the number that decides
+        # whether the recovered orientation is a measurement or its prior
+        truncated_entries = 0
+        total_entries = 0
+        maximum_ml_u = 0.0
 
         for c0 in range(0, self.n_cells_archive, chunk_cells):
             c1 = min(c0 + chunk_cells, self.n_cells_archive)
             r0 = int(self.ptr[c0])
             r1 = int(self.ptr[c1])
             s, y = self._row_statistics(r0, r1)
+            ml_u = y / s
+            truncated_entries += int(numpy.count_nonzero(ml_u > ceiling))
+            total_entries += int(ml_u.size)
+            if ml_u.size:
+                maximum_ml_u = max(maximum_ml_u, float(ml_u.max()))
             likelihood = table(s, y)
             nodes = likelihood + self.log_weights[None, :]
             row_lnb = _logsumexp_last(nodes)
@@ -1343,6 +1419,15 @@ class SufficientStatistics(object):
             "fine_rows_retained": int(retained_rows),
             "fine_rows_total": int(total_rows),
             "fine_lag_truncation_nats": float(far_nats),
+            "amplitude_ceiling": float(ceiling),
+            "amplitude_truncated_fraction": (
+                float(truncated_entries) / float(total_entries)
+                if total_entries else 0.0),
+            "amplitude_truncated_fraction_peak": truncated_peak,
+            "amplitude_ml_u_max": float(maximum_ml_u),
+            "amplitude_ml_u_max_over_ceiling": (
+                float(maximum_ml_u) / float(ceiling) if ceiling > 0 else 0.0),
+            "amplitude_truncation_limit": float(AMPLITUDE_TRUNCATION_LIMIT),
         }
         if interpolator is not None and measure_interpolation_error:
             diagnostics["interpolation_error"] = self.interpolation_error(
@@ -1479,6 +1564,32 @@ class SufficientStatistics(object):
                                 numpy.full(5, numpy.nan))),
             "amr_drawn_quantile_levels": numpy.asarray(
                 [0.05, 0.16, 0.5, 0.84, 0.95]),
+            "amr_amplitude_ceiling": float(ceiling),
+            "amr_amplitude_ml_u_max": float(
+                diagnostics.get("amplitude_ml_u_max", numpy.nan)),
+            "amr_amplitude_ml_u_max_over_ceiling": float(
+                diagnostics.get("amplitude_ml_u_max_over_ceiling",
+                                numpy.nan)),
+            "amr_amplitude_truncated_fraction": float(
+                diagnostics.get("amplitude_truncated_fraction", numpy.nan)),
+            "amr_amplitude_truncated_fraction_peak": float(
+                diagnostics.get("amplitude_truncated_fraction_peak",
+                                numpy.nan)),
+            "amr_amplitude_truncation_limit": float(
+                diagnostics.get("amplitude_truncation_limit",
+                                numpy.nan)),
+            "amr_amplitude_truncation_note": (
+                "amr_amplitude_truncated_fraction is the fraction of the "
+                "archived (cell, lag, node) entries whose flat-prior "
+                "maximum-likelihood amplitude u* = y/s lies above the "
+                "ceiling U; amr_amplitude_truncated_fraction_peak is the "
+                "same fraction on the strongest lag of every cell, which is "
+                "where the posterior mass is.  Above the truncation limit "
+                "the amplitude marginal is set by the prior boundary and the "
+                "recovered orientation and polarisation are the prior, not a "
+                "measurement; the stored archive at the registered U = 5 has "
+                "40.5 per cent on the peak rows and 1.8 per cent overall, "
+                "against zero at the corrected U = 20."),
         })
 
         # ------------------------------------------------------------------

@@ -217,4 +217,128 @@ class UniformRadius(UniformPowerLaw):
     def __init__(self, dim=3, **params):
         super(UniformRadius, self).__init__(dim=3, **params)
 
-__all__ = ["UniformPowerLaw", "UniformRadius"]
+
+
+class UniformAmplitudePowerLaw(bounded.BoundedDist):
+    r"""A power-law prior on an amplitude-like coordinate.
+
+    The pdf of each parameter :math:`x` is
+
+    .. math::
+
+        p(x) = \frac{1-\mathrm{power}}
+                    {x_\mathrm{hi}^{1-\mathrm{power}}
+                     - x_\mathrm{lo}^{1-\mathrm{power}}}\,
+               x^{-\mathrm{power}},
+
+    on :math:`x_\mathrm{lo} \le x \le x_\mathrm{hi}`, and zero outside.
+    The logarithmic normalisation is used when ``power == 1``.  ``power = 0``
+    is uniform; ``power = 4`` is the volumetric prior
+
+    .. math:: p(u) \propto u^{-4}
+
+    that a uniform-in-distance prior induces on the amplitude
+    :math:`u = K / d`.  Unlike :class:`UniformPowerLaw`, the exponent is a
+    scalar option rather than a number of dimensions, and it is read from the
+    configuration file.
+
+    The optional ``distance_constant`` is stored for provenance only; it is
+    the constant :math:`K` in :math:`d = K / u`, so a consumer can recover a
+    distance from a drawn amplitude without repeating the convention.
+
+    Parameters
+    ----------
+    power : float, optional
+        The exponent of the power law. Default is 0 (uniform).
+    distance_constant : float, optional
+        The constant that converts the coordinate to a distance. Default is
+        None (not recorded).
+
+    The keyword arguments also provide the parameter names and their bounds,
+    as either tuples or a :class:`pycbc.boundaries.Bounds` instance.
+    """
+    name = "uniform_amplitude_power_law"
+
+    def __init__(self, power=0.0, distance_constant=None, **params):
+        self.power = float(power)
+        self.distance_constant = (None if distance_constant is None
+                                  else float(distance_constant))
+        super(UniformAmplitudePowerLaw, self).__init__(**params)
+        lognorm = 0.0
+        for p in self._params:
+            lo, hi = self._bounds[p]
+            if lo <= 0:
+                raise ValueError("uniform_amplitude_power_law needs a "
+                                 "positive lower bound, got %r for %s"
+                                 % (lo, p))
+            if abs(self.power - 1.0) < 1e-12:
+                norm = 1.0 / numpy.log(hi / lo)
+            else:
+                norm = ((1.0 - self.power)
+                        / (hi ** (1.0 - self.power)
+                           - lo ** (1.0 - self.power)))
+            lognorm += numpy.log(norm)
+        self._lognorm = float(lognorm)
+        self._norm = float(numpy.exp(lognorm))
+
+    @property
+    def norm(self):
+        """float: The normalisation of the pdf."""
+        return self._norm
+
+    @property
+    def lognorm(self):
+        """float: The log of the normalisation."""
+        return self._lognorm
+
+    def _pdf(self, **kwargs):
+        """Return the pdf at the given values."""
+        for p in self._params:
+            if p not in kwargs:
+                raise ValueError(
+                    'Missing parameter {} to construct pdf.'.format(p))
+        if kwargs in self:
+            values = numpy.array([kwargs[p] for p in self._params], dtype=float)
+            return float(self._norm
+                         * numpy.prod(values ** (-self.power)))
+        return 0.0
+
+    def _logpdf(self, **kwargs):
+        """Return the log of the pdf at the given values."""
+        for p in self._params:
+            if p not in kwargs:
+                raise ValueError(
+                    'Missing parameter {} to construct pdf.'.format(p))
+        if kwargs in self:
+            values = numpy.array([kwargs[p] for p in self._params], dtype=float)
+            return float(self._lognorm
+                         - self.power * numpy.log(values).sum())
+        return -numpy.inf
+
+    def _cdfinv_param(self, param, value):
+        """Map a unit-interval value to the parameter's support."""
+        lo, hi = self._bounds[param]
+        if abs(self.power - 1.0) < 1e-12:
+            return lo * (hi / lo) ** value
+        a = lo ** (1.0 - self.power)
+        b = hi ** (1.0 - self.power)
+        return (a + (b - a) * value) ** (1.0 / (1.0 - self.power))
+
+    @classmethod
+    def from_config(cls, cp, section, variable_args):
+        """Return a distribution from a section of a configuration file.
+
+        The section is titled ``[section-variable_args]`` and holds
+        ``min-{param}``, ``max-{param}`` and ``power``.
+        """
+        try:
+            power = float(cp.get_opt_tag(section, "power", variable_args))
+        except Exception:
+            power = 0.0
+        return bounded.bounded_from_config(
+            cls, cp, section, variable_args, bounds_required=True,
+            additional_opts={"power": power})
+
+
+__all__ = ["UniformPowerLaw", "UniformRadius", "UniformAmplitudePowerLaw"]
+

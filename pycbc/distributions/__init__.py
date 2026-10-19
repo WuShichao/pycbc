@@ -28,7 +28,8 @@ from pycbc.distributions.angular import UniformAngle, SinAngle, CosAngle, \
                                         UniformSolidAngle
 from pycbc.distributions.arbitrary import Arbitrary, FromFile
 from pycbc.distributions.gaussian import Gaussian
-from pycbc.distributions.power_law import UniformPowerLaw, UniformRadius
+from pycbc.distributions.power_law import (UniformPowerLaw, UniformRadius,
+                                            UniformAmplitudePowerLaw)
 from pycbc.distributions.sky_location import UniformSky, UniformDiskSky, FisherSky, HealpixSky
 from pycbc.distributions.uniform import Uniform
 from pycbc.distributions.uniform_log import UniformLog10
@@ -48,6 +49,7 @@ distribs = {
     Gaussian.name : Gaussian,
     UniformPowerLaw.name : UniformPowerLaw,
     UniformRadius.name : UniformRadius,
+    UniformAmplitudePowerLaw.name : UniformAmplitudePowerLaw,
     Uniform.name : Uniform,
     UniformAngle.name : UniformAngle,
     CosAngle.name : CosAngle,

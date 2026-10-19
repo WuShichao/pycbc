@@ -488,6 +488,7 @@ _ALLOWED_OPTIONS = frozenset([
     "injection-seed", "injection-delta", "batch", "sufficient-file",
     "amplitude-ceiling", "amplitude-power", "distance-constant",
     "recovered-seed", "orientation-interpolation",
+    "allow-truncated-amplitude",
     "injection-inclination", "injection-polarization", "injection-coa-phase",
 ])
 
@@ -1019,6 +1020,7 @@ class AmrSampler(BaseSampler):
                  distance_constant=DEFAULT_DISTANCE_CONSTANT_MPC,
                  recovered_seed=20261018,
                  orientation_interpolation=True,
+                 allow_truncated_amplitude=False,
                  injection_inclination=1.0,
                  injection_polarization=0.7, injection_coa_phase=0.3,
                  injection_xi=(3.0, -2.0, 1.5, -1.0), injection_rho=16.0,
@@ -1061,6 +1063,7 @@ class AmrSampler(BaseSampler):
                                   else float(distance_constant))
         self.recovered_seed = int(recovered_seed)
         self.orientation_interpolation = bool(orientation_interpolation)
+        self.allow_truncated_amplitude = bool(allow_truncated_amplitude)
         self.injection_inclination = float(injection_inclination)
         self.injection_polarization = float(injection_polarization)
         self.injection_coa_phase = float(injection_coa_phase)
@@ -1265,6 +1268,9 @@ class AmrSampler(BaseSampler):
             orientation_interpolation=_as_bool(
                 get("orientation-interpolation", "true"),
                 "orientation-interpolation"),
+            allow_truncated_amplitude=_as_bool(
+                get("allow-truncated-amplitude", "false"),
+                "allow-truncated-amplitude"),
             injection_inclination=float(get("injection-inclination", 1.0)),
             injection_polarization=float(
                 get("injection-polarization", 0.7)),
@@ -1377,7 +1383,8 @@ class AmrSampler(BaseSampler):
             self.amplitude_ceiling, power=self.amplitude_power,
             seed=self.recovered_seed,
             distance_constant=self.distance_constant,
-            orientation_interpolation=self.orientation_interpolation)
+            orientation_interpolation=self.orientation_interpolation,
+            allow_truncated_amplitude=self.allow_truncated_amplitude)
         columns = result["columns"]
         diagnostics = result["diagnostics"]
         registered_prior = (
