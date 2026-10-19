@@ -315,9 +315,27 @@ def _preparation(params, terms, orbit):
         # is no single frequency range to clip to.
         band = list(edges)
         if len(fiducial.harmonics) == 1 and params.get('tdi_clip_bands', True):
-            band = _harmonic_band_edges(
+            clipped = _harmonic_band_edges(
                 fiducial, fiducial.harmonics[0], edges,
                 params['t_obs_start'], params['t_obs_end'])
+            # `_harmonic_band_edges` says the clip only bounds the sampling
+            # rate, but it also bounds the transform:
+            # `MultibandSparseTDIResponse.frequency_samples` evaluates a band
+            # only inside `[f_lower, f_upper]` and returns an exact zero
+            # elsewhere. A harmonic whose instantaneous range is narrower
+            # than the request therefore leaves the outer part of the
+            # requested band identically zero -- measured on the index-0 AMR
+            # event as 236993 of 441505 bins above 0.0167425 Hz, 53.7 per
+            # cent. A plain matched filter does not notice, because the
+            # source is about 1e-12 of its peak there and the norm is
+            # unharmed. Relative binning does: it divides by the fiducial
+            # bin by bin, so a zero reference makes the ratio undefined and
+            # collapses the kernel to a flat function. Keep the harmonic's
+            # interior partition, but let the outer edges bracket the
+            # requested band rather than the harmonic's own range.
+            band = [min(clipped[0], float(edges[0])),
+                    *clipped[1:-1],
+                    max(clipped[-1], float(edges[-1]))]
         prepared = prepare_sparse_tdi(
             fiducial, orbit, terms,
             float(params['eclipticlongitude']),
