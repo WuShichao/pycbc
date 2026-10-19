@@ -28,6 +28,8 @@ over an arrival-time window of width ``W``, with ``X = w^H z / s^2`` and
 ``G`` and the per-component noise variance ``s^2`` of the data spectrum.
 """
 
+import logging
+
 import numpy
 
 from pycbc.filter.bstatistic import (OrientationNodes, _project,
@@ -190,3 +192,226 @@ class BStatisticSurrogate(BaseModel):
                                                 2 * numpy.pi)),
                    loglikelihood=self.loglikelihood)
         return rec
+
+    @classmethod
+    def from_data(cls, variable_params, data, psds, reference, intrinsic,
+                  low_frequency_cutoff, high_frequency_cutoff, time_window,
+                  distance_prior, orbit=None, to_source=None, periods=5,
+                  coarse_bins=1500, harmonics=4, response_samples=32,
+                  derivative_step=0.5, max_time_loss=1e-3, **kwargs):
+        """Build the model from frequency-domain TDI data.
+
+        Parameters
+        ----------
+        data, psds : dict
+            Channel name (``LISA_A`` or ``A``) to FrequencySeries, all with
+            the same epoch and resolution.
+        reference : dict
+            The reference source: every parameter ``to_source`` needs, the
+            sky as ``eclipticlongitude`` and ``eclipticlatitude``, the
+            source clock as ``f_lower`` and ``tdi_t_start``.
+        intrinsic : list of str
+            The intrinsic coordinates of the family, keys of ``reference``.
+        low_frequency_cutoff, high_frequency_cutoff : float
+            The analysis band, Hz.
+        time_window, distance_prior
+            As in the class.
+        orbit : optional
+            The orbit; default the equal-arm LISA orbit with ``t0 = 0`` of
+            :func:`pycbc.tdi.inference.sparse_tdi_fd_det_sequence`.
+        to_source : callable, optional
+            Point to source parameters for
+            :func:`pycbc.tdi.linear_exponent_surrogate.lal_plus_source`.
+        periods, coarse_bins, harmonics, response_samples
+            The SSB grid's length in orbits, the response's coarse
+            frequencies, its yearly harmonics and its samples per orbit.
+        derivative_step : float
+            Step of the family's derivative columns, in shape units. The
+            shape unit of a coordinate is ``1 / sqrt(M_ii)`` of the
+            F-statistic metric ``M`` at the reference, so the units follow
+            the source and the data rather than being set by hand.
+        max_time_loss : float
+            Largest fraction of the statistic lost between fine arrival-time
+            samples; sets the oversampling from the rms bandwidth.
+        """
+        from pycbc.coordinates.space_orbit import LisaEqualArmOrbit
+        from pycbc.filter.subsample_arrival_time import (
+            oversampling_for_loss, rms_bandwidth)
+        from pycbc.tdi.inference import DEFAULT_ARM, channel_terms
+        from pycbc.tdi.linear_exponent_surrogate import (
+            DailyGram, surrogate_from_source)
+        from pycbc.tdi.ssb_yearly_harmonics import (SSBGrid,
+                                                    ssb_data_spectrum)
+        from pycbc.tmpltbank.fstatistic_metric import fstatistic_metric
+        # the orbit of pycbc.tdi's sparse response, unless told otherwise
+        orbit = (LisaEqualArmOrbit(armlength=DEFAULT_ARM, t0=0.0)
+                 if orbit is None else orbit)
+        names = sorted(data)
+        channels = tuple(n.split('_')[-1] for n in names)
+        first = data[names[0]]
+        df = float(first.delta_f)
+        kmin = int(numpy.ceil(low_frequency_cutoff / df))
+        kmax = int(numpy.floor(high_frequency_cutoff / df))
+        freqs = numpy.arange(kmin, kmax + 1) * df
+        weight = {n: 4 * df / numpy.asarray(psds[n])[kmin:kmax + 1]
+                  for n in names}
+        bins = numpy.array([numpy.asarray(data[n])[kmin:kmax + 1]
+                            * numpy.sqrt(weight[n]) for n in names])
+        start = float(first.start_time)
+        grid = SSBGrid(start, start + 1 / df, freqs[0], len(freqs), df,
+                       periods=periods)
+        # the source carries the first channel's whitening, the response
+        # the ratio of each channel's to it
+        sw = numpy.sqrt(numpy.interp(grid.frequencies, freqs,
+                                     weight[names[0]], left=0, right=0))
+        coarse = numpy.linspace(grid.frequencies[0],
+                                grid.frequencies[-1], coarse_bins)
+        ratio = numpy.array([numpy.sqrt(numpy.interp(
+            coarse, freqs, weight[n] / weight[names[0]])) for n in names])
+        terms = channel_terms(channels, generation=2, delta_t=5.0)
+        lon = reference['eclipticlongitude']
+        lat = reference['eclipticlatitude']
+
+        def build(scales, step):
+            fam = surrogate_from_source(
+                grid, sw, orbit, terms, reference,
+                {k: scales[k] for k in intrinsic},
+                (scales['eclipticlongitude'], scales['eclipticlatitude']),
+                coarse, to_source=to_source, step=step,
+                kmax=harmonics, samples=response_samples)
+            fam.R0 = fam.R0 * fam.xp.asarray(ratio)[None, None]
+            return fam
+
+        keys = list(intrinsic) + ['eclipticlongitude', 'eclipticlatitude']
+        nodes = OrientationNodes(4, 2)
+
+        def unit_lengths(fam):
+            """sqrt of the metric's diagonal in the family's shape units,
+            averaged over orientations."""
+            y, dy = fam.tangents()
+            window = fam.xp.asarray(grid.in_data)
+
+            def windowed(s):
+                return _to_numpy(fam.xp.fft.fft(
+                    fam.xp.fft.ifft(s, axis=-1) * window, axis=-1))
+            y, dy = windowed(y), windowed(dy)
+            metric = sum(w * fstatistic_metric(y, dy, v, grid.frequencies)
+                         for w, v in zip(nodes.weights, nodes.vectors))
+            return numpy.sqrt(numpy.diag(metric)), y
+
+        # the metric from derivatives over a part in 1e6 of each value and
+        # 1e-6 rad of sky, checked against steps ten times smaller
+        probe = {k: 1e-6 * max(abs(reference[k]), 1e-3) for k in intrinsic}
+        probe.update(eclipticlongitude=1e-6, eclipticlatitude=1e-6)
+        units, y = unit_lengths(build(probe, 1.0))
+        finer, _ = unit_lengths(build(probe, 0.1))
+        if not numpy.allclose(finer, units, rtol=1e-2):
+            raise RuntimeError("the metric's derivatives have not converged: "
+                               "{} against {}".format(units, finer))
+        scales = {k: probe[k] / u for k, u in zip(keys, units)}
+        logging.info("shape units %s", scales)
+        fam = build(scales, derivative_step)
+        daily = DailyGram(fam)
+        spectrum, noise = ssb_data_spectrum(grid, bins, orbit, lon, lat,
+                                            xp=fam.xp)
+        sigma_f = rms_bandwidth(grid.frequencies, numpy.sum(
+            numpy.abs(y) ** 2, axis=(0, 1)))
+        oversampling = oversampling_for_loss(sigma_f, grid.delta_t,
+                                             max_time_loss)
+        point = {k: reference[k] for k in keys}
+        return cls(variable_params, fam, daily, spectrum, noise, point,
+                   scales, distance_prior, time_window,
+                   oversampling=oversampling, **kwargs)
+
+    _CONFIG_OPTIONS = {
+        'low-frequency-cutoff': float, 'high-frequency-cutoff': float,
+        'intrinsic-parameters': str, 'time-window': str,
+        'distance-min': float, 'distance-max': float,
+        'distance-power': float, 'grid-periods': int, 'coarse-bins': int,
+        'harmonics': int, 'response-samples': int,
+        'derivative-step': float, 'max-time-loss': float,
+        'orientation-nodes': str, 'margin': float}
+
+    @classmethod
+    def from_config(cls, cp, data_section='data', data=None, psds=None,
+                    **kwargs):
+        """Build the model from a configuration file.
+
+        The ``[data]`` section is read as for the Gaussian-noise models,
+        unless ``data`` and ``psds`` are given. ``[model]`` takes:
+
+        * ``name = bstatistic_surrogate``
+        * ``low-frequency-cutoff``, ``high-frequency-cutoff``: the band, Hz.
+        * ``intrinsic-parameters``: the family's intrinsic coordinates.
+        * ``reference-{param}``: the reference value of each intrinsic
+          coordinate and of ``eclipticlongitude`` and ``eclipticlatitude``;
+          a static parameter of that name serves too.
+        * ``time-window = LOW HIGH``: arrival-time offsets marginalised
+          over, s.
+        * ``distance-min``, ``distance-max``, ``distance-power`` (default
+          2): the distance prior, in the units of the waveform's distance.
+        * ``grid-periods`` (5), ``coarse-bins`` (1500), ``harmonics`` (4),
+          ``response-samples`` (32), ``derivative-step`` (0.5),
+          ``max-time-loss`` (1e-3), ``orientation-nodes`` (``32 16``),
+          ``margin`` (40): see :meth:`from_data` and the class.
+
+        The source parameters are the static parameters and the reference
+        point passed through the ``[waveform_transforms]``.
+        """
+        from pycbc import transforms
+        from pycbc.filter.bstatistic import DistancePowerLaw
+        from .data_utils import (data_opts_from_config, data_from_cli,
+                                 fd_data_from_strain_dict)
+        section = 'model'
+        options = set(cp.options(section)) - {'name'}
+        refs = {o for o in options if o.startswith('reference-')}
+        unknown = options - refs - set(cls._CONFIG_OPTIONS)
+        if unknown:
+            raise ValueError("unknown option(s) in [model] for {}: {}".format(
+                cls.name, ', '.join(sorted(unknown))))
+        get = {k: conv(cp.get(section, k))
+               for k, conv in cls._CONFIG_OPTIONS.items()
+               if cp.has_option(section, k)}
+        for required in ('low-frequency-cutoff', 'high-frequency-cutoff',
+                         'intrinsic-parameters', 'time-window',
+                         'distance-min', 'distance-max'):
+            if required not in get:
+                raise ValueError("[model] needs " + required)
+        args = cls._init_args_from_config(cp)
+        flow, fhigh = get['low-frequency-cutoff'], get['high-frequency-cutoff']
+        if data is None or psds is None:
+            detectors = cp.get(data_section, 'instruments').split()
+            opts = data_opts_from_config(cp, data_section,
+                                         {d: flow for d in detectors})
+            strain, psd_strain = data_from_cli(opts)
+            data, psds = fd_data_from_strain_dict(opts, strain, psd_strain)
+        intrinsic = get['intrinsic-parameters'].split()
+        reference = dict(args.get('static_params') or {})
+        for name in intrinsic + ['eclipticlongitude', 'eclipticlatitude']:
+            option = 'reference-' + name
+            if cp.has_option(section, option):
+                reference[name] = float(cp.get(section, option))
+            elif name not in reference:
+                raise ValueError("no reference value for " + name)
+        waveform_transforms = args.get('waveform_transforms')
+        to_source = None
+        if waveform_transforms:
+            def to_source(point):
+                return transforms.apply_transforms(dict(point),
+                                                   waveform_transforms)
+        prior = DistancePowerLaw(get['distance-min'], get['distance-max'],
+                                 get.get('distance-power', 2.0))
+        window = tuple(float(v) for v in get['time-window'].split())
+        nodes = tuple(int(v) for v in
+                      get.get('orientation-nodes', '32 16').split())
+        args.update(kwargs)
+        return cls.from_data(
+            args.pop('variable_params'), data, psds, reference, intrinsic,
+            flow, fhigh, window, prior, to_source=to_source,
+            periods=get.get('grid-periods', 5),
+            coarse_bins=get.get('coarse-bins', 1500),
+            harmonics=get.get('harmonics', 4),
+            response_samples=get.get('response-samples', 32),
+            derivative_step=get.get('derivative-step', 0.5),
+            max_time_loss=get.get('max-time-loss', 1e-3),
+            orientation_nodes=nodes, margin=get.get('margin', 40.0), **args)

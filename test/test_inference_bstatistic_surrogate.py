@@ -146,3 +146,116 @@ def test_the_model_runs_on_the_gpu():
         assert mg.loglikelihood == pytest.approx(expected, abs=1e-8)
         rec = mg.reconstruct(seed=1)
     assert 0 <= rec['polarization'] < 2 * numpy.pi
+
+
+CONFIG = """
+[model]
+name = bstatistic_surrogate
+low-frequency-cutoff = 0.0150
+high-frequency-cutoff = 0.0153
+intrinsic-parameters = mchirp q spin1z spin2z
+time-window = -259200 259200
+distance-min = 1
+distance-max = 1000
+grid-periods = 1
+coarse-bins = 200
+orientation-nodes = 16 8
+reference-mchirp = 31.831389387890596
+
+[variable_params]
+mchirp =
+
+[static_params]
+q = 2.0711690321562553
+spin1z = -0.1493668476836033
+spin2z = -0.7820976081717529
+eclipticlongitude = 3.5763564997428436
+eclipticlatitude = 0.3429283438977949
+f_lower = 0.015
+tdi_f_upper = 0.0155
+tdi_t_start = 864000
+
+[prior-mchirp]
+name = uniform
+min-mchirp = 31.8
+max-mchirp = 31.86
+
+[waveform_transforms-mass1+mass2]
+name = mchirp_q_to_mass1_mass2
+"""
+
+
+def stbbh_data(days=120.0, distance=20.0, seed=3):
+    """An exact sparse-TDI stellar-mass binary in LISA A and E noise."""
+    from pycbc.conversions import mass1_from_mchirp_q, mass2_from_mchirp_q
+    from pycbc.psd.analytical_space import analytical_psd_lisa_tdi_AE
+    from pycbc.tdi.inference import sparse_tdi_fd_det_sequence
+    from pycbc.types import FrequencySeries
+    df = 1 / (days * DAY)
+    q, mc = 2.0711690321562553, 31.831389387890596
+    source = dict(mass1=mass1_from_mchirp_q(mc, q),
+                  mass2=mass2_from_mchirp_q(mc, q), spin1z=-0.1493668476836033,
+                  spin2z=-0.7820976081717529,
+                  eclipticlongitude=3.5763564997428436,
+                  eclipticlatitude=0.3429283438977949,
+                  inclination=1.2870182448496255,
+                  polarization=0.5011808775099882,
+                  coa_phase=2.2688697243830247, distance=distance,
+                  f_lower=0.015, tdi_f_upper=0.0155, tdi_t_start=10 * DAY)
+    kmin, kmax = int(numpy.ceil(0.0135 / df)), int(numpy.floor(0.0168 / df))
+    freqs = numpy.arange(kmin, kmax + 1) * df
+    signal = sparse_tdi_fd_det_sequence(
+        ifos=('A', 'E'), sample_points=freqs, approximant='TDISparse',
+        tdi_source='lal', tdi_approximant='IMRPhenomD',
+        tdi_band_edges=[0.0135, 0.0168], tdi_delta_f=df, t_obs_start=0.0,
+        t_obs_end=days * DAY, tdi_epoch=0.0, tdi_channels=('A', 'E'),
+        **source)
+    n = int(round(days * DAY * 0.2)) // 2 + 1
+    psd = numpy.asarray(analytical_psd_lisa_tdi_AE(n, df, df, tdi='2.0'))
+    rng = numpy.random.default_rng(seed)
+    data, psds, snr2 = {}, {}, 0.0
+    for c in ('A', 'E'):
+        d = numpy.zeros(n, complex)
+        s = numpy.asarray(signal[c])
+        sd = numpy.sqrt(psd[kmin:kmax + 1] / (4 * df))
+        d[kmin:kmax + 1] = s + sd * (rng.normal(size=len(s))
+                                     + 1j * rng.normal(size=len(s)))
+        band = (freqs >= 0.015) & (freqs <= 0.0153)
+        snr2 += numpy.sum((4 * df / psd[kmin:kmax + 1]
+                           * numpy.abs(s) ** 2)[band])
+        data['LISA_' + c] = FrequencySeries(d, delta_f=df, epoch=0.0)
+        psds['LISA_' + c] = FrequencySeries(psd, delta_f=df, epoch=0.0)
+    return data, psds, snr2, mc
+
+
+def test_from_config_on_an_exact_tdi_injection():
+    """Built from a configuration and exact sparse-TDI data, the model
+    peaks at the injected chirp mass with ln B near SNR^2 / 2 in the
+    band, and recovers the injected distance."""
+    from pycbc.inference import models
+    from pycbc.workflow import WorkflowConfigParser
+    cp = WorkflowConfigParser()
+    cp.read_string(CONFIG)
+    data, psds, snr2, mc = stbbh_data()
+    m = models.read_from_config(cp, data=data, psds=psds)
+    unit = m.scales['mchirp']
+    values = {}
+    for k in (-1, 0, 1):
+        m.update(mchirp=mc + k * unit)
+        values[k] = m.loglikelihood
+    assert values[0] > values[-1] and values[0] > values[1]
+    assert abs(values[0] - 0.5 * snr2) < 5 * numpy.sqrt(snr2) + 50
+    m.update(mchirp=mc)
+    distance = [m.reconstruct(seed=s)['distance'] for s in range(30)]
+    low, high = numpy.percentile(distance, [5, 95])
+    assert low < 20.0 < high
+
+
+def test_from_config_refuses_unknown_options():
+    from pycbc.inference import models
+    from pycbc.workflow import WorkflowConfigParser
+    cp = WorkflowConfigParser()
+    cp.read_string(CONFIG.replace(
+        'grid-periods = 1', 'grid-periods = 1\nnlive = 10'))
+    with pytest.raises(ValueError, match='unknown option'):
+        models.read_from_config(cp, data={}, psds={})
