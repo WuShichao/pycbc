@@ -59,6 +59,33 @@ def test_posterior_samples_recover_the_mean_and_width():
     assert len(numpy.unique(samples['x'])) > 0.9 * len(samples['x'])
 
 
+def ridge_model(width):
+    # a unit-length ridge of the given width, at 30 degrees to the axes
+    angle = math.radians(30)
+    rotation = numpy.array([[math.cos(angle), -math.sin(angle)],
+                            [math.sin(angle), math.cos(angle)]])
+    cov = rotation @ numpy.diag([1.0, width ** 2]) @ rotation.T
+    prior = JointDistribution(
+        ['x', 'y'], Uniform(x=(-HALF, HALF)), Uniform(y=(-HALF, HALF)))
+    return models.TestNormal(['x', 'y'], mean=[0.3, -0.2], cov=cov,
+                             prior=prior)
+
+
+@pytest.mark.parametrize('width', [0.05, 0.01])
+def test_a_thin_oblique_ridge_is_followed(width):
+    sampler = AMRSampler(ridge_model(width), mass_fraction=1e-5,
+                         max_evaluations=100000, posterior_samples=20000,
+                         seed=1)
+    sampler.run()
+    error = sampler.logz + math.log((2 * HALF) ** 2)
+    assert abs(error) < 1e-2
+    assert abs(error) < 3 * sampler.logz_err
+    x = sampler.samples['x']
+    assert numpy.mean(x) == pytest.approx(0.3, abs=0.02)
+    assert numpy.std(x) == pytest.approx(math.sqrt(0.75 + 0.25 * width ** 2),
+                                         rel=0.03)
+
+
 def test_box_masses_cover_the_prior_exactly():
     sampler = AMRSampler(normal_model(), max_evaluations=5000)
     sampler.run()

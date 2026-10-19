@@ -17,12 +17,22 @@
 The prior is mapped to the unit cube with the same transform the nested
 samplers use, so a box in the cube carries prior mass equal to its volume.
 The cube starts as a regular grid and the likelihood is evaluated at each
-box centre. A box is bisected along its widest side while its error
-estimate exceeds ``mass-fraction`` of the evidence: the error of a box is
-how much the midpoint mass of its region changed when its parent was split,
-and a box of the starting grid has its own mass as its error. Refinement
-stops when no box qualifies, the boxes reach ``max-level`` bisections, or
-``max-evaluations`` is spent.
+box centre. A box is bisected along its widest side when either
+
+* its error estimate exceeds ``mass-fraction`` of the evidence. The error of
+  a box is how much the midpoint mass of its region changed when its parent
+  was split; a box of the starting grid has its own mass as its error.
+* it is more than twice as coarse as a face neighbour, and would hold more
+  than ``mass-fraction`` of the evidence at that neighbour's likelihood. This
+  carries the refinement along a narrow ridge, whose continuation a coarse
+  box can miss because its centre falls off the ridge.
+* it holds more than ``mass-fraction`` of the evidence and its log
+  likelihood differs from a face neighbour's by more than
+  ``loglikelihood-step``. The split error alone can miss a ridge narrower
+  than the box when the halves' centres fall as far off it as the parent's.
+
+Refinement stops when no box qualifies, the boxes reach ``max-level``
+bisections, or ``max-evaluations`` is spent.
 
 The evidence is the midpoint sum over the boxes; its error estimate is the
 summed error of the final boxes. Posterior samples are drawn by choosing
@@ -60,9 +70,14 @@ class AMRSampler(BaseSampler):
         Divisions per parameter of the starting grid. Default 4.
     max_level : int, optional
         Maximum number of bisections of any box. Default 30.
+    loglikelihood_step : float, optional
+        A box holding more than ``mass_fraction`` of the evidence is refined
+        while its log likelihood differs from a face neighbour's by more
+        than this. Default 1.
     mass_fraction : float, optional
-        A box is refined while its error estimate exceeds this fraction of
-        the evidence. Default 1e-4.
+        A box is refined while its error estimate, or its volume times the
+        likelihood of a much finer neighbour, exceeds this fraction of the
+        evidence. Default 1e-4.
     max_evaluations : int, optional
         Budget of likelihood evaluations. Default 100000.
     posterior_samples : int, optional
@@ -81,12 +96,14 @@ class AMRSampler(BaseSampler):
     _io = AMRFile
 
     def __init__(self, model, initial_divisions=4, max_level=30,
-                 mass_fraction=1e-4, max_evaluations=100000,
+                 loglikelihood_step=1.0, mass_fraction=1e-4,
+                 max_evaluations=100000,
                  posterior_samples=10000, seed=0, nprocesses=1,
                  use_mpi=False, loglikelihood_function=None):
         super().__init__(model)
         self.initial_divisions = int(initial_divisions)
         self.max_level = int(max_level)
+        self.loglikelihood_step = float(loglikelihood_step)
         self.mass_fraction = float(mass_fraction)
         self.max_evaluations = int(max_evaluations)
         self.posterior_samples = int(posterior_samples)
@@ -197,6 +214,8 @@ class AMRSampler(BaseSampler):
             logging.info("AMR: %d boxes, %d evaluations, log Z %.4f",
                          len(leaves), self.nevaluations, logz)
             refine = self._logerr[leaves] - logz > threshold
+            refine |= self._neighbour_flags(leaves, logmass - logz > threshold,
+                                            logz + threshold)
             refine &= self._level[leaves] < self.max_level
             refine = leaves[refine]
             room = (budget - self.nevaluations) // 2
@@ -207,6 +226,62 @@ class AMRSampler(BaseSampler):
                                          self._log_mass(refine))
                 refine = refine[numpy.argsort(-priority)[:room]]
             self._bisect(refine)
+
+    def _locate(self, points):
+        """The leaf holding each point of the unit cube."""
+        n = self.initial_divisions
+        cell = numpy.clip((points * n).astype(int), 0, n - 1)
+        node = numpy.ravel_multi_index(tuple(cell.T), (n,) * self.ndim)
+        rows = numpy.arange(len(points))
+        while True:
+            inner = self._children[node, 0] >= 0
+            if not inner.any():
+                return node
+            hi = self._children[node[inner], 1]
+            axis = numpy.argmax(self._lower[hi] != self._lower[node[inner]],
+                                axis=1)
+            upper = points[rows[inner], axis] >= self._lower[hi, axis]
+            node[inner] = self._children[node[inner], upper.astype(int)]
+
+    def _neighbour_flags(self, leaves, significant, logbound):
+        """Leaves to refine because of their face neighbours: those more
+        than twice as coarse as a neighbour whose likelihood, times their own
+        volume, exceeds ``logbound``, and the significant ones whose log
+        likelihood steps by more than ``loglikelihood_step`` to a neighbour
+        (with the neighbour, unless it is the finer)."""
+        flag = numpy.zeros(len(self._lower), dtype=bool)
+        flag_significant = numpy.zeros(len(self._lower), dtype=bool)
+        flag_significant[leaves[significant]] = True
+        # a neighbour is at most as large as a box of the starting grid
+        largest = -self.ndim * numpy.log(self.initial_divisions)
+        source = leaves[(self._logl[leaves] + largest > logbound)
+                        | significant]
+        if len(source) == 0:
+            return numpy.zeros(len(leaves), dtype=bool)
+        centre = self._lower[source] + 0.5 * self._width[source]
+        size = self._width[source].max(axis=1)
+        for axis in range(self.ndim):
+            for sign in (-1, 1):
+                probe = centre.copy()
+                probe[:, axis] += sign * 0.5 * self._width[source, axis] * (
+                    1 + 1e-9)
+                inside = (probe[:, axis] > 0) & (probe[:, axis] < 1)
+                found = self._locate(probe[inside])
+                logvol = numpy.sum(numpy.log(self._width[found]), axis=1)
+                origin = source[inside]
+                coarseness = self._width[found].max(axis=1)
+                coarse = ((coarseness > 2 * size[inside])
+                          & (self._logl[origin] + logvol > logbound))
+                flag[found[coarse]] = True
+                with numpy.errstate(invalid='ignore'):
+                    step = ~(numpy.abs(self._logl[origin] - self._logl[found])
+                             <= self.loglikelihood_step)
+                # two boxes outside the likelihood's support do not step
+                step &= numpy.isfinite(self._logl[origin])
+                step &= flag_significant[origin]
+                flag[origin[step]] = True
+                flag[found[step & (coarseness >= size[inside])]] = True
+        return flag[leaves]
 
     def _split(self, index):
         """Halves boxes along their widest side, without evaluating them;
@@ -296,7 +371,8 @@ class AMRSampler(BaseSampler):
 
         * ``name = amr``
         * ``initial-divisions = INT``, ``max-level = INT``,
-          ``mass-fraction = FLOAT``, ``max-evaluations = INT``,
+          ``loglikelihood-step = FLOAT``, ``mass-fraction = FLOAT``,
+          ``max-evaluations = INT``,
           ``posterior-samples = INT``, ``seed = INT``: optional, see the
           class docstring.
         * ``loglikelihood-function = STR``: optional, the model attribute to
@@ -306,8 +382,8 @@ class AMRSampler(BaseSampler):
         assert cp.get(section, 'name') == cls.name, (
             "name in section [sampler] must match mine")
         types = {'initial-divisions': int, 'max-level': int,
-                 'mass-fraction': float, 'max-evaluations': int,
-                 'posterior-samples': int, 'seed': int,
+                 'loglikelihood-step': float, 'mass-fraction': float,
+                 'max-evaluations': int, 'posterior-samples': int, 'seed': int,
                  'loglikelihood-function': str}
         unknown = set(cp.options(section)) - set(types) - {'name'}
         if unknown:
