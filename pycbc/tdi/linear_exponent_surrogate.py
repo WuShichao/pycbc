@@ -156,6 +156,34 @@ class LinearExponentSurrogate(object):
         shift = xp.asarray(self.grid.frequencies - self.grid.first_frequency)
         return y * xp.exp(-2j * numpy.pi * shift * delta).astype(self.dtype)
 
+    def tangents(self, xi=None, delta=0.0):
+        """The template and its derivatives in every shape coordinate at
+        ``xi`` (default the reference) and arrival time ``delta``: shapes
+        ``(2, nchannels, N)`` and ``(nintrinsic + 2, 2, nchannels, N)``."""
+        xp = self.xp
+        xi = numpy.zeros(self.nintrinsic + 2) if xi is None else xi
+        b, t, rho = self.pieces(xi)
+        sky = xp.exp(float(xi[-2]) * self.L[0] + float(xi[-1]) * self.L[1])
+        y = self.template(b, t, rho, delta)
+        shift = xp.exp(-2j * numpy.pi * xp.asarray(
+            self.grid.frequencies - self.grid.first_frequency)
+            * delta).astype(self.dtype)
+        out = []
+        for i in range(self.nintrinsic):
+            d = xp.zeros_like(y)
+            for j, k in enumerate(self.orders):
+                factor = self.D[i] + 1j * k * ORBITAL_ANGULAR_FREQUENCY \
+                    * self.T[i]
+                d += self.fine(rho[j]) * (self._phase(k, b, t, delta)
+                                          * factor.astype(self.dtype))
+            out.append(d * shift)
+        for axis in range(2):
+            drho = xp.fft.fft(self.R0 * sky * self.L[axis], axis=0) \
+                / self.samples
+            drho = drho[xp.asarray(self.orders % self.samples)]
+            out.append(self.template(b, t, drho, delta))
+        return y, xp.stack(out)
+
 
 class DailyGram(object):
     """The Gram matrix ``G_ab(Delta)`` of a surrogate's bases over the data

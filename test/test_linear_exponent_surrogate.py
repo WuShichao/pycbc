@@ -178,3 +178,19 @@ def test_builder_reproduces_the_research_family():
     assert numpy.abs(family.R0 - ref['R0']).max() < 1e-7 * r0
     assert numpy.abs(family.L - ref['L']).max() \
         < 2e-6 * numpy.abs(ref['L']).max()
+
+
+def test_tangents_are_the_derivatives_of_the_template():
+    family, _, _ = build()
+    xi = numpy.array([0.2, -0.1, 0.3, 0.05, 0.1, -0.2])
+    delta = 7 * family.grid.delta_t
+    y, dy = family.tangents(xi, delta)
+    assert numpy.allclose(y, family.template(*family.pieces(xi), delta))
+    step = 1e-6
+    for i in range(len(xi)):
+        up, down = xi.copy(), xi.copy()
+        up[i] += step
+        down[i] -= step
+        numeric = (family.template(*family.pieces(up), delta)
+                   - family.template(*family.pieces(down), delta)) / (2 * step)
+        assert numpy.abs(dy[i] - numeric).max() < 1e-6 * numpy.abs(y).max()
