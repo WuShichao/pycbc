@@ -123,3 +123,26 @@ def test_reference_must_match_the_family():
     with pytest.raises(ValueError):
         BStatisticSurrogate(['x'], fam, daily, numpy.zeros((2, fam.size)),
                             1.0, dict(x=0.0), dict(x=1.0), PRIOR, (0, 1e5))
+
+
+def test_the_model_runs_on_the_gpu():
+    cupy = pytest.importorskip('cupy')
+    from pycbc.scheme import CUPYScheme
+    try:
+        scheme = CUPYScheme()
+    except Exception:
+        pytest.skip('no usable GPU')
+    fam, daily = family()
+    data, _ = inject(fam, numpy.zeros(3))
+    m = model(fam, daily, data)
+    m.update(x=0.1)
+    expected = m.loglikelihood
+    with scheme:
+        gpu = LinearExponentSurrogate(
+            fam.grid, fam.coarse_frequencies, fam.R0, fam.L, fam.b0, fam.t0,
+            fam.D, fam.T, kmax=3)
+        mg = model(gpu, DailyGram(gpu), cupy.asarray(data))
+        mg.update(x=0.1)
+        assert mg.loglikelihood == pytest.approx(expected, abs=1e-8)
+        rec = mg.reconstruct(seed=1)
+    assert 0 <= rec['polarization'] < 2 * numpy.pi

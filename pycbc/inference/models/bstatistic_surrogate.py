@@ -40,6 +40,10 @@ from pycbc.tmpltbank.fstatistic_metric import orientation_weights
 from .base import BaseModel
 
 
+def _to_numpy(array):
+    return array.get() if hasattr(array, 'get') else numpy.asarray(array)
+
+
 class BStatisticSurrogate(BaseModel):
     """Bayes factor of a linear-exponent family, marginalised over arrival
     time, orientation, distance and phase.
@@ -69,13 +73,17 @@ class BStatisticSurrogate(BaseModel):
         Fine samples per grid step of the arrival time.
     orientation_nodes : tuple
         ``(n_cos, n_psi)`` of the orientation quadrature.
+    margin : float
+        Terms of the marginal below ``exp(-margin)`` of its total are
+        skipped, see
+        :func:`pycbc.filter.bstatistic.log_orientation_marginal`.
     """
     name = 'bstatistic_surrogate'
 
     def __init__(self, variable_params, surrogate, daily_gram,
                  data_spectrum, noise_variance, reference, scales,
                  distance_prior, time_window, oversampling=10,
-                 orientation_nodes=(32, 16), **kwargs):
+                 orientation_nodes=(32, 16), margin=40.0, **kwargs):
         super().__init__(variable_params, **kwargs)
         self.surrogate, self.daily_gram = surrogate, daily_gram
         self.data_spectrum = data_spectrum
@@ -88,6 +96,7 @@ class BStatisticSurrogate(BaseModel):
                                  surrogate.nintrinsic))
         self.distance_prior = distance_prior
         self.oversampling = int(oversampling)
+        self.margin = float(margin)
         self.nodes = OrientationNodes(*orientation_nodes)
         grid = surrogate.grid
         step = grid.delta_t / self.oversampling
@@ -101,6 +110,9 @@ class BStatisticSurrogate(BaseModel):
         if not self._window.any():
             raise ValueError("the time window holds no arrival times")
         self.delays = fine[self._window]
+        xp = self.xp = surrogate.xp
+        self._window_xp = xp.asarray(self._window)
+        self._delays_xp = xp.asarray(self.delays)
         self.time_step = step
         self.window_width = float(hi - lo)
 
@@ -116,20 +128,23 @@ class BStatisticSurrogate(BaseModel):
         s = self.surrogate
         b, t, rho = s.pieces(self._shape_coordinates(params))
         spectrum = s.correlation_spectrum(self.data_spectrum, b, t, rho)
-        fine = fractional_correlations(spectrum, self.oversampling)
-        z = numpy.stack([fine[:, a, :][self._window] for a in range(2)])
+        xp = self.xp
+        fine = fractional_correlations(spectrum, self.oversampling, xp=xp)
+        z = xp.stack([fine[:, a, :][self._window_xp] for a in range(2)])
         z = z / self.noise_variance
         gram = self.daily_gram(b, t, rho)
         g = tuple(x / self.noise_variance for x in
-                  self.daily_gram.at_delays(gram, self.delays))
+                  self.daily_gram.at_delays(gram, self._delays_xp))
         lnb = log_orientation_marginal(z, *g, self.distance_prior,
-                                       self.nodes)
+                                       self.nodes, margin=self.margin,
+                                       xp=xp)
         return z, g, lnb, (spectrum, gram)
 
     def _loglikelihood(self):
         _, _, lnb, _ = self._time_samples(self.current_params)
-        top = lnb.max()
-        return float(top + numpy.log(numpy.sum(numpy.exp(lnb - top))
+        xp = self.xp
+        top = float(xp.max(lnb))
+        return top + float(numpy.log(float(xp.sum(xp.exp(lnb - top)))
                                      * self.time_step / self.window_width))
 
     def reconstruct(self, rec=None, seed=None):
@@ -144,14 +159,17 @@ class BStatisticSurrogate(BaseModel):
         rec = {} if rec is None else rec
         params = self.current_params
         _, _, lnb, (spectrum, gram) = self._time_samples(params)
+        xp = self.xp
+        lnb = _to_numpy(lnb)
         weight = numpy.exp(lnb - lnb.max())
         k = rng.choice(len(weight), p=weight / weight.sum())
         delay = self.delays[k] + (rng.random() - 0.5) * self.time_step
-        z = correlation_at(spectrum, [delay],
-                           self.surrogate.grid.duration)[:, 0]
+        z = _to_numpy(correlation_at(spectrum, [delay],
+                                     self.surrogate.grid.duration,
+                                     xp=xp))[:, 0]
         z = z / self.noise_variance
-        g00, g11, g01 = (x[0] / self.noise_variance for x in
-                         self.daily_gram.at_delays(gram, [delay]))
+        g00, g11, g01 = (_to_numpy(x)[0] / self.noise_variance for x in
+                         self.daily_gram.at_delays(gram, xp.asarray([delay])))
         g = (float(numpy.real(g00)), float(numpy.real(g11)), complex(g01))
         cos_iota, psi = draw_orientation(z, g, self.distance_prior,
                                          self.nodes, rng)
