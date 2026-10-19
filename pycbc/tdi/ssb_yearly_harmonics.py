@@ -256,22 +256,27 @@ def interpolate_in_frequency(values, coarse, fine):
 def ssb_data_spectrum(grid, bins, orbit, longitude, latitude, xp=numpy):
     """The SSB-time spectrum of whitened detector-frame data, normalised so
     that a signal appears as its whitened spectrum on the grid's
-    frequencies, and the per-component variance of its noise.
+    frequencies, and the noise variance of a correlation with it.
 
     ``bins`` are the data times ``sqrt(4 delta_f / S_n)``, whose noise has
     unit variance per real component (see :func:`resample_to_ssb`). The FFT
     of the resampled series carries a signal ``n_in`` times its whitened
-    spectrum, ``n_in`` being the grid samples inside the data. Its noise
-    power, ``2 N nbins n_in`` in all, fills the ``N nbins / n_in`` bins of
-    the band, so dividing by ``n_in`` leaves the signal as the template
-    family models it and noise of unit variance per component in the band.
+    spectrum, ``n_in`` being the grid samples inside the data, so dividing
+    by ``n_in`` leaves the signal as the template family models it. The
+    grid's frequencies are finer than the data's, and neighbouring bins
+    share their noise: a correlation ``z = sum_f conj(y) X`` has, per real
+    component, variance ``sigma^2 G`` with ``G`` the windowed Gram matrix
+    and ``sigma^2 = N nbins / n_in^2``, about the grid's duration over the
+    data's.
 
     Returns
     -------
     spectrum : array, shape ``(nchannels, grid.size)``
     noise_variance : float
+        ``sigma^2``, by which the correlation and the Gram matrix are
+        divided to give the likelihood.
     """
     series = resample_to_ssb(grid, bins, orbit, longitude, latitude)
     n_in = int(grid.in_data.sum())
     spectrum = xp.fft.fft(xp.asarray(series), axis=-1) / n_in
-    return spectrum, 1.0
+    return spectrum, grid.size * grid.data_nbins / n_in ** 2

@@ -145,19 +145,31 @@ class _StillOrbit(object):
         return numpy.zeros((len(numpy.atleast_1d(t)), len(sc), 3))
 
 
-def test_ssb_spectrum_noise_has_the_stated_variance():
+def test_ssb_spectrum_noise_gives_chi_squared_four():
+    """2F of two templates inside the data window averages 4 in noise once
+    the correlation and the windowed Gram matrix are divided by the stated
+    variance."""
     pytest.importorskip('finufft')
     from pycbc.tdi.ssb_yearly_harmonics import ssb_data_spectrum
     start, days, nbins = 0.0, 30.0, 200
     grid = SSBGrid(start, start + days * DAY, 0.0151, nbins,
                    1 / (days * DAY), periods=1)
     rng = numpy.random.default_rng(6)
-    noise = rng.normal(size=(40, nbins)) + 1j * rng.normal(size=(40, nbins))
-    spectrum, variance = ssb_data_spectrum(grid, noise, ORBIT, *SKY)
-    # away from the band edges, where the resampled band is fully covered
-    middle = slice(grid.size // 10, grid.size - grid.size // 10)
-    measured = 0.5 * numpy.mean(numpy.abs(spectrum[:, middle]) ** 2)
-    assert measured == pytest.approx(variance, rel=0.03)
+    # two templates whose time series lie inside the data window
+    series = numpy.zeros((2, 2, grid.size), complex)
+    inside = numpy.nonzero(grid.in_data)[0]
+    series[..., inside] = rng.normal(size=(2, 2, len(inside))) \
+        * numpy.hanning(len(inside))
+    y = numpy.fft.fft(series, axis=-1)
+    gram = numpy.einsum('acf,bcf->ab', numpy.conj(y), y)
+    values = []
+    for _ in range(400):
+        noise = rng.normal(size=(2, nbins)) + 1j * rng.normal(size=(2, nbins))
+        spectrum, variance = ssb_data_spectrum(grid, noise, ORBIT, *SKY)
+        z = numpy.einsum('acf,cf->a', numpy.conj(y), spectrum)
+        values.append(numpy.real(z.conj() @ numpy.linalg.solve(gram, z))
+                      / variance)
+    assert numpy.mean(values) == pytest.approx(4.0, abs=4 * 2.0 / 20)
 
 
 def test_ssb_spectrum_of_a_signal_is_its_whitened_spectrum():
