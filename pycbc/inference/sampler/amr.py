@@ -231,6 +231,7 @@ column            units      meaning
 ``polarization``  rad        ``psi`` of the same node, on ``[0, pi/2)``
 ``delta_tc``      s          the drawn lag
 ``amplitude_u``   --         ``u = A/A_min`` of the drawn amplitude
+``distance``      Mpc        ``d = K/u`` of the same draw
 ``distance_ratio`` --        ``d/d_best = u_best/u`` of the same draw
 ================  =========  ==============================================
 
@@ -243,12 +244,25 @@ injected zero, so the column is a shift in seconds, not an absolute GPS time.
 An absolute ``tc`` would require a reference epoch the partition does not
 record, and inventing one would be a fiction.
 
-``amplitude_u`` is ``u = A/A_min``, dimensionless, and ``distance_ratio`` is
+``amplitude_u`` is ``u = A/A_min``, dimensionless, and ``distance`` is the
+same draw in megaparsecs, ``d = K/u``.  ``K`` is the measured distance at which
+a face-on signal has optimal SNR 4: the exact-TDI base waveform at the
+partition's recorded 100 Mpc has ``rho_face = 21.6840`` under the search's own
+whitening, so ``K = 100 * 21.6840 / 4 = 542.1006 Mpc``.  A second determination
+from the base orientation with the analytic inclination factor gives
+548.9 Mpc, 1.3 per cent higher, so the constant is measured and checked rather
+than assumed.  ``K`` is the ``distance-constant`` option; it defaults to the
+measured value and the adapter raises if it is unset.  ``distance_ratio`` is
 ``d/d_best = u_best / u``, where ``u_best`` is the amplitude that maximises the
-likelihood at the highest-weight (cell, lag, node) of the partition.  **No
-distance in megaparsecs is available**: converting ``u`` to a distance needs
-the source's intrinsic amplitude normalisation, which the partition does not
-carry, so only ``u`` and ``d/d_best`` are written and the metadata says so.
+likelihood at the highest-weight (cell, lag, node) of the partition.
+
+Because ``distance`` is ``K / amplitude_u``, the two columns are reciprocal to
+within ``K`` and the distance inherits the amplitude's correlation with the
+inclination by construction.  It is a conditional draw, not a sampled
+dimension, and its marginal is controlled by the amplitude prior: quote a
+distance only under a prior whose support exceeds ``u`` of about 7 and which is
+flat over five to nine.  The default draw is the registered ``u^-4`` prior, so
+a flat prior is not the default; set ``amplitude-power = 0`` to select it.
 
 The columns are one joint draw per cell from that cell's own reduced
 posterior.  The resulting column is a valid draw from the joint posterior of
@@ -259,8 +273,9 @@ they cannot feed back on the four stiff coordinates.
 
 The joint is the object to quote, not the inclination marginal.  The amplitude
 prior is registered as ``u^-4`` on ``[1, 5]`` and that window truncates the
-controlled injection (its amplitude is ``u = 6.717`` and its likelihood mode is
-near ``u = 7.15``).  At the registered ceiling the ``(cos iota, ln u)``
+controlled injection (its amplitude is ``u = 6.673`` from the measured
+waveform norm, 6.717 from the analytic inclination factor, and its likelihood
+mode is near ``u = 7.15``).  At the registered ceiling the ``(cos iota, ln u)``
 correlation is only about -0.36 because the prior wall stops the ridge before
 it develops; at the corrected ceiling 20 it is -0.94 and under a flat amplitude
 prior -0.95.  The inclination *marginal* is therefore prior-dominated through
@@ -334,15 +349,21 @@ Configuration
     physical-map = examples/inference/amr-partition/physical-map.json
 
     # the archived sufficient statistics, (D, Gram) per (cell, lag).  When set,
-    # inclination, polarization, delta_tc, amplitude_u and distance_ratio are
-    # written as one joint draw per cell.
+    # inclination, polarization, delta_tc, amplitude_u, distance and
+    # distance_ratio are written as one joint draw per cell.
     sufficient-file = /path/to/sufficient_full.npz
 
     # the amplitude prior p(u) ~ u^-power on [1, U], u = A/A_min.  4 and 5 are
     # the registered pair and reproduce the stored Bayes factors; 20 is the
-    # corrected default ceiling and 0 would be a flat (diagnostic) prior.
+    # corrected default ceiling and 0 would be a flat prior, which is the prior
+    # under which the distance marginal is statistically consistent.
     amplitude-ceiling = 20
     amplitude-power = 4
+
+    # the conversion from u to a distance, in Mpc: the measured distance at
+    # which a face-on signal has optimal SNR 4 (u = 1).  The default is the
+    # measured 542.1006 Mpc; an unset value is refused, not replaced by u^-1.
+    distance-constant = 542.1005802811611
 
     # the seed of the joint draw, so the columns are reproducible
     recovered-seed = 20261018
@@ -378,7 +399,8 @@ import numpy
 
 from .base import BaseSampler, setup_output
 from .amr_demarg import (AMPLITUDE_COLUMN, AMPLITUDE_POWER,
-                         DEFAULT_CEILING, DISTANCE_RATIO_COLUMN,
+                         DEFAULT_CEILING, DEFAULT_DISTANCE_CONSTANT_MPC,
+                         DISTANCE_COLUMN, DISTANCE_RATIO_COLUMN,
                          RECOVERED_PARAMETERS, REGISTERED_CEILING,
                          SufficientStatistics, weighted_correlation,
                          weighted_quantile)
@@ -408,7 +430,8 @@ _ALLOWED_OPTIONS = frozenset([
     "refinement", "eps", "n-fmax", "max-cells", "max-level", "evidence",
     "eta-columns", "physical-map", "injection-xi", "injection-rho",
     "injection-seed", "injection-delta", "batch", "sufficient-file",
-    "amplitude-ceiling", "amplitude-power", "recovered-seed",
+    "amplitude-ceiling", "amplitude-power", "distance-constant",
+    "recovered-seed",
     "injection-inclination", "injection-polarization", "injection-coa-phase",
 ])
 
@@ -459,6 +482,16 @@ def _as_list(value):
         return list(value)
     return [item for item in re.split(r"[,\s]+", str(value).strip())
             if item]
+
+
+def _as_distance(value):
+    """Parse ``distance-constant``; an empty or 'none' value means unset."""
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in ("", "none", "null"):
+        return None
+    return float(value)
 
 
 class ShapeToPhysicalMap(object):
@@ -885,9 +918,17 @@ class AmrSampler(BaseSampler):
         are used unchanged.
     amplitude_power : float, optional
         The exponent of the amplitude prior, 4 by default (the registered
-        volumetric prior).  ``0`` is a flat prior and is a diagnostic.  The
-        registered pair is ``power = 4`` and ``ceiling = 5``; any other pair
-        needs the archive.
+        volumetric prior).  ``0`` is a flat prior and is the prior under which
+        the distance marginal is statistically consistent.  The registered
+        pair is ``power = 4`` and ``ceiling = 5``; any other pair needs the
+        archive.
+    distance_constant : float, optional
+        The measured ``K`` in Mpc at which a face-on signal has optimal SNR 4,
+        so ``distance = K / amplitude_u``.  Default is the measured
+        542.1006 Mpc for the stored partition and its waveform path.  A
+        different partition or a different waveform must measure ``K`` again.
+        ``None`` is refused with a clear error: an unset constant would write
+        ``u^-1`` as if it were megaparsecs.
     recovered_seed : int, optional
         Seed of the joint draw over (lag, node, amplitude), so a file is
         reproducible.  Default is 20261018.
@@ -908,7 +949,9 @@ class AmrSampler(BaseSampler):
                  eps=3e-4, n_fmax=100, max_cells=45000, max_level=6,
                  evidence="quadrature", eta_columns=None, physical_map=None,
                  sufficient_file=None, amplitude_ceiling=None,
-                 amplitude_power=AMPLITUDE_POWER, recovered_seed=20261018,
+                 amplitude_power=AMPLITUDE_POWER,
+                 distance_constant=DEFAULT_DISTANCE_CONSTANT_MPC,
+                 recovered_seed=20261018,
                  injection_inclination=1.0,
                  injection_polarization=0.7, injection_coa_phase=0.3,
                  injection_xi=(3.0, -2.0, 1.5, -1.0), injection_rho=16.0,
@@ -947,6 +990,8 @@ class AmrSampler(BaseSampler):
                                  else REGISTERED_CEILING)
         self.amplitude_ceiling = float(amplitude_ceiling)
         self.amplitude_power = float(amplitude_power)
+        self.distance_constant = (None if distance_constant is None
+                                  else float(distance_constant))
         self.recovered_seed = int(recovered_seed)
         self.injection_inclination = float(injection_inclination)
         self.injection_polarization = float(injection_polarization)
@@ -1041,6 +1086,19 @@ class AmrSampler(BaseSampler):
             raise ValueError(
                 "amplitude-power must be a finite non-negative number, got "
                 "{}".format(self.amplitude_power))
+        if self.distance_constant is None:
+            raise ValueError(
+                "distance-constant is not set: it is the measured distance in "
+                "Mpc at which a face-on signal has optimal SNR 4, so that "
+                "distance = distance-constant / amplitude_u.  The measured "
+                "value for the stored partition is {}.  Refusing to write a "
+                "distance without it, because u^-1 is not a distance in "
+                "megaparsecs.".format(DEFAULT_DISTANCE_CONSTANT_MPC))
+        if (not numpy.isfinite(self.distance_constant)
+                or self.distance_constant <= 0.0):
+            raise ValueError(
+                "distance-constant must be a positive finite distance in "
+                "Mpc, got {}".format(self.distance_constant))
         registered_prior = (
             abs(self.amplitude_ceiling - REGISTERED_CEILING) <= 1e-12
             and abs(self.amplitude_power - AMPLITUDE_POWER) <= 1e-12)
@@ -1133,6 +1191,8 @@ class AmrSampler(BaseSampler):
             amplitude_ceiling=(None if get("amplitude-ceiling", None) is None
                                else float(get("amplitude-ceiling"))),
             amplitude_power=float(get("amplitude-power", AMPLITUDE_POWER)),
+            distance_constant=_as_distance(
+                get("distance-constant", DEFAULT_DISTANCE_CONSTANT_MPC)),
             recovered_seed=int(get("recovered-seed", 20261018)),
             injection_inclination=float(get("injection-inclination", 1.0)),
             injection_polarization=float(
@@ -1177,12 +1237,15 @@ class AmrSampler(BaseSampler):
         posterior expressed in the parameters a reader wants.
 
         When a ``sufficient-file`` is configured the restored ``inclination``,
-        ``polarization``, ``delta_tc``, ``amplitude_u`` and ``distance_ratio``
-        columns are present too.  They are one joint draw per cell from
-        ``p(lag, node, u | cell)``, not sampled dimensions; see the module
-        docstring.  ``inclination`` and ``polarization`` are drawn with the
-        amplitude, so they stay correlated with ``amplitude_u``, and
-        ``delta_tc`` is a drawn lag rather than the cell's peak.
+        ``polarization``, ``delta_tc``, ``amplitude_u``, ``distance`` and
+        ``distance_ratio`` columns are present too.  They are one joint draw
+        per cell from ``p(lag, node, u | cell)``, not sampled dimensions; see
+        the module docstring.  ``inclination`` and ``polarization`` are drawn
+        with the amplitude, so they stay correlated with ``amplitude_u``, and
+        ``delta_tc`` is a drawn lag rather than the cell's peak.  ``distance``
+        is ``K / amplitude_u`` with the measured ``K``, so it is exactly
+        reciprocal to the amplitude column and adds no independent
+        information; its units are Mpc.
         """
         if self._samples is None:
             return {}
@@ -1241,7 +1304,8 @@ class AmrSampler(BaseSampler):
         statistics = self._sufficient_statistics(eta, lnb)
         result = statistics.columns(
             self.amplitude_ceiling, power=self.amplitude_power,
-            seed=self.recovered_seed)
+            seed=self.recovered_seed,
+            distance_constant=self.distance_constant)
         columns = result["columns"]
         diagnostics = result["diagnostics"]
         registered_prior = (
@@ -1275,9 +1339,12 @@ class AmrSampler(BaseSampler):
             columns[AMPLITUDE_COLUMN], weights, quantile_levels)
         diagnostics["inclination_quantiles"] = weighted_quantile(
             columns["inclination"], weights, quantile_levels)
+        diagnostics["distance_quantiles"] = weighted_quantile(
+            columns[DISTANCE_COLUMN], weights, quantile_levels)
         metadata = statistics.metadata(
             self.amplitude_ceiling, self.amplitude_power,
-            self.recovered_seed, diagnostics)
+            self.recovered_seed, diagnostics,
+            distance_constant=self.distance_constant)
         metadata.update(result["table"].metadata())
         metadata.update({
             "amr_recovered_lnb_source": source,
@@ -1314,10 +1381,12 @@ class AmrSampler(BaseSampler):
         logging.info(
             "AMR: drew the joint (lag, node, u) columns %s from %s at "
             "amplitude-ceiling %.6g, amplitude-power %.6g (%s); "
+            "distance = %.6g Mpc / u; "
             "corr(cos iota, ln u) %+.3f, %d distinct lags, %d cells off the "
             "peak lag; lnB against stored: median %+.2e, max |d| %.2e",
             ", ".join(RECOVERED_PARAMETERS), self.sufficient_file,
             self.amplitude_ceiling, self.amplitude_power, source,
+            self.distance_constant,
             diagnostics["corr_cos_lnu"], diagnostics["distinct_lags"],
             diagnostics["cells_not_at_peak_lag"], numpy.median(delta_lnb),
             numpy.max(numpy.abs(delta_lnb)))

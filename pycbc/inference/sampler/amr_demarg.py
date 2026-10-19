@@ -65,6 +65,7 @@ The drawn columns are
     polarization    psi of the same node, on [0, pi/2)
     delta_tc        the drawn lag, in seconds
     amplitude_u     u = A / A_min of the drawn amplitude, dimensionless
+    distance        the same draw in Mpc, d = K / u
     distance_ratio  d/d_best = u_best / u of the same draw
 
 ``inclination``, ``polarization`` and ``delta_tc`` are one joint draw per cell,
@@ -79,7 +80,9 @@ THE JOINT, NOT THE MARGINAL
 The amplitude is the one genuine integral of the statistic, and its prior is
 **registered and truncated**: ``u in [1, 5]`` with ``p(u) ~ u^-4``.  For the
 stored controlled injection the likelihood mode is near ``u = 7.15`` and its
-true amplitude is ``u = 6.717``, so the registered prior cuts the likelihood
+true amplitude is ``u = 6.673`` from the measured waveform norm (``6.717``
+from the analytic inclination factor, 0.7 per cent higher), so the registered
+prior cuts the likelihood
 before the ``(cos iota, ln u)`` ridge can develop.  At the registered ceiling
 the correlation of ``cos iota`` with ``ln u`` is only about -0.36; at the
 corrected ceiling 20 it is -0.94, and under a flat amplitude prior -0.95.  The
@@ -95,16 +98,49 @@ the prior power are explicit arguments of :class:`AmplitudeMarginal`, and the
 adapter records both in the file metadata so a reader knows which prior the
 columns were drawn under.
 
-THE AMPLITUDE COLUMN IS NOT A DISTANCE
---------------------------------------
-``u`` and ``d/d_best`` are the only amplitude statements the partition supports.
-An absolute distance would require the source's amplitude normalisation (the
-intrinsic strain scale), which the partition does not carry.  Do not convert
-``amplitude_u`` to megaparsecs; the metadata says so, and the column is named
-``amplitude_u`` rather than ``distance`` for that reason.  ``u_best`` is the
-amplitude that maximises the likelihood at the highest-weight (cell, lag, node)
-of the partition, so ``distance_ratio = u_best / u`` is the distance relative
-to the best-fit amplitude of this partition.
+FROM u TO A DISTANCE
+--------------------
+``u = A / A_min`` is dimensionless, and ``A_min`` is fixed by the search's own
+calibration as the amplitude giving a face-on template an optimal SNR of 4 at
+full overlap.  ``A`` multiplies the archived template, whose normalisation is
+the SSB Gram's rather than the physical strain scale, so the archive's
+``A_min`` alone does not fix a distance: the naive ``100 / A_min`` gives
+7.0e10 Mpc, wrong by the ratio of the two scales.  The scale is recovered by
+evaluating the waveform.  The partition's base point is recorded at 100 Mpc,
+and under the search's own whitening the distance at which a face-on signal
+reaches SNR 4 is
+
+    d[Mpc] = K / u ,    K = 100 * rho_face(100 Mpc) / 4 .
+
+``K`` is measured, not assumed.  Building the exact-TDI base waveform through
+``pycbc.tdi.inference.source_from_parameters`` and whitening it exactly as the
+search does (``ex.spectrum * sqrt(ex.weight)``) gives an optimal SNR of
+``rho_face = 21.6840`` for the face-on base waveform at 100 Mpc, hence
+``K = 542.1006 Mpc``.  A second determination evaluates the base orientation
+instead (``rho = 9.4334`` at the base inclination 1.287) and extrapolates with
+the two-polarization factor ``sqrt(((1 + c^2) / 2)^2 + c^2)``; it gives
+548.9 Mpc, 1.3 per cent higher.  The two agree to that level, the residual
+being the exact-TDI response's small departure from the analytic inclination
+factor.  The controlled injection at ``rho = 16`` is at 81.24 Mpc, and the
+drawn distance interval contains it.
+
+``K`` is an option (``distance-constant``, in Mpc), defaulting to the measured
+value.  The adapter raises rather than writing a distance when the constant is
+unset: an unset constant would silently write ``u^-1``, which is a distance in
+the wrong units.  ``u_best`` is the amplitude that maximises the likelihood at
+the highest-weight (cell, lag, node) of the partition, so ``distance_ratio =
+u_best / u`` is the distance relative to the best-fit amplitude of this
+partition.
+
+``distance`` is a deterministic function of the drawn ``amplitude_u``, so the
+two columns are reciprocal to within ``K`` (``distance * amplitude_u = K``) and
+the distance is correlated with the inclination and the amplitude by
+construction.  It is a conditional draw, not a sampled dimension.  Its marginal
+is controlled by the amplitude prior: a distance can be quoted only under an
+amplitude prior whose support exceeds ``u`` of about 7 and which is flat over
+five to nine.  The default draw uses the registered ``u^-4`` power, so a flat
+prior is not the default; a user selects it with ``amplitude-power = 0`` (with
+the default ceiling 20 when the archive is given).
 
 WHY THE TABLE LOOKS LIKE THE PRODUCTION ONE
 -------------------------------------------
@@ -141,15 +177,29 @@ N_NODES = N_CI * N_PSI
 
 #: The names the adapter writes for the restored joint draw.  The first three
 #: are PyCBC's own parameter names (``pycbc.waveform.parameters``);
-#: ``amplitude_u`` and ``distance_ratio`` are the new amplitude columns.
+#: ``amplitude_u``, ``distance`` and ``distance_ratio`` are the amplitude and
+#: distance columns.
 RECOVERED_PARAMETERS = ("inclination", "polarization", "delta_tc",
-                        "amplitude_u", "distance_ratio")
+                        "amplitude_u", "distance", "distance_ratio")
 
 #: The amplitude column: u = A / A_min, dimensionless.
 AMPLITUDE_COLUMN = "amplitude_u"
 
+#: The distance column: d = K / u, in megaparsecs.
+DISTANCE_COLUMN = "distance"
+
 #: The distance-ratio column: d / d_best = u_best / u, dimensionless.
 DISTANCE_RATIO_COLUMN = "distance_ratio"
+
+#: The measured conversion constant: the distance in Mpc at which a face-on
+#: signal has optimal SNR 4, i.e. u = 1.  Measured on 2026-10-18 from the
+#: exact-TDI base waveform at the partition's recorded 100 Mpc under the
+#: search's own whitening (rho_face = 21.684023211, so K = 100*rho_face/4).
+#: A second determination from the base orientation with the analytic
+#: inclination factor gives 548.9 Mpc, 1.3 per cent higher.  The value is a
+#: default, not a law: a different partition or waveform path must measure it
+#: again and pass ``distance-constant``.
+DEFAULT_DISTANCE_CONSTANT_MPC = 542.1005802811611
 
 #: The full axes of the production amplitude table.  A table built on a slice
 #: of these axes has the production values at the production nodes.
@@ -668,6 +718,7 @@ class SufficientStatistics(object):
         return s_lo, s_hi, 0.0, y_hi
 
     def columns(self, ceiling, power=AMPLITUDE_POWER, seed=20261018,
+                distance_constant=DEFAULT_DISTANCE_CONSTANT_MPC,
                 weights=None, chunk=16384, n_u=N_U, return_marginal=False):
         """Draws the joint ``(lag, node, u)`` columns, one per cell.
 
@@ -683,6 +734,11 @@ class SufficientStatistics(object):
             The upper limit ``U`` of ``u = A / A_min``.
         power : float, optional
             The power of the amplitude prior.  Default is the registered 4.
+        distance_constant : float, optional
+            The measured distance ``K`` in Mpc at which a face-on signal has
+            optimal SNR 4, so ``distance = K / amplitude_u``.  Default is the
+            measured 542.1006 Mpc.  ``None`` is refused, because an unset
+            constant would write ``u^-1`` as if it were megaparsecs.
         seed : int, optional
             Seed of the draw, so a file is reproducible.
         weights : array-like, optional
@@ -706,6 +762,19 @@ class SufficientStatistics(object):
         """
         ceiling = float(ceiling)
         power = float(power)
+        if distance_constant is None:
+            raise ValueError(
+                "distance-constant is not set: the conversion from u = A/A_min "
+                "to a distance in Mpc is the measured constant K at which a "
+                "face-on signal has optimal SNR 4 (542.1006 Mpc for the "
+                "stored partition). Pass distance-constant in Mpc; without it "
+                "the distance column would be u^-1 in the wrong units.")
+        distance_constant = float(distance_constant)
+        if (not numpy.isfinite(distance_constant)
+                or distance_constant <= 0.0):
+            raise ValueError(
+                "distance-constant must be a positive finite distance in "
+                "Mpc, got {}".format(distance_constant))
         s_lo, s_hi, y_lo, y_hi = self._table_bounds()
         table = AmplitudeMarginal.from_bounds(
             s_lo, s_hi, y_lo, y_hi, ceiling, power=power, n_u=n_u)
@@ -770,6 +839,7 @@ class SufficientStatistics(object):
         polarization = self.node_psi[draw_node]
         delta_tc = self.Delta[draw_lag]
         amplitude = u
+        distance = distance_constant / amplitude
         distance_ratio = u_best / amplitude
 
         corr_inc_amp = weighted_correlation(inclination, amplitude, weights)
@@ -784,6 +854,8 @@ class SufficientStatistics(object):
             "s": draw_s,
             "y": draw_y,
             "amplitude": amplitude,
+            "distance": distance,
+            "distance_constant_mpc": float(distance_constant),
             "u_best": float(u_best),
             "corr_inclination_amplitude": float(corr_inc_amp),
             "corr_cos_lnu": float(corr_cos_lnu),
@@ -791,6 +863,7 @@ class SufficientStatistics(object):
             "cells_not_at_peak_lag": int(numpy.sum(draw_lag != peak_lag)),
             "amplitude_quantiles": numpy.quantile(
                 amplitude, quantiles),
+            "distance_quantiles": numpy.quantile(distance, quantiles),
             "inclination_quantiles": numpy.quantile(
                 inclination, quantiles),
             "n_cells": int(self.n_cells_archive),
@@ -806,6 +879,7 @@ class SufficientStatistics(object):
             "polarization": in_partition_order(polarization),
             "delta_tc": in_partition_order(delta_tc),
             AMPLITUDE_COLUMN: in_partition_order(amplitude),
+            DISTANCE_COLUMN: in_partition_order(distance),
             DISTANCE_RATIO_COLUMN: in_partition_order(distance_ratio),
         }
         result = {"columns": columns, "diagnostics": diagnostics,
@@ -814,7 +888,8 @@ class SufficientStatistics(object):
             result["orientation_marginal"] = marginal
         return result
 
-    def metadata(self, ceiling, power, seed, diagnostics=None):
+    def metadata(self, ceiling, power, seed, diagnostics=None,
+                 distance_constant=None):
         """The attributes that describe the restored joint draw."""
         info = self.report()
         diagnostics = {} if diagnostics is None else diagnostics
@@ -846,17 +921,43 @@ class SufficientStatistics(object):
             "amr_amplitude_units": "u = A/A_min, dimensionless",
             "amr_amplitude_a_min": float(self.A_min),
             "amr_amplitude_u_best": float(diagnostics.get("u_best", numpy.nan)),
+            "amr_distance_column": DISTANCE_COLUMN,
+            "amr_distance_units": "Mpc",
+            "amr_distance_constant_mpc": float(
+                distance_constant if distance_constant is not None
+                else diagnostics.get("distance_constant_mpc", numpy.nan)),
+            "amr_distance_definition": (
+                "d[Mpc] = K/u, with u = amplitude_u and K = "
+                "amr_distance_constant_mpc the distance at which a face-on "
+                "signal has optimal SNR 4 (u = 1).  K is measured from the "
+                "exact-TDI base waveform at the partition's recorded 100 Mpc "
+                "under the search's whitening: K = 100*rho_face(100 Mpc)/4, "
+                "rho_face = 21.6840, K = 542.1006 Mpc.  A second determination "
+                "from the base orientation extrapolated with the analytic "
+                "inclination factor gives 548.9 Mpc, 1.3 per cent higher; the "
+                "two agree at that level."),
+            "amr_amplitude_distance_relation": (
+                "distance[Mpc] * amplitude_u = K to machine precision: the "
+                "two columns are reciprocal to within the calibration "
+                "constant K = amr_distance_constant_mpc, so a distance has "
+                "exactly the information content of the amplitude it is "
+                "derived from"),
+            "amr_distance_note": (
+                "distance is a deterministic function of the drawn "
+                "amplitude_u, so it is correlated with inclination and "
+                "amplitude by construction and is a conditional draw, not a "
+                "sampled dimension.  Its marginal is controlled by the "
+                "amplitude prior: quote a distance only under a prior whose "
+                "support exceeds u of about 7 and which is flat over five to "
+                "nine.  The default draw uses the registered u^-4 power, so a "
+                "flat prior is NOT the default; select it with "
+                "amplitude-power = 0."),
             "amr_distance_ratio_column": DISTANCE_RATIO_COLUMN,
             "amr_distance_ratio_definition": (
                 "d/d_best = u_best/u, where u_best = {} is the amplitude that "
                 "maximises the likelihood at the highest-weight (cell, lag, "
                 "node) of the partition".format(
                     float(diagnostics.get("u_best", numpy.nan)))),
-            "amr_distance_note": (
-                "the absolute distance needs the source amplitude "
-                "normalisation, which the partition does not carry: only "
-                "u = A/A_min and d/d_best are available, and a distance in "
-                "megaparsecs must not be invented"),
             "amr_drawn_corr_cos_lnu": float(
                 diagnostics.get("corr_cos_lnu", numpy.nan)),
             "amr_drawn_corr_inclination_amplitude": float(
@@ -867,6 +968,9 @@ class SufficientStatistics(object):
                 diagnostics.get("cells_not_at_peak_lag", 0)),
             "amr_drawn_amplitude_quantiles": numpy.asarray(
                 diagnostics.get("amplitude_quantiles",
+                                numpy.full(5, numpy.nan))),
+            "amr_drawn_distance_quantiles": numpy.asarray(
+                diagnostics.get("distance_quantiles",
                                 numpy.full(5, numpy.nan))),
             "amr_drawn_inclination_quantiles": numpy.asarray(
                 diagnostics.get("inclination_quantiles",

@@ -46,8 +46,8 @@ sum evidence over the covered partition (see the note listed below for the
 constant offset to the evidence normalised by the exact prior ellipsoid).
 
 The demo config also sets `sufficient-file`, so the file holds one joint draw
-per cell in `inclination`, `polarization`, `delta_tc`, `amplitude_u` and
-`distance_ratio` beside the `eta` and physical columns.  With
+per cell in `inclination`, `polarization`, `delta_tc`, `amplitude_u`,
+`distance` and `distance_ratio` beside the `eta` and physical columns.  With
 `amplitude-ceiling = 5` and `amplitude-power = 4` (the registered pair) the
 stored cell Bayes factors are used unchanged; with the default `20` they are
 recomputed from the archive at the wider prior ceiling.  The two files are
@@ -139,6 +139,7 @@ from the joint** `p(lag, node, u | cell)`, writing:
 | `polarization` | rad | `psi` of the same node, on `[0, pi/2)` |
 | `delta_tc` | s | the drawn arrival-time lag |
 | `amplitude_u` | dimensionless | `u = A/A_min` of the drawn amplitude |
+| `distance` | Mpc | `d = K/u`, the same draw as a luminosity distance |
 | `distance_ratio` | dimensionless | `d/d_best = u_best/u` of the same draw |
 
 The draw factorises as `p(lag, node | cell) p(u | lag, node, cell)`: the pair is
@@ -154,7 +155,8 @@ without a `--labels` option.
 
 The joint, not the inclination marginal, is the object to quote.  The amplitude
 prior is registered as `u^-4` on `[1, 5]`, and that window truncates this
-injection (`u = 6.717`, likelihood mode near `u = 7.15`).  At the registered
+injection (`u = 6.673` from the measured waveform norm, `6.717` from the
+analytic inclination factor; likelihood mode near `u = 7.15`).  At the registered
 ceiling the `(cos iota, ln u)` correlation is only about -0.36 because the prior
 wall stops the ridge before it develops; at the corrected ceiling 20 it is -0.94
 and under a flat amplitude prior -0.95.  The marginal inclination is therefore
@@ -163,15 +165,36 @@ interval is about 0.40 to 0.92 rad and excludes the injected 1.0 rad, while
 conditional on the amplitude the inclination is determined with a width of about
 0.055 rad.
 
-`amplitude_u` and `distance_ratio` are the only amplitude statements the
-partition supports.  An absolute distance needs the source's intrinsic
-amplitude normalisation, which the partition does not carry, so no distance in
-megaparsecs is written or implied.  The amplitude prior itself is configurable:
-`amplitude-ceiling` sets `U` and `amplitude-power` sets the exponent, both are
-reachable at the registered pair, and both are recorded in the file as
-`amr_amplitude_ceiling` and `amr_amplitude_power` (with `amr_amplitude_prior`,
-`amr_amplitude_units`, `amr_distance_note` and the drawn correlations beside
-them).
+The absolute scale that turns `u` into a distance is measured rather than
+assumed.  The base waveform is evaluated at the partition's recorded 100 Mpc
+and whitened exactly as the search whitens it: the face-on base waveform has
+optimal SNR 21.6840 there, so the distance at which a face-on signal reaches
+SNR 4, and therefore `u = 1`, is
+
+    K = 100 * 21.6840 / 4 = 542.1006 Mpc ,
+
+and `distance = K / amplitude_u`.  A second determination from the base
+orientation extrapolated with the analytic inclination factor gives 548.9 Mpc,
+1.3 per cent higher, so the two agree and the constant is not a fit to the
+recovered posterior.  On the controlled injection the drawn 68 per cent
+distance interval contains the injected 81.24 Mpc.  `distance` is exactly
+reciprocal to `amplitude_u` (`distance * amplitude_u = K`) and inherits its
+correlation with the inclination, so it is a conditional draw, not an
+independent measurement.
+
+`K` is the `distance-constant` option, in Mpc.  It defaults to the measured
+value; the adapter raises with a clear error if it is unset, because an unset
+constant would write `u^-1` as if it were megaparsecs.  A different partition
+or waveform path must measure it again.  The amplitude prior itself is
+configurable: `amplitude-ceiling` sets `U` and `amplitude-power` sets the
+exponent, both are reachable at the registered pair, and both are recorded in
+the file as `amr_amplitude_ceiling` and `amr_amplitude_power`.  The distance
+marginal is controlled by that prior: quote a distance only under a prior whose
+support exceeds `u` of about 7 and which is flat over five to nine.  The
+default is `amplitude-power = 4`, so a flat prior is not the default; select it
+with `amplitude-power = 0`.  `amr_distance_constant_mpc`,
+`amr_distance_units`, `amr_amplitude_distance_relation`, `amr_distance_note`
+and the drawn correlations record all of this beside the columns.
 
 The full posterior, in two readable corners:
 
@@ -185,7 +208,7 @@ PYTHONPATH=/home/nightwing/src/pycbc \
     --contour-percentiles 68 90 95 --z-arg snr:SNR \
     --expected-parameters mchirp:31.83141195 q:2.08874494 \
                           spin1z:-0.14437378 spin2z:-0.79002668 \
-                          inclination:1.0 amplitude_u:6.717 delta_tc:0.0
+                          inclination:1.0 amplitude_u:6.673 delta_tc:0.0
 ```
 
 ## Prior

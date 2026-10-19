@@ -41,9 +41,10 @@ from pycbc.inference.io import loadfile
 from pycbc.inference.models.analytic import TestNormal
 from pycbc.inference.sampler.amr import AmrSampler, ShapeToPhysicalMap
 from pycbc.inference.sampler.amr_demarg import (
-    AMPLITUDE_COLUMN, AMPLITUDE_POWER, DISTANCE_RATIO_COLUMN,
-    REGISTERED_CEILING, AmplitudeMarginal, SufficientStatistics,
-    orientation_grid, weighted_correlation)
+    AMPLITUDE_COLUMN, AMPLITUDE_POWER, DEFAULT_DISTANCE_CONSTANT_MPC,
+    DISTANCE_COLUMN, DISTANCE_RATIO_COLUMN, REGISTERED_CEILING,
+    AmplitudeMarginal, SufficientStatistics, orientation_grid,
+    weighted_correlation)
 from pycbc.workflow import WorkflowConfigParser
 
 
@@ -58,6 +59,13 @@ A_MIN = 1.4246657895237213e-09
 NORM = 1.0e18
 #: The lag grid spacing of the stored run, in seconds.
 DT = 142.6782667983213
+
+#: The measured distance constant of the stored partition, in Mpc, and the
+#: distance of its controlled injection (rho = 16, inclination 1.0).  Both are
+#: measured by the research calibration pass; the optional real-archive test
+#: checks that the drawn 68 per cent distance interval contains the injection.
+DISTANCE_CONSTANT = DEFAULT_DISTANCE_CONSTANT_MPC
+INJECTED_DISTANCE = 81.24030874912705
 
 #: The archived amplitude posterior of the stored run lives in this directory;
 #: the two environment variables let the optional real-archive test find it.
@@ -283,13 +291,16 @@ def test_the_restored_columns_are_ordinary_samples(tmp_path):
                      "\n".format(archive))
     sampler = run_sampler(tmp_path, cp)
     for name in ("inclination", "polarization", "delta_tc",
-                 AMPLITUDE_COLUMN, DISTANCE_RATIO_COLUMN):
+                 AMPLITUDE_COLUMN, DISTANCE_COLUMN, DISTANCE_RATIO_COLUMN):
         assert name in sampler.samples
         assert len(sampler.samples[name]) == len(eta)
     inclination = sampler.samples["inclination"]
     polarization = sampler.samples["polarization"]
     amplitude = sampler.samples[AMPLITUDE_COLUMN]
+    distance = sampler.samples[DISTANCE_COLUMN]
     ratio = sampler.samples[DISTANCE_RATIO_COLUMN]
+    numpy.testing.assert_array_equal(
+        distance, DISTANCE_CONSTANT / amplitude)
     assert numpy.all(inclination >= 0.0) and numpy.all(inclination <= numpy.pi)
     assert numpy.all(polarization >= 0.0)
     assert numpy.all(polarization < numpy.pi / 2.0)
@@ -303,7 +314,7 @@ def test_the_restored_columns_are_ordinary_samples(tmp_path):
         sampler.samples["loglikelihood"] + sampler.samples["logprior"])
     with loadfile(str(sampler.checkpoint_file), "r") as fp:
         names = ["inclination", "polarization", "delta_tc",
-                 AMPLITUDE_COLUMN, DISTANCE_RATIO_COLUMN]
+                 AMPLITUDE_COLUMN, DISTANCE_COLUMN, DISTANCE_RATIO_COLUMN]
         raw = fp.read_raw_samples(names, raw_samples=True)
         assert set(raw) == set(names)
         post = fp.read_raw_samples(names, nsamples=100)
@@ -311,14 +322,118 @@ def test_the_restored_columns_are_ordinary_samples(tmp_path):
         assert fp.attrs["amr_amplitude_ceiling"] == 20.0
         assert fp.attrs["amr_amplitude_power"] == 4.0
         assert fp.attrs["amr_recovered_params"] == \
-            "inclination polarization delta_tc amplitude_u distance_ratio"
+            "inclination polarization delta_tc amplitude_u distance distance_ratio"
         assert "joint draw" in fp.attrs["amr_recovered_kind"]
         assert "lag, node, u" in fp.attrs["amr_joint_components"]
         assert "dimensionless" in fp.attrs["amr_amplitude_units"]
-        assert "megaparsecs" in fp.attrs["amr_distance_note"]
-        assert "must not be invented" in fp.attrs["amr_distance_note"]
+        assert fp.attrs["amr_distance_column"] == DISTANCE_COLUMN
+        assert fp.attrs["amr_distance_units"] == "Mpc"
+        assert fp.attrs["amr_distance_constant_mpc"] == pytest.approx(
+            DISTANCE_CONSTANT, rel=0.0, abs=0.0)
+        assert "reciprocal" in fp.attrs["amr_amplitude_distance_relation"]
+        assert "flat" in fp.attrs["amr_distance_note"]
+        assert "not a sampled dimension" in fp.attrs["amr_distance_note"]
         assert fp.attrs["amr_amplitude_column"] == AMPLITUDE_COLUMN
         assert fp.attrs["amr_distance_ratio_column"] == DISTANCE_RATIO_COLUMN
+
+
+def test_the_distance_column_is_the_constant_over_the_amplitude(tmp_path):
+    """distance = K / amplitude_u to machine precision, and the file says so."""
+    partition, eta, widths, lnb = make_partition(tmp_path)
+    archive = make_archive(tmp_path, eta, lnb)
+    statistics = SufficientStatistics(archive, eta, lnb)
+    result = statistics.columns(
+        20.0, power=0.0, seed=20261018,
+        distance_constant=DISTANCE_CONSTANT)
+    distance = result["columns"][DISTANCE_COLUMN]
+    amplitude = result["columns"][AMPLITUDE_COLUMN]
+    assert numpy.all(distance > 0.0)
+    numpy.testing.assert_array_equal(distance, DISTANCE_CONSTANT / amplitude)
+    info = statistics.metadata(
+        20.0, 0.0, 20261018, result["diagnostics"],
+        distance_constant=DISTANCE_CONSTANT)
+    assert info["amr_distance_column"] == DISTANCE_COLUMN
+    assert info["amr_distance_units"] == "Mpc"
+    assert info["amr_distance_constant_mpc"] == DISTANCE_CONSTANT
+    assert "reciprocal" in info["amr_amplitude_distance_relation"]
+    # the measured constant is the default of the draw, and a caller can
+    # override it without touching the amplitude column
+    default = statistics.columns(20.0, power=0.0, seed=20261018)
+    numpy.testing.assert_array_equal(default["columns"][DISTANCE_COLUMN],
+                                    distance)
+    other = statistics.columns(
+        20.0, power=0.0, seed=20261018, distance_constant=2.0 * DISTANCE_CONSTANT)
+    numpy.testing.assert_array_equal(
+        other["columns"][DISTANCE_COLUMN], 2.0 * distance)
+    numpy.testing.assert_array_equal(
+        other["columns"][AMPLITUDE_COLUMN], amplitude)
+
+
+def test_the_distance_constant_must_be_set(tmp_path):
+    """An unset constant is refused; it must not silently write u^-1 as Mpc."""
+    partition, eta, widths, lnb = make_partition(tmp_path)
+    archive = make_archive(tmp_path, eta, lnb)
+    with pytest.raises(ValueError, match="distance-constant is not set"):
+        AmrSampler(make_model(), partition_file=partition,
+                   sufficient_file=archive, distance_constant=None)
+    statistics = SufficientStatistics(archive, eta, lnb)
+    with pytest.raises(ValueError, match="distance-constant is not set"):
+        statistics.columns(20.0, distance_constant=None)
+    with pytest.raises(ValueError, match="positive finite"):
+        AmrSampler(make_model(), partition_file=partition,
+                   sufficient_file=archive, distance_constant=0.0)
+
+
+def test_the_file_metadata_records_the_distance_constant(tmp_path):
+    """The written file names K, its units and the reciprocal relation."""
+    partition, eta, widths, lnb = make_partition(tmp_path)
+    archive = make_archive(tmp_path, eta, lnb)
+    sampler = run_sampler(
+        tmp_path, make_config(
+            partition,
+            "sufficient-file = {}\namplitude-ceiling = 20\n"
+            "amplitude-power = 0\ndistance-constant = {}\n".format(
+                archive, DISTANCE_CONSTANT)))
+    with loadfile(str(sampler.checkpoint_file), "r") as fp:
+        assert fp.attrs["amr_distance_constant_mpc"] == pytest.approx(
+            DISTANCE_CONSTANT, rel=0.0, abs=0.0)
+        assert fp.attrs["amr_distance_units"] == "Mpc"
+        assert "d[Mpc] = K/u" in fp.attrs["amr_distance_definition"]
+        assert "reciprocal" in fp.attrs["amr_amplitude_distance_relation"]
+        assert "flat" in fp.attrs["amr_distance_note"]
+        assert "amplitude-power = 0" in fp.attrs["amr_distance_note"]
+    numpy.testing.assert_array_equal(
+        sampler.samples[DISTANCE_COLUMN],
+        DISTANCE_CONSTANT / sampler.samples[AMPLITUDE_COLUMN])
+
+
+def test_the_real_distance_interval_contains_the_injection():
+    """The controlled injection's drawn 68 per cent distance set contains it."""
+    if not (REAL_ARCHIVE and REAL_PARTITION):
+        pytest.skip("set PYCBC_AMR_SUFFICIENT and PYCBC_AMR_PARTITION")
+    with numpy.load(REAL_PARTITION) as data:
+        levels = sorted(int(key.rsplit("_L", 1)[1]) for key in data.files
+                        if key.startswith("eta_L"))
+        level = levels[-1]
+        eta = numpy.asarray(data["eta_L%d" % level], dtype=float)
+        widths = numpy.asarray(data["w_L%d" % level], dtype=float)
+        lnb = numpy.asarray(data["lnB_L%d" % level], dtype=float)
+    statistics = SufficientStatistics(REAL_ARCHIVE, eta, lnb)
+    # the flat amplitude prior is the one under which the marginal is
+    # statistically consistent; the default draw keeps u^-4
+    result = statistics.columns(20.0, power=0.0, seed=20261018,
+                                distance_constant=DISTANCE_CONSTANT)
+    distance = result["columns"][DISTANCE_COLUMN]
+    volume = numpy.prod(widths[:, [0, 1, 2, 3]], axis=1)
+    logmass = lnb + numpy.log(volume)
+    weights = numpy.exp(logmass - logmass.max())
+    order = numpy.argsort(distance)
+    cumulative = numpy.cumsum(weights[order]) / numpy.sum(weights)
+    low = distance[order][numpy.searchsorted(cumulative, 0.16)]
+    high = distance[order][numpy.searchsorted(cumulative, 0.84)]
+    median = distance[order][numpy.searchsorted(cumulative, 0.50)]
+    assert low < INJECTED_DISTANCE < high
+    assert 0.7 < median / INJECTED_DISTANCE < 1.3
 
 
 def test_the_registered_prior_keeps_the_stored_bayes_factors(tmp_path):
