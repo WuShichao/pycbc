@@ -731,6 +731,18 @@ def test_the_enumerated_draw_can_still_be_selected(tmp_path):
     assert "ENUMERATED" in info["amr_orientation_axis_note"]
     assert "comb" in info["amr_inclination_resolution"]
 
+    # and the config option reaches the written file
+    sampler = run_sampler(
+        tmp_path,
+        make_config(partition,
+                    "sufficient-file = {}\n"
+                    "orientation-interpolation = false\n"
+                    .format(archive)),
+        name="enumerated.hdf")
+    with loadfile(str(sampler.checkpoint_file), "r") as fp:
+        assert "enumerated" in fp.attrs["amr_orientation_draw_kind"]
+        assert "comb" in fp.attrs["amr_inclination_resolution"]
+
 
 def test_the_amplitude_column_matches_the_archived_posterior(tmp_path):
     """The drawn amplitude follows the integrated amplitude posterior."""
