@@ -352,7 +352,8 @@ def surrogate_from_source(grid, whitening, orbit, terms, params, intrinsic,
     source : callable
         ``source(params, frequencies, epoch) -> (h, t)``.
     step : float
-        Central-difference step of the derivative columns, shape units.
+        Central-difference step of the derivative columns, shape units;
+        halved for a coordinate until its displaced sources are valid.
     kmax, samples : int
         Yearly harmonics kept and response samples per orbit.
     dtype : numpy dtype
@@ -372,18 +373,28 @@ def surrogate_from_source(grid, whitening, orbit, terms, params, intrinsic,
     b0, t0 = evaluate(params)
     log_derivatives, time_derivatives = [], []
     for name, scale in intrinsic.items():
-        moved = []
-        for sign in (1, -1):
-            point = dict(params)
-            point[name] = point[name] + sign * step * scale
-            moved.append(evaluate(point))
+        # halve the step until both displaced sources are valid: a weakly
+        # measured coordinate has a shape unit beyond its physical range
+        h = step
+        for _ in range(60):
+            try:
+                moved = []
+                for sign in (1, -1):
+                    point = dict(params)
+                    point[name] = point[name] + sign * h * scale
+                    moved.append(evaluate(point))
+                break
+            except (RuntimeError, ValueError):
+                h *= 0.5
+        else:
+            raise ValueError("no valid derivative step for " + name)
         (bp, tp), (bm, tm) = moved
         ok = (numpy.abs(bp) > 0) & (numpy.abs(bm) > 0)
         ratio = numpy.where(ok, bp / numpy.where(ok, bm, 1), 1.0)
         log_derivatives.append((numpy.log(numpy.abs(ratio)) + 1j
                                 * numpy.unwrap(numpy.angle(ratio)))
-                               / (2 * step))
-        time_derivatives.append((tp - tm) / (2 * step))
+                               / (2 * h))
+        time_derivatives.append((tp - tm) / (2 * h))
     lon, lat = params['eclipticlongitude'], params['eclipticlatitude']
     response = yearly_response_samples(orbit, terms, coarse_frequencies, lon,
                                        lat, lon, lat, samples=samples)
