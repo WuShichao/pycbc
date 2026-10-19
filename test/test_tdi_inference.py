@@ -480,3 +480,34 @@ def test_registration_also_serves_injections():
     assert 'sample_times' in sparse_tdi_td_det_sequence.required
     assert _channel('LISA_A') == 'A'
     assert _channel('E') == 'E'
+
+
+def test_detector_names_are_served_as_their_tdi_channels():
+    """Data written by pycbc_generate_mock_data is named ``LISA_A``.
+
+    `Relative` passes its data names through as ``ifos``, so the generator has
+    to answer ``LISA_A`` with channel ``A``, as the time-domain generator
+    does, and key the result by the name it was asked for.
+    """
+    register()
+    t_obs = 30 * 86400.0
+    delta_f = 1.0 / t_obs
+    freqs = np.arange(int(0.0150 / delta_f), int(0.0150 / delta_f) + 40) * delta_f
+    params = dict(approximant='TDISparse', tdi_source='lal',
+                  tdi_approximant='IMRPhenomD', mass1=53.3, mass2=25.7,
+                  spin1z=-0.15, spin2z=-0.78, distance=100.0,
+                  inclination=1.29, coa_phase=2.27, polarization=0.50,
+                  eclipticlongitude=3.58, eclipticlatitude=0.34,
+                  f_lower=0.015, tdi_f_upper=0.019, tdi_t_start=-86400.0,
+                  tdi_band_edges=[0.0148, 0.0192], t_obs_start=0.0,
+                  t_obs_end=t_obs, tdi_delta_f=delta_f, sample_points=freqs)
+    clear_cache()
+    by_detector = sparse_tdi_fd_det_sequence(ifos=['LISA_A', 'LISA_E'],
+                                             **params)
+    clear_cache()
+    by_channel = sparse_tdi_fd_det_sequence(ifos=['A', 'E'], **params)
+    assert set(by_detector) == {'LISA_A', 'LISA_E'}
+    for name in ('A', 'E'):
+        values = np.asarray(by_detector['LISA_' + name])
+        assert np.any(values != 0)
+        assert np.array_equal(values, np.asarray(by_channel[name]))

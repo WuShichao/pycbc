@@ -811,15 +811,21 @@ def sparse_tdi_fd_det_sequence(**params):
     if isinstance(requested, str):
         requested = (requested,)
     requested = tuple(requested)
+    # Detector names (``LISA_A``) are mapped to TDI channels (``A``), as the
+    # time-domain generator does, so that data named by
+    # pycbc_generate_mock_data can be analysed.
+    channel = {name: _channel(name) for name in requested}
     sample_points = np.asarray(params['sample_points'], dtype=float)
 
     # Prepare and transform every channel the caller will eventually ask for,
     # not just this one. `Relative` iterates its detectors and calls in here
     # once per detector, and each call would otherwise rebuild the band's time
     # series for the same candidate.
-    served = tuple(params.get('tdi_channels', requested))
-    if not set(requested) <= set(served):
-        served = tuple(dict.fromkeys(served + requested))
+    served = tuple(_channel(c) for c in params.get('tdi_channels',
+                                                   requested))
+    wanted = tuple(dict.fromkeys(channel.values()))
+    if not set(wanted) <= set(served):
+        served = tuple(dict.fromkeys(served + wanted))
     # Evict the preceding proposal before constructing any object for this
     # one.  Doing this after the harmonic-membership check discarded the
     # source that check had just built, so the projection rebuilt its wrapper
@@ -901,7 +907,8 @@ def sparse_tdi_fd_det_sequence(**params):
     # resizes and rolls it. The non-det branch feeds it Arrays from
     # `get_fd_waveform_sequence`, and the det branch has to match, because
     # ``sample_points`` is an arbitrary set of frequencies rather than a grid.
-    return {name: Array(np.asarray(samples[name], dtype=np.complex128))
+    return {name: Array(np.asarray(samples[channel[name]],
+                                   dtype=np.complex128))
             for name in requested}
 
 
