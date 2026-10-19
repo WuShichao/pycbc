@@ -353,6 +353,51 @@ def test_band_edges_are_clipped_to_a_single_harmonic():
     assert len(clipped) == 2, clipped
 
 
+def test_prepared_band_brackets_the_requested_band(monkeypatch):
+    """A harmonic narrower than the request must not zero the outer band.
+
+    `MultibandSparseTDIResponse.frequency_samples` evaluates a band only
+    between its own ``f_lower`` and ``f_upper`` and returns an exact zero
+    elsewhere.  Clipping the prepared band to the harmonic's instantaneous
+    range therefore makes the outer part of the *requested* band
+    identically zero: on the index-0 AMR event, 236993 of 441505 bins above
+    0.0167425 Hz, 53.7 per cent.  A matched filter is blind to it because
+    the source is about 1e-12 of its peak there.  Relative binning is not:
+    it divides by the fiducial, so a zero reference makes the ratio
+    undefined.  Only the interior partition may be clipped; the outer edges
+    have to bracket the request.
+    """
+    from pycbc.tdi import inference
+
+    class Narrow:
+        harmonics = (2,)
+
+        def angular_frequency(self, harmonic, times):
+            return np.full_like(
+                np.asarray(times, dtype=float), 2 * np.pi * 1.5e-3)
+
+    clear_cache()
+    seen = []
+    monkeypatch.setattr(inference, '_build_source', lambda _: Narrow())
+    monkeypatch.setattr(
+        inference, 'prepare_sparse_tdi',
+        lambda *args, **kwargs: seen.append(
+            kwargs['band_edges']) or object())
+    params = dict(tdi_source='lal', tdi_band_edges=[1.0e-3, 3.0e-3],
+                  t_obs_start=0.0, t_obs_end=1.0e7,
+                  eclipticlongitude=0.9, eclipticlatitude=-0.25,
+                  tdi_preparation_id='band-coverage')
+    terms, orbit = {'A': ()}, object()
+
+    inference._preparation(params, terms, orbit)
+    band = seen[0]
+    # The harmonic lives at 1.5 mHz, inside the request, so the old code
+    # passed a band of about [1.43, 1.58] mHz and left the rest of the
+    # requested band at exact zero.
+    assert min(band) <= 1.0e-3, band
+    assert max(band) >= 3.0e-3, band
+
+
 def test_the_chirp_z_plan_is_reused():
     """`zoom_fft` rebuilds its plan every call; a likelihood asks repeatedly."""
     from pycbc.tdi.multiband import (_ZOOM_PLANS, _zoom_plan,
