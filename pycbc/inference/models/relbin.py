@@ -363,7 +363,10 @@ class Relative(DistMarg, BaseGaussianNoise):
             self.lik = likelihood_parts_v
             self.mlik = likelihood_parts_multi_v
         else:
-            atimes = self.fid_params["tc"]
+            # A waveform with its own detector response carries its own
+            # timing, so it needs no antenna time (and need not have a tc).
+            atimes = (None if self.still_needs_det_response
+                      else self.fid_params["tc"])
             if self.still_needs_det_response:
                 self.lik = likelihood_parts_det
                 self.mlik = likelihood_parts_det_multi
