@@ -112,7 +112,7 @@ def log_amplitude_integrand(h, x, g, prior, xp=numpy):
     return prior.log_pdf(h, xp=xp) + log_i0(h * x, xp=xp) - 0.5 * h * h * g
 
 
-def log_amplitude_marginal(x, g, prior, order=64, xp=numpy):
+def log_amplitude_marginal(x, g, prior, order=64, chunk=65536, xp=numpy):
     """``ln int p(h) I0(h x) exp(-h^2 g / 2) dh`` over the prior.
 
     The prior's support is split into the interval about the integrand's
@@ -132,10 +132,23 @@ def log_amplitude_marginal(x, g, prior, order=64, xp=numpy):
         The amplitude prior.
     order : int
         Gauss-Legendre nodes per interval.
+    chunk : int
+        Values integrated at a time, which bounds the memory to about
+        ``chunk * 4 * order`` doubles whatever the size of ``x``.
     """
     x = xp.asarray(x, dtype=xp.float64)
     g = xp.asarray(g, dtype=xp.float64)
     x, g = xp.broadcast_arrays(x, g)
+    shape = x.shape
+    x, g = x.ravel(), g.ravel()
+    out = xp.empty(x.shape, dtype=xp.float64)
+    for k in range(0, x.size, chunk):
+        out[k:k + chunk] = _log_amplitude_marginal(
+            x[k:k + chunk], g[k:k + chunk], prior, order, xp)
+    return out.reshape(shape)
+
+
+def _log_amplitude_marginal(x, g, prior, order, xp):
     low, high = _segments(x, g, prior, xp)
     floor = xp.full(x.shape, prior.hmin)
     parts = []
