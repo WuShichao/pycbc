@@ -232,3 +232,15 @@ def test_pruning_keeps_the_total_to_the_margin():
     assert abs(total(pruned) - total(full)) < numpy.exp(-20.0)
     assert numpy.isneginf(pruned).sum() > n // 2
     assert pruned[140] == pytest.approx(full[140], abs=1e-12)
+
+
+def test_amplitude_table_agrees_with_the_integral():
+    from pycbc.filter.bstatistic import AmplitudeTable
+    table = AmplitudeTable(PRIOR, tolerance=1e-4)
+    rng = numpy.random.default_rng(41)
+    # every regime: below the table's smallest a, inside it, beyond its
+    # largest y, and with the closest distance in reach of the peak
+    g = 10 ** rng.uniform(-8, 6, 3000)
+    x = rng.uniform(0, 60, 3000) * numpy.sqrt(g)
+    exact = log_amplitude_marginal(x, g, PRIOR)
+    assert numpy.abs(table.log_marginal(x, g) - exact).max() < 2e-4

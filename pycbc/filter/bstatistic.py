@@ -222,7 +222,7 @@ def _project(z, g00, g11, g01, vectors, xp):
 
 
 def log_orientation_marginal(z, g00, g11, g01, prior, nodes, order=64,
-                             margin=None, xp=numpy):
+                             margin=None, table=None, xp=numpy):
     """``ln B`` at each sample, marginalised over phase, amplitude and an
     isotropic orientation: ``ln sum_n weight_n B(w_n)``.
 
@@ -239,12 +239,20 @@ def log_orientation_marginal(z, g00, g11, g01, prior, nodes, order=64,
     than ``exp(-margin)`` of the total, so the sum over samples (an
     arrival-time marginal) keeps that relative accuracy; a sample all of
     whose terms are dropped gets ``-inf``.
+
+    ``table``, an :class:`AmplitudeTable` of ``prior``, replaces the
+    amplitude integrals by its interpolation.
     """
+    if table is None:
+        def amplitude(x, g):
+            return log_amplitude_marginal(x, g, prior, order=order, xp=xp)
+    else:
+        def amplitude(x, g):
+            return table.log_marginal(x, g, xp=xp)
     x, g = _project(z, g00, g11, g01, nodes.vectors, xp)
     logw = xp.log(xp.asarray(nodes.weights))[None, :]
     if margin is None:
-        terms = log_amplitude_marginal(x, g, prior, order=order, xp=xp) \
-            + logw
+        terms = amplitude(x, g) + logw
     else:
         with numpy.errstate(divide='ignore', invalid='ignore'):
             h = xp.clip(x / g, prior.hmin, prior.hmax)
@@ -257,8 +265,7 @@ def log_orientation_marginal(z, g00, g11, g01, prior, nodes, order=64,
             + float(logw[0, j])
         keep = bound >= lower - margin - numpy.log(bound.size)
         terms = xp.full(bound.shape, -numpy.inf)
-        terms[keep] = log_amplitude_marginal(x[keep], g[keep], prior,
-                                             order=order, xp=xp) \
+        terms[keep] = amplitude(x[keep], g[keep]) \
             + xp.broadcast_to(logw, bound.shape)[keep]
     top = xp.max(terms, axis=1, keepdims=True)
     with numpy.errstate(invalid='ignore'):
@@ -327,3 +334,134 @@ def converged_orientation_marginal(z, g00, g11, g01, prior, n_cos=16,
             return value, nodes
     raise RuntimeError("orientation marginal did not converge to {} in {} "
                        "doublings".format(tolerance, max_doublings))
+
+
+class AmplitudeTable(object):
+    """:func:`log_amplitude_marginal` by interpolation in a table checked
+    against it.
+
+    With ``u = h sqrt(g)``, ``y = x / sqrt(g)``, ``a = h_min sqrt(g)`` and
+    ``b = h_max sqrt(g)``, a prior ``p(h) = c h^-m`` gives
+
+        ln J = ln c + (m - 1)/2 ln g + K(y, a),
+        K = ln int_a^b u^-m I0(u y) exp(-u^2 / 2) du,
+
+    which does not depend on ``b`` once ``b > y + 12``. ``K`` is split at
+    ``u = 1``: the part below is tabulated on ``y`` and ``ln a``, the part
+    above, less ``y^2 / 2``, on ``y``, both read linearly and added in
+    logs; below the table's smallest
+    ``a`` the integrand is ``u^-m`` to ``a^2 y^2`` and that piece is added
+    in closed form. Values off the table - ``y`` beyond its largest, ``a``
+    beyond its largest or ``b`` within reach of the peak - are integrated
+    exactly. The table is refined until random checks against the exact
+    integral agree to ``tolerance``.
+
+    Parameters
+    ----------
+    prior : DistancePowerLaw
+        The amplitude prior.
+    y_max : float
+        Largest ``y`` (peak SNR) tabulated.
+    tolerance : float
+        Largest error in ``ln J`` accepted at the checks.
+    """
+    def __init__(self, prior, y_max=40.0, log_a=(-12.0, -1.0),
+                 tolerance=1e-4, checks=4000, seed=0):
+        self.prior = prior
+        self.m = prior.power + 2
+        self.log_c = prior._log_norm
+        self.y_max, self.log_a = float(y_max), log_a
+        self.tolerance = float(tolerance)
+        ny, na = 200, 100
+        rng = numpy.random.default_rng(seed)
+        for _ in range(4):
+            self._build(ny, na)
+            y = rng.uniform(0, self.y_max, checks)
+            la = rng.uniform(*log_a, checks)
+            g = rng.uniform(0.5, 2.0, checks)
+            a = numpy.exp(la)
+            hmin = a / numpy.sqrt(g)
+            exact = self._exact_scaled(y, a)
+            error = numpy.abs(self._lookup(y, la, numpy) - exact).max()
+            self.error = float(error)
+            if error <= self.tolerance:
+                return
+            ny, na = 2 * ny, 2 * na
+        raise RuntimeError("the amplitude table did not reach {}: {}".format(
+            tolerance, error))
+
+    def _exact_scaled(self, y, a, b=numpy.inf):
+        """ln int_a^b u^-m I0(u y) exp(-u^2 / 2) du, from the exact
+        integral at unit ``g``."""
+        prior = DistancePowerLaw.__new__(DistancePowerLaw)
+        prior.power, prior.scale, prior._log_norm = self.prior.power, 1.0, 0.0
+        y = numpy.asarray(y, dtype=float)
+        a = numpy.broadcast_to(numpy.asarray(a, dtype=float), y.shape)
+        out = numpy.empty(y.shape)
+        for value in numpy.unique(a):
+            sel = a == value
+            prior.hmin = value
+            prior.hmax = min(b, value * 1e12 + 1e3)
+            out[sel] = log_amplitude_marginal(y[sel], 1.0, prior, order=96)
+        return out
+
+    def _build(self, ny, na):
+        # the integral split at u = 1: the tail below, smooth in y and ln a,
+        # and the peak above, a function of y alone; their competition is
+        # left to logaddexp rather than to the interpolation
+        self.y = numpy.linspace(0.0, self.y_max, ny)
+        self.la = numpy.linspace(self.log_a[0], self.log_a[1], na)
+        tail = numpy.array([self._exact_scaled(self.y, numpy.exp(v), 1.0)
+                            for v in self.la]).T
+        # an empty tail (a = 1) is a finite floor, so that interpolation
+        # weights of zero do not meet -inf
+        self.tail = numpy.maximum(numpy.nan_to_num(tail, neginf=-1e30), -1e30)
+        self.peak = self._exact_scaled(self.y, 1.0) - 0.5 * self.y ** 2
+        self._device = {}
+
+    def _lookup(self, y, la, xp):
+        if xp not in self._device:
+            self._device[xp] = (xp.asarray(self.tail), xp.asarray(self.peak))
+        tail, peak = self._device[xp]
+        dy = self.y[1] - self.y[0]
+        da = self.la[1] - self.la[0]
+        fy = xp.clip(y / dy, 0, len(self.y) - 1.000001)
+        fa = xp.clip((la - self.la[0]) / da, 0, len(self.la) - 1.000001)
+        i = xp.floor(fy).astype(xp.int64)
+        j = xp.floor(fa).astype(xp.int64)
+        wy, wa = fy - i, fa - j
+        low = ((1 - wy) * (1 - wa) * tail[i, j]
+               + wy * (1 - wa) * tail[i + 1, j]
+               + (1 - wy) * wa * tail[i, j + 1]
+               + wy * wa * tail[i + 1, j + 1])
+        high = (1 - wy) * peak[i] + wy * peak[i + 1] + 0.5 * y * y
+        return xp.logaddexp(low, high)
+
+    def log_marginal(self, x, g, xp=numpy):
+        """``ln J(x, g)``, as :func:`log_amplitude_marginal`."""
+        x = xp.asarray(x, dtype=xp.float64)
+        g = xp.asarray(g, dtype=xp.float64)
+        x, g = xp.broadcast_arrays(x, g)
+        root = xp.sqrt(g)
+        y = x / root
+        a = self.prior.hmin * root
+        b = self.prior.hmax * root
+        la = xp.log(a)
+        m = self.m
+        K = self._lookup(y, xp.maximum(la, self.log_a[0]), xp)
+        # below the table, int_a^a0 u^-m du in closed form
+        a0 = numpy.exp(self.log_a[0])
+        below = a < a0
+        if bool(xp.any(below)):
+            if abs(m - 1) < 1e-12:
+                extra = xp.log(a0) - la
+            else:
+                extra = (a ** (1 - m) - a0 ** (1 - m)) / (m - 1)
+            extra = xp.where(below, xp.maximum(extra, 0.0), 0.0)
+            K = K + xp.log1p(extra * xp.exp(-K))
+        out = self.log_c + 0.5 * (m - 1) * xp.log(g) + K
+        off = (y > self.y_max) | (la > self.log_a[1]) | (b < y + 12)
+        if bool(xp.any(off)):
+            out[off] = log_amplitude_marginal(x[off], g[off], self.prior,
+                                              xp=xp)
+        return out
