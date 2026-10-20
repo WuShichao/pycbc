@@ -86,7 +86,9 @@ def test_time_samples_match_exact_inner_products():
     z, g, lnb, _ = m._time_samples(dict(x=0.0))
     b, t, rho = fam.pieces(numpy.zeros(3))
     nodes = OrientationNodes(16, 8)
-    for k in (0, len(m.delays) // 2, len(m.delays) - 1):
+    kept = numpy.nonzero(numpy.isfinite(lnb[:len(m.delays)]))[0]
+    assert len(kept) > 0
+    for k in (kept[0], kept[len(kept) // 2], kept[-1]):
         y = fam.template(b, t, rho, m.delays[k])
         zk = numpy.einsum('acf,cf->a', numpy.conj(y), data) / 2.0
         assert numpy.allclose(z[:, k], zk, rtol=1e-7)
@@ -107,10 +109,12 @@ def test_reconstruction_recovers_a_loud_injection():
     with warnings.catch_warnings():
         # a discarded imaginary part of the Gram matrix once biased this
         warnings.simplefilter('error')
-        draws = [m.reconstruct(seed=s) for s in range(60)]
+        draws = [m.reconstruct(seed=s) for s in range(200)]
+    # 99 per cent intervals: three 90 per cent ones fail together a quarter
+    # of the time by construction
     for name in ('delta_tc', 'distance', 'inclination'):
         values = numpy.array([d[name] for d in draws])
-        low, high = numpy.percentile(values, [5, 95])
+        low, high = numpy.percentile(values, [0.5, 99.5])
         assert low < TRUTH[name] < high, name
     for d in draws:
         assert 0 <= d['polarization'] < 2 * numpy.pi
@@ -259,3 +263,34 @@ def test_from_config_refuses_unknown_options():
         'grid-periods = 1', 'grid-periods = 1\nnlive = 10'))
     with pytest.raises(ValueError, match='unknown option'):
         models.read_from_config(cp, data={}, psds={})
+
+
+def test_amr_sampler_integrates_the_model():
+    """The amr sampler's evidence and posterior of the intrinsic coordinate
+    agree with a direct integral of the model over its prior."""
+    from pycbc.distributions import JointDistribution, Uniform
+    from pycbc.inference.sampler.amr import AMRSampler
+    fam, daily = family()
+    data, _ = inject(fam, numpy.array([0.3, 0.0, 0.0]))
+    prior = JointDistribution(['x'], Uniform(x=(-1.0, 1.0)))
+    reference = dict(x=0.0, eclipticlongitude=1.0, eclipticlatitude=0.2)
+    scales = dict(x=1.0, eclipticlongitude=1e-3, eclipticlatitude=1e-3)
+    m = BStatisticSurrogate(['x'], fam, daily, data, 1.0, reference, scales,
+                            PRIOR, (-2e5, 2e5), oversampling=4,
+                            orientation_nodes=(16, 8), prior=prior)
+    grid = numpy.linspace(-1, 1, 4001)
+    values = []
+    for x in grid:
+        m.update(x=x)
+        values.append(m.loglikelihood)
+    values = numpy.array(values)
+    top = values.max()
+    density = numpy.exp(values - top)
+    logz = top + numpy.log(numpy.trapz(density, grid) / 2.0)
+    sampler = AMRSampler(m, mass_fraction=1e-5, max_evaluations=4000,
+                         posterior_samples=4000, seed=2)
+    sampler.run()
+    assert sampler.logz == pytest.approx(logz, abs=max(
+        3 * sampler.logz_err, 1e-3))
+    mean = numpy.trapz(grid * density, grid) / numpy.trapz(density, grid)
+    assert numpy.mean(sampler.samples['x']) == pytest.approx(mean, abs=2e-3)

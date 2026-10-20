@@ -32,11 +32,13 @@ import logging
 
 import numpy
 
-from pycbc.filter.bstatistic import (OrientationNodes, _project,
+from pycbc.filter.bstatistic import (AmplitudeTable, OrientationNodes,
+                                     _project,
                                      draw_amplitude, draw_orientation,
                                      draw_phase, log_orientation_marginal)
 from pycbc.filter.subsample_arrival_time import (correlation_at,
-                                                 fractional_correlations)
+                                                 fractional_correlations,
+                                                 rms_bandwidth)
 from pycbc.tmpltbank.fstatistic_metric import orientation_weights
 
 from .base import BaseModel
@@ -87,7 +89,8 @@ class BStatisticSurrogate(BaseModel):
     def __init__(self, variable_params, surrogate, daily_gram,
                  data_spectrum, noise_variance, reference, scales,
                  distance_prior, time_window, oversampling=10,
-                 orientation_nodes=(32, 16), margin=40.0, **kwargs):
+                 orientation_nodes=(32, 16), margin=40.0,
+                 amplitude_table=True, **kwargs):
         super().__init__(variable_params, **kwargs)
         self.surrogate, self.daily_gram = surrogate, daily_gram
         self.data_spectrum = data_spectrum
@@ -107,18 +110,28 @@ class BStatisticSurrogate(BaseModel):
         lags = numpy.arange(grid.size)
         delays = numpy.where(lags < grid.size // 2, lags, lags - grid.size) \
             * grid.delta_t
-        fine = delays[None, :] + step * numpy.arange(
-            self.oversampling)[:, None]
         lo, hi = time_window
-        self._window = (fine >= lo) & (fine < hi)
-        if not self._window.any():
+        inside = (delays >= lo) & (delays < hi)
+        if not inside.any():
             raise ValueError("the time window holds no arrival times")
-        self.delays = fine[self._window]
+        order = numpy.argsort(delays[inside])
+        self._lags = numpy.nonzero(inside)[0][order]
+        self.delays = delays[self._lags]
         xp = self.xp = surrogate.xp
-        self._window_xp = xp.asarray(self._window)
-        self._delays_xp = xp.asarray(self.delays)
+        self._lags_xp = xp.asarray(self._lags)
         self.time_step = step
+        self.grid_step = grid.delta_t
         self.window_width = float(hi - lo)
+        # a lag is sampled finely where its peak is narrower than two grid
+        # steps, 1 / (2 pi sigma_f sqrt(2 ln B)) < 2 dt, and where it adds
+        # to the integral more than 1e-4 / (number of lags) of the largest
+        b0 = surrogate.b0.get() if hasattr(surrogate.b0, 'get') \
+            else numpy.asarray(surrogate.b0)
+        sigma_f = rms_bandwidth(grid.frequencies, numpy.abs(b0) ** 2)
+        self._narrow = 0.5 / (numpy.pi * sigma_f * grid.delta_t) ** 2
+        self._tau = numpy.log(1e4 * len(self._lags))
+        self.table = (AmplitudeTable(distance_prior) if amplitude_table
+                      else None)
 
     def _shape_coordinates(self, params):
         point = dict(self.reference)
@@ -133,16 +146,50 @@ class BStatisticSurrogate(BaseModel):
         b, t, rho = s.pieces(self._shape_coordinates(params))
         spectrum = s.correlation_spectrum(self.data_spectrum, b, t, rho)
         xp = self.xp
-        fine = fractional_correlations(spectrum, self.oversampling, xp=xp)
-        z = xp.stack([fine[:, a, :][self._window_xp] for a in range(2)])
-        z = z / self.noise_variance
+        P = self.oversampling
+        fine = fractional_correlations(spectrum, P, xp=xp)
         gram = self.daily_gram(b, t, rho)
-        g = tuple(x / self.noise_variance for x in
-                  self.daily_gram.at_delays(gram, self._delays_xp))
+        var = self.noise_variance
+
+        def samples(p, lags, delays):
+            z = fine[p][:, lags].astype(xp.complex128) / var
+            g = tuple(v / var for v in self.daily_gram.at_delays(gram, delays))
+            return z, g
+        # every lag of the window on the grid
+        z, g = samples(0, self._lags_xp, xp.asarray(self.delays))
         nodes = self._orientation_nodes(z, g)
-        lnb = log_orientation_marginal(z, *g, self.distance_prior, nodes,
-                                       margin=self.margin, xp=xp)
-        return z, g, lnb, (spectrum, gram)
+
+        def marginal(z, g):
+            return log_orientation_marginal(
+                z, *g, self.distance_prior, nodes, margin=self.margin,
+                table=self.table, xp=xp)
+        lnb = marginal(z, g)
+        width = numpy.full(len(self.delays), self.grid_step)
+        delays = self.delays
+        # the lags whose peaks the grid does not resolve, and neighbours
+        values = _to_numpy(lnb)
+        top = values.max()
+        need = (values >= top - self._tau) & (values >= self._narrow)
+        need = need | numpy.roll(need, 1) | numpy.roll(need, -1)
+        if P > 1 and need.any():
+            k = numpy.nonzero(need)[0]
+            width[k] = self.time_step
+            zs, gs, ls, ds = [z], [g], [lnb], [delays]
+            for p in range(1, P):
+                d = self.delays[k] + p * self.time_step
+                zp, gp = samples(p, self._lags_xp[xp.asarray(k)],
+                                 xp.asarray(d))
+                zs.append(zp)
+                gs.append(gp)
+                ls.append(marginal(zp, gp))
+                ds.append(d)
+            z = xp.concatenate(zs, axis=1)
+            g = tuple(xp.concatenate([v[i] for v in gs]) for i in range(3))
+            lnb = xp.concatenate(ls)
+            delays = numpy.concatenate(ds)
+            width = numpy.concatenate(
+                [width] + [numpy.full(len(k), self.time_step)] * (P - 1))
+        return z, g, lnb, (spectrum, gram, delays, width)
 
     def _orientation_nodes(self, z, g):
         """The coarsest orientation quadrature, doubling from 8 x 4 up to
@@ -169,11 +216,11 @@ class BStatisticSurrogate(BaseModel):
         return nodes
 
     def _loglikelihood(self):
-        _, _, lnb, _ = self._time_samples(self.current_params)
-        xp = self.xp
-        top = float(xp.max(lnb))
-        return top + float(numpy.log(float(xp.sum(xp.exp(lnb - top)))
-                                     * self.time_step / self.window_width))
+        _, _, lnb, (_, _, _, width) = self._time_samples(self.current_params)
+        terms = _to_numpy(lnb) + numpy.log(width)
+        top = terms.max()
+        return float(top + numpy.log(numpy.sum(numpy.exp(terms - top))
+                                     / self.window_width))
 
     def reconstruct(self, rec=None, seed=None):
         """Draw the marginalised parameters at the current point.
@@ -187,12 +234,14 @@ class BStatisticSurrogate(BaseModel):
         rng = numpy.random.default_rng(seed)
         rec = {} if rec is None else rec
         params = self.current_params
-        _, _, lnb, (spectrum, gram) = self._time_samples(params)
+        _, _, lnb, (spectrum, gram, delays, width) = \
+            self._time_samples(params)
         xp = self.xp
-        lnb = _to_numpy(lnb)
-        weight = numpy.exp(lnb - lnb.max())
+        terms = _to_numpy(lnb) + numpy.log(width)
+        weight = numpy.exp(terms - terms.max())
         k = rng.choice(len(weight), p=weight / weight.sum())
-        delay = self.delays[k] + (rng.random() - 0.5) * self.time_step
+        # each sample stands for [delay, delay + width)
+        delay = delays[k] + rng.random() * width[k]
         z = _to_numpy(correlation_at(spectrum, [delay],
                                      self.surrogate.grid.duration,
                                      xp=xp))[:, 0]
