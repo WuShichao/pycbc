@@ -74,7 +74,9 @@ class BStatisticSurrogate(BaseModel):
     oversampling : int
         Fine samples per grid step of the arrival time.
     orientation_nodes : tuple
-        ``(n_cos, n_psi)`` of the orientation quadrature.
+        The largest ``(n_cos, n_psi)`` of the orientation quadrature; each
+        likelihood uses the coarsest one that has converged, see
+        :meth:`_orientation_nodes`.
     margin : float
         Terms of the marginal below ``exp(-margin)`` of its total are
         skipped, see
@@ -137,10 +139,34 @@ class BStatisticSurrogate(BaseModel):
         gram = self.daily_gram(b, t, rho)
         g = tuple(x / self.noise_variance for x in
                   self.daily_gram.at_delays(gram, self._delays_xp))
-        lnb = log_orientation_marginal(z, *g, self.distance_prior,
-                                       self.nodes, margin=self.margin,
-                                       xp=xp)
+        nodes = self._orientation_nodes(z, g)
+        lnb = log_orientation_marginal(z, *g, self.distance_prior, nodes,
+                                       margin=self.margin, xp=xp)
         return z, g, lnb, (spectrum, gram)
+
+    def _orientation_nodes(self, z, g):
+        """The coarsest orientation quadrature, doubling from 8 x 4 up to
+        ``orientation_nodes``, whose value at the sample with the largest
+        F-statistic changes by less than 1e-3 on the next doubling. A weak
+        signal's broad orientation posterior needs few nodes, a loud one's
+        many."""
+        xp = self.xp
+        x = xp.abs(z[0]) ** 2 / xp.maximum(g[0], 1e-300) \
+            + xp.abs(z[1]) ** 2 / xp.maximum(g[1], 1e-300)
+        k = int(xp.argmax(x))
+        one = (z[:, k:k + 1],) + tuple(v[k:k + 1] for v in g)
+        n_cos, n_psi = 8, 4
+        nodes = OrientationNodes(n_cos, n_psi)
+        value = float(log_orientation_marginal(*one, self.distance_prior,
+                                               nodes, xp=xp)[0])
+        while n_cos < self.nodes.n_cos:
+            finer = OrientationNodes(2 * n_cos, 2 * n_psi)
+            new = float(log_orientation_marginal(*one, self.distance_prior,
+                                                 finer, xp=xp)[0])
+            if abs(new - value) < 1e-3:
+                break
+            n_cos, n_psi, nodes, value = 2 * n_cos, 2 * n_psi, finer, new
+        return nodes
 
     def _loglikelihood(self):
         _, _, lnb, _ = self._time_samples(self.current_params)
