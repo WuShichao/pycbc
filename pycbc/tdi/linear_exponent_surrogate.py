@@ -133,16 +133,82 @@ class LinearExponentSurrogate(object):
         at any ``Delta``, see
         :mod:`pycbc.filter.subsample_arrival_time`."""
         xp = self.xp
+        data = data.astype(self.dtype, copy=False)
+        if xp is not numpy and self.dtype == numpy.complex64:
+            return self._correlation_spectrum_kernel(data, b, t, rho)
         acc = xp.zeros((2, self.size), dtype=self.dtype)
+        # exp(i k Omega t) b by recurrence in k, one exponential in all
+        step = xp.exp(1j * ORBITAL_ANGULAR_FREQUENCY * t).astype(self.dtype)
+        phase = (b * step ** int(self.orders[0])).astype(self.dtype)
         for i, k in enumerate(self.orders):
-            phase = self._phase(k, b, t)
-            for a in range(2):
-                prod = xp.zeros(self.size, dtype=self.dtype)
-                for c in range(data.shape[0]):
-                    prod += xp.conj(self.fine(rho[i, a, c]) * phase) * data[c]
-                # the k-th harmonic is a shift of k bins per orbital period
-                acc[a] += xp.roll(prod, -int(k) * self.shift)
+            if i:
+                phase = phase * step
+            # both bases and every channel of one harmonic at once
+            weighted = xp.conj(self.fine(rho[i].astype(self.dtype,
+                                                       copy=False)) * phase)
+            prod = (weighted * data[None]).sum(axis=1)
+            # the k-th harmonic is a shift of k bins per orbital period
+            acc += xp.roll(prod, -int(k) * self.shift, axis=-1)
         return acc
+
+    _KERNEL = r"""
+    #include <cupy/complex.cuh>
+    extern "C" __global__ void corr(
+        const complex<float>* data, const complex<float>* b,
+        const double* t, const int* index, const float* weight,
+        const complex<float>* rho, complex<float>* out, const int n,
+        const int nch, const int ncoarse, const int nk, const int kmin,
+        const int shift, const double omega) {
+      // out[a, f] = sum_k sum_c conj(y_kac(f + k shift)) X_c(f + k shift)
+      int f = blockDim.x * blockIdx.x + threadIdx.x;
+      if (f >= n) return;
+      complex<float> acc0(0, 0), acc1(0, 0);
+      for (int q = 0; q < nk; q++) {
+        int k = kmin + q;
+        long jj = ((long)f + (long)k * shift) % n;
+        int j = (int)(jj < 0 ? jj + n : jj);
+        double arg = k * omega * t[j];
+        float c = (float)cos(fmod(arg, 6.283185307179586));
+        float sn = (float)sin(fmod(arg, 6.283185307179586));
+        complex<float> ph = b[j] * complex<float>(c, sn);
+        int i = index[j];
+        float w = weight[j];
+        for (int ch = 0; ch < nch; ch++) {
+          const complex<float>* r0 = rho + ((q * 2 + 0) * nch + ch) * ncoarse;
+          const complex<float>* r1 = rho + ((q * 2 + 1) * nch + ch) * ncoarse;
+          complex<float> f0 = r0[i] * (1.0f - w) + r0[i + 1] * w;
+          complex<float> f1 = r1[i] * (1.0f - w) + r1[i + 1] * w;
+          complex<float> x = data[ch * n + j];
+          acc0 += conj(f0 * ph) * x;
+          acc1 += conj(f1 * ph) * x;
+        }
+      }
+      out[f] = acc0;
+      out[n + f] = acc1;
+    }
+    """
+
+    def _correlation_spectrum_kernel(self, data, b, t, rho):
+        """correlation_spectrum in one pass of a fused kernel, single
+        precision on cupy."""
+        xp = self.xp
+        if not hasattr(self, '_corr'):
+            self._corr = xp.RawKernel(self._KERNEL, 'corr')
+            self._index32 = self._index.astype(xp.int32)
+            self._weight32 = self._weight.astype(xp.float32)
+        out = xp.empty((2, self.size), dtype=xp.complex64)
+        nch = data.shape[0]
+        threads = 256
+        self._corr(((self.size + threads - 1) // threads,), (threads,), (
+            xp.ascontiguousarray(data), xp.ascontiguousarray(
+                b.astype(xp.complex64)), xp.ascontiguousarray(
+                t.astype(xp.float64)), self._index32, self._weight32,
+            xp.ascontiguousarray(rho.astype(xp.complex64)), out,
+            numpy.int32(self.size), numpy.int32(nch),
+            numpy.int32(rho.shape[-1]), numpy.int32(len(self.orders)),
+            numpy.int32(self.orders[0]), numpy.int32(self.shift),
+            numpy.float64(ORBITAL_ANGULAR_FREQUENCY)))
+        return out
 
     def template(self, b, t, rho, delta):
         """The template ``y_ac(f; Delta)`` on the fine grid, shape
