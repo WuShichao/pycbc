@@ -37,7 +37,6 @@ from pycbc.filter.bstatistic import (AmplitudeTable, OrientationNodes,
                                      draw_amplitude, draw_orientation,
                                      draw_phase, log_orientation_marginal)
 from pycbc.filter.subsample_arrival_time import (correlation_at,
-                                                 fractional_correlations,
                                                  rms_bandwidth)
 from pycbc.tmpltbank.fstatistic_metric import orientation_weights
 
@@ -147,12 +146,22 @@ class BStatisticSurrogate(BaseModel):
         spectrum = s.correlation_spectrum(self.data_spectrum, b, t, rho)
         xp = self.xp
         P = self.oversampling
-        fine = fractional_correlations(spectrum, P, xp=xp)
+        n = spectrum.shape[-1]
+        ramp = 2j * numpy.pi * xp.arange(n, dtype=xp.float64) / (P * n)
+        fine = {}
+
+        def correlation(p):
+            # the p-th fraction of a step, transformed only when asked for
+            if p not in fine:
+                shifted = spectrum if p == 0 else spectrum * xp.exp(
+                    ramp * p).astype(spectrum.dtype)
+                fine[p] = xp.fft.ifft(shifted, axis=-1) * n
+            return fine[p]
         gram = self.daily_gram(b, t, rho)
         var = self.noise_variance
 
         def samples(p, lags, delays):
-            z = fine[p][:, lags].astype(xp.complex128) / var
+            z = correlation(p)[:, lags].astype(xp.complex128) / var
             g = tuple(v / var for v in self.daily_gram.at_delays(gram, delays))
             return z, g
         # every lag of the window on the grid
@@ -205,11 +214,13 @@ class BStatisticSurrogate(BaseModel):
         n_cos, n_psi = 8, 4
         nodes = OrientationNodes(n_cos, n_psi)
         value = float(log_orientation_marginal(*one, self.distance_prior,
-                                               nodes, xp=xp)[0])
+                                               nodes, table=self.table,
+                                               xp=xp)[0])
         while n_cos < self.nodes.n_cos:
             finer = OrientationNodes(2 * n_cos, 2 * n_psi)
             new = float(log_orientation_marginal(*one, self.distance_prior,
-                                                 finer, xp=xp)[0])
+                                                 finer, table=self.table,
+                                                 xp=xp)[0])
             if abs(new - value) < 1e-3:
                 break
             n_cos, n_psi, nodes, value = 2 * n_cos, 2 * n_psi, finer, new
@@ -278,7 +289,8 @@ class BStatisticSurrogate(BaseModel):
                   low_frequency_cutoff, high_frequency_cutoff, time_window,
                   distance_prior, orbit=None, to_source=None, periods=5,
                   coarse_bins=1500, harmonics=4, response_samples=32,
-                  derivative_step=0.5, max_time_loss=1e-3, **kwargs):
+                  derivative_step=0.5, max_time_loss=1e-3, precision='double',
+                  **kwargs):
         """Build the model from frequency-domain TDI data.
 
         Parameters
@@ -313,6 +325,9 @@ class BStatisticSurrogate(BaseModel):
         max_time_loss : float
             Largest fraction of the statistic lost between fine arrival-time
             samples; sets the oversampling from the rms bandwidth.
+        precision : {'double', 'single'}
+            Precision of the family's correlation and transforms; the
+            marginals are always in double precision.
         """
         from pycbc.coordinates.space_orbit import LisaEqualArmOrbit
         from pycbc.filter.subsample_arrival_time import (
@@ -324,6 +339,8 @@ class BStatisticSurrogate(BaseModel):
                                                     ssb_data_spectrum)
         from pycbc.tmpltbank.fstatistic_metric import fstatistic_metric
         # the orbit of pycbc.tdi's sparse response, unless told otherwise
+        dtype = {'double': numpy.complex128,
+                 'single': numpy.complex64}[precision]
         orbit = (LisaEqualArmOrbit(armlength=DEFAULT_ARM, t0=0.0)
                  if orbit is None else orbit)
         names = sorted(data)
@@ -352,14 +369,16 @@ class BStatisticSurrogate(BaseModel):
         lon = reference['eclipticlongitude']
         lat = reference['eclipticlatitude']
 
-        def build(scales, step):
+        def build(scales, step, dtype=numpy.complex128):
             fam = surrogate_from_source(
                 grid, sw, orbit, terms, reference,
                 {k: scales[k] for k in intrinsic},
                 (scales['eclipticlongitude'], scales['eclipticlatitude']),
                 coarse, to_source=to_source, step=step,
-                kmax=harmonics, samples=response_samples)
-            fam.R0 = fam.R0 * fam.xp.asarray(ratio)[None, None]
+                kmax=harmonics, samples=response_samples, dtype=dtype)
+            # the response ratio in the family's own precision
+            fam.R0 = (fam.R0 * fam.xp.asarray(ratio)[None, None]).astype(
+                fam.R0.dtype)
             return fam
 
         keys = list(intrinsic) + ['eclipticlongitude', 'eclipticlatitude']
@@ -390,7 +409,7 @@ class BStatisticSurrogate(BaseModel):
                                "{} against {}".format(units, finer))
         scales = {k: probe[k] / u for k, u in zip(keys, units)}
         logging.info("shape units %s", scales)
-        fam = build(scales, derivative_step)
+        fam = build(scales, derivative_step, dtype)
         daily = DailyGram(fam)
         spectrum, noise = ssb_data_spectrum(grid, bins, orbit, lon, lat,
                                             xp=fam.xp)
