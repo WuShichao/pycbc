@@ -58,6 +58,7 @@ does.
 """
 
 import logging
+import time
 
 import numpy
 from scipy.special import logsumexp
@@ -193,7 +194,17 @@ class AMRSampler(BaseSampler):
         logl = numpy.full(len(index), -numpy.inf)
         if inside.any():
             points = [self._prior_transform(c) for c in cube[inside]]
-            logl[inside] = self.pool.map(self._loglikelihood, points)
+            # a large batch in tenths, each logged with an estimate of the rest
+            values, step, start = [], max(100, len(points) // 10), time.time()
+            for k in range(0, len(points), step):
+                values.extend(self.pool.map(self._loglikelihood,
+                                            points[k:k + step]))
+                if len(points) > step:
+                    done, elapsed = len(values), time.time() - start
+                    logging.info("AMR: batch %d/%d evaluated, %.0f s, about "
+                                 "%.0f s left", done, len(points), elapsed,
+                                 elapsed / done * (len(points) - done))
+            logl[inside] = values
         self.nevaluations += int(inside.sum())
         self._logl[index] = logl
 
@@ -246,13 +257,17 @@ class AMRSampler(BaseSampler):
             logmass = self._log_mass(leaves)
             logz = logsumexp(logmass)
             self.history.append((len(leaves), self.nevaluations, logz))
-            logging.info("AMR: %d boxes, %d evaluations, log Z %.4f",
-                         len(leaves), self.nevaluations, logz)
             refine = self._logerr[leaves] - logz > threshold
             refine |= self._neighbour_flags(leaves, logmass - logz > threshold,
                                             logz + threshold)
             refine &= self._level[leaves] < self.max_level
             refine = leaves[refine]
+            finite = numpy.isfinite(self._logerr[leaves])
+            dlogz = (float(numpy.exp(logsumexp(self._logerr[leaves][finite])
+                                     - logz)) if finite.any() else 0.0)
+            logging.info("AMR: %d boxes, %d evaluations, log Z %.4f, "
+                         "dlog Z %.2g, %d boxes to refine", len(leaves),
+                         self.nevaluations, logz, dlogz, len(refine))
             room = (budget - self.nevaluations) // 2
             if len(refine) == 0 or room <= 0:
                 return leaves, logmass, logz, refine
