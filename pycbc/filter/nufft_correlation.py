@@ -612,6 +612,80 @@ class PhaseGrid(object):
         logging.info("PhaseGrid %s, %d vectors, %.2f s", self.size,
                      len(grids), time.time() - tick)
 
+    def grid_twof(self, gram, noise_variance=1.0, s3_values=(0.0,),
+                  sky=None, chunk=None):
+        """The F-statistic ``2F = z^H G^-1 z`` at every node of the grid:
+        each node of the two phase coordinates is a template, for each of
+        ``s3_values`` of the third (offsets from the region's middle) and
+        each sky position, at every arrival-time sample of the grid, with no
+        interpolation.
+
+        The constant phase and the amplitude a template carries cancel in
+        ``2F``, the latter against the Gram matrix's ``A^2``; ``gram(T,
+        sky)`` gives the reference's Gram matrix ``(g00, g11, g01)`` at grid
+        times ``T`` and sky offsets ``sky``, which stand for the arrival
+        times since the Gram matrix changes over a day far less than a
+        template's time offset matters.
+
+        Every (sky, third coordinate) pair weighs the grid's vectors
+        (Taylor orders and sky basis vectors) differently; one matrix product
+        per block of nodes gives them all.
+
+        Parameters
+        ----------
+        sky : array, shape ``(S, 2)``
+            Sky offsets; the correlator's ``sky`` when not given.
+
+        Returns the largest 2F over arrival time, shape ``(S,
+        len(s3_values), n1, n2)``, the arrival-time grid index where it is
+        reached, and the nodes' phase coordinates ``(s1, s2)``."""
+        xp = self.xp
+        c = self.correlator
+        npoly = c.sky_sets
+        shape = self.grid.shape[1:]
+        n1, n2, n3 = shape
+        sky = numpy.atleast_2d(c.sky if sky is None else sky)
+        T = self.start[-1] + numpy.arange(n3) * self.step[-1]
+        G = []
+        for d in sky:
+            g00, g11, g01 = (xp.asarray(v) / noise_variance
+                             for v in gram(T, d))
+            det = xp.maximum(g00 * g11 - xp.abs(g01) ** 2, 1e-300)
+            G.append((g00 / det, g11 / det, g01 / det))
+        mono = c.sky_weights(sky)                          # (npoly, S)
+        s3 = numpy.asarray(s3_values, dtype=float)
+        taylor = s3[None, :] ** numpy.arange(self.terms)[:, None]
+        # (S, n_s3, terms, npoly), the vectors' order in the grid
+        weight = (mono.T[:, None, None, :] * taylor.T[None, :, :, None])
+        combos = len(sky) * len(s3)
+        weight = xp.asarray(weight.reshape(combos, -1) / noise_variance,
+                            dtype=self.grid.dtype)
+        vectors = self.grid.reshape(self.terms * npoly, 2, n1, n2 * n3)
+        if chunk is None:
+            # the products' output, two bases of every combination, within
+            # about as much memory as a vector of the grid
+            chunk = max(1, n1 // (2 * combos))
+        best = xp.empty((combos, n1, n2))
+        where = xp.empty((combos, n1, n2), dtype=xp.int64)
+        for r0 in range(0, n1, chunk):
+            rows = slice(r0, min(r0 + chunk, n1))
+            nr = rows.stop - rows.start
+            sub = vectors[:, :, rows].reshape(len(weight[0]), -1)
+            z = (weight @ sub).reshape(combos, 2, nr, n2, n3)
+            for i in range(combos):
+                h00, h11, h01 = G[i // len(s3)]
+                z0 = z[i, 0].astype(xp.complex128)
+                z1 = z[i, 1].astype(xp.complex128)
+                twof = (h11 * xp.abs(z0) ** 2 + h00 * xp.abs(z1) ** 2
+                        - 2 * xp.real(xp.conj(z0) * h01 * z1))
+                best[i, rows] = twof.max(axis=-1)
+                where[i, rows] = twof.argmax(axis=-1)
+            del z
+        nodes = [self.start[d] + numpy.arange(shape[d]) * self.step[d]
+                 for d in range(self.ndir)]
+        out = (len(sky), len(s3), n1, n2)
+        return best.reshape(out), where.reshape(out), nodes
+
     def time_limits(self):
         """The grid times, s, interpolation can reach."""
         hw = self.half_width[-1]
@@ -1029,6 +1103,108 @@ def _complex(xp):
 
 def _real(xp):
     return numpy.float64 if xp is numpy else xp.float32
+
+
+def phase_grid_search(correlator, region, delay_range, gram,
+                      noise_variance=1.0, sky=None, top=20, depth=0,
+                      max_depth=8, **grid_options):
+    """The F-statistic over a region of templates and sky positions, on
+    NUFFT grids: each grid gives ``2F`` at every node, third phase
+    coordinate and sky position, and arrival-time sample (see
+    :meth:`PhaseGrid.grid_twof`). While one grid cannot hold the region, it
+    is halved along its leading phase coordinate, or the arrival times are
+    once the region is down to a few points; so is a region whose points
+    keep more phase outside the grid's directions than the grid's
+    ``phase_tolerance``.
+
+    The third phase coordinate is searched at the grid's spacing of the
+    first two, ``pi / (oversample X)`` with ``X`` the half-extent of its
+    node coordinates.
+
+    Parameters
+    ----------
+    correlator : PhaseNUFFTCorrelation
+        The family's strengths, on a sky basis spanning the positions
+        searched (``sky_points``).
+    region : array, shape ``(M, 4)``
+        Points (mchirp, q, spin1z, spin2z) spanning the region.
+    delay_range : tuple
+        Arrival times searched, s.
+    gram : callable
+        ``gram(T, sky)``, the reference's Gram matrix at grid times, see
+        :meth:`PhaseGrid.grid_twof`.
+    sky : array, shape ``(S, 2)``
+        Sky offsets searched; the correlator's ``sky`` when not given.
+    top : int
+        Candidates kept.
+
+    Returns
+    -------
+    dict
+        ``candidates``, the ``top`` largest ``2F`` values with their phase
+        coordinates, third coordinate, sky offsets, arrival time and the
+        region point nearest each, and ``templates``, the number of
+        templates (nodes, third values and sky positions) searched.
+    """
+    import logging
+    region = numpy.atleast_2d(region)
+    sky = numpy.atleast_2d(correlator.sky if sky is None else sky)
+    try:
+        grid = PhaseGrid(correlator, region, delay_range, **grid_options)
+        if grid.phase_residual > grid.phase_tolerance:
+            del grid
+            if len(region) < 4:
+                raise ValueError("the region's phase does not fit the "
+                                 "grid's directions")
+            raise MemoryError("the region's phase leaves the grid's "
+                              "directions")
+    except MemoryError:
+        if depth >= max_depth:
+            raise
+        if len(region) >= 4:
+            frame = correlator.frame(region, 1)
+            s, _, _ = correlator.project(region, frame)
+            half = numpy.median(s[:, 0])
+            parts = [(region[s[:, 0] <= half], delay_range),
+                     (region[s[:, 0] > half], delay_range)]
+        else:
+            mid = 0.5 * (delay_range[0] + delay_range[1])
+            parts = [(region, (delay_range[0], mid)),
+                     (region, (mid, delay_range[1]))]
+        found, count = [], 0
+        for part, delays in parts:
+            out = phase_grid_search(correlator, part, delays, gram,
+                                    noise_variance, sky, top, depth + 1,
+                                    max_depth, **grid_options)
+            found.extend(out['candidates'])
+            count += out['templates']
+        found.sort(key=lambda c: -c['twof'])
+        return dict(candidates=found[:top], templates=count)
+    if grid.terms > 1 and numpy.isfinite(grid.s3_half):
+        n = int(numpy.ceil(2 * grid.s3_half / grid.s3_step)) + 1
+        s3_values = numpy.linspace(-1, 1, n) * grid.s3_half
+    else:
+        s3_values = numpy.zeros(1)
+    best, where, axes = grid.grid_twof(gram, noise_variance, s3_values, sky)
+    best, where = _host(best), _host(where)
+    flat = numpy.argsort(best, axis=None)[::-1][:top]
+    found = []
+    s_region, _, _ = correlator.project(region, grid.frame)
+    for k in flat:
+        i0, i3, i1, i2 = numpy.unravel_index(k, best.shape)
+        coords = [axes[0][i1]] + ([axes[1][i2]] if grid.ndir > 1 else [])
+        dist = numpy.sum((s_region[:, :len(coords)] - coords) ** 2, axis=1)
+        found.append(dict(
+            twof=float(best[i0, i3, i1, i2]), s=coords,
+            s3=float(s3_values[i3] + grid.middle), sky=sky[i0],
+            time=float(grid.start[-1] + where[i0, i3, i1, i2]
+                       * grid.step[-1]),
+            nearest=region[numpy.argmin(dist)]))
+    count = int(numpy.prod(best.shape))
+    logging.info("phase grid search: grid %s, %d templates, 2F max %.1f",
+                 grid.size, count, best.max())
+    del grid
+    return dict(candidates=found, templates=count)
 
 
 def _host(array):

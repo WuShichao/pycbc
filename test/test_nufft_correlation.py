@@ -97,6 +97,36 @@ def test_gpu_grid_matches_the_cpu():
     assert relative_error(z, exact) < 5e-4
 
 
+def test_grid_twof_weighs_every_vector():
+    from pycbc.filter.nufft_correlation import PhaseGrid
+    c = correlator()
+    region = templates(12)
+    g = PhaseGrid(c, region, (-2e4, 2e4), taylor_tolerance=1e-9)
+    assert g.terms > 1
+    T = g.start[-1] + numpy.arange(g.size[-1]) * g.step[-1]
+    g00 = 1 + 0.1 * numpy.cos(T / 1e4)
+    g11 = 1 + 0.1 * numpy.sin(T / 1e4)
+    g01 = 0.05 * numpy.exp(1j * T / 3e4)
+
+    def gram(times, sky):
+        return g00, g11, g01
+    s3 = numpy.array([-0.5, 0.0, 0.7]) * g.s3_half
+    best, where, axes = g.grid_twof(gram, 2.0, s3, numpy.zeros((2, 2)),
+                                    chunk=3)
+    assert best.shape == (2, 3) + tuple(g.size[:2])
+    vectors = g.grid.reshape(g.terms, 2, *g.grid.shape[1:])
+    det = g00 * g11 - abs(g01) ** 2
+    for i, v in enumerate(s3):
+        z = (vectors * (v ** numpy.arange(g.terms))[:, None, None, None,
+                                                    None]).sum(axis=0) / 2
+        twof = (g11 * abs(z[0]) ** 2 + g00 * abs(z[1]) ** 2 - 2 * numpy.real(
+            numpy.conj(z[0]) * g01 * z[1])) / det * 2
+        numpy.testing.assert_allclose(best[0, i], twof.max(axis=-1),
+                                      rtol=1e-10)
+        numpy.testing.assert_array_equal(where[1, i], twof.argmax(axis=-1))
+    assert len(axes) == 2 and len(axes[0]) == g.size[0]
+
+
 def test_runs_of_bins_gathered_by_their_moments():
     """For a narrow window of arrival times the transform gathers runs of
     bins at their middles through their moments; the correlations stay
