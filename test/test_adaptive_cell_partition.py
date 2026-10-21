@@ -79,3 +79,24 @@ def test_kept_cells_meet_the_region_and_dropped_ones_do_not():
 def test_bad_radii_are_refused():
     with pytest.raises(ValueError):
         EllipsoidCells(CHART, [1.0, 1.0], 0.05)
+
+
+def test_a_written_partition_reads_back(tmp_path):
+    from pycbc.tmpltbank.adaptive_cell_partition import (read_partition,
+                                                         write_partition)
+    rng = numpy.random.default_rng(2)
+    centres = rng.normal(size=(5, 3))
+    widths = numpy.full((5, 3), 0.5)
+    statistic = rng.normal(size=5)
+    candidate = statistic > 0
+    path = str(tmp_path / 'cells.hdf')
+    write_partition(path, ['a', 'b', 'c'], [1.0, 2.0, 3.0], [0.1, 0.2, 0.3],
+                    numpy.eye(3), centres, widths, statistic, candidate,
+                    program='test', distance=190.0)
+    part = read_partition(path)
+    assert part['parameters'] == ['a', 'b', 'c']
+    assert numpy.array_equal(part['centres'], centres)
+    assert numpy.array_equal(part['candidate'], candidate)
+    assert numpy.array_equal(part['metric'], numpy.eye(3))
+    assert part['attrs']['program'] == 'test'
+    assert part['attrs']['distance'] == 190.0

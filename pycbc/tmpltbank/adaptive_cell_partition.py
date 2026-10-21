@@ -134,3 +134,55 @@ class EllipsoidCells(object):
         group['stiff'] = self.stiff
         group['centres'] = centres
         group['widths'] = widths
+
+
+def write_partition(path, parameters, reference, scales, metric, centres,
+                    widths, statistic, candidate, **attrs):
+    """Write a search's cells for a follow-up.
+
+    Parameters
+    ----------
+    path : str
+        The HDF file.
+    parameters : list of str
+        The shape coordinates' parameters, in order.
+    reference, scales : array_like
+        Each parameter's reference value and shape unit: a parameter is
+        ``reference + scale * xi``.
+    metric : array_like
+        The metric in ``xi``, whose chart (see
+        :class:`pycbc.tmpltbank.fstatistic_metric.MetricChart`) the cells are
+        boxes of.
+    centres, widths : array_like, shape ``(ncells, dim)``
+        The cells, in chart coordinates.
+    statistic : array_like, shape ``(ncells,)``
+        The detection statistic of each cell.
+    candidate : array_like of bool, shape ``(ncells,)``
+        The cells handed to the follow-up.
+    attrs
+        Further attributes of the file, such as the program and its
+        arguments.
+    """
+    import h5py
+    with h5py.File(path, 'w') as f:
+        f.attrs['parameters'] = list(parameters)
+        for key, value in attrs.items():
+            f.attrs[key] = value
+        f['reference'] = numpy.asarray(reference, dtype=float)
+        f['scales'] = numpy.asarray(scales, dtype=float)
+        f['metric'] = numpy.asarray(metric, dtype=float)
+        f['centres'] = numpy.asarray(centres, dtype=float)
+        f['widths'] = numpy.asarray(widths, dtype=float)
+        f['statistic'] = numpy.asarray(statistic, dtype=float)
+        f['candidate'] = numpy.asarray(candidate, dtype=bool)
+
+
+def read_partition(path):
+    """The contents of :func:`write_partition`'s file, as a dict."""
+    import h5py
+    with h5py.File(path, 'r') as f:
+        out = {key: f[key][()] for key in f}
+        out['parameters'] = [str(p) for p in f.attrs['parameters']]
+        out['attrs'] = dict(f.attrs)
+    return out
+
