@@ -33,6 +33,8 @@ The inputs are whitened spectra, already multiplied by any data window, so
 the metric holds for any detector whose response gives the two bases.
 """
 
+import sys
+
 import numpy
 
 
@@ -45,9 +47,94 @@ def orientation_weights(inclination, polarization):
     return numpy.array([c2 * plus - s2 * cross, s2 * plus + c2 * cross])
 
 
-def _real(z):
-    z = numpy.asarray(z)
-    return numpy.concatenate([z.real.ravel(), z.imag.ravel()])
+def _array_module(array):
+    cupy = sys.modules.get('cupy')
+    if cupy is not None and isinstance(array, cupy.ndarray):
+        return cupy
+    return numpy
+
+
+def tangent_gram(basis, derivatives, frequencies, chunk=1 << 18):
+    """The Hermitian inner products ``sum conj(u) v`` of the vectors
+
+        y_a,  2 pi i f y_a,  d_i y_a,
+
+    for each basis ``a`` and parameter ``i``, in that order (``a`` fastest):
+    everything :func:`metric_from_gram` needs, in one pass over the samples.
+
+    The arrays may live on numpy or cupy; they are read ``chunk`` samples
+    of the last axis at a time, so no copy of their size is made.
+
+    Parameters
+    ----------
+    basis : array, complex, shape ``(2, ..., N)``
+        The whitened plus and cross bases; the last axis is frequency.
+    derivatives : array, complex, shape ``(nparams, 2, ..., N)``
+        Their derivatives with respect to each parameter.
+    frequencies : array_like, shape ``(N,)``
+        The frequency of each sample of the last axis, Hz.
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape ``(4 + 2 nparams, 4 + 2 nparams)``, complex.
+    """
+    xp = _array_module(basis)
+    if basis.shape[0] != 2 or tuple(derivatives.shape[1:]) != basis.shape:
+        raise ValueError("basis must be (2, ...) and derivatives "
+                         "(nparams, 2, ...) of the same trailing shape")
+    nparams = derivatives.shape[0]
+    size = basis.shape[-1]
+    freqs = xp.asarray(frequencies, dtype=xp.float64)
+    gram = 0
+    for start in range(0, size, chunk):
+        cut = slice(start, min(start + chunk, size))
+        y = basis[..., cut].astype(xp.complex128)
+        timing = 2j * numpy.pi * freqs[cut] * y
+        d = derivatives[..., cut].astype(xp.complex128)
+        rows = xp.concatenate([y, timing, d.reshape((2 * nparams,)
+                                                    + y.shape[1:])])
+        rows = rows.reshape(len(rows), -1)
+        gram = gram + xp.conj(rows) @ rows.T
+    return gram.get() if hasattr(gram, 'get') else numpy.asarray(gram)
+
+
+def metric_from_gram(gram, weights, project='fstat'):
+    """:func:`fstatistic_metric` from :func:`tangent_gram`'s inner products,
+    for orientation ``weights``: each vector of the metric is a complex
+    combination of the Gram's vectors, so its real inner products follow
+    exactly."""
+    gram = numpy.asarray(gram)
+    nparams = (len(gram) - 4) // 2
+    w = numpy.asarray(weights, dtype=complex)
+
+    def vector(entries):
+        c = numpy.zeros(len(gram), dtype=complex)
+        for index, value in entries:
+            c[index] = value
+        return c
+    signal = vector([(0, w[0]), (1, w[1])])
+    timing = vector([(2, w[0]), (3, w[1])])
+    if project == 'fstat':
+        removed = [vector([(0, 1)]), vector([(0, 1j)]), vector([(1, 1)]),
+                   vector([(1, 1j)]), timing]
+    elif project == 'orientation':
+        removed = [signal, 1j * signal, timing]
+    else:
+        raise ValueError("project must be 'fstat' or 'orientation'")
+    tangents = [vector([(4 + 2 * i, w[0]), (5 + 2 * i, w[1])])
+                for i in range(nparams)]
+    C = numpy.array(removed + tangents).T
+    real = numpy.real(C.conj().T @ gram @ C)
+    r = len(removed)
+    # the tangents' part orthogonal to the removed span: a Schur complement
+    # in units where the removed vectors have unit norm
+    scale = 1 / numpy.sqrt(numpy.diag(real)[:r])
+    rss = real[:r, :r] * numpy.outer(scale, scale)
+    rst = real[:r, r:] * scale[:, None]
+    projected = real[r:, r:] - rst.T @ numpy.linalg.solve(rss, rst)
+    norm = numpy.real(signal.conj() @ gram @ signal)
+    return projected / (2 * norm)
 
 
 def fstatistic_metric(basis, derivatives, weights, frequencies,
@@ -72,26 +159,14 @@ def fstatistic_metric(basis, derivatives, weights, frequencies,
     numpy.ndarray
         The metric, shape ``(nparams, nparams)``.
     """
-    basis = numpy.asarray(basis, dtype=complex)
-    derivatives = numpy.asarray(derivatives, dtype=complex)
-    weights = numpy.asarray(weights, dtype=complex)
-    if basis.shape[0] != 2 or derivatives.shape[1:] != basis.shape:
-        raise ValueError("basis must be (2, ...) and derivatives "
-                         "(nparams, 2, ...) of the same trailing shape")
-    signal = numpy.tensordot(weights, basis, axes=1)
-    tangents = numpy.tensordot(derivatives, weights, axes=([1], [0]))
-    timing = 2j * numpy.pi * numpy.asarray(frequencies) * signal
-    if project == 'fstat':
-        removed = [basis[0], 1j * basis[0], basis[1], 1j * basis[1], timing]
-    elif project == 'orientation':
-        removed = [signal, 1j * signal, timing]
-    else:
-        raise ValueError("project must be 'fstat' or 'orientation'")
-    span, _ = numpy.linalg.qr(numpy.array([_real(b) for b in removed]).T)
-    t = numpy.array([_real(d) for d in tangents]).T
-    t -= span @ (span.T @ t)
-    norm = numpy.sum(_real(signal) ** 2)
-    return t.T @ t / (2 * norm)
+    xp = _array_module(basis)
+    basis, derivatives = xp.asarray(basis), xp.asarray(derivatives)
+    if not xp.iscomplexobj(basis):
+        basis = basis.astype(complex)
+    if not xp.iscomplexobj(derivatives):
+        derivatives = derivatives.astype(complex)
+    return metric_from_gram(tangent_gram(basis, derivatives, frequencies),
+                            weights, project)
 
 
 class MetricChart(object):
