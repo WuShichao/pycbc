@@ -40,6 +40,8 @@ directions, and what its sky's response keeps outside the region's sky
 basis (:class:`SkyBasis`), are measured for each template.
 """
 
+import math
+
 import numpy
 
 from pycbc.tdi.ssb_yearly_harmonics import ORBITAL_ANGULAR_FREQUENCY
@@ -337,6 +339,17 @@ class PhaseNUFFTCorrelation(object):
             amp.append(numpy.exp(la - self._la0))
         return numpy.array(dC), numpy.array(amp)
 
+    def correlate_grid(self, thetas, delays, **kwargs):
+        """``z`` of shape ``(2, M, L)`` for parameter rows ``thetas`` ``(M,
+        4)`` (mchirp, q, spin1z, spin2z) and arrival times ``delays``
+        ``(L,)``, s, through a :class:`PhaseGrid` over the batch itself: one
+        type-1 transform whose cost does not grow with the number of
+        templates, then interpolation to each."""
+        delays = numpy.asarray(delays, dtype=float)
+        grid = PhaseGrid(self, thetas, (delays.min(), delays.max()),
+                         **kwargs)
+        return grid.evaluate(thetas, delays)
+
     def frame(self, thetas, nall):
         """The phase frame of a region given by sample points ``thetas``:
         its leading ``nall`` directions and what :meth:`project` needs.
@@ -420,6 +433,593 @@ class PhaseNUFFTCorrelation(object):
         if d < 0:
             return omega - w
         return x_phase[d] - w / (2 * numpy.pi) * x_slope[d]
+
+
+class PhaseGrid(object):
+    """The correlations of a PN-coefficient family over a region, on a
+    uniform grid of two phase coordinates and arrival time, from one type-1
+    transform per Taylor order and basis; any template of the region is
+    then an interpolation.
+
+    The correlation is band-limited in each coordinate by the extent ``X``
+    of the nodes; the grid steps are ``pi / (oversample X)`` and the
+    Kaiser-windowed sinc interpolation uses ``half_width`` points either
+    side. The third phase direction enters through its Taylor series about
+    the region's middle, with as many orders as bring the largest omitted
+    one below ``taylor_tolerance``.
+
+    Parameters
+    ----------
+    correlator : PhaseNUFFTCorrelation
+        The family's data-side strengths and basis.
+    region : array, shape ``(M, 4)``
+        Points (mchirp, q, spin1z, spin2z) spanning the region.
+    delay_range : tuple
+        The arrival times to cover, s.
+    time_range : tuple, optional
+        The grid times ``delay + shift`` to cover, s, in place of those
+        ``delay_range`` gives every template of the region.
+    phase_tolerance : float
+        The largest power-weighted rms phase, rad, a template may keep
+        outside the grid's directions (see
+        :meth:`PhaseNUFFTCorrelation.phase_residual`); :meth:`inside` is
+        false beyond it.
+    """
+    def __init__(self, correlator, region, delay_range, ndir=2,
+                 taylor_tolerance=1e-4, oversample=(4.0, 4.0, 2.0),
+                 half_width=(6, 6, 12), beta=(14.0, 14.0, 18.0),
+                 upsampfac=2.0, nufft_options=None, margin=0.05,
+                 memory_limit=2.2e9, phase_tolerance=1e-4,
+                 time_range=None):
+        import logging
+        import time
+        xp = self.xp = correlator.xp
+        cplx, real = _complex(xp), _real(xp)
+        self.correlator = correlator
+        region = numpy.atleast_2d(numpy.asarray(region, dtype=float))
+        ndir = max(1, min(ndir, len(region)))
+        frame = correlator.frame(region, ndir + 1)
+        self.frame = frame
+        ndir = min(ndir, frame['directions'].shape[1])
+        self.ndir = ndir
+        self.phase_tolerance = float(phase_tolerance)
+        self.phase_residual = float(correlator.phase_residual(
+            region, frame).max())
+        s, shift, _ = correlator.project(region, frame)
+        parts = correlator.nodes(frame)
+        orders = correlator.orders
+        rows = list(range(ndir)) + [-1]
+
+        def extent(d):
+            lo_, hi_ = numpy.inf, -numpy.inf
+            for k in orders:
+                r = correlator.node_row(parts, d, k)
+                lo_, hi_ = min(lo_, float(r.min())), max(hi_, float(r.max()))
+            return lo_, hi_
+        # Taylor variable: the third direction about the region's middle
+        self.terms, self.middle, self.s3_half = 1, 0.0, numpy.inf
+        third = s.shape[1] > ndir
+        if third:
+            self.middle = 0.5 * (s[:, ndir].max() + s[:, ndir].min())
+            self.s3_half = numpy.abs(s[:, ndir] - self.middle).max() * (
+                1 + margin)
+            x3lo, x3hi = extent(ndir)
+            reach = max(abs(x3lo), abs(x3hi)) * float(
+                numpy.abs(s[:, ndir] - self.middle).max()) * (1 + margin)
+            # the templates' spacing along it, as along the grid's axes
+            self.s3_step = numpy.pi / (oversample[0] * max(
+                0.5 * (x3hi - x3lo), 1e-300))
+            term = 1.0
+            while term > taylor_tolerance:
+                term *= reach / self.terms
+                self.terms += 1
+        if time_range is None:
+            time_range = (delay_range[0] + shift.min(),
+                          delay_range[1] + shift.max())
+        lo = [s[:, d].min() for d in range(ndir)] + [time_range[0]]
+        hi = [s[:, d].max() for d in range(ndir)] + [time_range[1]]
+        self.half_width, self.beta = half_width, beta
+        self.centre, self.step, self.start, self.size = [], [], [], []
+        for d, row in enumerate(rows):
+            xlo, xhi = extent(row)
+            xc = 0.5 * (xlo + xhi)
+            X = max(0.5 * (xhi - xlo), 1e-300)
+            h = numpy.pi / (oversample[d] * X)
+            pad = margin * (hi[d] - lo[d])
+            n = int(numpy.ceil((hi[d] - lo[d] + 2 * pad) / h)) \
+                + 2 * half_width[d] + 2
+            n += n % 2
+            mid = 0.5 * (hi[d] + lo[d])
+            self.centre.append(xc)
+            self.step.append(h)
+            self.start.append(mid - (n // 2) * h)
+            self.size.append(n)
+        npoly = correlator.sky_sets
+        item = numpy.dtype(cplx).itemsize
+        need = 2 * self.terms * npoly * numpy.prod(self.size) * item * (
+            1 + upsampfac ** len(self.size) / (2 * self.terms * npoly))
+        logging.info("PhaseGrid: grid %s, %d Taylor terms, about %.2f GB",
+                     self.size, self.terms, need / 1e9)
+        if xp is not numpy:
+            # what the device can hold now, with room for the transform
+            xp.get_default_memory_pool().free_all_blocks()
+            free = xp.cuda.runtime.memGetInfo()[0]
+            memory_limit = min(memory_limit, free - 4e8)
+        if need > memory_limit:
+            raise MemoryError(
+                "the region needs a grid of {:.2f} GB ({} Taylor terms, "
+                "grid {}); split it into smaller regions".format(
+                    need / 1e9, self.terms, self.size))
+        # the grid first, while the device memory is free: an array
+        # allocated after the transforms' work space may land in host-shared
+        # memory, where every read crosses the bus
+        shape = tuple(self.size) if len(self.size) == 3 else (
+            self.size[0], 1, self.size[1])
+        self.grid = xp.empty((self.terms * npoly * 2,) + shape, dtype=cplx)
+        # scaled nodes and strengths, a harmonic at a time, in single
+        # precision: F(mid + m h) = sum c exp(i mid (x - xc)) exp(i m h (x -
+        # xc)), times exp(i (mid + m h) xc), applied in evaluate
+        N = len(correlator.f)
+        total = N * len(orders)
+        scaled = [xp.empty(total, dtype=real) for _ in rows]
+        ix3 = xp.empty(total, dtype=cplx) if third else None
+        centring = []
+        for i, k in enumerate(orders):
+            cut = slice(i * N, (i + 1) * N)
+            phase = 0.0
+            for d, row in enumerate(rows):
+                x = correlator.node_row(parts, row, k)
+                scaled[d][cut] = ((x - self.centre[d]) * self.step[d])
+                phase = phase + 0.5 * (hi[d] + lo[d]) * (x - self.centre[d])
+            if third:
+                x3 = correlator.node_row(parts, ndir, k)
+                phase = phase + self.middle * x3
+                ix3[cut] = 1j * x3
+            centring.append(xp.exp(1j * phase).astype(cplx))
+        parts = None
+        if xp is numpy:
+            import finufft as lib
+            options = dict(nufft_options or {})
+        else:
+            import cufinufft as lib
+            options = dict(gpu_method=1, gpu_sort=0, gpu_maxbatchsize=1)
+            options.update(nufft_options or {})
+        blocked = _BlockedNodes(scaled, len(orders), N, self.size,
+                                correlator.eps, xp)
+        del scaled
+        blocked.plan(lib, options, cplx, upsampfac, correlator.eps)
+        self.blocks = blocked.width
+        logging.info("PhaseGrid: %d bins a block, moments to order %d",
+                     blocked.width, blocked.order)
+        tick = time.time()
+        base = xp.empty((2, total), dtype=cplx)
+        for p in range(npoly):
+            for i in range(len(orders)):
+                cut = slice(i * N, (i + 1) * N)
+                base[:, cut] = correlator.strength(i, p) * centring[i][None]
+            current = base
+            for q in range(self.terms):
+                if q:
+                    current = current * ix3[None] / q
+                for a in range(2):
+                    self.grid[(q * npoly + p) * 2 + a] = blocked.transform(
+                        current[a]).reshape(shape)
+        del current, base, ix3, centring, blocked
+        if xp is not numpy:
+            xp.cuda.Stream.null.synchronize()
+            xp.get_default_memory_pool().free_all_blocks()
+        grids = self.grid
+        logging.info("PhaseGrid %s, %d vectors, %.2f s", self.size,
+                     len(grids), time.time() - tick)
+
+    def time_limits(self):
+        """The grid times, s, interpolation can reach."""
+        hw = self.half_width[-1]
+        return (self.start[-1] + hw * self.step[-1],
+                self.start[-1] + (self.size[-1] - hw - 1) * self.step[-1])
+
+    def inside(self, thetas, delay_range=None):
+        """Whether each template's interpolation stays on the grid and its
+        third coordinate within the Taylor series' reach, for arrival times
+        in ``delay_range`` (not checked when not given)."""
+        s, shift, _ = self.correlator.project(thetas, self.frame)
+        ok = numpy.ones(len(shift), dtype=bool)
+        hw = self.half_width
+        for d in range(self.ndir):
+            lo = self.start[d] + hw[d] * self.step[d]
+            hi = self.start[d] + (self.size[d] - hw[d] - 1) * self.step[d]
+            ok &= (s[:, d] >= lo) & (s[:, d] <= hi)
+        if delay_range is not None:
+            lo, hi = self.time_limits()
+            ok &= (delay_range[0] + shift >= lo) & (
+                delay_range[1] + shift <= hi)
+        if self.terms > 1:
+            ok &= numpy.abs(s[:, self.ndir] - self.middle) <= self.s3_half
+        ok &= self.correlator.phase_residual(thetas, self.frame) \
+            <= self.phase_tolerance
+        return ok
+
+    def evaluate(self, thetas, delays, sky=None, chunk=1024):
+        """``z`` of shape ``(2, M, L)`` for templates ``thetas`` of the
+        region at arrival times ``delays``, s: ``(L,)`` for all, or ``(M,
+        L)``, each template its own; ``sky``, ``(M, 2)``, their sky offsets,
+        by default the correlator's ``sky``.
+
+        The vectors of the grid (Taylor orders, sky basis vectors, bases) are
+        combined with each template's weights while interpolating along the
+        phase coordinates, so the arrival-time interpolation works on the
+        two bases only."""
+        xp = self.xp
+        s, shift, const = self.correlator.project(thetas, self.frame)
+        delays = numpy.asarray(delays, dtype=float)
+        if delays.ndim == 1:
+            delays = numpy.broadcast_to(delays, (len(shift), len(delays)))
+        nd = self.ndir
+        hw, beta = self.half_width, self.beta
+        M, nl = delays.shape
+        npoly = self.correlator.sky_sets
+        weight = numpy.ones((M, self.terms, npoly), dtype=complex)
+        if self.terms > 1:
+            s3 = s[:, nd] - self.middle
+            weight = weight * (s3[:, None] ** numpy.arange(self.terms)
+                               )[:, :, None]
+        if npoly > 1 or getattr(self.correlator, 'sky_basis',
+                                None) is not None:
+            if sky is None:
+                sky = numpy.broadcast_to(self.correlator.sky, (M, 2))
+            weight = weight * self.correlator.sky_weights(sky).T[:, None, :]
+        weight = weight.reshape(M, -1)                    # (M, terms npoly)
+        out = xp.empty((2, M, nl), dtype=self.grid.dtype)
+        for j0 in range(0, M, chunk):
+            js = numpy.arange(j0, min(j0 + chunk, M))
+            taps = []
+            for d in range(nd):
+                u = (s[js, d] - self.start[d]) / self.step[d]
+                i0 = numpy.floor(u).astype(int) - hw[d] + 1
+                offs = u[:, None] - (i0[:, None] + numpy.arange(2 * hw[d]))
+                taps.append((i0, _kaiser_taps(offs, hw[d], beta[d])))
+            if nd == 1:
+                taps.append((numpy.zeros(len(js), int),
+                             numpy.ones((len(js), 1))))
+            (i1, w1), (i2, w2) = taps
+            H = _phase_combine(self.grid, i1, w1, i2, w2, weight[js], xp)
+            T = delays[js] + shift[js][:, None]
+            vals = _time_interpolate(H, (T - self.start[-1]) / self.step[-1],
+                                     hw[-1], beta[-1], xp)
+            cphase = sum(s[js, d] * self.centre[d] for d in range(nd))
+            cphase = cphase[:, None] + T * self.centre[-1]
+            out[:, js] = vals * xp.asarray(numpy.exp(1j * cphase),
+                                           dtype=self.grid.dtype)[None]
+        return out * xp.asarray(const)[None, :, None]
+
+
+class _BlockedNodes(object):
+    """The type-1 transform of the PhaseGrid's nodes, ``sum_j c_j exp(i m .
+    y_j)`` on the grid's modes ``m``, with the nodes of runs of ``width``
+    consecutive frequency bins of each harmonic gathered at the run's
+    middle node ``y_b``: with ``delta_j = y_j - y_b``,
+
+        exp(i m . delta_j) = sum_alpha (i m)^alpha delta_j^alpha / alpha!,
+
+    so the transform is ``sum_alpha m^alpha i^|alpha| / alpha!`` times the
+    transform of the moments ``sum_{j in b} c_j delta_j^alpha`` at the run
+    middles. With ``e = sum_d (n_d / 2) |delta_jd|``, the largest over the
+    bins, the terms past order ``R`` change each bin's term by at most
+    ``e^(R+1) exp(e) / (R+1)!`` of ``|c_j|``, kept below the transform's
+    ``eps``; the run width is the one of least cost, one bin (the plain
+    transform) when no run pays."""
+    #: the cost of a moment's pass over the bins, in kernel points spread
+    moment_cost = 1.0
+
+    def __init__(self, scaled, nk, N, size, eps, xp, max_order=8,
+                 widths=(1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)):
+        self.xp, self.nk, self.N = xp, nk, N
+        self.size = list(size)
+        D = len(scaled)
+        half = [n // 2 for n in size]
+        kernel = (int(numpy.ceil(-numpy.log10(eps))) + 1) ** D
+        total = nk * N
+        best = (total * kernel, 1, 0)
+        for width in widths[1:]:
+            if width > N:
+                break
+            e = 0
+            for d in range(D):
+                y = self._runs(scaled[d], width)
+                e = e + half[d] * xp.abs(y - y[:, width // 2][:, None])
+            e = float(e.max())
+            order = None
+            for R in range(1, max_order + 1):
+                if e ** (R + 1) * numpy.exp(e) / math.factorial(R + 1) \
+                        <= eps:
+                    order = R
+                    break
+            if order is None:
+                continue
+            terms = math.comb(order + D, D)
+            cost = terms * (total / width * kernel
+                            + self.moment_cost * total)
+            if cost < best[0]:
+                best = (cost, width, order)
+        _, self.width, self.order = best
+        if self.width == 1:
+            self.nodes = scaled
+            self.alphas = [(0,) * D]
+            return
+        runs = [self._runs(y, self.width) for y in scaled]
+        self.nodes = [xp.ascontiguousarray(y[:, self.width // 2])
+                      for y in runs]
+        self.deltas = [y - y[:, self.width // 2][:, None] for y in runs]
+        self.alphas = _nested(self.order, D)
+
+    def _runs(self, values, width, zero=False):
+        """``values`` of the harmonics' bins as runs ``(runs, width)``,
+        each harmonic's last run padded with its last value, or with zeros
+        (strengths)."""
+        xp = self.xp
+        v = values.reshape(self.nk, self.N)
+        extra = (-self.N) % width
+        if extra:
+            pad = (xp.zeros((self.nk, extra), dtype=v.dtype) if zero
+                   else xp.repeat(v[:, -1:], extra, axis=1))
+            v = xp.concatenate([v, pad], axis=1)
+        return v.reshape(-1, width)
+
+    def plan(self, lib, options, cplx, upsampfac, eps, memory=2.5e8):
+        """The transform's plan, for as many moments at a time as fit in
+        ``memory`` bytes of output."""
+        cells = int(numpy.prod(self.size))
+        self.batch = int(max(1, min(len(self.alphas),
+                                    memory // (8 * cells))))
+        self.cplx = cplx
+        self._plan = lib.Plan(1, tuple(self.size), n_trans=self.batch,
+                              eps=eps, isign=1,
+                              dtype=numpy.dtype(cplx).name,
+                              upsampfac=upsampfac, **options)
+        self._plan.setpts(*self.nodes)
+        self._modes = [self.xp.arange(n, dtype=numpy.float64) - n // 2
+                       for n in self.size]
+
+    def _mode_power(self, alpha):
+        out = None
+        for d, a in enumerate(alpha):
+            if a == 0:
+                continue
+            shape = [1] * len(self.size)
+            shape[d] = self.size[d]
+            v = (self._modes[d] ** a).reshape(shape)
+            out = v if out is None else out * v
+        return out
+
+    def transform(self, strengths):
+        """The transform of one vector of strengths, shape the grid's."""
+        xp = self.xp
+        if self.width == 1:
+            if self.batch == 1:
+                return self._plan.execute(xp.ascontiguousarray(
+                    strengths, dtype=self.cplx))
+            stack = xp.zeros((self.batch, len(strengths)), dtype=self.cplx)
+            stack[0] = strengths
+            return self._plan.execute(stack)[0]
+        c = self._runs(xp.asarray(strengths, dtype=self.cplx), self.width,
+                       zero=True)
+        moments = self._moments(c)
+        total = None
+        stack = xp.zeros((self.batch, len(c)), dtype=self.cplx)
+        for g in range(0, len(self.alphas), self.batch):
+            group = self.alphas[g:g + self.batch]
+            for i, alpha in enumerate(group):
+                stack[i] = next(moments)
+            out = self._plan.execute(stack)
+            for i, alpha in enumerate(group):
+                factor = 1j ** sum(alpha) / numpy.prod(
+                    [math.factorial(a) for a in alpha])
+                power = self._mode_power(alpha)
+                term = out[i] * (factor if power is None
+                                 else factor * power)
+                total = term if total is None else total + term
+        return total
+
+    def _moments(self, c):
+        """The moments ``sum_{j in b} c_j delta_j^alpha`` in the order of
+        :attr:`alphas`, each power one product from the last."""
+        def walk(w, d, left):
+            if d == len(self.deltas) - 1:
+                for _ in range(left + 1):
+                    yield w.sum(axis=1)
+                    w = w * self.deltas[d]
+                return
+            for a in range(left + 1):
+                yield from walk(w, d + 1, left - a)
+                w = w * self.deltas[d]
+        return walk(c, 0, self.order)
+
+
+def _nested(order, D):
+    """The multi-indices of ``D`` non-negative integers summing to at most
+    ``order``, the first varying slowest."""
+    if D == 1:
+        return [(a,) for a in range(order + 1)]
+    return [(a,) + rest for a in range(order + 1)
+            for rest in _nested(order - a, D - 1)]
+
+
+def _kaiser_taps(offsets, half_width, beta):
+    """Kaiser-windowed cardinal sine at ``offsets`` (in grid steps)."""
+    from scipy.special import i0
+    u = numpy.clip(offsets / half_width, -1, 1)
+    window = i0(beta * numpy.sqrt(1 - u * u)) / i0(beta)
+    return numpy.sinc(offsets) * window
+
+
+_TIME_INTERPOLATE = r"""
+#include <cupy/complex.cuh>
+__device__ float bessel_i0(float x) {
+  // series of I0, enough for the window's arguments
+  float term = 1.0f, sum = 1.0f, y = 0.25f * x * x;
+  for (int k = 1; k < 40; k++) {
+    term *= y / ((float)k * k);
+    sum += term;
+    if (term < 1e-8f * sum) break;
+  }
+  return sum;
+}
+
+extern "C" __global__ void time_interpolate(
+    const complex<float>* H, const double* u, const int V, const int J,
+    const int L, const int n3, const int hw, const float beta,
+    const float norm, complex<float>* out) {
+  // out[v, j, l] = sum_c K(u[j, l] - i) H[v, j, i], i within hw of u
+  long long k = (long long)blockDim.x * blockIdx.x + threadIdx.x;
+  if (k >= (long long)V * J * L) return;
+  int l = k % L;
+  int j = (k / L) % J;
+  int v = k / ((long long)L * J);
+  double x = u[(long long)j * L + l];
+  int first = (int)floor(x) - hw + 1;
+  complex<float> acc(0, 0);
+  for (int c = 0; c < 2 * hw; c++) {
+    int i = first + c;
+    if (i < 0 || i >= n3) continue;
+    float d = (float)(x - i);
+    float w = d / hw;
+    if (fabsf(w) >= 1.0f) continue;
+    float sinc = fabsf(d) < 1e-6f ? 1.0f : sinpif(d) / (3.14159265f * d);
+    float window = bessel_i0(beta * sqrtf(1.0f - w * w)) / norm;
+    acc += (sinc * window) * H[((long long)v * J + j) * n3 + i];
+  }
+  out[k] = acc;
+}
+"""
+
+
+def _time_interpolate(H, u, half_width, beta, xp, threads=256):
+    if xp is numpy:
+        return _time_interpolate_cpu(H, u, half_width, beta)
+    return _time_interpolate_gpu(H, u, half_width, beta, xp, threads)
+
+
+def _time_interpolate_cpu(H, u, half_width, beta):
+    V, J, n3 = H.shape
+    first = numpy.floor(u).astype(int) - half_width + 1        # (J, L)
+    idx = first[..., None] + numpy.arange(2 * half_width)      # (J, L, C)
+    w = _kaiser_taps(u[..., None] - idx, half_width, beta)
+    valid = (idx >= 0) & (idx < n3)
+    w = numpy.where(valid, w, 0.0)
+    idx = numpy.clip(idx, 0, n3 - 1)
+    rows = numpy.arange(J)[:, None, None]
+    return (H[:, rows, idx] * w[None]).sum(axis=-1)
+
+
+def _time_interpolate_gpu(H, u, half_width, beta, xp, threads=256):
+    """Kaiser-sinc interpolation of ``H`` ``(V, J, n3)`` at fractional
+    indices ``u`` ``(J, L)``: ``(V, J, L)``."""
+    from scipy.special import i0
+    kernel = _kernel(xp, _TIME_INTERPOLATE, 'time_interpolate')
+    rdt = numpy.float32
+    V, J, n3 = H.shape
+    L = u.shape[1]
+    out = xp.empty((V, J, L), dtype=H.dtype)
+    total = V * J * L
+    kernel(((total + threads - 1) // threads,), (threads,), (
+        xp.ascontiguousarray(H), xp.asarray(u, dtype=xp.float64),
+        numpy.int32(V), numpy.int32(J), numpy.int32(L), numpy.int32(n3),
+        numpy.int32(half_width), rdt(beta), rdt(i0(beta)), out))
+    return out
+
+
+_KERNELS = {}
+
+
+def _kernel(xp, code, name):
+    """A compiled kernel, compiled once per process."""
+    if name not in _KERNELS:
+        _KERNELS[name] = xp.RawKernel(code, name)
+    return _KERNELS[name]
+
+
+_PHASE_COMBINE = r"""
+#include <cupy/complex.cuh>
+extern "C" __global__ void phase_combine(
+    const complex<float>* grid, const int* i1, const float* w1,
+    const int* i2, const float* w2, const complex<float>* weight,
+    const int V,
+    const int J, const int n1, const int n2, const int n3, const int A,
+    const int B, complex<float>* out) {
+  // out[c, j, t] = sum_{v = c mod 2} weight[j, v / 2]
+  //                sum_a,b w1[j, a] w2[j, b] grid[v, i1[j] + a, i2[j] + b, t]
+  long long k = (long long)blockDim.x * blockIdx.x + threadIdx.x;
+  if (k >= 2LL * J * n3) return;
+  int t = k % n3;
+  int j = (k / n3) % J;
+  int c = k / ((long long)n3 * J);
+  complex<float> total(0, 0);
+  for (int v = c; v < V; v += 2) {
+    complex<float> wv = weight[(long long)j * (V / 2) + v / 2];
+    complex<float> acc(0, 0);
+    for (int a = 0; a < A; a++) {
+      int x = i1[j] + a;
+      if (x < 0 || x >= n1) continue;
+      complex<float> row(0, 0);
+      for (int b = 0; b < B; b++) {
+        int y = i2[j] + b;
+        if (y < 0 || y >= n2) continue;
+        row += w2[j * B + b]
+            * grid[(((long long)v * n1 + x) * n2 + y) * n3 + t];
+      }
+      acc += w1[j * A + a] * row;
+    }
+    total += wv * acc;
+  }
+  out[k] = total;
+}
+"""
+
+
+def _phase_combine(grid, i1, w1, i2, w2, weight, xp, threads=256):
+    if xp is numpy:
+        return _phase_combine_cpu(grid, i1, w1, i2, w2, weight)
+    return _phase_combine_gpu(grid, i1, w1, i2, w2, weight, xp, threads)
+
+
+def _phase_combine_cpu(grid, i1, w1, i2, w2, weight):
+    V, n1, n2, n3 = grid.shape
+    J, A = numpy.shape(w1)
+    B = numpy.shape(w2)[1]
+    out = numpy.zeros((2, J, n3), dtype=grid.dtype)
+    for j in range(J):
+        a = i1[j] + numpy.arange(A)
+        b = i2[j] + numpy.arange(B)
+        wa = numpy.where((a >= 0) & (a < n1), w1[j], 0.0)
+        wb = numpy.where((b >= 0) & (b < n2), w2[j], 0.0)
+        a, b = numpy.clip(a, 0, n1 - 1), numpy.clip(b, 0, n2 - 1)
+        local = grid[:, a[:, None], b[None, :], :]             # (V, A, B, n3)
+        H = numpy.einsum('vabt,a,b->vt', local, wa, wb)
+        w = numpy.repeat(weight[j], 2)                         # (V,)
+        out[0, j] = (w[0::2, None] * H[0::2]).sum(axis=0)
+        out[1, j] = (w[1::2, None] * H[1::2]).sum(axis=0)
+    return out
+
+
+def _phase_combine_gpu(grid, i1, w1, i2, w2, weight, xp, threads=256):
+    """Interpolate ``grid`` ``(V, n1, n2, n3)`` along its phase axes for
+    each template and combine its vectors (pairs of bases) with the
+    template's complex ``weight`` ``(J, V / 2)``: ``(2, J, n3)``."""
+    kernel = _kernel(xp, _PHASE_COMBINE, 'phase_combine')
+    cplx, rdt = xp.complex64, xp.float32
+    V, n1, n2, n3 = grid.shape
+    J, A = numpy.shape(w1)
+    B = numpy.shape(w2)[1]
+    out = xp.empty((2, J, n3), dtype=cplx)
+    total = 2 * J * n3
+    kernel(((total + threads - 1) // threads,), (threads,), (
+        xp.ascontiguousarray(grid, dtype=cplx),
+        xp.asarray(i1, dtype=xp.int32), xp.asarray(w1, dtype=rdt),
+        xp.asarray(i2, dtype=xp.int32), xp.asarray(w2, dtype=rdt),
+        xp.asarray(weight, dtype=cplx), numpy.int32(V),
+        numpy.int32(J), numpy.int32(n1), numpy.int32(n2), numpy.int32(n3),
+        numpy.int32(A), numpy.int32(B), out))
+    return out
 
 
 def _complex(xp):

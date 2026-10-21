@@ -51,6 +51,67 @@ def relative_error(z, exact):
     return float(numpy.abs(z - exact).max() / numpy.abs(exact).max())
 
 
+def test_grid_reproduces_the_sum():
+    c = correlator()
+    thetas = templates(8)
+    delays = numpy.linspace(-2e4, 2e4, 21)
+    exact = c.direct(thetas, delays)
+    grid = c.correlate_grid(thetas, delays, taylor_tolerance=1e-9)
+    assert relative_error(grid, exact) < 1e-5
+    # per-template delays reach the same values
+    from pycbc.filter.nufft_correlation import PhaseGrid
+    g = PhaseGrid(c, thetas, (delays.min(), delays.max()),
+                  taylor_tolerance=1e-9)
+    own = numpy.repeat(delays[None], len(thetas), axis=0)
+    assert relative_error(g.evaluate(thetas, own), exact) < 1e-5
+    assert g.inside(thetas, (delays.min(), delays.max())).all()
+    far = thetas.copy()
+    far[:, 0] += 0.05
+    assert not g.inside(far, (delays.min(), delays.max())).any()
+
+
+def test_one_grid_serves_any_number_of_templates():
+    from pycbc.filter.nufft_correlation import PhaseGrid
+    c = correlator()
+    region = templates(12)
+    delays = numpy.linspace(-2e4, 2e4, 21)
+    g = PhaseGrid(c, region, (delays.min(), delays.max()),
+                  taylor_tolerance=1e-9)
+    rng = numpy.random.default_rng(4)
+    i, j = rng.integers(0, len(region), (2, 200))
+    w = rng.random((200, 1))
+    many = w * region[i] + (1 - w) * region[j]
+    z = g.evaluate(many, delays)
+    assert z.shape == (2, 200, len(delays))
+    assert relative_error(z[:, :6], c.direct(many[:6], delays)) < 1e-5
+
+
+def test_gpu_grid_matches_the_cpu():
+    cupy = gpu()
+    thetas = templates(8)
+    delays = numpy.linspace(-2e4, 2e4, 21)
+    exact = correlator().direct(thetas, delays)
+    z = host(correlator(cupy).correlate_grid(thetas, delays,
+                                             taylor_tolerance=1e-7))
+    # the transform runs in single precision on the device
+    assert relative_error(z, exact) < 5e-4
+
+
+def test_runs_of_bins_gathered_by_their_moments():
+    """For a narrow window of arrival times the transform gathers runs of
+    bins at their middles through their moments; the correlations stay
+    those of the direct sum."""
+    from pycbc.filter.nufft_correlation import PhaseGrid
+    c = correlator(n=200000)
+    thetas = templates(8)
+    delays = numpy.linspace(-300, 300, 7)
+    g = PhaseGrid(c, thetas, (delays.min(), delays.max()),
+                  taylor_tolerance=1e-9)
+    assert g.blocks > 1
+    exact = c.direct(thetas, delays)
+    assert relative_error(g.evaluate(thetas, delays), exact) < 1e-5
+
+
 def test_sky_basis_errors_are_exact():
     """The sky basis reports each point's relative error of its projected
     response, weighted by the source's power on the coarse frequencies,
