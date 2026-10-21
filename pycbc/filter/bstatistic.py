@@ -399,6 +399,12 @@ class AmplitudeTable(object):
         self.log_a = (float(log_a_min), float(numpy.log(a_max)))
         self.tolerance = float(tolerance)
         self._xp = xp
+        self._fit(checks, seed)
+
+    def _fit(self, checks=4000, seed=0):
+        """Builds the tables over the current ranges, doubling their
+        resolution until random checks against the exact integral agree to
+        the tolerance."""
         rng = numpy.random.default_rng(seed)
         y = rng.uniform(0, self.y_max, checks)
         half = checks // 2
@@ -415,7 +421,33 @@ class AmplitudeTable(object):
                 return
             ny, na, nb = 2 * ny, 2 * na, 2 * nb
         raise RuntimeError("the amplitude table did not reach {}: {}".format(
-            tolerance, error))
+            self.tolerance, error))
+
+    def extend(self, a_max, xp=None):
+        """Rebuilds the tables out to ``a`` of ``a_max``: the SNR a template
+        would have at the prior's largest distance can exceed the tables'
+        reach when that distance is small, and samples beyond it would
+        otherwise be integrated exactly, each at every orientation node."""
+        import logging
+        if xp is not None:
+            self._xp = xp
+        self.log_a = (self.log_a[0], float(numpy.log(a_max)))
+        logging.info("amplitude table extended to a = %.4g", a_max)
+        self._fit()
+        self._device = {}
+
+    #: beyond this ``a`` the tables are not extended: the samples are
+    #: integrated exactly
+    largest_a = 1e6
+
+    def _extend_for(self, la, xp):
+        """:meth:`extend` to twice the largest ``exp(la)`` when it is beyond
+        the tables, and within :attr:`largest_a`; whether it did."""
+        top = float(xp.max(la)) if la.size else -numpy.inf
+        if self.log_a[1] < top <= numpy.log(self.largest_a / 2):
+            self.extend(2 * numpy.exp(top), xp)
+            return True
+        return False
 
     def _exact_scaled(self, y, a, b=numpy.inf, chunk=32768):
         """ln int_a^b u^-m I0(u y) exp(-u^2 / 2) du, from the exact
@@ -467,6 +499,7 @@ class AmplitudeTable(object):
             table.error = float(f.attrs['error'])
         table.prior, table.m, table.log_c = prior, m, prior._log_norm
         table._device = {}
+        table._xp = numpy
         return table
 
     def envelope(self, y, a, xp=numpy):
@@ -540,7 +573,7 @@ class AmplitudeTable(object):
         return xp.where(la <= 0, below, above)
 
     def log_orientation_marginals(self, z, g00, g11, g01, node_sets,
-                                  xp=numpy):
+                                  xp=numpy, _retry=False):
         """:func:`log_orientation_marginal` with this table for each of
         ``node_sets`` at once, shape ``(len(node_sets), n)``; on cupy one
         fused kernel projects, reads the table and sums over the nodes,
@@ -589,22 +622,45 @@ class AmplitudeTable(object):
         off = xp.isnan(out).any(axis=0)
         if bool(off.any()):
             rows = xp.nonzero(off)[0]
+            if not _retry:
+                # rows off the tables only by a: the tables extend to them
+                # and the kernel reads them
+                la = xp.concatenate([xp.log(self.prior.hmin * xp.sqrt(
+                    _project(z[:, rows], g00[rows], g11[rows], g01[rows],
+                             nodes.vectors, xp)[1])).ravel()
+                    for nodes in node_sets])
+                if self._extend_for(la[xp.isfinite(la)], xp):
+                    out[:, rows] = self.log_orientation_marginals(
+                        z[:, rows], g00[rows], g11[rows], g01[rows],
+                        node_sets, xp=xp, _retry=True)
+                    return out
             exact = self._exact_orientation(
                 z[:, rows], g00[rows], g11[rows], g01[rows], node_sets, xp)
             out[:, rows] = exact
         return out
 
-    def _exact_orientation(self, z, g00, g11, g01, node_sets, xp):
-        out = []
-        for nodes in node_sets:
-            x, g = _project(z, g00, g11, g01, nodes.vectors, xp)
-            terms = self.log_marginal(x, g, xp=xp) \
-                + xp.log(xp.asarray(nodes.weights))[None, :]
-            top = xp.max(terms, axis=1, keepdims=True)
-            with numpy.errstate(invalid='ignore'):
-                v = top[:, 0] + xp.log(xp.sum(xp.exp(terms - top), axis=1))
-            out.append(xp.where(xp.isfinite(top[:, 0]), v, -numpy.inf))
-        return xp.stack(out)
+    def _exact_orientation(self, z, g00, g11, g01, node_sets, xp,
+                           memory=2.5e8):
+        """The orientation marginals of the samples off the tables, by the
+        exact amplitude integral at every node; in chunks of samples whose
+        work arrays (nodes times the integral's 64 points) stay within
+        ``memory`` bytes."""
+        n = z.shape[1]
+        out = xp.empty((len(node_sets), n), dtype=xp.float64)
+        for i, nodes in enumerate(node_sets):
+            weights = xp.log(xp.asarray(nodes.weights))[None, :]
+            step = max(1, int(memory // (16 * 64 * len(nodes.weights))))
+            for k in range(0, n, step):
+                cut = slice(k, k + step)
+                x, g = _project(z[:, cut], g00[cut], g11[cut], g01[cut],
+                                nodes.vectors, xp)
+                terms = self.log_marginal(x, g, xp=xp) + weights
+                top = xp.max(terms, axis=1, keepdims=True)
+                with numpy.errstate(invalid='ignore'):
+                    v = top[:, 0] + xp.log(xp.sum(xp.exp(terms - top),
+                                                  axis=1))
+                out[i, cut] = xp.where(xp.isfinite(top[:, 0]), v, -numpy.inf)
+        return out
 
     def log_marginal(self, x, g, xp=numpy):
         """``ln J(x, g)``, as :func:`log_amplitude_marginal`."""
@@ -617,6 +673,8 @@ class AmplitudeTable(object):
         b = self.prior.hmax * root
         la = xp.log(a)
         m = self.m
+        self._extend_for(la[xp.isfinite(la) & (y <= self.y_max)
+                            & (b >= y + 12)], xp)
         K = self._lookup(y, xp.maximum(la, self.log_a[0]), xp)
         # below the table, int_a^a0 u^-m du in closed form
         a0 = numpy.exp(self.log_a[0])
@@ -626,8 +684,9 @@ class AmplitudeTable(object):
                 extra = xp.log(a0) - la
             else:
                 extra = (a ** (1 - m) - a0 ** (1 - m)) / (m - 1)
-            extra = xp.where(below, xp.maximum(extra, 0.0), 0.0)
-            K = K + xp.log1p(extra * xp.exp(-K))
+            with numpy.errstate(divide='ignore'):
+                extra = xp.log(xp.where(below, xp.maximum(extra, 0.0), 0.0))
+            K = xp.logaddexp(K, extra)
         out = self.log_c + 0.5 * (m - 1) * xp.log(g) + K
         off = (y > self.y_max) | (la > self.log_a[1]) | (b < y + 12)
         if bool(xp.any(off)):

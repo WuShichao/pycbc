@@ -298,3 +298,51 @@ def test_gpu_orientation_marginals_match_the_cpu():
     # the kernel projects in single precision, as its input is
     assert numpy.abs(cupy.asnumpy(gpu) - cpu).max() < 1e-5 \
         + 1e-6 * numpy.abs(cpu).max()
+    # the exact integrals off the tables, in chunks of a few samples, are
+    # those of one pass
+    args = [cupy.asarray(v) for v in (z, g00, g11, g01)]
+    whole = t._exact_orientation(*args, sets, cupy)
+    chunked = t._exact_orientation(*args, sets, cupy, memory=16 * 64 * 128
+                                   * 7)
+    assert cupy.array_equal(whole, chunked)
+
+
+def test_the_table_extends_to_the_a_the_samples_need():
+    """Samples whose SNR at the prior's largest distance is beyond the
+    tables extend them, and are then read off them to the tolerance."""
+    from pycbc.filter.bstatistic import AmplitudeTable
+    t = AmplitudeTable(PRIOR, y_max=20.0, a_max=5.0, tolerance=1e-4)
+    rng = numpy.random.default_rng(3)
+    g = (rng.uniform(10, 60, 200) / PRIOR.hmin) ** 2
+    x = rng.uniform(0, 15, 200) * numpy.sqrt(g)
+    exact = log_amplitude_marginal(x, g, PRIOR)
+    got = t.log_marginal(x, g)
+    assert numpy.exp(t.log_a[1]) >= 60
+    assert numpy.abs(got - exact).max() < 1e-3
+
+
+def test_gpu_marginals_extend_the_table_and_read_it():
+    from pycbc.filter.bstatistic import (AmplitudeTable, OrientationNodes,
+                                         log_orientation_marginal)
+    cupy = pytest.importorskip('cupy')
+    try:
+        cupy.cuda.runtime.getDeviceCount()
+    except Exception:
+        pytest.skip('no usable GPU')
+    rng = numpy.random.default_rng(15)
+    n = 200
+    # templates whose SNR at the largest distance reaches 40 to 60
+    g00 = (rng.uniform(40, 60, n) / PRIOR.hmin) ** 2
+    g11 = g00 * 10 ** rng.uniform(-0.3, 0.3, n)
+    g01 = 0.2 * numpy.sqrt(g00 * g11) * numpy.exp(2j * numpy.pi
+                                                  * rng.random(n))
+    snr = rng.uniform(0, 15, n)
+    z = (rng.normal(size=(2, n)) + 1j * rng.normal(size=(2, n))) \
+        * numpy.sqrt(numpy.array([g00, g11])) * snr / 2
+    nodes = OrientationNodes(8, 4)
+    t = AmplitudeTable(PRIOR, y_max=20.0, a_max=5.0, tolerance=1e-4)
+    gpu = t.log_orientation_marginals(*(cupy.asarray(v) for v in (
+        z, g00, g11, g01)), [nodes], xp=cupy)[0]
+    assert numpy.exp(t.log_a[1]) > 60
+    exact = log_orientation_marginal(z, g00, g11, g01, PRIOR, nodes)
+    assert numpy.abs(cupy.asnumpy(gpu) - exact).max() < 1e-3
