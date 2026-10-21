@@ -355,6 +355,9 @@ def test_shared_computation_matches_one_point_at_a_time():
     assert shared.inside(inner).all()
     own = shared(inner)
     assert numpy.isfinite(own).all()
+    stats = m.shared_statistics
+    assert stats['regions'] == 1 and stats['regions_refused'] == 0
+    assert stats['shared_points'] >= 5 and stats['single_points'] >= 1
     assert numpy.abs(own - single[:5])[near[:5]].max() < 0.02
     # the point beyond the region is computed one at a time, exactly
     assert batch[-1] == pytest.approx(single[-1], abs=1e-9)

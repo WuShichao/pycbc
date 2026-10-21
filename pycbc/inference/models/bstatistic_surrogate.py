@@ -318,16 +318,38 @@ class BStatisticSurrogate(BaseModel):
         it) from computations they share, through :class:`SharedLikelihood`;
         :meth:`loglikelihoods` then uses it for the points it covers.
         Raises ``MemoryError`` when the region is too large for one grid."""
+        import time
         regions = getattr(self, '_shared_regions', [])
         # make room on the device first: the oldest region goes
         while len(regions) >= self.max_shared_regions:
             regions.pop(0)
         self._shared_regions = regions
-        shared = SharedLikelihood(self, region, **kwargs)
+        stats = self.shared_statistics
+        tick = time.time()
+        try:
+            shared = SharedLikelihood(self, region, **kwargs)
+        except MemoryError:
+            stats['regions_refused'] += 1
+            raise
+        stats['regions'] += 1
+        stats['region_seconds'] += time.time() - tick
         regions.append(shared)
         self._shared_regions = regions[-self.max_shared_regions:]
         self._share_options = kwargs
         return shared
+
+    @property
+    def shared_statistics(self):
+        """Counts of the shared computation, for diagnostics: points from
+        shared regions and one at a time in :meth:`loglikelihoods`, and the
+        seconds each took; regions set up, their seconds, and regions
+        refused as too large."""
+        if getattr(self, '_shared_statistics', None) is None:
+            self._shared_statistics = dict(
+                shared_points=0, single_points=0, shared_seconds=0.0,
+                single_seconds=0.0, regions=0, region_seconds=0.0,
+                regions_refused=0)
+        return self._shared_statistics
 
     #: the shared regions kept at once, the oldest dropped first
     max_shared_regions = 2
@@ -393,6 +415,11 @@ class BStatisticSurrogate(BaseModel):
         for i in numpy.nonzero(todo)[0]:
             self.update(**points[i])
             out[i] = self.loglikelihood
+        stats = self.shared_statistics
+        stats['shared_points'] += nshared
+        stats['single_points'] += int(todo.sum())
+        stats['shared_seconds'] += middle - tick
+        stats['single_seconds'] += time.time() - middle
         logging.info("batch of %d: %d shared in %.2f s, %d one at a time in "
                      "%.2f s", len(full), nshared, middle - tick,
                      int(todo.sum()), time.time() - middle)

@@ -99,6 +99,9 @@ def test_evaluation_budget_is_respected():
                          max_evaluations=300)
     sampler.run()
     assert sampler.nevaluations <= 300 + 2
+    # and the run says it stopped short
+    assert sampler.diagnostics['stopped_by'] == 'max-evaluations'
+    assert sampler.diagnostics['boxes_to_refine'] > 0
 
 
 def test_config_runs_and_writes_a_readable_file(tmp_path):
@@ -136,6 +139,12 @@ seed = 1
         posterior = fp.read_samples(['x', 'y'])
         assert len(posterior['x']) == 1000
         assert 'cells' in fp[fp.sampler_group]
+        diagnostics = fp.read_diagnostics()
+    assert diagnostics['evaluations'] == sampler.nevaluations
+    assert diagnostics['stopped_by'] == (
+        'max-evaluations' if diagnostics['boxes_to_refine'] else
+        'convergence')
+    assert diagnostics['logz'] == pytest.approx(sampler.logz)
 
 
 def test_unknown_options_are_refused(tmp_path):

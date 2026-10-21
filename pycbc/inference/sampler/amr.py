@@ -350,6 +350,7 @@ class AMRSampler(BaseSampler):
                                self._logl[index] + logvol, -numpy.inf)
 
     def run(self):
+        start = time.time()
         self._grid()
         if self.pilot_evaluations > 0:
             for _ in range(self.whitening_rounds):
@@ -375,6 +376,34 @@ class AMRSampler(BaseSampler):
             logging.warning("AMR stopped by max-evaluations with %d boxes "
                             "still to refine", len(refine))
         self._draw_posterior(leaves, logmass)
+        seconds = time.time() - start
+        diag = self._diagnostics
+        diag.update(stopped_by=('max-evaluations' if len(refine)
+                                else 'convergence'),
+                    boxes_to_refine=len(refine), boxes=len(leaves),
+                    evaluations=self.nevaluations, logz=float(logz),
+                    dlogz=float(self._dlogz), seconds=seconds,
+                    seconds_per_evaluation=seconds / max(self.nevaluations,
+                                                         1))
+        stats = getattr(self.model, 'shared_statistics', None)
+        if stats is not None:
+            diag.update(stats)
+            used = stats['shared_points'] + stats['single_points']
+            diag['shared_fraction'] = (stats['shared_points']
+                                       / self.nevaluations)
+            diag['batched_fraction'] = used / self.nevaluations
+        logging.info("AMR diagnostics: %s", ', '.join(
+            '%s %s' % (k, ('%.4g' % v) if isinstance(v, float) else v)
+            for k, v in diag.items()))
+
+    @property
+    def diagnostics(self):
+        """How the run went, for judging its result afterwards: what
+        stopped it and how many boxes were still to refine, the
+        evaluations and seconds, the frame's peak, and, for a model that
+        shares computations, the fraction of evaluations from shared
+        regions and the regions set up or refused."""
+        return dict(self._diagnostics)
 
     def _grid(self, evaluate=True):
         """Starts the tree from a regular grid over the box coordinates, or
@@ -845,6 +874,7 @@ class AMRSampler(BaseSampler):
                 fp.write_logevidence(self._logz, self._dlogz)
                 fp.write_niterations(self.niterations)
                 fp.write_cells(self.cells)
+                fp.write_diagnostics(self.diagnostics)
 
     @classmethod
     def from_config(cls, cp, model, output_file=None, nprocesses=1,

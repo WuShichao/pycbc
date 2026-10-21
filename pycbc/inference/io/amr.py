@@ -45,3 +45,20 @@ class AMRFile(DynestyFile):
         group = self.create_group(path)
         for key, value in cells.items():
             group[key] = value
+
+    def write_diagnostics(self, diagnostics):
+        """Writes the run's diagnostics (see
+        :attr:`pycbc.inference.sampler.amr.AMRSampler.diagnostics`) as the
+        attributes of ``sampler_info/diagnostics``."""
+        path = self.sampler_group + '/diagnostics'
+        if path in self:
+            del self[path]
+        group = self.create_group(path)
+        for key, value in diagnostics.items():
+            group.attrs[key] = value
+
+    def read_diagnostics(self):
+        """The diagnostics :meth:`write_diagnostics` wrote, as a dict."""
+        path = self.sampler_group + '/diagnostics'
+        return dict(self[path].attrs) if path in self else {}
+
