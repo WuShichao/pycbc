@@ -406,14 +406,19 @@ class DailyGram(object):
         kmax = int(surrogate.orders[-1])
         self.harmonics = numpy.arange(-2 * kmax, 2 * kmax + 1)
         omega = ORBITAL_ANGULAR_FREQUENCY
-        self._Wm = xp.asarray(numpy.array([
-            numpy.fft.fft(w * numpy.exp(1j * m * omega * days))
-            for m in self.harmonics]))
+        window = numpy.array([w * numpy.exp(1j * m * omega * days)
+                              for m in self.harmonics])
+        self._Wt = xp.asarray(window)
+        # the window and each harmonic's phase on the day centres
+        self._w = xp.asarray(w)
+        self._E = xp.asarray(numpy.exp(1j * numpy.outer(
+            surrogate.orders, omega * days)))
+        self._Wm = xp.asarray(numpy.fft.fft(window, axis=-1))
         nk = len(surrogate.orders)
         mmap = numpy.zeros((len(self.harmonics), nk * nk))
         for k in range(nk):
-            for l in range(nk):
-                mmap[l - k + 2 * kmax, k * nk + l] = 1.0
+            for k2 in range(nk):
+                mmap[k2 - k + 2 * kmax, k * nk + k2] = 1.0
         self._mmap = xp.asarray(mmap.astype(complex))
         lag = numpy.arange(grid.size)
         delta = numpy.where(lag < grid.size // 2, lag, lag - grid.size) \
@@ -425,29 +430,361 @@ class DailyGram(object):
 
     def __call__(self, b, t, rho):
         """``(g00, g11, g01)`` on the daily grid for one template."""
+        xp = self.xp
+        q = self.terms(b, t, rho)
+        # sum_tau Q(tau) W_m(tau + lag), Q complex: conjugate it first
+        g = xp.fft.ifft(xp.conj(xp.fft.fft(xp.conj(q), axis=-1))
+                        * self._Wm[:, None, None, :], axis=-1).sum(axis=0)
+        return g[0, 0].real, g[1, 1].real, g[0, 1]
+
+    def terms(self, b, t, rho):
+        """The day-binned ``Q_ab,m(tau)``, shape ``(4 kmax + 1, 2, 2,
+        days)``."""
         xp, s = self.xp, self.surrogate
-        power = xp.abs(b.astype(xp.complex128)) ** 2
-        tau = xp.floor((t - self.t_lo) / self.day).astype(xp.int64)
-        ok = (tau >= 0) & (tau < self.size)
-        tau = xp.where(ok, tau, 0)
-        power = xp.where(ok, power, 0)
-        pw = xp.bincount(tau, weights=power, minlength=self.size)
-        fbar = xp.bincount(tau, weights=power * self._freqs,
-                           minlength=self.size) / xp.maximum(pw, 1e-300)
+        pw, fbar = self._days_power(b, t)
+        rk = self._response_at(fbar, rho)
+        nk = len(s.orders)
+        pk = xp.einsum('kacd,lbcd->klabd', xp.conj(rk), rk).reshape(
+            nk * nk, 2, 2, self.size)
+        return xp.tensordot(self._mmap, pk, axes=([1], [0])) * pw
+
+    def at(self, b, t, rho, delays):
+        """``(g00, g11, g01)`` at ``delays`` (s), summed directly at the
+        whole days the delays fall between. Since ``W_m = W e^{i m Omega
+        t}``, the harmonic pairs factor,
+
+            G_ab(J) = sum_tau pw(tau) W(t_{tau+J})
+                      sum_c conj(A_ac) A_bc,
+            A_ac = sum_k r_k,ac(tau) e^{i k Omega t_{tau+J}},
+
+        nine harmonics a day rather than their 81 pairs."""
+        return self.at_prepared(self.prepare(b, t, rho), delays)
+
+    def prepare(self, b, t, rho):
+        """What every :meth:`at_prepared` of one template shares: on cupy
+        each day's power and power-weighted frequency, otherwise the days
+        with power, their power and the response harmonics at each."""
+        xp = self.xp
+        if xp is not numpy:
+            pw, fw = self._day_sums(b, t)
+            return pw, fw, xp.ascontiguousarray(rho)
+        pw, fbar = self._days_power(b, t)
+        days = xp.nonzero(pw > 0)[0]
+        return days, pw[days], self._response_at(fbar[days], rho)
+
+    def _whole_days(self, delays):
+        """The day each delay falls after and the fraction past it."""
+        x = numpy.mod(numpy.asarray(delays, dtype=numpy.float64),
+                      self.day * self.size) / self.day - 0.5
+        j = numpy.floor(x).astype(numpy.int64) % self.size
+        return j, x - numpy.floor(x)
+
+    def at_prepared(self, prepared, delays):
+        """:meth:`at` from :meth:`prepare`'s output."""
+        xp = self.xp
+        j, fr = self._whole_days(_host(delays))
+        lags = numpy.unique(numpy.concatenate([j, (j + 1) % self.size]))
+        if xp is not numpy:
+            return self._at_kernel(prepared, lags, delays)
+        days, pw, rk = prepared
+        # every needed lag at once, over the days with power
+        shifted = (days[None, :] + lags[:, None]) % self.size
+        A = numpy.einsum('kacd,kld->lacd', rk, self._E[:, shifted])
+        weight = pw[None, :] * self._w[shifted]
+        values = numpy.einsum('lacd,lbcd,ld->lab', numpy.conj(A), A, weight)
+        where = numpy.searchsorted(lags, j)
+        where1 = numpy.searchsorted(lags, (j + 1) % self.size)
+        g = values[where] * (1 - fr)[:, None, None] \
+            + values[where1] * fr[:, None, None]
+        return g[:, 0, 0].real, g[:, 1, 1].real, g[:, 0, 1]
+
+    def _days_power(self, b, t):
+        """The power and mean frequency of each day."""
+        xp = self.xp
+        if xp is not numpy:
+            pw, fw = self._day_sums(b, t)
+            return pw, fw / xp.maximum(pw, 1e-300)
+        raw = numpy.floor((t - self.t_lo) / self.day).astype(numpy.int64)
+        power = numpy.abs(b.astype(numpy.complex128)) ** 2
+        if numpy.all(raw[1:] >= raw[:-1]):
+            # days in frequency order, as for a chirp: differences of
+            # cumulative sums at each day's first bin
+            edges = numpy.searchsorted(raw, numpy.arange(self.size + 1))
+            total = numpy.concatenate([[0.0], numpy.cumsum(power)])
+            moment = numpy.concatenate([[0.0], numpy.cumsum(
+                power * self._freqs)])
+            pw = total[edges[1:]] - total[edges[:-1]]
+            fw = moment[edges[1:]] - moment[edges[:-1]]
+        else:
+            ok = (raw >= 0) & (raw < self.size)
+            tau = numpy.where(ok, raw, 0)
+            power = numpy.where(ok, power, 0)
+            pw = numpy.bincount(tau, weights=power, minlength=self.size)
+            fw = numpy.bincount(tau, weights=power * self._freqs,
+                                minlength=self.size)
+        return pw, fw / numpy.maximum(pw, 1e-300)
+
+    def _response_at(self, fbar, rho):
+        """The harmonics of the response at each day's mean frequency."""
+        xp, s = self.xp, self.surrogate
         coarse = s.coarse_frequencies
         x = (fbar - coarse[0]) / (coarse[1] - coarse[0])
         i = xp.clip(xp.floor(x).astype(xp.int64), 0, len(coarse) - 2)
         w = xp.clip(x - i, 0, 1)
         r = rho.astype(xp.complex128)
-        rk = r[..., i] * (1 - w) + r[..., i + 1] * w
-        nk = len(s.orders)
-        pk = xp.einsum('kacd,lbcd->klabd', xp.conj(rk), rk).reshape(
-            nk * nk, 2, 2, self.size)
-        q = xp.tensordot(self._mmap, pk, axes=([1], [0])) * pw
-        # sum_tau Q(tau) W_m(tau + lag), Q complex: conjugate it first
-        g = xp.fft.ifft(xp.conj(xp.fft.fft(xp.conj(q), axis=-1))
-                        * self._Wm[:, None, None, :], axis=-1).sum(axis=0)
-        return g[0, 0].real, g[1, 1].real, g[0, 1]
+        return r[..., i] * (1 - w) + r[..., i + 1] * w
+
+    _KERNELS = r"""
+    #include <cupy/complex.cuh>
+    typedef complex<{real}> cplx;
+
+    extern "C" __global__ void days(
+        const cplx* b, const double* t, const double* freqs,
+        const double t_lo, const double per_day, const long long n,
+        const long long size, const int chunk, double* pw, double* fw) {
+      // a warp reads 32 consecutive bins at a time, chunk times over; bins
+      // of one day, as a chirp's mostly are, are summed across the warp and
+      // kept by lane 0 until the day changes, any others added one by one
+      const unsigned all = 0xffffffffu;
+      int lane = threadIdx.x & 31;
+      long long warp = ((long long)blockDim.x * blockIdx.x + threadIdx.x)
+          >> 5;
+      long long start = warp * 32 * chunk;
+      long long stop = min(start + 32LL * chunk, n), current = -1;
+      double p = 0, m = 0;
+      for (long long base = start; base < stop; base += 32) {
+        long long j = base + lane, tau = -1;
+        double v = 0, vf = 0;
+        if (j < stop) {
+          tau = (long long)floor((t[j] - t_lo) * per_day);
+          v = (double)b[j].real() * b[j].real()
+              + (double)b[j].imag() * b[j].imag();
+          vf = v * freqs[j];
+        }
+        long long first = __shfl_sync(all, tau, 0);
+        if (__all_sync(all, tau == first || j >= stop)) {
+          for (int h = 16; h > 0; h >>= 1) {
+            v += __shfl_down_sync(all, v, h);
+            vf += __shfl_down_sync(all, vf, h);
+          }
+          if (lane == 0) {
+            if (first != current) {
+              if (current >= 0 && current < size) {
+                atomicAdd(pw + current, p);
+                atomicAdd(fw + current, m);
+              }
+              current = first; p = 0; m = 0;
+            }
+            p += v;
+            m += vf;
+          }
+        } else if (j < stop && tau >= 0 && tau < size) {
+          atomicAdd(pw + tau, v);
+          atomicAdd(fw + tau, vf);
+        }
+      }
+      if (lane == 0 && current >= 0 && current < size) {
+        atomicAdd(pw + current, p);
+        atomicAdd(fw + current, m);
+      }
+    }
+
+    #define MAXK 33
+    extern "C" __global__ void gram(
+        const double* pw, const double* fw, const double* w,
+        const cplx* rho, const long long* lags, const double t_lo,
+        const double day, const double omega, const double c0,
+        const double dc, const int ncoarse, const int size, const int nch,
+        const int nk, const int kmin, double* out) {
+      // out[lag] += (g00, g11, Re g01, Im g01), the sum over days d of
+      // pw(d) w(d + lag) sum_c conj(A_ac) A_bc; blockIdx.z the template of
+      // a batch, its day sums, response and output one after another
+      __shared__ double part[4][256];
+      long long z = blockIdx.z;
+      pw += z * size;
+      fw += z * size;
+      rho += z * (long long)nk * 2 * nch * ncoarse;
+      out += z * 4LL * size;
+      int d = blockDim.x * blockIdx.x + threadIdx.x;
+      long long lag = lags[blockIdx.y];
+      double s[4] = {0, 0, 0, 0};
+      if (d < size && pw[d] > 0) {
+        int day_s = (int)((d + lag) % size);
+        double weight = pw[d] * w[day_s];
+        if (weight != 0) {
+          double x = (fw[d] / pw[d] - c0) / dc;
+          int i = min(max((int)floor(x), 0), ncoarse - 2);
+          double u = fmin(fmax(x - i, 0.0), 1.0);
+          double theta = omega * (t_lo + (day_s + 0.5) * day);
+          complex<double> e[MAXK];
+          for (int q = 0; q < nk; q++) {
+            double sn, cs;
+            sincos((kmin + q) * theta, &sn, &cs);
+            e[q] = complex<double>(cs, sn);
+          }
+          for (int c = 0; c < nch; c++) {
+            complex<double> A[2];
+            for (int a = 0; a < 2; a++) {
+              complex<double> acc(0, 0);
+              for (int q = 0; q < nk; q++) {
+                const cplx* r = rho + ((q * 2 + a) * nch + c) * ncoarse + i;
+                complex<double> r0(r[0].real(), r[0].imag());
+                complex<double> r1(r[1].real(), r[1].imag());
+                acc += (r0 * (1 - u) + r1 * u) * e[q];
+              }
+              A[a] = acc;
+            }
+            complex<double> p = conj(A[0]) * A[1];
+            s[0] += norm(A[0]);
+            s[1] += norm(A[1]);
+            s[2] += p.real();
+            s[3] += p.imag();
+          }
+          for (int v = 0; v < 4; v++) s[v] *= weight;
+        }
+      }
+      for (int v = 0; v < 4; v++) part[v][threadIdx.x] = s[v];
+      __syncthreads();
+      for (int h = blockDim.x / 2; h > 0; h >>= 1) {
+        if (threadIdx.x < h)
+          for (int v = 0; v < 4; v++)
+            part[v][threadIdx.x] += part[v][threadIdx.x + h];
+        __syncthreads();
+      }
+      if (threadIdx.x < 4)
+        atomicAdd(out + 4 * lag + threadIdx.x, part[threadIdx.x][0]);
+    }
+    """
+
+    _INTERPOLATE = (
+        'float64 delay, raw float64 values, int64 size, float64 day',
+        'float64 g00, float64 g11, complex128 g01',
+        '''
+        double span = day * size;
+        double x = fmod(delay, span);
+        if (x < 0) x += span;
+        x = x / day - 0.5;
+        double fl = floor(x), fr = x - fl;
+        long long j = ((long long)fl % size + size) % size;
+        long long j1 = (j + 1) % size;
+        g00 = values[4 * j] * (1 - fr) + values[4 * j1] * fr;
+        g11 = values[4 * j + 1] * (1 - fr) + values[4 * j1 + 1] * fr;
+        g01 = complex<double>(
+            values[4 * j + 2] * (1 - fr) + values[4 * j1 + 2] * fr,
+            values[4 * j + 3] * (1 - fr) + values[4 * j1 + 3] * fr);
+        ''', 'daily_gram_interpolate')
+
+    def _kernel(self, name, real):
+        xp = self.xp
+        key = (name, real)
+        if not hasattr(self, '_kernels'):
+            self._kernels = {}
+        if key not in self._kernels:
+            module = xp.RawModule(code=self._KERNELS.replace(
+                '{real}', real))
+            self._kernels[key] = module.get_function(name)
+        return self._kernels[key]
+
+    def _day_sums(self, b, t, chunk=16, threads=256):
+        xp = self.xp
+        real = 'float' if b.dtype == xp.complex64 else 'double'
+        pw = xp.zeros(self.size, dtype=xp.float64)
+        fw = xp.zeros(self.size, dtype=xp.float64)
+        n = int(b.size)
+        warps = (n + 32 * chunk - 1) // (32 * chunk)
+        self._kernel('days', real)(
+            ((32 * warps + threads - 1) // threads,), (threads,), (
+                xp.ascontiguousarray(b), xp.ascontiguousarray(
+                    t, dtype=xp.float64), self._freqs,
+                numpy.float64(self.t_lo), numpy.float64(1 / self.day),
+                numpy.int64(n), numpy.int64(self.size), numpy.int32(chunk),
+                pw, fw))
+        return pw, fw
+
+    def _at_kernel(self, prepared, lags, delays, threads=256):
+        xp, s = self.xp, self.surrogate
+        pw, fw, rho = prepared
+        real = 'float' if rho.dtype == xp.complex64 else 'double'
+        nk, nch = rho.shape[0], rho.shape[2]
+        if nk > 33:
+            raise ValueError("at most 33 yearly harmonics on cupy")
+        coarse = s.coarse_frequencies
+        values = xp.zeros(4 * self.size, dtype=xp.float64)
+        self._kernel('gram', real)(
+            ((self.size + threads - 1) // threads, len(lags)), (threads,), (
+                pw, fw, self._w, rho, xp.asarray(lags, dtype=xp.int64),
+                numpy.float64(self.t_lo), numpy.float64(self.day),
+                numpy.float64(ORBITAL_ANGULAR_FREQUENCY),
+                numpy.float64(coarse[0]),
+                numpy.float64(coarse[1] - coarse[0]),
+                numpy.int32(len(coarse)), numpy.int32(self.size),
+                numpy.int32(nch), numpy.int32(nk),
+                numpy.int32(s.orders[0]), values))
+        if not hasattr(self, '_interpolate'):
+            self._interpolate = xp.ElementwiseKernel(*self._INTERPOLATE)
+        return self._interpolate(
+            xp.asarray(delays, dtype=xp.float64), values,
+            numpy.int64(self.size), numpy.float64(self.day))
+
+    def at_batch(self, pw, fw, rho, delays, threads=256):
+        """``(g00, g11, g01)`` of shape ``(M, L)`` for a batch of templates
+        on cupy: their day sums ``pw``, ``fw`` ``(M, days)`` (as
+        :meth:`prepare` gives them), responses ``rho`` ``(M, 2 kmax + 1, 2,
+        nchannels, ncoarse)`` and arrival times ``delays`` ``(M, L)``, s;
+        one kernel call for all."""
+        xp, s = self.xp, self.surrogate
+        delays = xp.asarray(delays, dtype=xp.float64)
+        M = pw.shape[0]
+        x = xp.mod(delays, self.day * self.size) / self.day - 0.5
+        j = xp.floor(x).astype(xp.int64) % self.size
+        fr = x - xp.floor(x)
+        j1 = (j + 1) % self.size
+        lags = numpy.unique(_host(xp.concatenate([j.ravel(), j1.ravel()])))
+        rho = xp.ascontiguousarray(rho)
+        real = 'float' if rho.dtype == xp.complex64 else 'double'
+        nk, nch = rho.shape[1], rho.shape[3]
+        if nk > 33:
+            raise ValueError("at most 33 yearly harmonics on cupy")
+        coarse = s.coarse_frequencies
+        values = xp.zeros((M, 4 * self.size), dtype=xp.float64)
+        self._kernel('gram', real)(
+            ((self.size + threads - 1) // threads, len(lags), M), (threads,),
+            (xp.ascontiguousarray(pw, dtype=xp.float64),
+             xp.ascontiguousarray(fw, dtype=xp.float64), self._w, rho,
+             xp.asarray(lags, dtype=xp.int64), numpy.float64(self.t_lo),
+             numpy.float64(self.day),
+             numpy.float64(ORBITAL_ANGULAR_FREQUENCY),
+             numpy.float64(coarse[0]), numpy.float64(coarse[1] - coarse[0]),
+             numpy.int32(len(coarse)), numpy.int32(self.size),
+             numpy.int32(nch), numpy.int32(nk), numpy.int32(s.orders[0]),
+             values))
+        values = values.reshape(M, self.size, 4)
+        rows = xp.arange(M)[:, None]
+        v = values[rows, j] * (1 - fr)[..., None] \
+            + values[rows, j1] * fr[..., None]
+        return v[..., 0], v[..., 1], v[..., 2] + 1j * v[..., 3]
+
+    def direct(self, q, delays):
+        """``(g00, g11, g01)`` at ``delays`` (s) from the terms ``q``,
+        summed directly at the whole days the delays fall between: no
+        transform over all lags, for a window of a few days."""
+        xp = self.xp
+        x = xp.mod(xp.asarray(delays, dtype=xp.float64),
+                   self.day * self.size) / self.day - 0.5
+        j = xp.floor(x).astype(xp.int64) % self.size
+        fr = x - xp.floor(x)
+        lags = numpy.unique(_host(xp.concatenate([j, (j + 1) % self.size])))
+        tau = xp.arange(self.size)
+        values = xp.stack([
+            xp.einsum('mabt,mt->ab', q,
+                      self._Wt[:, (tau + int(lag)) % self.size])
+            for lag in lags])
+        where = xp.asarray(numpy.searchsorted(lags, _host(j)))
+        where1 = xp.asarray(numpy.searchsorted(
+            lags, _host((j + 1) % self.size)))
+        g0, g1 = values[where], values[where1]
+        g = g0 * (1 - fr)[:, None, None] + g1 * fr[:, None, None]
+        return g[:, 0, 0].real, g[:, 1, 1].real, g[:, 0, 1]
 
     def at_lags(self, gram):
         """The daily ``(g00, g11, g01)`` interpolated to every arrival time
@@ -466,6 +803,10 @@ class DailyGram(object):
         fr = x - xp.floor(x)
         j1 = (j + 1) % self.size
         return tuple(g[j] * (1 - fr) + g[j1] * fr for g in gram)
+
+
+def _host(array):
+    return array.get() if hasattr(array, 'get') else numpy.asarray(array)
 
 
 def lal_plus_source(params, frequencies, epoch):

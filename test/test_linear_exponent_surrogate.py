@@ -65,13 +65,22 @@ def test_single_precision_on_the_gpu_matches_the_cpu():
         pytest.skip('no usable GPU')
     family, data, _ = build()
     xi = numpy.array([0.2, 0.1, -0.3, 0.05, 0.4, -0.2])
-    z = family.correlate(data, *family.pieces(xi))
+    b, t, rho = family.pieces(xi)
+    z = family.correlate(data, b, t, rho)
     with scheme:
         gpu, _, _ = build(dtype=numpy.complex64)
+        bg, tg, _ = gpu.pieces(xi)
         zg = gpu.correlate(cupy.asarray(data, dtype=numpy.complex64),
                            *gpu.pieces(xi))
-        zg = cupy.asnumpy(zg)
+        zg, bg, tg = cupy.asnumpy(zg), cupy.asnumpy(bg), cupy.asnumpy(tg)
+        double, _, _ = build()
+        bd, td, _ = double.pieces(xi)
+        bd, td = cupy.asnumpy(bd), cupy.asnumpy(td)
     assert numpy.abs(zg - z).max() < 1e-4 * numpy.abs(z).max()
+    assert numpy.abs(bg - b).max() < 1e-6 * numpy.abs(b).max()
+    assert numpy.allclose(tg, t, rtol=1e-15, atol=1e-9)
+    assert numpy.allclose(bd, b, rtol=1e-13, atol=0)
+    assert numpy.allclose(td, t, rtol=1e-15, atol=1e-9)
 
 
 def test_wrong_coordinates_are_refused():
@@ -194,3 +203,39 @@ def test_tangents_are_the_derivatives_of_the_template():
         numeric = (family.template(*family.pieces(up), delta)
                    - family.template(*family.pieces(down), delta)) / (2 * step)
         assert numpy.abs(dy[i] - numeric).max() < 1e-6 * numpy.abs(y).max()
+
+
+def gram_at_delays(days=60):
+    family, daily = chirp(days)
+    b, t, rho = family.pieces(numpy.zeros(3))
+    delays = numpy.linspace(-3 * DAY, 3 * DAY, 37) + 0.3 * DAY
+    return daily, (b, t, rho), delays
+
+
+def test_daily_gram_at_delays_is_the_transform_over_all_lags():
+    daily, (b, t, rho), delays = gram_at_delays()
+    direct = daily.at(b, t, rho, delays)
+    through_fft = daily.at_delays(daily(b, t, rho), delays)
+    for a, c in zip(direct, through_fft):
+        assert numpy.abs(a - c).max() < 1e-12 * numpy.abs(c).max()
+
+
+def test_daily_gram_on_the_gpu_matches_the_cpu_in_any_day_order():
+    cupy = pytest.importorskip('cupy')
+    try:
+        scheme = CUPYScheme()
+    except Exception:
+        pytest.skip('no usable GPU')
+    daily, (b, t, rho), delays = gram_at_delays()
+    # a chirp's days rise with frequency; reversed, they fall
+    cases = [(t, slice(None)), (t[::-1].copy(), slice(None, None, -1))]
+    cpu = [daily.at(b, tt, rho, delays) for tt, _ in cases]
+    with scheme:
+        gpu_daily, (bg, tg, rg), _ = gram_at_delays()
+        for (_, order), expected in zip(cases, cpu):
+            gpu = gpu_daily.at(bg, cupy.ascontiguousarray(tg[order]), rg,
+                               delays)
+            for a, c in zip(gpu, expected):
+                # atomic sums add in their own order
+                assert numpy.abs(cupy.asnumpy(a) - c).max() \
+                    < 1e-10 * numpy.abs(c).max()
