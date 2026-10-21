@@ -361,3 +361,16 @@ def test_shared_computation_matches_one_point_at_a_time():
     assert numpy.abs(own - single[:5])[near[:5]].max() < 0.02
     # the point beyond the region is computed one at a time, exactly
     assert batch[-1] == pytest.approx(single[-1], abs=1e-9)
+    # the grid holds no time the region's shifted delays never reach
+    _, shift, _ = shared.correlator.project(shared._thetas(full),
+                                            shared.grid.frame)
+    lo, hi = shared.grid.time_limits()
+    pad = 0.1 * (m.delays[-1] - m.delays[0] + numpy.ptp(shift)) \
+        + 4 * m.grid_step
+    assert lo >= m.delays[0] + shift.min() - pad
+    assert hi <= m.delays[-1] + shift.max() + pad
+    # a grid beyond the memory allowed is refused, and its size kept
+    with pytest.raises(MemoryError):
+        m.share(full, grid_options=dict(memory_limit=1.0))
+    assert m.shared_statistics['regions_refused'] == 1
+    assert m.shared_statistics['largest_refused_gb'] > 0

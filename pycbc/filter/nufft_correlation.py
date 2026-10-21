@@ -546,10 +546,12 @@ class PhaseGrid(object):
             free = xp.cuda.runtime.memGetInfo()[0]
             memory_limit = min(memory_limit, free - 4e8)
         if need > memory_limit:
-            raise MemoryError(
+            err = MemoryError(
                 "the region needs a grid of {:.2f} GB ({} Taylor terms, "
                 "grid {}); split it into smaller regions".format(
                     need / 1e9, self.terms, self.size))
+            err.need = need
+            raise err
         # the grid first, while the device memory is free: an array
         # allocated after the transforms' work space may land in host-shared
         # memory, where every read crosses the bus

@@ -328,8 +328,10 @@ class BStatisticSurrogate(BaseModel):
         tick = time.time()
         try:
             shared = SharedLikelihood(self, region, **kwargs)
-        except MemoryError:
+        except MemoryError as err:
             stats['regions_refused'] += 1
+            stats['largest_refused_gb'] = max(stats['largest_refused_gb'],
+                                              getattr(err, 'need', 0) / 1e9)
             raise
         stats['regions'] += 1
         stats['region_seconds'] += time.time() - tick
@@ -342,13 +344,13 @@ class BStatisticSurrogate(BaseModel):
     def shared_statistics(self):
         """Counts of the shared computation, for diagnostics: points from
         shared regions and one at a time in :meth:`loglikelihoods`, and the
-        seconds each took; regions set up, their seconds, and regions
-        refused as too large."""
+        seconds each took; regions set up, their seconds, regions refused
+        as too large and the largest grid refused, GB."""
         if getattr(self, '_shared_statistics', None) is None:
             self._shared_statistics = dict(
                 shared_points=0, single_points=0, shared_seconds=0.0,
                 single_seconds=0.0, regions=0, region_seconds=0.0,
-                regions_refused=0)
+                regions_refused=0, largest_refused_gb=0.0)
         return self._shared_statistics
 
     #: the shared regions kept at once, the oldest dropped first
@@ -905,7 +907,12 @@ class SharedLikelihood(object):
             T = m.delays[keep] + shift[i]
             lo, hi = min(lo, T.min()), max(hi, T.max())
         pad = (hi - lo) + 8 * m.grid_step
-        return (lo - pad, hi + pad)
+        # no point of the region reaches grid times beyond its delays
+        # shifted: a wide likelihood leaves the window there
+        _, shifts, _ = self.correlator.project(thetas, frame)
+        reach = (m.delays[0] + shifts.min() - m.grid_step,
+                 m.delays[-1] + shifts.max() + 2 * m.grid_step)
+        return (max(lo - pad, reach[0]), min(hi + pad, reach[1]))
 
     def _sky(self, points):
         m = self.model

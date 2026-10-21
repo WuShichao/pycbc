@@ -430,6 +430,10 @@ class AMRSampler(BaseSampler):
         # the model's counts are its own, over all runs: this run's are the
         # change
         before = dict(getattr(self.model, 'shared_statistics', None) or {})
+        if 'largest_refused_gb' in before:
+            # a largest is this run's own
+            self.model.shared_statistics['largest_refused_gb'] = 0.0
+            before['largest_refused_gb'] = 0.0
         if self.explore_basin > 0:
             self._explore()
         self._grid()
