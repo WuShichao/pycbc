@@ -180,3 +180,88 @@ def test_a_whitened_frame_follows_a_ridge_with_fewer_evaluations():
         @ cells['frame_matrix'].T
     inside = numpy.all((centre >= 0) & (centre <= 1), axis=1)
     assert inside.any()
+
+
+def lattice_partition(path, radius=2.0, width=0.5):
+    """Cells of an oblique chart about the normal model's mean, with the
+    parameters in the other order than the model's."""
+    from pycbc.tmpltbank.adaptive_cell_partition import write_partition
+    from pycbc.tmpltbank.fstatistic_metric import MetricChart
+    metric = numpy.array([[1.0, 0.6], [0.6, 1.0]])
+    reference, scales = numpy.array([-0.5, 1.0]), numpy.array([1.0, 0.5])
+    axis = (numpy.arange(-12, 12) + 0.5) * width
+    centres = numpy.array(numpy.meshgrid(axis, axis)).reshape(2, -1).T
+    candidate = numpy.linalg.norm(centres, axis=1) <= radius
+    write_partition(path, ['y', 'x'], reference, scales, metric, centres,
+                    numpy.full(centres.shape, width),
+                    -numpy.sum(centres ** 2, axis=1), candidate)
+    chart = MetricChart(metric)
+
+    def inside(points):
+        """Whether each (x, y) lies in a candidate cell."""
+        xi = (points[:, ::-1] - reference) / scales
+        eta = chart.to_chart(xi)
+        cell = numpy.floor(eta / width + 12).astype(int)
+        ok = numpy.all((cell >= 0) & (cell < 24), axis=1)
+        flat = numpy.zeros(len(points), dtype=bool)
+        index = cell[ok, 1] * 24 + cell[ok, 0]
+        flat[ok] = candidate[index]
+        return flat
+    return inside
+
+
+def test_a_search_partition_restricts_the_quadrature_to_its_cells(tmp_path):
+    path = str(tmp_path / 'partition.hdf')
+    inside = lattice_partition(path)
+    model = normal_model(mean=(1.0, -0.5), cov=(0.25, 1.0))
+    sampler = AMRSampler(model, partition_file=path, mass_fraction=1e-5,
+                         max_evaluations=40000, posterior_samples=4000,
+                         seed=4)
+    sampler.run()
+    # the evidence is the normal's mass inside the cells over the prior's
+    # area
+    rng = numpy.random.default_rng(9)
+    draws = rng.normal([1.0, -0.5], [0.5, 1.0], size=(400000, 2))
+    mass = inside(draws).mean()
+    assert 0.5 < mass < 0.99
+    assert sampler.logz == pytest.approx(
+        math.log(mass / (2 * HALF) ** 2), abs=5e-3)
+    samples = numpy.array([sampler.samples['x'], sampler.samples['y']]).T
+    assert inside(samples).all()
+
+
+def test_a_partition_takes_no_pilot(tmp_path):
+    path = str(tmp_path / 'partition.hdf')
+    lattice_partition(path)
+    with pytest.raises(ValueError):
+        AMRSampler(normal_model(), partition_file=path,
+                   pilot_evaluations=100)
+
+
+def test_a_laplace_frame_integrates_a_thin_oblique_ridge():
+    """A ridge 400 times thinner than the prior, oblique to every axis: the
+    pilot's samples whiten it badly, its curvature does not."""
+    from scipy.stats import multivariate_normal
+    names = ['a', 'b', 'c', 'd']
+    rotation, _ = numpy.linalg.qr(numpy.random.default_rng(0).normal(
+        size=(4, 4)))
+    cov = rotation @ numpy.diag([1.5, 0.05, 0.03, 0.02]) ** 2 @ rotation.T
+
+    class Ridge(models.base.BaseModel):
+        name = 'test_ridge'
+
+        def _loglikelihood(self):
+            x = [self.current_params[n] for n in names]
+            return multivariate_normal.logpdf(x, numpy.zeros(4), cov)
+    prior = JointDistribution(names, *[Uniform(**{n: (-4.0, 4.0)})
+                                       for n in names])
+    draws = numpy.random.default_rng(1).multivariate_normal(
+        numpy.zeros(4), cov, 200000)
+    truth = math.log(numpy.all(numpy.abs(draws) < 4, axis=1).mean()
+                     / 8.0 ** 4)
+    sampler = AMRSampler(Ridge(names, prior=prior), initial_divisions=2,
+                         pilot_evaluations=1000, laplace_frame=True,
+                         mass_fraction=1e-4, max_evaluations=30000,
+                         posterior_samples=10)
+    sampler.run()
+    assert sampler.logz == pytest.approx(truth, abs=0.02)
