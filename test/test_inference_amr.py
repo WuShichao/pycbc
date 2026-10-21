@@ -342,6 +342,118 @@ def test_differences_at_the_edge_of_the_support_are_one_sided():
     assert numpy.allclose(hess, -A, atol=1e-6)
 
 
+class HiddenBump(models.base.BaseModel):
+    """A flat likelihood with a bump the starting boxes' midpoints miss:
+    ``L = 1 + B exp(-r^2 / 2 s^2)``, the bump holding four times the flat
+    part's mass, so that ``Z = 5``."""
+    name = 'test_hidden_bump'
+    centre, width = numpy.array([0.1, -0.2]), 0.15
+    height = 400 / (2 * numpy.pi * 0.15 ** 2)
+
+    def _loglikelihood(self):
+        x = numpy.array([self.current_params[n] for n in ('x', 'y')])
+        r2 = numpy.sum((x - self.centre) ** 2)
+        return numpy.log1p(self.height * numpy.exp(-r2 / (2 * self.width
+                                                           ** 2)))
+
+
+def hidden_bump():
+    prior = JointDistribution(
+        ['x', 'y'], Uniform(x=(-HALF, HALF)), Uniform(y=(-HALF, HALF)))
+    return HiddenBump(['x', 'y'], prior=prior)
+
+
+def test_the_check_finds_mass_the_midpoints_miss():
+    """Without the check the refinement stops on the flat part and claims
+    a small error; with it the bump is found and refined, and the evidence
+    is right within the error the check gives."""
+    plain = AMRSampler(hidden_bump(), mass_fraction=1e-4,
+                       max_evaluations=20000)
+    plain.run()
+    assert plain.logz < 0.1 and plain.logz_err < 0.05
+    for seed in range(3):
+        checked = AMRSampler(hidden_bump(), mass_fraction=1e-4,
+                             max_evaluations=20000, check_points=1000,
+                             check_tolerance=0.05, seed=seed)
+        checked.run()
+        diag = checked.diagnostics
+        assert diag['stopped_by'] == 'check'
+        assert checked.logz == pytest.approx(math.log(5), abs=max(
+            3 * checked.logz_err, 1e-3))
+        assert checked.logz_err <= 0.05
+        # the posterior follows the bump: four fifths of its mass
+        near = numpy.hypot(checked.samples['x'] - 0.1,
+                           checked.samples['y'] + 0.2) < 1.0
+        assert numpy.mean(near) == pytest.approx(0.806, abs=0.03)
+
+
+def test_the_check_is_unbiased_where_the_midpoints_are_exact_enough():
+    """On a resolved Gaussian the check's correction is within its error
+    of zero and the evidence keeps its accuracy."""
+    sampler = AMRSampler(normal_model(), mass_fraction=1e-6,
+                         max_evaluations=40000, check_points=2000,
+                         check_tolerance=0.01)
+    sampler.run()
+    error = sampler.logz + math.log((2 * HALF) ** 2)
+    assert abs(error) < max(3 * sampler.logz_err, 2e-3)
+    assert abs(sampler.diagnostics['check_correction']) < max(
+        3 * sampler.logz_err, 2e-3)
+
+
+def test_a_single_check_point_is_refused():
+    with pytest.raises(ValueError):
+        AMRSampler(normal_model(), check_points=1)
+
+
+class CubedCoordinates(object):
+    """``u = x^3``: a curvilinear frame whose Jacobian changes 400 times
+    over the prior."""
+    names = ['x']
+
+    def forward(self, theta):
+        return theta ** 3
+
+    def inverse(self, y):
+        return numpy.cbrt(y)
+
+    def log_jacobian(self, theta):
+        return -numpy.log(3 * theta[:, 0] ** 2)
+
+
+class SkewedNormal(models.base.BaseModel):
+    """A normal likelihood wide in ``x``, where the cubed frame is most
+    curved, with ``Z`` in closed form."""
+    name = 'test_skewed_normal'
+    curvilinear_coordinates = CubedCoordinates()
+
+    def _loglikelihood(self):
+        x, y = self.current_params['x'], self.current_params['y']
+        return -0.5 * ((x - 1.2) / 0.6) ** 2 - 0.5 * (y / 0.4) ** 2
+
+
+def test_the_curvilinear_box_masses_take_the_jacobian_across_the_box():
+    from scipy.special import erf
+    prior = JointDistribution(['x', 'y'], Uniform(x=(0.2, 4.0)),
+                              Uniform(y=(-3.0, 3.0)))
+
+    def gauss(lo, hi, mu, sd):
+        return sd * math.sqrt(math.pi / 2) * (
+            erf((hi - mu) / (sd * math.sqrt(2)))
+            - erf((lo - mu) / (sd * math.sqrt(2))))
+    exact = math.log(gauss(0.2, 4.0, 1.2, 0.6) * gauss(-3.0, 3.0, 0.0, 0.4)
+                     / (3.8 * 6.0))
+    sampler = AMRSampler(SkewedNormal(['x', 'y'], prior=prior),
+                         initial_divisions=2, pilot_evaluations=300,
+                         curvilinear_frame=True, mass_fraction=1e-4,
+                         max_evaluations=20000, check_points=2000,
+                         check_tolerance=0.01, seed=2)
+    sampler.run()
+    assert sampler.logz == pytest.approx(exact, abs=max(
+        3 * sampler.logz_err, 2e-3))
+    assert abs(sampler.diagnostics['midpoint_logz'] - exact) < 0.01
+    assert sampler.diagnostics['check_uncovered'] < 1e-3
+
+
 def test_a_peak_on_the_prior_edge_keeps_its_mass_in_a_tilted_frame():
     """A normal likelihood centred on a face of the prior, in a whitened
     frame whose boxes straddle that face: the boxes whose centres lie

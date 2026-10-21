@@ -134,6 +134,18 @@ class AMRSampler(BaseSampler):
         highest one whose basin is that large. Default 0, off.
     explore_miss : float, optional
         See ``explore_basin``. Default 0.01.
+    check_points : int, optional
+        Check the quadrature with this many random points once the
+        refinement stops: boxes drawn with probabilities half by their mass
+        and half by their volume, each evaluated at a uniform point inside
+        it, give an unbiased estimate of what the midpoint rule misses and
+        a variance that bounds its error (see :meth:`_check`). The evidence
+        is corrected by it and its error is ``dlogz``; while that exceeds
+        ``check_tolerance``, the boxes the check found wrong are bisected
+        and the refinement goes on, half as many evaluations again each
+        round, up to ``max_evaluations``. Default 0, off.
+    check_tolerance : float, optional
+        The error in ``log Z`` the check must reach. Default 0.1.
     whitening_rounds : int, optional
         Pilot refinements, each of ``pilot_evaluations`` more evaluations
         in the frame the previous one whitened. A thin ridge oblique to the
@@ -171,7 +183,8 @@ class AMRSampler(BaseSampler):
                  use_mpi=False, loglikelihood_function=None,
                  partition_file=None, whitening_rounds=1,
                  laplace_frame=False, curvilinear_frame=False,
-                 shared_region=0, explore_basin=0.0, explore_miss=0.01):
+                 shared_region=0, explore_basin=0.0, explore_miss=0.01,
+                 check_points=0, check_tolerance=0.1):
         super().__init__(model)
         self.initial_divisions = int(initial_divisions)
         self.partition_file = partition_file
@@ -186,6 +199,12 @@ class AMRSampler(BaseSampler):
         if not 0 <= self.explore_basin < 1 or not 0 < self.explore_miss < 1:
             raise ValueError("explore-basin must be in [0, 1) and "
                              "explore-miss in (0, 1)")
+        self.check_points = int(check_points)
+        self.check_tolerance = float(check_tolerance)
+        if self.check_points < 0 or self.check_points == 1 \
+                or self.check_tolerance <= 0:
+            raise ValueError("check-points must be 0 or at least 2 and "
+                             "check-tolerance positive")
         self._explored = None
         self._batched = False
         self._next_share = 0
@@ -503,22 +522,29 @@ class AMRSampler(BaseSampler):
             # no pilot, as from a search's cells: share the starting boxes'
             # region
             self._share()
-        leaves, logmass, logz, refine = self._refine(self.max_evaluations)
-        self._logz = logz
-        logerr = self._logerr[leaves]
-        finite = numpy.isfinite(logerr)
-        self._dlogz = (float(numpy.exp(logsumexp(logerr[finite]) - logz))
-                       if finite.any() else 0.0)
-        if len(refine):
+        if self.check_points:
+            leaves, logmass, logz, refine = self._checked_refinement()
+        else:
+            leaves, logmass, logz, refine = self._refine(self.max_evaluations)
+            self._logz = logz
+            logerr = self._logerr[leaves]
+            finite = numpy.isfinite(logerr)
+            self._dlogz = (float(numpy.exp(logsumexp(logerr[finite]) - logz))
+                           if finite.any() else 0.0)
+        if len(refine) and not self.check_points:
             logging.warning("AMR stopped by max-evaluations with %d boxes "
                             "still to refine", len(refine))
         self._draw_posterior(leaves, logmass)
         seconds = time.time() - start
         diag = self._diagnostics
-        diag.update(stopped_by=('max-evaluations' if len(refine)
-                                else 'convergence'),
+        if self.check_points:
+            stopped = ('check' if self._dlogz <= self.check_tolerance
+                       else 'max-evaluations')
+        else:
+            stopped = 'max-evaluations' if len(refine) else 'convergence'
+        diag.update(stopped_by=stopped,
                     boxes_to_refine=len(refine), boxes=len(leaves),
-                    evaluations=self.nevaluations, logz=float(logz),
+                    evaluations=self.nevaluations, logz=float(self._logz),
                     dlogz=float(self._dlogz), seconds=seconds,
                     seconds_per_evaluation=seconds / max(self.nevaluations,
                                                          1))
@@ -989,6 +1015,106 @@ class AMRSampler(BaseSampler):
         self._logerr[first] = logerr
         self._logerr[second] = logerr
 
+    def _check(self, leaves, logmass, logz, n):
+        """A random check of the quadrature over ``leaves``: importance
+        sampling of the prior cube from a mixture, half the prior itself and
+        half the tree's posterior (a leaf by its mass, a uniform point in
+        its box coordinates).
+
+        With ``q`` the mixture's density in the cube, ``r = L / (Z q)`` at
+        ``n`` independent draws has a mean ``1 + D`` unbiased for
+        ``Z_true / Z``, whatever the likelihood, the frame or the tree's
+        reach; ``V``, the variance of ``r`` over ``n - 1``, is unbiased for
+        ``D``'s variance, and ``r <= 2 L / Z`` bounds every draw's weight.
+
+        Returns ``D``, ``V``, ``U``, the part of ``1 + D`` from draws no leaf
+        holds, the leaves the draws fell in and, for each, the mass the
+        draw gives its box less the box's midpoint mass, over ``Z``."""
+        rng = numpy.random.default_rng(self.seed + 7 + len(self.history))
+        share = numpy.exp(logmass - logz)
+        share /= share.sum()
+        ntree = int(rng.binomial(n, 0.5))
+        pick = leaves[rng.choice(len(leaves), size=ntree, p=share)]
+        prior = rng.random((n - ntree, self.ndim))
+        s = numpy.vstack([self._lower[pick] + rng.random((ntree, self.ndim))
+                          * self._width[pick], self._unmap(prior)])
+        cube, logjac = self._map(s)
+        # the prior's draws at their own points, whatever the frame's round
+        # trip
+        cube[ntree:] = prior
+        within = numpy.all(numpy.isfinite(s) & (s >= 0) & (s <= 1), axis=1)
+        box = numpy.full(n, -1)
+        box[within] = self._locate(s[within])
+        box[:ntree] = pick
+        held = box >= 0
+        # the tree's density at each draw, in the cube
+        mass = numpy.full(len(self._lower), -numpy.inf)
+        mass[leaves] = logmass - logz
+        logq_tree = numpy.full(n, -numpy.inf)
+        with numpy.errstate(invalid='ignore'):
+            logq_tree[held] = (mass[box[held]]
+                               - numpy.sum(numpy.log(self._width[box[held]]),
+                                           axis=1) - logjac[held])
+        logq = numpy.logaddexp(numpy.log(0.5), numpy.log(0.5) + numpy.where(
+            numpy.isfinite(logq_tree), logq_tree, -numpy.inf))
+        logl = self._cube_loglikelihoods(cube, numpy.where(
+            numpy.arange(n) < ntree, logjac, 0.0))
+        r = numpy.exp(numpy.where(numpy.isfinite(logl), logl - logz - logq,
+                                  -numpy.inf))
+        D = float(numpy.mean(r)) - 1
+        V = float(numpy.var(r, ddof=1) / n)
+        U = float(numpy.sum(r[~held]) / n)
+        with numpy.errstate(invalid='ignore'):
+            there = numpy.where(numpy.isfinite(logl[held]), logl[held]
+                                + numpy.sum(numpy.log(self._width[box[held]]),
+                                            axis=1) + logjac[held] - logz,
+                                -numpy.inf)
+        d = numpy.exp(there) - numpy.exp(mass[box[held]])
+        return D, V, U, box[held], d
+
+    def _checked_refinement(self):
+        """Refinement in rounds, each ended by :meth:`_check`, until the
+        checked error in ``log Z`` is within ``check_tolerance`` or the
+        budget is spent; ``log Z`` is corrected by the last check."""
+        n = self.check_points
+        budget = min(self.max_evaluations,
+                     max(self.nevaluations + 2 * n, self.max_evaluations // 4))
+        rounds = []
+        while True:
+            leaves, logmass, logz, refine = self._refine(budget)
+            D, V, U, box, d = self._check(leaves, logmass, logz, n)
+            # ln(1 + D) with its error; a correction below -1 is noise of a
+            # check far too small
+            ratio = max(1 + D, 1e-3)
+            err = numpy.sqrt(V) / ratio
+            rounds.append((self.nevaluations, float(logz), D, float(err), U))
+            logging.info("AMR check: %d evaluations, log Z %.4f, "
+                         "correction %+.4f, error %.3f, beyond the tree "
+                         "%.3g", self.nevaluations, logz, numpy.log(ratio),
+                         err, U)
+            if err <= self.check_tolerance or \
+                    self.nevaluations + 2 * n >= self.max_evaluations:
+                break
+            # the boxes whose check point disagreed with their midpoint by
+            # more than the mass a box may hold
+            wrong = numpy.unique(box[numpy.abs(d) > self.mass_fraction])
+            wrong = wrong[self._level[wrong] < self.max_level]
+            if len(wrong):
+                self._bisect(wrong)
+            budget = min(self.max_evaluations,
+                         self.nevaluations + max(self.nevaluations // 2, 2 * n))
+        self._logz = float(logz + numpy.log(ratio))
+        self._dlogz = float(err)
+        self._diagnostics.update(check_rounds=len(rounds),
+                                 check_uncovered=float(rounds[-1][4]),
+                                 check_correction=float(numpy.log(ratio)),
+                                 midpoint_logz=float(logz))
+        if err > self.check_tolerance:
+            logging.warning("AMR check error %.3f above the tolerance %.3f "
+                            "at the evaluation budget", err,
+                            self.check_tolerance)
+        return leaves, logmass, logz, refine
+
     def _draw_posterior(self, leaves, logmass):
         rng = numpy.random.default_rng(self.seed)
         weights = numpy.exp(logmass - self._logz)
@@ -1062,7 +1188,8 @@ class AMRSampler(BaseSampler):
                  'mass-fraction': float, 'max-evaluations': int,
                  'posterior-samples': int, 'seed': int,
                  'loglikelihood-function': str,
-                 'explore-basin': float, 'explore-miss': float}
+                 'explore-basin': float, 'explore-miss': float,
+                 'check-points': int, 'check-tolerance': float}
         unknown = set(cp.options(section)) - set(types) - {'name'}
         if unknown:
             raise ValueError("unknown option(s) in [sampler] for amr: "
