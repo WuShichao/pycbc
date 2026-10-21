@@ -296,6 +296,91 @@ class BStatisticSurrogate(BaseModel):
             choice[done] = i
         return choice
 
+    def share(self, region, **kwargs):
+        """Evaluate points of ``region`` (a list of parameter dicts spanning
+        it) from computations they share, through :class:`SharedLikelihood`;
+        :meth:`loglikelihoods` then uses it for the points it covers.
+        Raises ``MemoryError`` when the region is too large for one grid."""
+        regions = getattr(self, '_shared_regions', [])
+        # make room on the device first: the oldest region goes
+        while len(regions) >= self.max_shared_regions:
+            regions.pop(0)
+        self._shared_regions = regions
+        shared = SharedLikelihood(self, region, **kwargs)
+        regions.append(shared)
+        self._shared_regions = regions[-self.max_shared_regions:]
+        self._share_options = kwargs
+        return shared
+
+    #: the shared regions kept at once, the oldest dropped first
+    max_shared_regions = 2
+    #: points outside every shared region that one batch must have before a
+    #: new region is built for them
+    min_new_region = 3000
+
+    def _share_split(self, points, depth=0):
+        """Share ``points``, halving them along their first phase
+        coordinate while one grid cannot hold them."""
+        try:
+            self.share(points, **getattr(self, '_share_options', {}))
+            return True
+        except MemoryError:
+            if depth >= 3 or len(points) < 2 * self.min_new_region // 4:
+                return False
+            key = numpy.array([p['mchirp'] for p in points])
+            half = numpy.median(key)
+            low = [p for p, k in zip(points, key) if k <= half]
+            high = [p for p, k in zip(points, key) if k > half]
+            done = self._share_split(low, depth + 1)
+            return self._share_split(high, depth + 1) or done
+
+    def loglikelihoods(self, points):
+        """The log likelihood of each of ``points`` (dicts of the variable
+        parameters, the static ones added): from the shared computations
+        where :meth:`share` set them up and they cover the point, one at a
+        time otherwise. A batch with many points outside every region gets a
+        new region for them."""
+        import time
+        full = []
+        for p in points:
+            q = dict(self.static_params)
+            q.update(p)
+            full.append(q)
+        out = numpy.full(len(full), numpy.nan)
+        todo = numpy.ones(len(full), dtype=bool)
+        tick = time.time()
+        regions = getattr(self, '_shared_regions', [])
+        if regions and todo.sum() >= self.min_new_region:
+            # new region for the points no region covers yet
+            pending = numpy.nonzero(todo)[0]
+            covered = numpy.zeros(len(pending), dtype=bool)
+            for shared in regions:
+                covered |= shared.inside([full[i] for i in pending])
+            outside = pending[~covered]
+            if len(outside) >= self.min_new_region:
+                self._share_split([full[i] for i in outside])
+                regions = self._shared_regions
+        for shared in regions:
+            idx = numpy.nonzero(todo)[0]
+            if len(idx) == 0:
+                break
+            hit = shared.inside([full[i] for i in idx])
+            if hit.any():
+                sel = idx[hit]
+                out[sel] = shared([full[i] for i in sel])
+                # a point whose arrival times reach past the grid's goes
+                # one at a time
+                todo[sel] = ~numpy.isfinite(out[sel])
+        middle = time.time()
+        nshared = int((~todo).sum())
+        for i in numpy.nonzero(todo)[0]:
+            self.update(**points[i])
+            out[i] = self.loglikelihood
+        logging.info("batch of %d: %d shared in %.2f s, %d one at a time in "
+                     "%.2f s", len(full), nshared, middle - tick,
+                     int(todo.sum()), time.time() - middle)
+        return out
+
     def _loglikelihood(self):
         _, _, lnb, (_, _, _, width) = self._time_samples(self.current_params)
         terms = _to_numpy(lnb) + numpy.log(width)
@@ -690,3 +775,271 @@ def grid_periods_needed(source, start, duration, f_low, f_high, window,
     t_a, t_b = times.min() - start, times.max() - start
     need = (max(duration - t_a, t_b) + window) * (1 + margin)
     return max(1, int(numpy.ceil(need / ORBITAL_PERIOD)))
+
+
+class SharedLikelihood(object):
+    """The marginal log likelihood of :class:`BStatisticSurrogate` for many
+    points of a region at once, from computations they share.
+
+    The correlations of every point come from one
+    :class:`pycbc.filter.nufft_correlation.PhaseGrid` over the region; the
+    Gram matrix of a point is its own, from day sums of the reference's
+    power times ``(Mc / Mc0)^(5/3)`` at the point's closed-form stationary
+    times, a batch of points per kernel call; the orientation marginals of
+    all points and arrival times go through one kernel call per
+    quadrature.
+
+    Parameters
+    ----------
+    model : BStatisticSurrogate
+        A model whose family is a
+        :class:`pycbc.tdi.pn_coefficient_surrogate.PNCoefficientSurrogate`.
+    region : list of dict
+        Points spanning the region, with their sky positions.
+    sky_tolerance : float
+        The relative error, in the template's norm, allowed the response
+        on the region's sky basis (see
+        :class:`pycbc.filter.nufft_correlation.SkyBasis`); a point beyond
+        it, or keeping more phase outside the grid's directions than the
+        grid allows, is not :meth:`inside` the region.
+    edge_margin : float
+        A point's ``ln B`` must fall this far below its largest at both
+        ends of the grid's arrival times, or its log likelihood is not
+        given (``nan``) and the model computes it one point at a time.
+    probes : int
+        Points of the region whose arrival-time support, from the model's
+        own likelihood, sets the grid's arrival times.
+    grid_options : dict
+        Passed to :class:`pycbc.filter.nufft_correlation.PhaseGrid`.
+
+    In grid time ``T = delay + shift``, with ``shift`` a template's mean
+    arrival-time offset from the reference, the points of a region peak
+    together; the grid covers the ``T`` where the probes' ``ln B`` is
+    within ``edge_margin`` of their largest, twice over, for the probes
+    within it of the best. Every point checks that its ``ln B`` has fallen
+    by ``edge_margin`` at the ends.
+    """
+    def __init__(self, model, region, sky_tolerance=1e-4, edge_margin=30.0,
+                 probes=16, grid_options=None):
+        from pycbc.filter.nufft_correlation import (PhaseGrid,
+                                                    PhaseNUFFTCorrelation)
+        self.model = model
+        fam = model.surrogate
+        self.names = ['mchirp', 'q', 'spin1z', 'spin2z']
+        offsets = self._sky(region)
+        middle = 0.5 * (offsets.max(axis=0) + offsets.min(axis=0))
+        self.sky_tolerance = float(sky_tolerance)
+        self.correlator = PhaseNUFFTCorrelation(
+            fam, model.data_spectrum, sky=middle, sky_points=offsets,
+            sky_tolerance=self.sky_tolerance)
+        thetas = self._thetas(region)
+        self.edge_margin = float(edge_margin)
+        window = self._time_window(region, thetas, probes)
+        options = dict(time_range=window)
+        options.update(grid_options or {})
+        self.grid = PhaseGrid(self.correlator, thetas, window, **options)
+
+    def _time_window(self, region, thetas, probes):
+        """The grid times the region's points need: the span where the
+        probes' ``ln B`` lies within ``edge_margin`` of each one's largest,
+        for the probes within it of the best, widened by itself and eight
+        lags either side."""
+        m = self.model
+        frame = self.correlator.frame(thetas, 3)
+        pick = numpy.random.default_rng(0).choice(
+            len(region), min(probes, len(region)), replace=False)
+        _, shift, _ = self.correlator.project(thetas[pick], frame)
+        L = len(m.delays)
+        curves = [_to_numpy(m._time_samples(region[j])[2])[:L]
+                  for j in pick]
+        tops = numpy.array([numpy.nanmax(v) for v in curves])
+        lo, hi = numpy.inf, -numpy.inf
+        # the probes that matter: within the margin of the best; a point
+        # whose peak lies elsewhere fails its edge check
+        for i in numpy.nonzero(tops >= tops.max() - self.edge_margin)[0]:
+            keep = curves[i] >= tops[i] - self.edge_margin
+            T = m.delays[keep] + shift[i]
+            lo, hi = min(lo, T.min()), max(hi, T.max())
+        pad = (hi - lo) + 8 * m.grid_step
+        return (lo - pad, hi + pad)
+
+    def _sky(self, points):
+        m = self.model
+        names = ('eclipticlongitude', 'eclipticlatitude')
+        return numpy.array([[(p[n] - m.reference[n]) / m.scales[n]
+                             for n in names] for p in points])
+
+    def _thetas(self, points):
+        return numpy.array([[p[n] for n in self.names] for p in points])
+
+    def _gram_at(self, xis, thetas, delays, chunk=64):
+        """``(g00, g11, g01)`` of shape ``(M, L)`` at ``delays`` ``(M, L)``,
+        each template's own: its day sums and response as the model forms
+        them, batched on cupy (stationary times in closed form, no
+        waveform), one template at a time on the CPU."""
+        m = self.model
+        xp, dg, fam = m.xp, m.daily_gram, m.surrogate
+        var = m.noise_variance
+        if xp is numpy:
+            out = [numpy.empty(delays.shape), numpy.empty(delays.shape),
+                   numpy.empty(delays.shape, dtype=complex)]
+            for i, xi in enumerate(xis):
+                q = dg.prepare(*fam.pieces(xi))
+                for c, v in enumerate(dg.at_prepared(q, delays[i])):
+                    out[c][i] = v / var
+            return tuple(out)
+        parts = [[], [], []]
+        for j0 in range(0, len(xis), chunk):
+            js = slice(j0, j0 + chunk)
+            pw, fw = fam.day_sums(thetas[js], dg, reach=float(
+                numpy.abs(delays).max()) + dg.day)
+            rho = fam.responses(xis[js, -2:])
+            for c, v in enumerate(dg.at_batch(pw, fw, rho, delays[js])):
+                parts[c].append(v / var)
+        return tuple(xp.concatenate(v) for v in parts)
+
+    def __call__(self, points):
+        """The log likelihood of each point; ``nan`` where its ``ln B``
+        has not fallen by ``edge_margin`` at the ends of the grid's arrival
+        times."""
+        m = self.model
+        xp = m.xp
+        thetas = self._thetas(points)
+        sky = self._sky(points)
+        xis = numpy.array([m._shape_coordinates(p) for p in points])
+        M = len(thetas)
+        var = m.noise_variance
+        gs = m.grid_step
+        # each point's lags whose grid time, and the refinement's up to a
+        # lag later, the grid holds
+        _, shift, _ = self.correlator.project(thetas, self.grid.frame)
+        t_lo, t_hi = self.grid.time_limits()
+        d0, L = m.delays[0], len(m.delays)
+        first = numpy.clip(numpy.ceil((t_lo - shift - d0) / gs), 0,
+                           L - 1).astype(int)
+        last = numpy.clip(numpy.floor((t_hi - gs - shift - d0) / gs), 0,
+                          L - 1).astype(int)
+        count = numpy.maximum(last - first + 1, 0)
+        width_l = max(int(count.max()), 1)
+        K = first[:, None] + numpy.arange(width_l)[None]
+        valid = K <= last[:, None]
+        K = numpy.minimum(K, L - 1)
+        delays = m.delays[K]
+        z = self.grid.evaluate(thetas, delays, sky).astype(
+            xp.complex128) / var
+        g = self._gram_at(xis, thetas, delays)
+        lnb, choice = self._marginal(z, g)
+        values = numpy.where(valid, _to_numpy(lnb), -numpy.inf)
+        top = values.max(axis=1, keepdims=True)
+        # the integrand has fallen off at both ends, or the window ends
+        # where the model's does
+        rows = numpy.arange(M)
+        cut = top[:, 0] - self.edge_margin
+        ok = ((values[rows, 0] <= cut) | (first == 0)) & (
+            (values[rows, numpy.maximum(count - 1, 0)] <= cut)
+            | (last == L - 1)) & (count > 0)
+        width = numpy.full((M, width_l), gs)
+        terms = [values + numpy.log(width)]
+        # finer arrival times where a point's peak is narrower than the
+        # grid, as the model does
+        need = (values >= top - m._tau) & (values >= m._narrow)
+        need = need | numpy.roll(need, 1, axis=1) | numpy.roll(need, -1,
+                                                               axis=1)
+        need &= valid
+        peak = numpy.maximum(numpy.where(need, values, -numpy.inf).max(
+            axis=1), 0.5)
+        sigma_t = 1 / (2 * numpy.pi * m._sigma_f * numpy.sqrt(2 * peak))
+        P = numpy.ceil(gs / sigma_t).astype(int)
+        refine = need.any(axis=1) & (P > 1)
+        if refine.any():
+            rows = numpy.nonzero(refine)[0]
+            fine, widths = [], []
+            for j in rows:
+                k = numpy.nonzero(need[j])[0]
+                step = gs / P[j]
+                fine.append(numpy.concatenate([delays[j, k] + p * step
+                                               for p in range(1, P[j])]))
+                widths.append(step)
+                width[j, k] = step
+            terms[0] = values + numpy.log(width)
+            longest = max(len(f) for f in fine)
+            pad = numpy.array([numpy.concatenate(
+                [f, numpy.full(longest - len(f), f[-1])]) for f in fine])
+            fvalid = numpy.array([numpy.arange(longest) < len(f)
+                                  for f in fine])
+            zf = self.grid.evaluate(thetas[rows], pad, sky[rows]).astype(
+                xp.complex128) / var
+            gf = self._gram_at(xis[rows], thetas[rows], pad)
+            lf = _to_numpy(self._marginal(zf, gf, choice=choice[rows])[0])
+            extra = numpy.full((M, longest), -numpy.inf)
+            extra[rows] = numpy.where(fvalid, lf + numpy.log(
+                numpy.array(widths))[:, None], -numpy.inf)
+            terms.append(extra)
+        allterms = numpy.concatenate(terms, axis=1)
+        top = allterms.max(axis=1, keepdims=True)
+        out = (top[:, 0] + numpy.log(numpy.exp(allterms - top).sum(axis=1))
+               - numpy.log(m.window_width))
+        return numpy.where(ok, out, numpy.nan)
+
+    def inside(self, points):
+        """Whether each point lies in the region the shared computation
+        covers: on the grid, within the Taylor reach of its third phase
+        coordinate, with its phase in the grid's directions and its
+        response on the sky basis, each to its tolerance."""
+        thetas = self._thetas(points)
+        ok = self.grid.inside(thetas)
+        if ok.any():
+            sky = self._sky([p for p, k in zip(points, ok) if k])
+            ok[ok] = self.correlator.sky_error(sky) <= self.sky_tolerance
+        return ok
+
+    def _marginal(self, z, g, margin=25.0, choice=None):
+        """``ln B`` of shape ``(M, L)``, each point with the coarsest
+        orientation quadrature that has converged at its largest
+        F-statistic, as the model chooses it.
+
+        ``F = z^H G^-1 z / 2`` bounds ``ln B`` from above at each arrival
+        time (the marginal is below the maximum over amplitude, phase and
+        any complex orientation). With ``ln B*`` computed at a point's
+        largest ``F``, arrival times whose bound is ``margin`` plus the log
+        of their number below it add less than ``exp(-margin)`` to the
+        point's arrival-time sum; they are given ``-inf`` without the
+        quadrature.
+
+        Returns ``ln B`` and the quadrature chosen for each point, which a
+        call for the same points' finer arrival times takes as
+        ``choice``."""
+        m = self.model
+        xp = m.xp
+        M, L = z.shape[1:]
+        sets = m._candidate_node_sets()
+        g00, g11, g01 = g
+        det = xp.maximum(g00 * g11 - xp.abs(g01) ** 2, 1e-300)
+        F = 0.5 * (g11 * xp.abs(z[0]) ** 2 + g00 * xp.abs(z[1]) ** 2
+                   - 2 * xp.real(xp.conj(z[0]) * g01 * z[1])) / det
+        flat_z = z.reshape(2, -1)
+        flat_g = tuple(v.reshape(-1) for v in g)
+        # the quadrature the model would choose for each point
+        if choice is None:
+            choice = m._node_choice(z, g, sets)
+        best = xp.asarray(_to_numpy(xp.argmax(F, axis=1))
+                          + numpy.arange(M) * L)
+        at_best = _to_numpy(m.table.log_orientation_marginals(
+            flat_z[:, best], *(v[best] for v in flat_g), sets, xp=xp))
+        # the bound's cut, from the exact ln B at the largest F
+        anchor = at_best[choice, numpy.arange(M)]
+        keep = F >= xp.asarray(anchor - margin - numpy.log(L))[:, None]
+        out = xp.full((M, L), -numpy.inf)
+        keep_flat = keep.reshape(-1)
+        for i in numpy.unique(choice):
+            rows = xp.asarray(numpy.nonzero(choice == i)[0])
+            mask = xp.zeros(M, dtype=bool)
+            mask[rows] = True
+            sel = xp.nonzero(keep_flat & xp.repeat(mask, L))[0]
+            if len(sel) == 0:
+                continue
+            vals = m.table.log_orientation_marginals(
+                flat_z[:, sel], *(v[sel] for v in flat_g), [sets[i]],
+                xp=xp)[0]
+            out.reshape(-1)[sel] = vals
+        return out, choice

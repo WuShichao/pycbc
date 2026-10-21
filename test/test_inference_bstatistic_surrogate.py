@@ -312,3 +312,49 @@ def test_amr_sampler_integrates_the_model():
         3 * sampler.logz_err, 1e-3))
     mean = numpy.trapz(grid * density, grid) / numpy.trapz(density, grid)
     assert numpy.mean(sampler.samples['x']) == pytest.approx(mean, abs=2e-3)
+
+
+def test_shared_computation_matches_one_point_at_a_time():
+    """On the exact sparse-TDI injection, the log likelihoods of a batch of
+    points from one shared NUFFT grid agree with the model's per-point
+    ones, inside the region the grid covers; points outside it fall back
+    to the per-point path."""
+    from pycbc.inference import models
+    from pycbc.workflow import WorkflowConfigParser
+    cp = WorkflowConfigParser()
+    cp.read_string(CONFIG.replace(
+        'grid-periods = 1',
+        'grid-periods = 1\namplitude-table-file = ' + table_file()))
+    data, psds, snr2, mc = stbbh_data()
+    m = models.read_from_config(cp, data=data, psds=psds)
+    unit = m.scales['mchirp']
+    region = [dict(mchirp=mc + u * unit) for u in numpy.linspace(-1, 1, 41)]
+    full = []
+    for p in region:
+        q = dict(m.static_params)
+        q.update(p)
+        full.append(q)
+    m.share(full)
+    points = [dict(mchirp=mc + u * unit)
+              for u in (-0.8, -0.3, 0.0, 0.45, 0.9, 3.0)]
+    batch = m.loglikelihoods(points)
+    single = []
+    for p in points:
+        m.update(**p)
+        single.append(m.loglikelihood)
+    single = numpy.array(single)
+    near = single > single.max() - 20
+    assert numpy.abs(batch - single)[near].max() < 0.02
+    # the region's points come from the shared grid itself
+    shared = m._shared_regions[-1]
+    inner = []
+    for p in points[:5]:
+        q = dict(m.static_params)
+        q.update(p)
+        inner.append(q)
+    assert shared.inside(inner).all()
+    own = shared(inner)
+    assert numpy.isfinite(own).all()
+    assert numpy.abs(own - single[:5])[near[:5]].max() < 0.02
+    # the point beyond the region is computed one at a time, exactly
+    assert batch[-1] == pytest.approx(single[-1], abs=1e-9)
