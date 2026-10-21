@@ -19,12 +19,15 @@ cross) and channel ``c`` at shape coordinates ``xi`` is
 
     y_ac(f; Delta) = b(f) sum_k rho_k,ac(f) exp(i k Omega (t(f) + Delta))
                      exp(-2 pi i (f - f0) Delta),
-    b = b0 exp(sum_i xi_i D_i),   t = t0 + sum_i xi_i T_i,
+    b = b0 exp(sum_i xi_i D_i + 1/2 sum_ij xi_i xi_j D_ij),
+    t = t0 + sum_i xi_i T_i + 1/2 sum_ij xi_i xi_j T_ij,
     rho_k = (1/N_T) sum_j R0(t_j) exp(delta . L(t_j)) exp(-i k Omega t_j),
 
 with ``xi_i`` the intrinsic coordinates, ``delta`` the two sky offsets and
 ``Delta`` the arrival time. ``b0`` is the whitened source and ``t0`` its
-stationary time, ``D_i`` and ``T_i`` their derivatives in ``xi_i``, ``R0``
+stationary time, ``D_i`` and ``T_i`` their derivatives in ``xi_i`` and
+``D_ij``, ``T_ij`` the second derivatives (zero for a first-order family),
+``R0``
 the yearly response samples of
 :func:`pycbc.tdi.ssb_yearly_harmonics.yearly_response_samples` on a coarse
 frequency grid and ``L`` their sky log-derivatives. The correlation with
@@ -61,6 +64,12 @@ class LinearExponentSurrogate(object):
         ``D_i``.
     time_derivatives : array_like, shape ``(nintrinsic, N)``
         ``T_i``.
+    second_log_derivatives, second_time_derivatives : array_like, optional
+        ``D_ij`` and ``T_ij`` for ``i <= j`` in row-major order, shape
+        ``(nintrinsic (nintrinsic + 1) / 2, N)``. Along a nearly degenerate
+        combination of the intrinsic parameters the first-order family
+        decorrelates from the source within a small fraction of a shape
+        unit; the second-order terms carry it much further.
     kmax : int
         Highest yearly harmonic kept.
     dtype : numpy dtype
@@ -68,7 +77,8 @@ class LinearExponentSurrogate(object):
     """
     def __init__(self, grid, coarse_frequencies, response_samples,
                  sky_derivatives, source, stationary_time, log_derivatives,
-                 time_derivatives, kmax=4, dtype=numpy.complex128):
+                 time_derivatives, kmax=4, dtype=numpy.complex128,
+                 second_log_derivatives=None, second_time_derivatives=None):
         xp = self.xp = array_module()
         self.grid = grid
         self.size = grid.size
@@ -85,13 +95,46 @@ class LinearExponentSurrogate(object):
         self.t0 = xp.asarray(stationary_time, dtype=numpy.float64)
         self.D = xp.asarray(log_derivatives, dtype=dtype)
         self.T = xp.asarray(time_derivatives, dtype=numpy.float64)
-        self.nintrinsic = self.D.shape[0]
+        self.nintrinsic = n = self.D.shape[0]
+        self.pairs = [(i, j) for i in range(n) for j in range(i, n)]
+        if second_log_derivatives is None:
+            self.D2 = self.T2 = None
+            self._D, self._T = self.D, self.T
+        else:
+            self.D2 = xp.asarray(second_log_derivatives, dtype=dtype)
+            self.T2 = xp.asarray(second_time_derivatives, dtype=numpy.float64)
+            if self.D2.shape[0] != len(self.pairs) or \
+                    self.T2.shape[0] != len(self.pairs):
+                raise ValueError("need one second derivative per pair i <= j")
+            # the second-order terms enter like further coordinates, with
+            # weights xi_i xi_j (halved on the diagonal)
+            self._D = xp.concatenate([self.D, self.D2])
+            self._T = xp.concatenate([self.T, self.T2])
         coarse = numpy.asarray(coarse_frequencies, dtype=float)
         x = (grid.frequencies - coarse[0]) / (coarse[1] - coarse[0])
         i = numpy.clip(numpy.floor(x).astype(int), 0, len(coarse) - 2)
         self._index = xp.asarray(i)
         self._weight = xp.asarray(numpy.clip(x - i, 0, 1), dtype=real)
         self.coarse_frequencies = coarse
+
+    def _weights(self, xi):
+        """The coefficient of each row of the stacked derivatives."""
+        xi = numpy.asarray(xi, dtype=float)
+        if self.D2 is None:
+            return xi
+        return numpy.concatenate([xi, [(0.5 if i == j else 1.0) * xi[i]
+                                       * xi[j] for i, j in self.pairs]])
+
+    def _gradient(self, xi, i):
+        """``d/dxi_i`` of the exponent and of ``t`` at ``xi``."""
+        dlog, dt = self.D[i], self.T[i]
+        if self.D2 is not None:
+            for p, (a, c) in enumerate(self.pairs):
+                if i in (a, c):
+                    other = c if a == i else a
+                    dlog = dlog + float(xi[other]) * self.D2[p]
+                    dt = dt + float(xi[other]) * self.T2[p]
+        return dlog, dt
 
     def fine(self, values):
         """Coarse-grid ``values`` (last axis) on the fine grid."""
@@ -102,18 +145,79 @@ class LinearExponentSurrogate(object):
         """``b``, ``t`` and ``rho_k`` (shape ``(2 kmax + 1, 2, nchannels,
         ncoarse)``) at shape coordinates ``xi``: the intrinsic ones, then
         the two sky offsets."""
-        xp = self.xp
         xi = numpy.asarray(xi, dtype=float)
         if xi.shape != (self.nintrinsic + 2,):
             raise ValueError("xi must have {} entries".format(
                 self.nintrinsic + 2))
-        intrinsic = xp.asarray(xi[:self.nintrinsic])
-        b = self.b0 * xp.exp(xp.tensordot(intrinsic.astype(self.dtype),
-                                          self.D, axes=1))
-        t = self.t0 + xp.tensordot(intrinsic, self.T, axes=1)
-        sky = xp.exp(float(xi[-2]) * self.L[0] + float(xi[-1]) * self.L[1])
+        b, t = self._source(xi[:self.nintrinsic])
+        return b, t, self._response(xi[-2:])
+
+    def _source(self, intrinsic):
+        """``b`` and ``t`` at the intrinsic shape coordinates."""
+        xp = self.xp
+        weights = self._weights(intrinsic)
+        if xp is not numpy:
+            return self._pieces_kernel(xp.asarray(weights))
+        b = self.b0 * xp.exp(xp.tensordot(weights.astype(self.dtype),
+                                          self._D, axes=1))
+        t = self.t0 + xp.tensordot(weights, self._T, axes=1)
+        return b, t
+
+    def _response(self, sky_offsets):
+        """``rho_k`` at the two sky offsets."""
+        xp = self.xp
+        sky = xp.exp(float(sky_offsets[0]) * self.L[0]
+                     + float(sky_offsets[1]) * self.L[1])
         rho = xp.fft.fft(self.R0 * sky, axis=0) / self.samples
-        return b, t, rho[xp.asarray(self.orders % self.samples)]
+        return rho[xp.asarray(self.orders % self.samples)]
+
+    def responses(self, sky_offsets):
+        """``rho_k`` at each row of sky offsets ``(M, 2)``, shape ``(M, 2
+        kmax + 1, 2, nchannels, ncoarse)``."""
+        xp = self.xp
+        d = xp.asarray(numpy.atleast_2d(sky_offsets), dtype=self.real)
+        expo = (d[:, 0, None, None, None, None] * self.L[0][None]
+                + d[:, 1, None, None, None, None] * self.L[1][None])
+        rho = xp.fft.fft(self.R0[None] * xp.exp(expo), axis=1) \
+            / self.samples
+        return rho[:, xp.asarray(self.orders % self.samples)]
+
+    _PIECES = r"""
+    #include <cupy/complex.cuh>
+    typedef complex<{real}> cplx;
+    extern "C" __global__ void pieces(
+        const cplx* b0, const cplx* D, const double* t0, const double* T,
+        const double* xi, const long long n, const int nint, cplx* b,
+        double* t) {
+      long long f = (long long)blockDim.x * blockIdx.x + threadIdx.x;
+      if (f >= n) return;
+      cplx e(0, 0);
+      double tt = t0[f];
+      for (int i = 0; i < nint; i++) {
+        e += ({real})xi[i] * D[i * n + f];
+        tt += xi[i] * T[i * n + f];
+      }
+      b[f] = b0[f] * exp(e);
+      t[f] = tt;
+    }
+    """
+
+    def _pieces_kernel(self, intrinsic, threads=256):
+        """``b`` and ``t`` in one pass on cupy."""
+        xp = self.xp
+        if not hasattr(self, '_pieces'):
+            real = 'float' if self.dtype == numpy.complex64 else 'double'
+            self._pieces = xp.RawModule(code=self._PIECES.replace(
+                '{real}', real)).get_function('pieces')
+            self._D = xp.ascontiguousarray(self._D)
+            self._T = xp.ascontiguousarray(self._T)
+        b = xp.empty(self.size, dtype=self.dtype)
+        t = xp.empty(self.size, dtype=xp.float64)
+        self._pieces(((self.size + threads - 1) // threads,), (threads,), (
+            self.b0, self._D, self.t0, self._T,
+            xp.ascontiguousarray(intrinsic, dtype=xp.float64),
+            numpy.int64(self.size), numpy.int32(len(intrinsic)), b, t))
+        return b, t
 
     def _phase(self, k, b, t, delta=0.0):
         omega = k * ORBITAL_ANGULAR_FREQUENCY
@@ -158,18 +262,19 @@ class LinearExponentSurrogate(object):
         const double* t, const int* index, const float* weight,
         const complex<float>* rho, complex<float>* out, const int n,
         const int nch, const int ncoarse, const int nk, const int kmin,
-        const int shift, const double omega) {
+        const int shift, const double turns_per_second) {
       // out[a, f] = sum_k sum_c conj(y_kac(f + k shift)) X_c(f + k shift)
       int f = blockDim.x * blockIdx.x + threadIdx.x;
       if (f >= n) return;
       complex<float> acc0(0, 0), acc1(0, 0);
       for (int q = 0; q < nk; q++) {
         int k = kmin + q;
-        long jj = ((long)f + (long)k * shift) % n;
-        int j = (int)(jj < 0 ? jj + n : jj);
-        double arg = k * omega * t[j];
-        float c = (float)cos(fmod(arg, 6.283185307179586));
-        float sn = (float)sin(fmod(arg, 6.283185307179586));
+        int j = f + k * shift;
+        j = j < 0 ? j + n : (j >= n ? j - n : j);
+        // Omega t in turns, reduced in double, then k turns in single
+        double turns = t[j] * turns_per_second;
+        float c, sn;
+        sincospif(2.0f * k * (float)(turns - floor(turns)), &sn, &c);
         complex<float> ph = b[j] * complex<float>(c, sn);
         int i = index[j];
         float w = weight[j];
@@ -198,16 +303,18 @@ class LinearExponentSurrogate(object):
             self._weight32 = self._weight.astype(xp.float32)
         out = xp.empty((2, self.size), dtype=xp.complex64)
         nch = data.shape[0]
+        if abs(int(self.orders[0])) * self.shift >= self.size:
+            raise ValueError("the harmonics shift beyond the grid")
         threads = 256
         self._corr(((self.size + threads - 1) // threads,), (threads,), (
             xp.ascontiguousarray(data), xp.ascontiguousarray(
-                b.astype(xp.complex64)), xp.ascontiguousarray(
-                t.astype(xp.float64)), self._index32, self._weight32,
-            xp.ascontiguousarray(rho.astype(xp.complex64)), out,
+                b, dtype=xp.complex64), xp.ascontiguousarray(
+                t, dtype=xp.float64), self._index32, self._weight32,
+            xp.ascontiguousarray(rho, dtype=xp.complex64), out,
             numpy.int32(self.size), numpy.int32(nch),
             numpy.int32(rho.shape[-1]), numpy.int32(len(self.orders)),
             numpy.int32(self.orders[0]), numpy.int32(self.shift),
-            numpy.float64(ORBITAL_ANGULAR_FREQUENCY)))
+            numpy.float64(ORBITAL_ANGULAR_FREQUENCY / (2 * numpy.pi))))
         return out
 
     def template(self, b, t, rho, delta):
@@ -234,21 +341,24 @@ class LinearExponentSurrogate(object):
         shift = xp.exp(-2j * numpy.pi * xp.asarray(
             self.grid.frequencies - self.grid.first_frequency)
             * delta).astype(self.dtype)
-        out = []
+        # filled in place: a list stacked at the end would hold every
+        # derivative twice
+        out = xp.empty((self.nintrinsic + 2,) + y.shape, dtype=y.dtype)
         for i in range(self.nintrinsic):
-            d = xp.zeros_like(y)
+            d = out[i]
+            d[...] = 0
+            dlog, dt = self._gradient(xi, i)
             for j, k in enumerate(self.orders):
-                factor = self.D[i] + 1j * k * ORBITAL_ANGULAR_FREQUENCY \
-                    * self.T[i]
+                factor = dlog + 1j * k * ORBITAL_ANGULAR_FREQUENCY * dt
                 d += self.fine(rho[j]) * (self._phase(k, b, t, delta)
                                           * factor.astype(self.dtype))
-            out.append(d * shift)
+            d *= shift
         for axis in range(2):
             drho = xp.fft.fft(self.R0 * sky * self.L[axis], axis=0) \
                 / self.samples
             drho = drho[xp.asarray(self.orders % self.samples)]
-            out.append(self.template(b, t, drho, delta))
-        return y, xp.stack(out)
+            out[self.nintrinsic + axis] = self.template(b, t, drho, delta)
+        return y, out
 
 
 class DailyGram(object):
@@ -392,7 +502,8 @@ def lal_plus_source(params, frequencies, epoch):
 def surrogate_from_source(grid, whitening, orbit, terms, params, intrinsic,
                           sky_scales, coarse_frequencies, to_source=None,
                           source=lal_plus_source, step=0.5, kmax=4,
-                          samples=32, dtype=numpy.complex128):
+                          samples=32, dtype=numpy.complex128, order=1,
+                          directions=None, derivatives='stencil'):
     """Build the linear-exponent family around a reference source.
 
     Parameters
@@ -424,6 +535,25 @@ def surrogate_from_source(grid, whitening, orbit, terms, params, intrinsic,
         Yearly harmonics kept and response samples per orbit.
     dtype : numpy dtype
         Complex type of the family's arrays.
+    order : {1, 2}
+        Order of the expansion in the intrinsic coordinates; 2 adds the
+        second derivatives from the same stencil plus the four corners of
+        each pair.
+    directions : array_like, optional
+        Columns ``v_k`` in shape units along which the stencil steps,
+        default the coordinate axes; the derivatives are transformed back
+        to the coordinates. Along a nearly degenerate combination the
+        curvature is what is left after large axis terms cancel, so their
+        stencil errors do not; stepping along the metric's eigenvectors
+        measures that curvature directly.
+    derivatives : {'stencil', 'taylorf2'}
+        How the derivatives are taken: central differences of the source,
+        or exactly, by Taylor-mode arithmetic through the TaylorF2 phase
+        pinned at ``f_lower`` (see :mod:`pycbc.waveform.taylorf2_jets`),
+        for the intrinsic coordinates mchirp, q, spin1z and spin2z. Along a
+        weakly measured coordinate the stencil's error is of the order of
+        the step squared times large higher derivatives; the second option
+        has none.
     """
     from pycbc.tdi.ssb_yearly_harmonics import (sky_log_derivatives,
                                                 yearly_response_samples)
@@ -437,30 +567,111 @@ def surrogate_from_source(grid, whitening, orbit, terms, params, intrinsic,
         return h * whitening, t
 
     b0, t0 = evaluate(params)
-    log_derivatives, time_derivatives = [], []
-    for name, scale in intrinsic.items():
-        # halve the step until both displaced sources are valid: a weakly
-        # measured coordinate has a shape unit beyond its physical range
-        h = step
-        for _ in range(60):
-            try:
-                moved = []
-                for sign in (1, -1):
-                    point = dict(params)
-                    point[name] = point[name] + sign * h * scale
-                    moved.append(evaluate(point))
-                break
-            except (RuntimeError, ValueError):
-                h *= 0.5
-        else:
-            raise ValueError("no valid derivative step for " + name)
-        (bp, tp), (bm, tm) = moved
-        ok = (numpy.abs(bp) > 0) & (numpy.abs(bm) > 0)
-        ratio = numpy.where(ok, bp / numpy.where(ok, bm, 1), 1.0)
-        log_derivatives.append((numpy.log(numpy.abs(ratio)) + 1j
-                                * numpy.unwrap(numpy.angle(ratio)))
-                               / (2 * h))
-        time_derivatives.append((tp - tm) / (2 * h))
+    names = list(intrinsic)
+    ok0 = numpy.abs(b0) > 0
+
+    def log_ratio(b):
+        """ln(b / b0), the phase unwrapped along frequency."""
+        ratio = numpy.where(ok0 & (numpy.abs(b) > 0),
+                            b / numpy.where(ok0, b0, 1), 1.0)
+        return numpy.log(numpy.abs(ratio)) + 1j * numpy.unwrap(
+            numpy.angle(ratio))
+
+    if derivatives == 'taylorf2':
+        from pycbc.waveform.taylorf2_jets import taylorf2_derivatives
+        order_names = ('mchirp', 'q', 'spin1z', 'spin2z')
+        if sorted(names) != sorted(order_names):
+            raise ValueError("TaylorF2 derivatives need the intrinsic "
+                             "coordinates " + ', '.join(order_names))
+        out = taylorf2_derivatives(params, intrinsic, f,
+                                   params['f_lower'], order=order)
+        # from the fixed order to the family's
+        perm = [order_names.index(n) for n in names]
+        log_derivatives = list(out[0][perm])
+        time_derivatives = list(out[1][perm])
+        second = None
+        if order == 2:
+            fixed = [(i, j) for i in range(4) for j in range(i, 4)]
+            rows = []
+            for i in range(4):
+                for j in range(i, 4):
+                    a_, b_ = sorted((perm[i], perm[j]))
+                    rows.append(fixed.index((a_, b_)))
+            second = (out[2][rows], out[3][rows])
+    elif derivatives == 'stencil':
+        nint = len(names)
+        V = numpy.eye(nint) if directions is None else numpy.asarray(
+            directions, dtype=float)
+        if V.shape != (nint, nint):
+            raise ValueError("need one direction per intrinsic coordinate")
+
+        def displaced(offsets):
+            """ln(b / b0) and t - t0 at the reference plus sum_k u_k v_k."""
+            point = dict(params)
+            for k, u in offsets.items():
+                for name, v in zip(names, V[:, k]):
+                    point[name] = point[name] + u * v * intrinsic[name]
+            b, t = evaluate(point)
+            return log_ratio(b), t - t0
+
+        # per direction, halve the step until the displaced sources are
+        # valid: a weakly measured coordinate has a shape unit beyond its
+        # physical range
+        steps, axis = [], []
+        for k in range(nint):
+            h = step
+            for _ in range(60):
+                try:
+                    axis.append([displaced({k: sign * h}) for sign in (1, -1)])
+                    break
+                except (RuntimeError, ValueError):
+                    h *= 0.5
+            else:
+                raise ValueError("no valid derivative step along direction "
+                                 "{}".format(k))
+            steps.append(h)
+        # derivatives in u, then in xi = V u: gradient W^T g, Hessian W^T H W
+        # with W = V^-1
+        W = numpy.linalg.inv(V)
+        grad_log = [(axis[k][0][0] - axis[k][1][0]) / (2 * steps[k])
+                    for k in range(nint)]
+        grad_t = [(axis[k][0][1] - axis[k][1][1]) / (2 * steps[k])
+                  for k in range(nint)]
+        log_derivatives = [sum(W[k, i] * grad_log[k] for k in range(nint))
+                           for i in range(nint)]
+        time_derivatives = [sum(W[k, i] * grad_t[k] for k in range(nint))
+                            for i in range(nint)]
+        second = None
+        if order == 2:
+            hess_log, hess_t = {}, {}
+            for k in range(nint):
+                (lp, tp), (lm, tm) = axis[k]
+                hess_log[k, k] = (lp + lm) / steps[k] ** 2
+                hess_t[k, k] = (tp + tm) / steps[k] ** 2
+                for m in range(k + 1, nint):
+                    corners = {(sa, sb): displaced({k: sa * steps[k],
+                                                    m: sb * steps[m]})
+                               for sa in (1, -1) for sb in (1, -1)}
+                    norm = 4 * steps[k] * steps[m]
+                    for out, part in ((hess_log, 0), (hess_t, 1)):
+                        out[k, m] = out[m, k] = (
+                            corners[1, 1][part] - corners[1, -1][part]
+                            - corners[-1, 1][part]
+                            + corners[-1, -1][part]) / norm
+            second_log, second_time = [], []
+            for i in range(nint):
+                for j in range(i, nint):
+                    second_log.append(sum(W[k, i] * W[m, j] * hess_log[k, m]
+                                          for k in range(nint)
+                                          for m in range(nint)))
+                    second_time.append(sum(W[k, i] * W[m, j] * hess_t[k, m]
+                                           for k in range(nint)
+                                           for m in range(nint)))
+            second = (numpy.array(second_log), numpy.array(second_time))
+        elif order != 1:
+            raise ValueError("order must be 1 or 2")
+    else:
+        raise ValueError("derivatives must be 'stencil' or 'taylorf2'")
     lon, lat = params['eclipticlongitude'], params['eclipticlatitude']
     response = yearly_response_samples(orbit, terms, coarse_frequencies, lon,
                                        lat, lon, lat, samples=samples)
@@ -469,4 +680,6 @@ def surrogate_from_source(grid, whitening, orbit, terms, params, intrinsic,
     return LinearExponentSurrogate(
         grid, coarse_frequencies, response, sky, b0, t0,
         numpy.array(log_derivatives), numpy.array(time_derivatives),
-        kmax=kmax, dtype=dtype)
+        kmax=kmax, dtype=dtype,
+        second_log_derivatives=None if second is None else second[0],
+        second_time_derivatives=None if second is None else second[1])
