@@ -1,10 +1,14 @@
 """The bstatistic_surrogate inference model on a small synthetic family."""
+import functools
+import os
+import tempfile
 import warnings
 
 import numpy
 import pytest
 
-from pycbc.filter.bstatistic import (DistancePowerLaw, OrientationNodes,
+from pycbc.filter.bstatistic import (AmplitudeTable, DistancePowerLaw,
+                                     OrientationNodes,
                                      log_orientation_marginal)
 from pycbc.inference.models.bstatistic_surrogate import BStatisticSurrogate
 from pycbc.tdi.linear_exponent_surrogate import (DailyGram,
@@ -15,7 +19,7 @@ from pycbc.tmpltbank.fstatistic_metric import orientation_weights
 DAY = 86400.0
 PRIOR = DistancePowerLaw(0.05, 50.0, power=2.0)
 TRUTH = dict(delta_tc=3.3e4, inclination=1.0, polarization=0.4,
-             distance=0.5, signal_phase=2.0)
+             distance=0.5, coa_phase=1.0)
 
 
 def family(days=60.0, seed=2):
@@ -47,12 +51,21 @@ def inject(fam, xi, noise=1.0, seed=4):
     w = orientation_weights(TRUTH['inclination'], TRUTH['polarization'])
     y = fam.template(b, t, rho, TRUTH['delta_tc'])
     h = PRIOR.scale / TRUTH['distance']
-    signal = h * numpy.exp(1j * TRUTH['signal_phase']) \
+    signal = h * numpy.exp(2j * TRUTH['coa_phase']) \
         * numpy.tensordot(w, y, axes=1)
     rng = numpy.random.default_rng(seed)
     n = numpy.sqrt(noise) * (rng.normal(size=signal.shape)
                              + 1j * rng.normal(size=signal.shape))
     return signal + n, signal
+
+
+@functools.lru_cache()
+def table_file():
+    """One amplitude table for every test: it depends only on the prior's
+    power."""
+    path = os.path.join(tempfile.mkdtemp(), 'amplitude_table.hdf')
+    AmplitudeTable(PRIOR, y_max=20.0).write(path)
+    return path
 
 
 def model(fam, daily, data, noise=1.0, window=(-2e5, 2e5), oversampling=4):
@@ -61,7 +74,8 @@ def model(fam, daily, data, noise=1.0, window=(-2e5, 2e5), oversampling=4):
     return BStatisticSurrogate(['x'], fam, daily, data, noise, reference,
                                scales, PRIOR, window,
                                oversampling=oversampling,
-                               orientation_nodes=(16, 8))
+                               orientation_nodes=(16, 8),
+                               amplitude_table=table_file())
 
 
 def test_likelihood_peaks_at_the_injected_intrinsic_point():
@@ -118,7 +132,7 @@ def test_reconstruction_recovers_a_loud_injection():
         assert low < TRUTH[name] < high, name
     for d in draws:
         assert 0 <= d['polarization'] < 2 * numpy.pi
-        assert 0 <= d['signal_phase'] < 2 * numpy.pi
+        assert 0 <= d['coa_phase'] < numpy.pi
         assert 0 <= d['inclination'] <= numpy.pi
 
 
@@ -126,7 +140,8 @@ def test_reference_must_match_the_family():
     fam, daily = family()
     with pytest.raises(ValueError):
         BStatisticSurrogate(['x'], fam, daily, numpy.zeros((2, fam.size)),
-                            1.0, dict(x=0.0), dict(x=1.0), PRIOR, (0, 1e5))
+                            1.0, dict(x=0.0), dict(x=1.0), PRIOR, (0, 1e5),
+                            amplitude_table=False)
 
 
 def test_the_model_runs_on_the_gpu():
@@ -239,7 +254,9 @@ def test_from_config_on_an_exact_tdi_injection():
     from pycbc.inference import models
     from pycbc.workflow import WorkflowConfigParser
     cp = WorkflowConfigParser()
-    cp.read_string(CONFIG)
+    cp.read_string(CONFIG.replace(
+        'grid-periods = 1',
+        'grid-periods = 1\namplitude-table-file = ' + table_file()))
     data, psds, snr2, mc = stbbh_data()
     m = models.read_from_config(cp, data=data, psds=psds)
     unit = m.scales['mchirp']
@@ -277,7 +294,8 @@ def test_amr_sampler_integrates_the_model():
     scales = dict(x=1.0, eclipticlongitude=1e-3, eclipticlatitude=1e-3)
     m = BStatisticSurrogate(['x'], fam, daily, data, 1.0, reference, scales,
                             PRIOR, (-2e5, 2e5), oversampling=4,
-                            orientation_nodes=(16, 8), prior=prior)
+                            orientation_nodes=(16, 8), prior=prior,
+                            amplitude_table=table_file())
     grid = numpy.linspace(-1, 1, 4001)
     values = []
     for x in grid:

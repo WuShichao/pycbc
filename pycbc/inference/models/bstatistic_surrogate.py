@@ -29,6 +29,7 @@ over an arrival-time window of width ``W``, with ``X = w^H z / s^2`` and
 """
 
 import logging
+import os
 
 import numpy
 
@@ -36,11 +37,15 @@ from pycbc.filter.bstatistic import (AmplitudeTable, OrientationNodes,
                                      _project,
                                      draw_amplitude, draw_orientation,
                                      draw_phase, log_orientation_marginal)
-from pycbc.filter.subsample_arrival_time import (correlation_at,
-                                                 rms_bandwidth)
+from pycbc.filter.subsample_arrival_time import (
+    correlation_at, interpolate_twice_sampled, rms_bandwidth)
 from pycbc.tmpltbank.fstatistic_metric import orientation_weights
 
 from .base import BaseModel
+
+
+def _boolean(value):
+    return value.strip().lower() in ('1', 'true', 'yes')
 
 
 def _to_numpy(array):
@@ -81,7 +86,16 @@ class BStatisticSurrogate(BaseModel):
     margin : float
         Terms of the marginal below ``exp(-margin)`` of its total are
         skipped, see
-        :func:`pycbc.filter.bstatistic.log_orientation_marginal`.
+        :func:`pycbc.filter.bstatistic.log_orientation_marginal`; only
+        without a table.
+    metric : array, optional
+        The orientation-averaged F-statistic metric in the shape units of
+        ``reference``'s coordinates, for laying cells over the family.
+    amplitude_table : bool, AmplitudeTable or str
+        Read the amplitude marginal from a
+        :class:`pycbc.filter.bstatistic.AmplitudeTable`: built here (True),
+        the one given, or the one in an HDF file, built and written there
+        if the file does not exist; False integrates every value.
     """
     name = 'bstatistic_surrogate'
 
@@ -89,10 +103,20 @@ class BStatisticSurrogate(BaseModel):
                  data_spectrum, noise_variance, reference, scales,
                  distance_prior, time_window, oversampling=10,
                  orientation_nodes=(32, 16), margin=40.0,
-                 amplitude_table=True, **kwargs):
+                 amplitude_table=True, metric=None, **kwargs):
         super().__init__(variable_params, **kwargs)
+        self.metric = None if metric is None else numpy.asarray(metric)
+        # coordinates in which the phase is nearly linear, for samplers
+        if sorted(set(variable_params) & {'mchirp', 'q', 'spin1z',
+                                          'spin2z'}) == sorted(
+                ('mchirp', 'q', 'spin1z', 'spin2z')):
+            from pycbc.waveform.taylorf2_jets import PhaseCoordinates
+            self.curvilinear_coordinates = PhaseCoordinates(
+                [reference[n] for n in PhaseCoordinates.names])
         self.surrogate, self.daily_gram = surrogate, daily_gram
-        self.data_spectrum = data_spectrum
+        # in the surrogate's precision once, not at every correlation
+        self.data_spectrum = data_spectrum.astype(surrogate.dtype,
+                                                  copy=False)
         self.noise_variance = float(noise_variance)
         self.reference = dict(reference)
         self.scales = dict(scales)
@@ -128,9 +152,20 @@ class BStatisticSurrogate(BaseModel):
             else numpy.asarray(surrogate.b0)
         sigma_f = rms_bandwidth(grid.frequencies, numpy.abs(b0) ** 2)
         self._narrow = 0.5 / (numpy.pi * sigma_f * grid.delta_t) ** 2
+        self._sigma_f = sigma_f
         self._tau = numpy.log(1e4 * len(self._lags))
-        self.table = (AmplitudeTable(distance_prior) if amplitude_table
-                      else None)
+        if isinstance(amplitude_table, AmplitudeTable):
+            self.table = amplitude_table
+        elif isinstance(amplitude_table, str):
+            if os.path.exists(amplitude_table):
+                self.table = AmplitudeTable.read(amplitude_table,
+                                                 distance_prior)
+            else:
+                self.table = AmplitudeTable(distance_prior, xp=xp)
+                self.table.write(amplitude_table)
+        else:
+            self.table = (AmplitudeTable(distance_prior, xp=xp)
+                          if amplitude_table else None)
 
     def _shape_coordinates(self, params):
         point = dict(self.reference)
@@ -139,92 +174,127 @@ class BStatisticSurrogate(BaseModel):
                             for k in self.reference])
 
     def _time_samples(self, params):
-        """``z``, the Gram matrix and ``ln B`` at every fine arrival time
-        of the window, scaled by the noise variance."""
+        """``z``, the Gram matrix and ``ln B`` at the arrival times of the
+        window, scaled by the noise variance: every grid lag, and finer
+        samples where the grid does not resolve the peak."""
         s = self.surrogate
         b, t, rho = s.pieces(self._shape_coordinates(params))
         spectrum = s.correlation_spectrum(self.data_spectrum, b, t, rho)
         xp = self.xp
-        P = self.oversampling
         n = spectrum.shape[-1]
-        ramp = 2j * numpy.pi * xp.arange(n, dtype=xp.float64) / (P * n)
-        fine = {}
-
-        def correlation(p):
-            # the p-th fraction of a step, transformed only when asked for
-            if p not in fine:
-                shifted = spectrum if p == 0 else spectrum * xp.exp(
-                    ramp * p).astype(spectrum.dtype)
-                fine[p] = xp.fft.ifft(shifted, axis=-1) * n
-            return fine[p]
-        gram = self.daily_gram(b, t, rho)
+        q = self.daily_gram.prepare(b, t, rho)
         var = self.noise_variance
+        table = self.table
+        margin = None if table is not None else self.margin
 
-        def samples(p, lags, delays):
-            z = correlation(p)[:, lags].astype(xp.complex128) / var
-            g = tuple(v / var for v in self.daily_gram.at_delays(gram, delays))
+        def samples(correlation, lags, delays):
+            z = correlation[:, lags].astype(xp.complex128) / var
+            g = tuple(v / var for v in self.daily_gram.at_prepared(q, delays))
             return z, g
-        # every lag of the window on the grid
-        z, g = samples(0, self._lags_xp, xp.asarray(self.delays))
+        coarse = xp.fft.ifft(spectrum, axis=-1, norm='forward')
+        z, g = samples(coarse, self._lags_xp, xp.asarray(self.delays))
         nodes = self._orientation_nodes(z, g)
 
         def marginal(z, g):
             return log_orientation_marginal(
-                z, *g, self.distance_prior, nodes, margin=self.margin,
-                table=self.table, xp=xp)
+                z, *g, self.distance_prior, nodes, margin=margin,
+                table=table, xp=xp)
         lnb = marginal(z, g)
         width = numpy.full(len(self.delays), self.grid_step)
         delays = self.delays
-        # the lags whose peaks the grid does not resolve, and neighbours
         values = _to_numpy(lnb)
         top = values.max()
         need = (values >= top - self._tau) & (values >= self._narrow)
         need = need | numpy.roll(need, 1) | numpy.roll(need, -1)
-        if P > 1 and need.any():
+        if need.any():
+            # a peak of width sigma_t = 1 / (2 pi sigma_f sqrt(2 ln B)) is
+            # integrated to e^-2pi^2 by samples sigma_t apart
+            peak = max(float(values[need].max()), 0.5)
+            sigma_t = 1 / (2 * numpy.pi * self._sigma_f * numpy.sqrt(
+                2 * peak))
+            P = int(numpy.ceil(self.grid_step / sigma_t))
+        if need.any() and P > 1:
             k = numpy.nonzero(need)[0]
-            width[k] = self.time_step
-            zs, gs, ls, ds = [z], [g], [lnb], [delays]
-            for p in range(1, P):
-                d = self.delays[k] + p * self.time_step
-                zp, gp = samples(p, self._lags_xp[xp.asarray(k)],
-                                 xp.asarray(d))
-                zs.append(zp)
-                gs.append(gp)
-                ls.append(marginal(zp, gp))
-                ds.append(d)
-            z = xp.concatenate(zs, axis=1)
-            g = tuple(xp.concatenate([v[i] for v in gs]) for i in range(3))
-            lnb = xp.concatenate(ls)
-            delays = numpy.concatenate(ds)
-            width = numpy.concatenate(
-                [width] + [numpy.full(len(k), self.time_step)] * (P - 1))
-        return z, g, lnb, (spectrum, gram, delays, width)
+            step = self.grid_step / P
+            width[k] = step
+            # the correlation at half steps from one more transform, and
+            # any finer delay by band-limited interpolation between them
+            if getattr(self, '_half_step', None) is None:
+                m = xp.arange(n, dtype=xp.float64)
+                self._half_step = xp.exp(1j * numpy.pi * m / n).astype(
+                    spectrum.dtype)
+            half = xp.fft.ifft(spectrum * self._half_step, axis=-1,
+                               norm='forward')
+            df = numpy.concatenate([self.delays[k] + p * step
+                                    for p in range(1, P)])
+            duration = n * self.grid_step
+            zf = interpolate_twice_sampled(
+                coarse, half, self.grid_step / 2, numpy.mod(df, duration),
+                xp=xp) / var
+            gf = tuple(v / var for v in self.daily_gram.at_prepared(q, df))
+            lf = marginal(zf, gf)
+            z = xp.concatenate([z, zf], axis=1)
+            g = tuple(xp.concatenate([a, c]) for a, c in zip(g, gf))
+            lnb = xp.concatenate([lnb, lf])
+            delays = numpy.concatenate([delays, df])
+            width = numpy.concatenate([width, numpy.full(len(df), step)])
+        return z, g, lnb, (spectrum, q, delays, width)
 
     def _orientation_nodes(self, z, g):
         """The coarsest orientation quadrature, doubling from 8 x 4 up to
-        ``orientation_nodes``, whose value at the sample with the largest
-        F-statistic changes by less than 1e-3 on the next doubling. A weak
-        signal's broad orientation posterior needs few nodes, a loud one's
-        many."""
+        ``orientation_nodes``, whose values at the ``samples`` arrival
+        times of largest ``|z_0|^2 / g_00 + |z_1|^2 / g_11`` all change by
+        less than 1e-3 on the next doubling, all candidates evaluated at
+        once. A weak signal's broad orientation posterior needs few nodes,
+        a loud one's many."""
+        sets = self._candidate_node_sets()
+        choice = self._node_choice(z[:, None], tuple(v[None] for v in g),
+                                   sets)
+        return sets[int(choice[0])]
+
+    #: arrival times at which the orientation quadrature must converge
+    node_samples = 5
+
+    def _candidate_node_sets(self):
+        if getattr(self, '_node_sets', None) is None:
+            sets = []
+            n_cos, n_psi = 8, 4
+            while True:
+                sets.append(OrientationNodes(n_cos, n_psi))
+                if n_cos >= self.nodes.n_cos:
+                    break
+                n_cos, n_psi = 2 * n_cos, 2 * n_psi
+            self._node_sets = sets
+        return self._node_sets
+
+    def _node_choice(self, z, g, sets):
+        """The index of the quadrature :meth:`_orientation_nodes` chooses
+        for each row of ``z`` ``(2, M, L)`` and ``g`` (three ``(M, L)``),
+        ``-inf`` entries of no weight."""
         xp = self.xp
-        x = xp.abs(z[0]) ** 2 / xp.maximum(g[0], 1e-300) \
-            + xp.abs(z[1]) ** 2 / xp.maximum(g[1], 1e-300)
-        k = int(xp.argmax(x))
-        one = (z[:, k:k + 1],) + tuple(v[k:k + 1] for v in g)
-        n_cos, n_psi = 8, 4
-        nodes = OrientationNodes(n_cos, n_psi)
-        value = float(log_orientation_marginal(*one, self.distance_prior,
-                                               nodes, table=self.table,
-                                               xp=xp)[0])
-        while n_cos < self.nodes.n_cos:
-            finer = OrientationNodes(2 * n_cos, 2 * n_psi)
-            new = float(log_orientation_marginal(*one, self.distance_prior,
-                                                 finer, table=self.table,
-                                                 xp=xp)[0])
-            if abs(new - value) < 1e-3:
-                break
-            n_cos, n_psi, nodes, value = 2 * n_cos, 2 * n_psi, finer, new
-        return nodes
+        M, L = z.shape[1:]
+        x = _to_numpy(xp.abs(z[0]) ** 2 / xp.maximum(g[0], 1e-300)
+                      + xp.abs(z[1]) ** 2 / xp.maximum(g[1], 1e-300))
+        x = numpy.where(numpy.isfinite(x), x, -numpy.inf)
+        n = min(self.node_samples, L)
+        top = numpy.argsort(x, axis=1)[:, ::-1][:, :n]
+        at = xp.asarray((top + numpy.arange(M)[:, None] * L).ravel())
+        flat_z = z.reshape(2, -1)[:, at]
+        flat_g = tuple(v.reshape(-1)[at] for v in g)
+        if self.table is not None:
+            values = _to_numpy(self.table.log_orientation_marginals(
+                flat_z, *flat_g, sets, xp=xp))
+        else:
+            values = numpy.array([_to_numpy(log_orientation_marginal(
+                flat_z, *flat_g, self.distance_prior, v, xp=xp))
+                for v in sets])
+        values = values.reshape(len(sets), M, n)
+        choice = numpy.full(M, len(sets) - 1)
+        for i in range(len(sets) - 2, -1, -1):
+            done = numpy.all(numpy.abs(values[i + 1] - values[i]) < 1e-3,
+                             axis=1)
+            choice[done] = i
+        return choice
 
     def _loglikelihood(self):
         _, _, lnb, (_, _, _, width) = self._time_samples(self.current_params)
@@ -238,9 +308,13 @@ class BStatisticSurrogate(BaseModel):
 
         Returns ``rec`` (a new dict by default) with ``delta_tc``,
         ``inclination``, ``polarization`` in ``[0, 2 pi)``, ``distance``,
-        ``signal_phase`` (the overall phase of the signal), ``loglr`` and
+        ``coa_phase`` in ``[0, pi)``, ``loglr`` and
         ``snr``, the matched-filter log likelihood ratio of the drawn signal
         and ``sqrt(2 loglr)``, and ``loglikelihood``, the marginal one.
+
+        ``coa_phase`` is the waveform generator's: a quadrupole signal's
+        phase ``phi`` is ``2 coa_phase`` at the reference source's reference
+        frequency, so ``coa_phase`` is defined modulo ``pi``.
         """
         rng = numpy.random.default_rng(seed)
         rec = {} if rec is None else rec
@@ -258,7 +332,7 @@ class BStatisticSurrogate(BaseModel):
                                      xp=xp))[:, 0]
         z = z / self.noise_variance
         g00, g11, g01 = (_to_numpy(x)[0] / self.noise_variance for x in
-                         self.daily_gram.at_delays(gram, xp.asarray([delay])))
+                         self.daily_gram.at_prepared(gram, [delay]))
         g = (float(numpy.real(g00)), float(numpy.real(g11)), complex(g01))
         cos_iota, psi = draw_orientation(z, g, self.distance_prior,
                                          self.nodes, rng)
@@ -279,17 +353,19 @@ class BStatisticSurrogate(BaseModel):
                    inclination=float(numpy.arccos(cos_iota)),
                    polarization=float(psi + quarter * numpy.pi / 2),
                    distance=float(self.distance_prior.scale / h),
-                   signal_phase=float(numpy.mod(phase + quarter * numpy.pi,
-                                                2 * numpy.pi)),
+                   coa_phase=float(numpy.mod(
+                       0.5 * (phase + quarter * numpy.pi), numpy.pi)),
                    loglikelihood=self.loglikelihood)
         return rec
 
     @classmethod
     def from_data(cls, variable_params, data, psds, reference, intrinsic,
                   low_frequency_cutoff, high_frequency_cutoff, time_window,
-                  distance_prior, orbit=None, to_source=None, periods=5,
+                  distance_prior, orbit=None, to_source=None, periods=None,
                   coarse_bins=1500, harmonics=4, response_samples=32,
-                  derivative_step=0.5, max_time_loss=1e-3, precision='double',
+                  derivative_step=0.05, max_time_loss=1e-3, precision='double',
+                  expansion_order=2, source_derivatives=None,
+                  exact_source_phase=None,
                   **kwargs):
         """Build the model from frequency-domain TDI data.
 
@@ -314,14 +390,39 @@ class BStatisticSurrogate(BaseModel):
         to_source : callable, optional
             Point to source parameters for
             :func:`pycbc.tdi.linear_exponent_surrogate.lal_plus_source`.
-        periods, coarse_bins, harmonics, response_samples
-            The SSB grid's length in orbits, the response's coarse
-            frequencies, its yearly harmonics and its samples per orbit.
+        periods : int, optional
+            The SSB grid's length in orbits; default the fewest that keep
+            the correlations within ``time_window`` from wrapping round, see
+            :func:`grid_periods_needed`.
+        coarse_bins, harmonics, response_samples
+            The response's coarse frequencies, its yearly harmonics and its
+            samples per orbit.
         derivative_step : float
             Step of the family's derivative columns, in shape units. The
             shape unit of a coordinate is ``1 / sqrt(M_ii)`` of the
             F-statistic metric ``M`` at the reference, so the units follow
-            the source and the data rather than being set by hand.
+            the source and the data rather than being set by hand. Along a
+            nearly degenerate combination the unit is wide in each of its
+            coordinates alone (for a two-year stellar-mass binary, mass
+            ratio 4 per unit), so a step of half a unit is a secant across
+            the waveform's curvature rather than its tangent; the default
+            0.05 keeps it local.
+        exact_source_phase : bool, optional
+            Use the family of :mod:`pycbc.tdi.pn_coefficient_surrogate`,
+            exact in the TaylorF2 phase over the whole parameter range, for
+            the intrinsic part; default when the intrinsic coordinates are
+            mchirp, q, spin1z and spin2z. ``expansion_order`` and
+            ``derivative_step`` then concern only the tangents.
+        source_derivatives : {'taylorf2', 'stencil'}, optional
+            How the family's derivatives are taken, see
+            ``surrogate_from_source`` in
+            :mod:`pycbc.tdi.linear_exponent_surrogate`;
+            default exact TaylorF2 jets when the intrinsic coordinates are
+            mchirp, q, spin1z and spin2z.
+        expansion_order : {1, 2}
+            Order of the family's expansion in the intrinsic coordinates,
+            see ``surrogate_from_source`` in
+            :mod:`pycbc.tdi.linear_exponent_surrogate`.
         max_time_loss : float
             Largest fraction of the statistic lost between fine arrival-time
             samples; sets the oversampling from the rms bandwidth.
@@ -335,9 +436,10 @@ class BStatisticSurrogate(BaseModel):
         from pycbc.tdi.inference import DEFAULT_ARM, channel_terms
         from pycbc.tdi.linear_exponent_surrogate import (
             DailyGram, surrogate_from_source)
-        from pycbc.tdi.ssb_yearly_harmonics import (SSBGrid,
-                                                    ssb_data_spectrum)
-        from pycbc.tmpltbank.fstatistic_metric import fstatistic_metric
+        from pycbc.tdi.ssb_yearly_harmonics import (
+            SSBGrid, guard_bins, ssb_data_spectrum)
+        from pycbc.tmpltbank.fstatistic_metric import (
+            metric_from_gram, tangent_gram)
         # the orbit of pycbc.tdi's sparse response, unless told otherwise
         dtype = {'double': numpy.complex128,
                  'single': numpy.complex64}[precision]
@@ -355,8 +457,18 @@ class BStatisticSurrogate(BaseModel):
         bins = numpy.array([numpy.asarray(data[n])[kmin:kmax + 1]
                             * numpy.sqrt(weight[n]) for n in names])
         start = float(first.start_time)
+        if periods is None:
+            periods = grid_periods_needed(
+                reference if to_source is None else to_source(
+                    dict(reference)), start, 1 / df, freqs[0], freqs[-1],
+                max(abs(v) for v in time_window))
+            logging.info("SSB grid of %d orbital periods", periods)
+        # guard bins either side of the band, so that neither the
+        # resampled data's Doppler spread nor the harmonics' shifts wrap
+        # round to the band's other end
         grid = SSBGrid(start, start + 1 / df, freqs[0], len(freqs), df,
-                       periods=periods)
+                       periods=periods, guard=guard_bins(
+                           freqs[-1], periods, harmonics))
         # the source carries the first channel's whitening, the response
         # the ratio of each channel's to it
         sw = numpy.sqrt(numpy.interp(grid.frequencies, freqs,
@@ -369,13 +481,22 @@ class BStatisticSurrogate(BaseModel):
         lon = reference['eclipticlongitude']
         lat = reference['eclipticlatitude']
 
-        def build(scales, step, dtype=numpy.complex128):
+        taylorf2 = sorted(intrinsic) == sorted(
+            ('mchirp', 'q', 'spin1z', 'spin2z'))
+        if source_derivatives is None:
+            source_derivatives = 'taylorf2' if taylorf2 else 'stencil'
+        if exact_source_phase is None:
+            exact_source_phase = taylorf2
+
+        def build(scales, step, dtype=numpy.complex128, order=1,
+                  directions=None, derivatives='stencil'):
             fam = surrogate_from_source(
                 grid, sw, orbit, terms, reference,
                 {k: scales[k] for k in intrinsic},
                 (scales['eclipticlongitude'], scales['eclipticlatitude']),
                 coarse, to_source=to_source, step=step,
-                kmax=harmonics, samples=response_samples, dtype=dtype)
+                kmax=harmonics, samples=response_samples, dtype=dtype,
+                order=order, directions=directions, derivatives=derivatives)
             # the response ratio in the family's own precision
             fam.R0 = (fam.R0 * fam.xp.asarray(ratio)[None, None]).astype(
                 fam.R0.dtype)
@@ -385,36 +506,63 @@ class BStatisticSurrogate(BaseModel):
         nodes = OrientationNodes(4, 2)
 
         def unit_lengths(fam):
-            """sqrt of the metric's diagonal in the family's shape units,
-            averaged over orientations."""
+            """The metric in the family's shape units, averaged over
+            orientations, and the whitened power at each frequency."""
             y, dy = fam.tangents()
             window = fam.xp.asarray(grid.in_data)
 
             def windowed(s):
                 return _to_numpy(fam.xp.fft.fft(
                     fam.xp.fft.ifft(s, axis=-1) * window, axis=-1))
-            y, dy = windowed(y), windowed(dy)
-            metric = sum(w * fstatistic_metric(y, dy, v, grid.frequencies)
+            # one derivative at a time to the host, which sums the Gram
+            y = windowed(y)
+            host = numpy.empty(dy.shape, dtype=numpy.complex64)
+            for i in range(len(dy)):
+                host[i] = windowed(dy[i])
+            del dy
+            gram = tangent_gram(y, host, grid.frequencies)
+            metric = sum(w * metric_from_gram(gram, v)
                          for w, v in zip(nodes.weights, nodes.vectors))
-            return numpy.sqrt(numpy.diag(metric)), y
+            return metric, numpy.sum(numpy.abs(y) ** 2, axis=(0, 1))
 
         # the metric from derivatives over a part in 1e6 of each value and
         # 1e-6 rad of sky, checked against steps ten times smaller
         probe = {k: 1e-6 * max(abs(reference[k]), 1e-3) for k in intrinsic}
         probe.update(eclipticlongitude=1e-6, eclipticlatitude=1e-6)
-        units, y = unit_lengths(build(probe, 1.0))
-        finer, _ = unit_lengths(build(probe, 0.1))
-        if not numpy.allclose(finer, units, rtol=1e-2):
+        metric, y = unit_lengths(build(probe, 1.0,
+                                       derivatives=source_derivatives))
+        finer, _ = unit_lengths(build(probe, 0.1,
+                                      derivatives=source_derivatives))
+        units = numpy.sqrt(numpy.diag(metric))
+        if not numpy.allclose(numpy.sqrt(numpy.diag(finer)), units,
+                              rtol=1e-2):
             raise RuntimeError("the metric's derivatives have not converged: "
-                               "{} against {}".format(units, finer))
+                               "{} against {}".format(
+                                   units, numpy.sqrt(numpy.diag(finer))))
         scales = {k: probe[k] / u for k, u in zip(keys, units)}
+        # in shape units the metric has a unit diagonal
+        kwargs.setdefault('metric', metric / numpy.outer(units, units))
         logging.info("shape units %s", scales)
-        fam = build(scales, derivative_step, dtype)
+        # the stencil steps along the metric's eigenvectors in the intrinsic
+        # shape units, so that a nearly degenerate combination's curvature
+        # is measured, not left over from the axes'
+        nint = len(intrinsic)
+        intrinsic_metric = kwargs['metric'][:nint, :nint]
+        _, directions = numpy.linalg.eigh(intrinsic_metric)
+        if exact_source_phase:
+            from pycbc.tdi.pn_coefficient_surrogate import (
+                PNCoefficientSurrogate)
+            fam = PNCoefficientSurrogate(
+                build(scales, derivative_step, dtype, 1,
+                      derivatives=source_derivatives),
+                reference, scales, intrinsic, reference['f_lower'])
+        else:
+            fam = build(scales, derivative_step, dtype, expansion_order,
+                        directions, source_derivatives)
         daily = DailyGram(fam)
         spectrum, noise = ssb_data_spectrum(grid, bins, orbit, lon, lat,
                                             xp=fam.xp)
-        sigma_f = rms_bandwidth(grid.frequencies, numpy.sum(
-            numpy.abs(y) ** 2, axis=(0, 1)))
+        sigma_f = rms_bandwidth(grid.frequencies, y)
         oversampling = oversampling_for_loss(sigma_f, grid.delta_t,
                                              max_time_loss)
         point = {k: reference[k] for k in keys}
@@ -429,7 +577,10 @@ class BStatisticSurrogate(BaseModel):
         'distance-power': float, 'grid-periods': int, 'coarse-bins': int,
         'harmonics': int, 'response-samples': int,
         'derivative-step': float, 'max-time-loss': float,
-        'orientation-nodes': str, 'margin': float}
+        'expansion-order': int, 'source-derivatives': str,
+        'exact-source-phase': _boolean,
+        'orientation-nodes': str, 'margin': float,
+        'amplitude-table-file': str}
 
     @classmethod
     def from_config(cls, cp, data_section='data', data=None, psds=None,
@@ -449,10 +600,14 @@ class BStatisticSurrogate(BaseModel):
           over, s.
         * ``distance-min``, ``distance-max``, ``distance-power`` (default
           2): the distance prior, in the units of the waveform's distance.
-        * ``grid-periods`` (5), ``coarse-bins`` (1500), ``harmonics`` (4),
-          ``response-samples`` (32), ``derivative-step`` (0.5),
+        * ``grid-periods`` (the fewest that hold the data and the
+          templates, see :func:`grid_periods_needed`), ``coarse-bins``
+          (1500), ``harmonics`` (4),
+          ``response-samples`` (32), ``derivative-step`` (0.05),
           ``max-time-loss`` (1e-3), ``orientation-nodes`` (``32 16``),
           ``margin`` (40): see :meth:`from_data` and the class.
+        * ``amplitude-table-file``: an HDF file of the amplitude table,
+          written on first use; it depends only on ``distance-power``.
 
         The source parameters are the static parameters and the reference
         point passed through the ``[waveform_transforms]``.
@@ -507,10 +662,31 @@ class BStatisticSurrogate(BaseModel):
         return cls.from_data(
             args.pop('variable_params'), data, psds, reference, intrinsic,
             flow, fhigh, window, prior, to_source=to_source,
-            periods=get.get('grid-periods', 5),
+            periods=get.get('grid-periods'),
             coarse_bins=get.get('coarse-bins', 1500),
             harmonics=get.get('harmonics', 4),
             response_samples=get.get('response-samples', 32),
-            derivative_step=get.get('derivative-step', 0.5),
+            derivative_step=get.get('derivative-step', 0.05),
+            expansion_order=get.get('expansion-order', 2),
+            source_derivatives=get.get('source-derivatives'),
+            exact_source_phase=get.get('exact-source-phase'),
             max_time_loss=get.get('max-time-loss', 1e-3),
-            orientation_nodes=nodes, margin=get.get('margin', 40.0), **args)
+            orientation_nodes=nodes, margin=get.get('margin', 40.0),
+            amplitude_table=get.get('amplitude-table-file', True), **args)
+
+
+def grid_periods_needed(source, start, duration, f_low, f_high, window,
+                        margin=1e-3):
+    """The fewest whole orbital periods ``T`` of an SSB grid on which the
+    correlations at arrival times within ``window`` (s) of the reference do
+    not wrap round: with the reference's in-band support ``[t_a, t_b]``
+    relative to the data start and data of ``duration``, ``T > max(duration -
+    t_a, t_b) + window``. A grid fixed at five years would be too short for
+    data of more than about four years and wasteful for shorter data."""
+    from pycbc.tdi.linear_exponent_surrogate import lal_plus_source
+    from pycbc.tdi.ssb_yearly_harmonics import ORBITAL_PERIOD
+    freqs = numpy.linspace(f_low, f_high, 64)
+    _, times = lal_plus_source(source, freqs, start)
+    t_a, t_b = times.min() - start, times.max() - start
+    need = (max(duration - t_a, t_b) + window) * (1 + margin)
+    return max(1, int(numpy.ceil(need / ORBITAL_PERIOD)))
