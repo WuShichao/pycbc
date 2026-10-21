@@ -340,3 +340,18 @@ def test_differences_at_the_edge_of_the_support_are_one_sided():
     grad, hess = _finite_differences(f, x, numpy.full(3, 1e-3))
     assert numpy.allclose(grad, -A @ (x - b), atol=1e-6)
     assert numpy.allclose(hess, -A, atol=1e-6)
+
+
+def test_a_peak_on_the_prior_edge_keeps_its_mass_in_a_tilted_frame():
+    """A normal likelihood centred on a face of the prior, in a whitened
+    frame whose boxes straddle that face: the boxes whose centres lie
+    beyond it hold the mass of their part inside."""
+    from scipy.special import erf
+    model = normal_model(mean=(HALF, 0.0), cov=(1.0, 0.3))
+    exact = math.log(0.5 * erf(2 * HALF / math.sqrt(2))
+                     * erf(HALF / math.sqrt(0.6)) / (2 * HALF) ** 2)
+    sampler = AMRSampler(model, initial_divisions=2, pilot_evaluations=400,
+                         laplace_frame=True, mass_fraction=1e-5,
+                         max_evaluations=40000, seed=1)
+    sampler.run()
+    assert sampler.logz == pytest.approx(exact, abs=0.01)

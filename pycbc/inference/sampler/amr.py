@@ -339,10 +339,58 @@ class AMRSampler(BaseSampler):
     def _to_cube(self, s):
         return self._map(s)[0]
 
+    def _unmap(self, cube):
+        """The box coordinates of cube points, the inverse of :meth:`_map`
+        (``nan`` where a frame's inverse fails)."""
+        if self._curve is not None:
+            return self._uncurve(cube)
+        return numpy.linalg.solve(self._matrix, (cube - self._origin).T).T
+
+    #: points per box at which its part inside the prior, and a curvilinear
+    #: frame's Jacobian over it, are averaged
+    volume_points = 16
+
     def _evaluate(self, index):
-        cube, logjac = self._map(self._lower[index] + 0.5 * self._width[index])
-        self._logjac[index] = logjac
+        """The log likelihood of each box of ``index`` at its centre, or,
+        when the centre lies beyond the prior, at the box's point nearest it
+        of those :meth:`_volume` finds inside; and the box's mean Jacobian
+        over the prior."""
+        centre = self._lower[index] + 0.5 * self._width[index]
+        cube, logjac = self._map(centre)
+        out = ~(numpy.all((cube >= 0) & (cube <= 1), axis=1)
+                & numpy.isfinite(logjac))
+        mean, inner = self._volume(index)
+        # a box straddling the prior's edge: a point inside it, where any
+        has = out & numpy.isfinite(mean)
+        if has.any():
+            cube[has], logjac[has] = self._map(inner[has])
         self._logl[index] = self._cube_loglikelihoods(cube, logjac)
+        self._logjac[index] = mean
+
+    def _volume(self, index):
+        """``ln`` of each box's mean Jacobian over scrambled Sobol points,
+        counting none beyond the prior (``-inf`` when all are), and of the
+        points inside the prior the one nearest the box's centre: a box
+        straddling the prior's edge holds its part inside only, and a
+        curvilinear frame's Jacobian can change many times over a box."""
+        if getattr(self, '_volume_offsets', None) is None:
+            from scipy.stats import qmc
+            self._volume_offsets = qmc.Sobol(
+                self.ndim, seed=self.seed + 11).random_base2(
+                    int(numpy.log2(self.volume_points)))
+        off = self._volume_offsets
+        n, k = len(index), len(off)
+        s = (self._lower[index][:, None, :] + off[None]
+             * self._width[index][:, None, :])
+        cube, logjac = self._map(s.reshape(-1, self.ndim))
+        inside = (numpy.all((cube >= 0) & (cube <= 1), axis=1)
+                  & numpy.isfinite(logjac)).reshape(n, k)
+        logjac = numpy.where(inside, logjac.reshape(n, k), -numpy.inf)
+        mean = logsumexp(logjac, axis=1) - numpy.log(k)
+        far = numpy.where(inside, numpy.sum((off - 0.5) ** 2, axis=1)[None],
+                          numpy.inf)
+        inner = s[numpy.arange(n), numpy.argmin(far, axis=1)]
+        return mean, inner
 
     def _cube_loglikelihoods(self, cube, logjac=None):
         """The log likelihood at cube points, ``-inf`` outside the cube or
@@ -710,7 +758,12 @@ class AMRSampler(BaseSampler):
             cube[bad] = numpy.nan
             logjac = numpy.where(bad, -numpy.inf, logjac)
             return cube, logjac
+        def uncurve(cube):
+            with numpy.errstate(invalid='ignore'):
+                y = to_y(bottom + cube * prior_range)
+            return ((y - mean) @ inverse.T - low) / span
         self._curve = curve
+        self._uncurve = uncurve
         self._scale = span
         logging.info("AMR: curvilinear frame after %d evaluations",
                      self.nevaluations)
