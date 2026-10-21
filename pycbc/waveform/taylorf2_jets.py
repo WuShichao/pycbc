@@ -363,18 +363,25 @@ def phase_coordinates(mchirp, q, spin1z, spin2z):
     return numpy.array(out)
 
 
-def from_phase_coordinates(y, guess, iterations=30, tolerance=1e-12):
-    """Invert :func:`phase_coordinates` by Newton steps from ``guess``
-    (``(4, n)`` arrays of mchirp, q, spin1z, spin2z); columns that do not
-    converge, or leave ``q >= 1``, come back as NaN."""
+def from_phase_coordinates(y, guess, iterations=30, tolerance=1e-12,
+                           forward=phase_coordinates, scale=None,
+                           max_step=None):
+    """Invert ``forward`` (default :func:`phase_coordinates`) by Newton
+    steps from ``guess`` (``(4, n)`` arrays of mchirp, q, spin1z, spin2z);
+    columns that do not converge, or leave ``q >= 1`` or spins within one,
+    come back as NaN. The residuals are relative to ``|y|``, or to
+    ``scale`` when given; ``max_step`` bounds each parameter's step, which
+    keeps the iteration on the root nearest the guess."""
     y = numpy.asarray(y, dtype=float)
     theta = numpy.array(guess, dtype=float, copy=True)
     theta = numpy.broadcast_to(theta, y.shape).copy()
     steps = numpy.array([1e-7, 1e-6, 1e-6, 1e-6])[:, None] * numpy.maximum(
         numpy.abs(theta), 1.0)
-    scale = numpy.abs(y) + 1e-30
+    scale = numpy.abs(y) + 1e-30 if scale is None else \
+        numpy.broadcast_to(numpy.asarray(scale, dtype=float).reshape(
+            (-1,) + (1,) * (y.ndim - 1)), y.shape)
     for _ in range(iterations):
-        f0 = phase_coordinates(*theta)
+        f0 = forward(*theta)
         res = (f0 - y) / scale
         if numpy.all(numpy.abs(res) < tolerance):
             break
@@ -382,27 +389,39 @@ def from_phase_coordinates(y, guess, iterations=30, tolerance=1e-12):
         for j in range(4):
             moved = theta.copy()
             moved[j] = moved[j] + steps[j]
-            jac[:, j] = (phase_coordinates(*moved) - f0) / steps[j]
+            jac[:, j] = (forward(*moved) - f0) / steps[j]
         delta = numpy.linalg.solve(numpy.moveaxis(jac, (0, 1), (-2, -1)),
                                    numpy.moveaxis(f0 - y, 0, -1)[..., None])
-        theta = theta - numpy.moveaxis(delta[..., 0], -1, 0)
-    bad = ~numpy.all(numpy.abs((phase_coordinates(*theta) - y) / scale)
-                     < 1e-9, axis=0) | ~(theta[1] >= 1)
+        delta = numpy.moveaxis(delta[..., 0], -1, 0)
+        if max_step is not None:
+            bound = numpy.asarray(max_step, dtype=float).reshape(
+                (4,) + (1,) * (y.ndim - 1))
+            with numpy.errstate(invalid='ignore', divide='ignore'):
+                shrink = numpy.nanmin(numpy.where(
+                    numpy.abs(delta) > bound, bound / numpy.abs(delta), 1.0),
+                    axis=0)
+            delta = delta * shrink
+        theta = theta - delta
+    with numpy.errstate(invalid='ignore'):
+        bad = ~numpy.all(numpy.abs((forward(*theta) - y) / scale) < 1e-9,
+                         axis=0) | ~(theta[1] >= 1) | ~(
+            numpy.abs(theta[2]) <= 1) | ~(numpy.abs(theta[3]) <= 1)
     theta[:, bad] = numpy.nan
     return theta
 
 
-def log_jacobian_from_phase_coordinates(theta):
-    """``ln |det d theta / d y|`` at ``theta`` ``(4, n)``."""
+def log_jacobian_from_phase_coordinates(theta, forward=phase_coordinates):
+    """``ln |det d theta / d y|`` at ``theta`` ``(4, n)`` for the
+    coordinates ``forward`` (default :func:`phase_coordinates`)."""
     theta = numpy.asarray(theta, dtype=float)
     steps = numpy.array([1e-7, 1e-6, 1e-6, 1e-6])[:, None] * numpy.maximum(
         numpy.abs(theta), 1.0)
-    f0 = phase_coordinates(*theta)
+    f0 = forward(*theta)
     jac = numpy.empty((4, 4) + theta.shape[1:])
     for j in range(4):
         moved = theta.copy()
         moved[j] = moved[j] + steps[j]
-        jac[:, j] = (phase_coordinates(*moved) - f0) / steps[j]
+        jac[:, j] = (forward(*moved) - f0) / steps[j]
     sign, logdet = numpy.linalg.slogdet(numpy.moveaxis(jac, (0, 1),
                                                        (-2, -1)))
     return -logdet
@@ -429,3 +448,104 @@ class PhaseCoordinates(object):
         return log_jacobian_from_phase_coordinates(
             numpy.asarray(theta, dtype=float).T)
 
+
+def basis_coefficients(mchirp, q, spin1z, spin2z):
+    """:func:`taylorf2_basis_coefficients`' ``A`` and ``B`` stacked, shape
+    ``(16,) + shape``, vectorised over arrays."""
+    mchirp, q, spin1z, spin2z = (numpy.asarray(v, dtype=float)
+                                 for v in (mchirp, q, spin1z, spin2z))
+    m1 = mchirp * (1 + q) ** 0.2 * q ** 0.4
+    m2 = m1 / q
+    a, b = taylorf2_phasing(m1, m2, spin1z, spin2z)
+    scale = numpy.pi * (m1 + m2) * MTSUN_SI
+    log_scale = numpy.log(scale)
+    A = [scale ** ((k - 5) / 3) * (a[k] + b[k] * log_scale / 3)
+         for k in range(8)]
+    B = [scale ** ((k - 5) / 3) * b[k] / 3 + 0 * mchirp for k in range(8)]
+    return numpy.array([numpy.broadcast_to(v, mchirp.shape)
+                        for v in A + B], dtype=float)
+
+
+class MeasuredPhaseCoordinates(PhaseCoordinates):
+    """Curvilinear coordinates ``(s_1, s_2, q, chi_a)`` in which the
+    likelihood's degenerate valley is straight: ``s_1`` and ``s_2`` are the
+    projections of the TaylorF2 basis coefficients on the two directions
+    along which the phase changes most over a sample of points (:meth:`fit`),
+    in the rms over frequency weighted by the template power, less the
+    constant and linear parts phase and time absorb; the mass ratio and the
+    spin difference ``chi_a = (spin1z - spin2z) / 2``, which the phase
+    barely fixes, complete them. Points of equal phase then differ in ``q``
+    and ``chi_a`` at nearly fixed ``s``, where the fixed coefficients of
+    :class:`PhaseCoordinates` change along them.
+
+    Parameters
+    ----------
+    guess : array_like
+        The (mchirp, q, spin1z, spin2z) the inverse starts from, at each
+        point's own ``q`` and ``chi_a``.
+    frequencies, weights : array_like
+        Frequencies, Hz, and the template's power at each; the power of the
+        frequencies the data do not cover should be zero.
+    f_lower : float
+        The frequency at which phase and time are pinned, Hz.
+    """
+    def __init__(self, guess, frequencies, weights, f_lower, ndir=2):
+        super().__init__(guess)
+        f = numpy.asarray(frequencies, dtype=float)
+        w = numpy.asarray(weights, dtype=float)
+        w = w / w.sum()
+        lf = numpy.log(f)
+        p = [f ** ((k - 5) / 3) for k in range(8)]
+        psi = numpy.array(p + [v * lf for v in p])          # (16, nf)
+        sw = numpy.sqrt(w)
+        X = numpy.vstack([numpy.ones_like(f), f - float(f_lower)]).T
+        coef = numpy.linalg.lstsq(X * sw[:, None], (psi * sw).T,
+                                  rcond=None)[0]
+        weighted = (psi - (X @ coef).T) * sw
+        # the metric of coefficient changes: weighted.T = Q R
+        self._root = numpy.linalg.qr(weighted.T)[1].T       # (16, 16)
+        self.ndir = int(ndir)
+        self._vs = None
+
+    def fit(self, theta):
+        """Set the directions from rows of (mchirp, q, spin1z, spin2z)."""
+        theta = numpy.atleast_2d(numpy.asarray(theta, dtype=float))
+        C = basis_coefficients(*theta.T).T                   # (M, 16)
+        self._mean = C.mean(axis=0)
+        _, _, vs = numpy.linalg.svd((C - self._mean) @ self._root,
+                                    full_matrices=False)
+        self._vs = vs[:self.ndir]
+        return self
+
+    def _forward(self, mchirp, q, spin1z, spin2z):
+        if self._vs is None:
+            raise RuntimeError("fit the coordinates to a sample first")
+        C = basis_coefficients(mchirp, q, spin1z, spin2z)
+        shape = C.shape[1:]
+        C = C.reshape(16, -1) - self._mean[:, None]
+        s = self._vs @ (self._root.T @ C)
+        rest = numpy.array([numpy.asarray(q, dtype=float).ravel(),
+                            0.5 * (numpy.asarray(spin1z, dtype=float)
+                                   - numpy.asarray(spin2z,
+                                                   dtype=float)).ravel()])
+        return numpy.concatenate([s, rest]).reshape((4,) + shape)
+
+    def forward(self, theta):
+        return self._forward(*numpy.asarray(theta, dtype=float).T).T
+
+    def inverse(self, y):
+        y = numpy.atleast_2d(numpy.asarray(y, dtype=float))
+        # each point starts at its own q and spin difference, equal spins
+        # otherwise zero
+        guess = numpy.repeat(self.guess[:, None], len(y), axis=1)
+        guess[1] = numpy.maximum(y[:, 2], 1.0)
+        guess[2], guess[3] = y[:, 3], -y[:, 3]
+        return from_phase_coordinates(y.T, guess, iterations=60,
+                                      forward=self._forward,
+                                      scale=numpy.ones(4),
+                                      max_step=[numpy.inf, numpy.inf, 0.2,
+                                                0.2]).T
+
+    def log_jacobian(self, theta):
+        return log_jacobian_from_phase_coordinates(
+            numpy.asarray(theta, dtype=float).T, forward=self._forward)

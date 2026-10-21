@@ -202,6 +202,7 @@ class AMRSampler(BaseSampler):
         self._curve = None
         self._logz = self._dlogz = None
         self._samples = {}
+        self._diagnostics = {}
         # the starting grid: divisions per axis and the cells of it that
         # are roots of the tree, by their index in the grid
         self._divisions = (self.initial_divisions,) * self.ndim
@@ -475,9 +476,13 @@ class AMRSampler(BaseSampler):
         logging.info("AMR: shared region of %d points set up in %.0f s",
                      len(full), time.time() - tick)
 
-    def _curvilinear(self, radius=4.0, prior_draws=20000, iterations=8):
+    def _curvilinear(self, radius=4.0, prior_draws=20000, iterations=8,
+                     starts=5):
         """Partition in the model's curvilinear coordinates ``y``, whitened
-        by the Laplace approximation about the likelihood's maximum there.
+        by the Laplace approximation about the likelihood's maximum there:
+        the highest of Newton climbs from the pilot's ``starts`` best boxes,
+        each step halved while it lowers ln L. Coordinates with a ``fit``
+        method take their directions from the prior's draws first.
 
         A box of ``s`` maps to ``y = mean + chol (low + span s)``, then to
         the parameters and, through the uniform priors' ranges, to the cube;
@@ -501,47 +506,74 @@ class AMRSampler(BaseSampler):
             return theta
         rng = numpy.random.default_rng(self.seed)
         draws = bottom + rng.random((prior_draws, self.ndim)) * prior_range
+        if hasattr(coords, 'fit'):
+            # coordinates that take their directions from the prior
+            coords.fit(draws[:, idx])
         image = to_y(draws)
         image = image[numpy.all(numpy.isfinite(image), axis=1)]
         prior_cov = numpy.cov(image.T)
         unit = numpy.sqrt(numpy.diag(prior_cov))
-        # start from the pilot's best box
+        prior_precision = numpy.linalg.inv(prior_cov / numpy.outer(unit,
+                                                                   unit))
+
+        def climb(y0):
+            """Newton steps of ln L in ``z``, ``y = y0 + unit z``, each
+            halved while it lowers ln L: the end point, the precision
+            there and ln L."""
+            def logl_z(z):
+                self.nevaluations += 1
+                theta = from_y((y0 + unit * z)[None])[0]
+                u = (theta - bottom) / prior_range
+                if not numpy.all(numpy.isfinite(u)) or numpy.any(
+                        (u < 0) | (u > 1)):
+                    return -numpy.inf
+                return float(self._loglikelihood(theta))
+            x = numpy.zeros(self.ndim)
+            value = logl_z(x)
+            step = numpy.full(self.ndim, 1e-3)
+            precision = prior_precision
+            for _ in range(iterations):
+                grad, hess = _finite_differences(logl_z, x, step)
+                values, vectors = numpy.linalg.eigh(-0.5 * (hess + hess.T))
+                precision = (vectors * numpy.maximum(values, 0)) @ vectors.T \
+                    + prior_precision
+                move = numpy.linalg.solve(precision, grad)
+                size = numpy.sqrt(move @ precision @ move)
+                if size > 3:
+                    move *= 3 / size
+                for _ in range(6):
+                    trial = logl_z(x + move)
+                    if trial >= value:
+                        break
+                    move = 0.5 * move
+                else:
+                    break
+                x, value = x + move, trial
+                step = numpy.clip(0.5 / numpy.sqrt(numpy.diag(precision)),
+                                  1e-7, 1e-1)
+                if size < 0.05:
+                    break
+            return y0 + unit * x, precision, value
+        # from the pilot's best boxes, the highest maximum
         leaves = self._leaves()
         logl = numpy.where(numpy.isfinite(self._logl[leaves]),
                            self._logl[leaves], -numpy.inf)
-        best = leaves[numpy.argmax(logl)]
-        start = numpy.array(self._prior_transform(self._to_cube(
-            self._lower[best:best + 1] + 0.5 * self._width[best:best + 1])[0]))
-        y0 = to_y(start[None])[0]
-
-        def logl_z(z):
-            """ln L at y = y0 + unit z."""
-            self.nevaluations += 1
-            theta = from_y((y0 + unit * z)[None])[0]
-            u = (theta - bottom) / prior_range
-            if not numpy.all(numpy.isfinite(u)) or numpy.any(
-                    (u < 0) | (u > 1)):
-                return -numpy.inf
-            return float(self._loglikelihood(theta))
-        x = numpy.zeros(self.ndim)
-        prior_precision = numpy.linalg.inv(prior_cov / numpy.outer(unit,
-                                                                   unit))
-        step = numpy.full(self.ndim, 1e-3)
-        for _ in range(iterations):
-            grad, hess = _finite_differences(logl_z, x, step)
-            values, vectors = numpy.linalg.eigh(-0.5 * (hess + hess.T))
-            precision = (vectors * numpy.maximum(values, 0)) @ vectors.T \
-                + prior_precision
-            move = numpy.linalg.solve(precision, grad)
-            size = numpy.sqrt(move @ precision @ move)
-            if size > 3:
-                move *= 3 / size
-            x = x + move
-            step = numpy.clip(0.5 / numpy.sqrt(numpy.diag(precision)), 1e-7,
-                              1e-1)
-            if size < 0.05:
-                break
-        mean = y0 + unit * x
+        best = None
+        for box in leaves[numpy.argsort(-logl)[:starts]]:
+            start = numpy.array(self._prior_transform(self._to_cube(
+                self._lower[box:box + 1]
+                + 0.5 * self._width[box:box + 1])[0]))
+            y0 = to_y(start[None])[0]
+            if not numpy.all(numpy.isfinite(y0)):
+                continue
+            found = climb(y0)
+            if best is None or found[2] > best[2]:
+                best = found
+        mean, precision, peak = best
+        logging.info("AMR: frame about ln L %.3f", peak)
+        self._diagnostics.update(frame_peak=float(peak),
+                                 frame_starts=int(starts),
+                                 frame_evaluations=self.nevaluations)
         chol = numpy.linalg.cholesky(numpy.linalg.inv(precision)) \
             * unit[:, None]
         inverse = numpy.linalg.inv(chol)

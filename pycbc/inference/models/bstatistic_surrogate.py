@@ -44,6 +44,23 @@ from pycbc.tmpltbank.fstatistic_metric import orientation_weights
 from .base import BaseModel
 
 
+def _measured_coordinates(surrogate, reference, coarse=4000):
+    """:class:`pycbc.waveform.taylorf2_jets.MeasuredPhaseCoordinates` of
+    the family, weighted by the reference's power at the frequencies it
+    sweeps while the data last: the phase elsewhere is not measured."""
+    from pycbc.waveform.taylorf2_jets import (MeasuredPhaseCoordinates,
+                                              PhaseCoordinates)
+    grid = surrogate.grid
+    step = max(1, grid.size // coarse)
+    f = numpy.asarray(grid.frequencies, dtype=float)[::step]
+    b0 = _to_numpy(surrogate.b0[::step])
+    t0 = _to_numpy(surrogate.t0[::step])
+    seen = (t0 >= grid.start) & (t0 < grid.stop)
+    return MeasuredPhaseCoordinates(
+        [reference[n] for n in PhaseCoordinates.names], f,
+        numpy.abs(b0) ** 2 * seen, getattr(surrogate, 'f_lower', f[0]))
+
+
 def _boolean(value):
     return value.strip().lower() in ('1', 'true', 'yes')
 
@@ -106,13 +123,13 @@ class BStatisticSurrogate(BaseModel):
                  amplitude_table=True, metric=None, **kwargs):
         super().__init__(variable_params, **kwargs)
         self.metric = None if metric is None else numpy.asarray(metric)
-        # coordinates in which the phase is nearly linear, for samplers
+        # coordinates in which the degenerate valley is straight, for
+        # samplers
         if sorted(set(variable_params) & {'mchirp', 'q', 'spin1z',
                                           'spin2z'}) == sorted(
                 ('mchirp', 'q', 'spin1z', 'spin2z')):
-            from pycbc.waveform.taylorf2_jets import PhaseCoordinates
-            self.curvilinear_coordinates = PhaseCoordinates(
-                [reference[n] for n in PhaseCoordinates.names])
+            self.curvilinear_coordinates = _measured_coordinates(
+                surrogate, reference)
         self.surrogate, self.daily_gram = surrogate, daily_gram
         # in the surrogate's precision once, not at every correlation
         self.data_spectrum = data_spectrum.astype(surrogate.dtype,

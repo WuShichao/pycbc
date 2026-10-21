@@ -122,3 +122,35 @@ def test_phase_coordinates_invert_and_their_jacobian_is_the_numerical():
         got = float(log_jacobian_from_phase_coordinates(t[:, None])[0])
         # both by differences
         assert got == pytest.approx(expected, abs=1e-5)
+
+
+def test_measured_phase_coordinates_invert_over_a_prior():
+    from pycbc.waveform.taylorf2_jets import MeasuredPhaseCoordinates
+    f = numpy.linspace(0.0136, 0.0157, 500)
+    coords = MeasuredPhaseCoordinates([POINT[n] for n in NAMES], f,
+                                      f ** (-7 / 3), F_LOWER)
+    rng = numpy.random.default_rng(1)
+    prior = numpy.column_stack([rng.uniform(31.295, 31.300, 2000),
+                                rng.uniform(1, 10, 2000),
+                                rng.uniform(-0.99, 0.99, 2000),
+                                rng.uniform(-0.99, 0.99, 2000)])
+    with pytest.raises(RuntimeError):
+        coords.forward(prior[:1])
+    coords.fit(prior)
+    y = coords.forward(prior[:200])
+    assert numpy.allclose(y[:, 2], prior[:200, 1])
+    assert numpy.allclose(y[:, 3], 0.5 * (prior[:200, 2] - prior[:200, 3]))
+    back = coords.inverse(y)
+    ok = numpy.all(numpy.isfinite(back), axis=1)
+    assert ok.mean() > 0.95
+    assert numpy.allclose(back[ok], prior[:200][ok], rtol=1e-6, atol=1e-6)
+    t = prior[0]
+    h = 1e-6 * numpy.maximum(numpy.abs(t), 1)
+    jac = numpy.empty((4, 4))
+    for i in range(4):
+        e = numpy.zeros(4)
+        e[i] = h[i]
+        jac[:, i] = (coords.forward((t + e)[None])[0]
+                     - coords.forward((t - e)[None])[0]) / (2 * h[i])
+    got = float(coords.log_jacobian(t[None])[0])
+    assert got == pytest.approx(-numpy.linalg.slogdet(jac)[1], abs=1e-4)
