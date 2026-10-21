@@ -1,4 +1,6 @@
 """Amplitude and phase marginalisation of pycbc.filter.bstatistic."""
+import functools
+
 import numpy
 import pytest
 from scipy import integrate, stats
@@ -132,7 +134,7 @@ def loud_case(snr=12.0, cos_iota=0.4, psi=0.9, seed=3):
 
 
 def brute_orientation(z, gram, prior, n=400):
-    from pycbc.filter.bstatistic import OrientationNodes, _project
+    from pycbc.filter.bstatistic import _project
     from pycbc.tmpltbank.fstatistic_metric import orientation_weights
     c = numpy.linspace(-1, 1, n + 1)
     c = 0.5 * (c[1:] + c[:-1])
@@ -145,7 +147,7 @@ def brute_orientation(z, gram, prior, n=400):
 
 
 def test_orientation_weights_sum_to_one_and_psi_has_period_quarter_turn():
-    from pycbc.filter.bstatistic import OrientationNodes, _project
+    from pycbc.filter.bstatistic import OrientationNodes
     from pycbc.tmpltbank.fstatistic_metric import orientation_weights
     nodes = OrientationNodes(8, 4)
     assert nodes.weights.sum() == pytest.approx(1.0)
@@ -234,13 +236,65 @@ def test_pruning_keeps_the_total_to_the_margin():
     assert pruned[140] == pytest.approx(full[140], abs=1e-12)
 
 
-def test_amplitude_table_agrees_with_the_integral():
+@functools.lru_cache()
+def table():
     from pycbc.filter.bstatistic import AmplitudeTable
-    table = AmplitudeTable(PRIOR, tolerance=1e-4)
-    rng = numpy.random.default_rng(41)
-    # every regime: below the table's smallest a, inside it, beyond its
-    # largest y, and with the closest distance in reach of the peak
-    g = 10 ** rng.uniform(-8, 6, 3000)
-    x = rng.uniform(0, 60, 3000) * numpy.sqrt(g)
+    return AmplitudeTable(PRIOR, y_max=20.0, tolerance=1e-4)
+
+
+def every_regime(n, seed=41):
+    """``x`` and ``g`` below the table's smallest ``a``, in both tables,
+    beyond the largest ``a`` and ``y``, and with the closest distance in
+    reach of the peak."""
+    rng = numpy.random.default_rng(seed)
+    g = 10 ** rng.uniform(-8, 12, n)
+    x = rng.uniform(0, 30, n) * numpy.sqrt(g)
+    return x, g
+
+
+def test_amplitude_table_agrees_with_the_integral():
+    x, g = every_regime(4000)
+    a = PRIOR.hmin * numpy.sqrt(g)
+    assert (a < numpy.exp(-12)).any() and (a > 1).any() and (a > 32).any()
     exact = log_amplitude_marginal(x, g, PRIOR)
-    assert numpy.abs(table.log_marginal(x, g) - exact).max() < 2e-4
+    assert numpy.abs(table().log_marginal(x, g) - exact).max() < 2e-4
+
+
+def test_amplitude_table_serves_any_prior_of_its_power(tmp_path):
+    from pycbc.filter.bstatistic import AmplitudeTable
+    path = str(tmp_path / 'table.hdf')
+    table().write(path)
+    other = DistancePowerLaw(3.0, 80.0, power=2.0)
+    read = AmplitudeTable.read(path, other)
+    x, g = every_regime(2000, seed=42)
+    exact = log_amplitude_marginal(x, g, other)
+    assert numpy.abs(read.log_marginal(x, g) - exact).max() < 2e-4
+    with pytest.raises(ValueError):
+        AmplitudeTable.read(path, DistancePowerLaw(3.0, 80.0, power=3.0))
+
+
+def test_gpu_orientation_marginals_match_the_cpu():
+    from pycbc.filter.bstatistic import OrientationNodes
+    cupy = pytest.importorskip('cupy')
+    try:
+        cupy.cuda.runtime.getDeviceCount()
+    except Exception:
+        pytest.skip('no usable GPU')
+    rng = numpy.random.default_rng(14)
+    n = 400
+    g00 = 10 ** rng.uniform(0, 10, n)
+    g11 = g00 * 10 ** rng.uniform(-0.5, 0.5, n)
+    g01 = 0.3 * numpy.sqrt(g00 * g11) * numpy.exp(2j * numpy.pi
+                                                  * rng.random(n))
+    # SNRs up to beyond the table's largest y, so some rows are integrated
+    snr = rng.uniform(0, 26, n)
+    z = (rng.normal(size=(2, n)) + 1j * rng.normal(size=(2, n))) \
+        * numpy.sqrt(numpy.array([g00, g11])) * snr / 2
+    sets = [OrientationNodes(8, 4), OrientationNodes(16, 8)]
+    t = table()
+    cpu = t.log_orientation_marginals(z, g00, g11, g01, sets)
+    gpu = t.log_orientation_marginals(*(cupy.asarray(v) for v in (
+        z, g00, g11, g01)), sets, xp=cupy)
+    # the kernel projects in single precision, as its input is
+    assert numpy.abs(cupy.asnumpy(gpu) - cpu).max() < 1e-5 \
+        + 1e-6 * numpy.abs(cpu).max()
