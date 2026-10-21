@@ -98,3 +98,49 @@ def refine_peak(statistic, low, high, tolerance=1e-3):
             d = a + ratio * (b - a)
             fd = statistic(d)
     return (c, fc) if fc >= fd else (d, fd)
+
+
+def interpolate_twice_sampled(even, odd, step, targets, half_width=24,
+                              beta=14.0, xp=numpy):
+    """A correlation at arbitrary ``targets`` from its samples at half the
+    grid step.
+
+    ``even[..., j]`` is ``z(2 j step)`` and ``odd[..., j]`` is ``z((2 j +
+    1) step)``, with ``step = T / (2 N)`` half the step of an ``N``-point
+    grid over ``T``: two inverse FFTs, the second of the spectrum turned by
+    half a step. The band of ``z`` fills the grid's Nyquist interval, so
+    demodulated at its centre, ``1 / (4 step)``, it fills half of the twice
+    finer one, and a Kaiser-windowed cardinal sine over ``half_width``
+    samples either side reconstructs it to about ``exp(-beta)`` (5e-8 at
+    the defaults). The samples are periodic, as an inverse FFT's are;
+    ``targets`` are in seconds from sample 0. The taps are computed where
+    ``targets`` live, so a few targets on the host cost no device work but
+    the final gather and sum.
+    """
+    tp = numpy if isinstance(targets, numpy.ndarray) else xp
+    targets = tp.asarray(targets, dtype=tp.float64)
+    x = targets / step
+    base = tp.floor(x).astype(tp.int64)
+    taps = tp.arange(-half_width + 1, half_width + 1)
+    index = base[:, None] + taps[None, :]
+    offset = x[:, None] - index
+    index = index % (2 * even.shape[-1])
+    # Kaiser window over the taps
+    u = offset / half_width
+    window = tp.where(tp.abs(u) < 1, _bessel_i0(
+        beta * tp.sqrt(tp.maximum(1 - u * u, 0)), tp)
+        / _bessel_i0(tp.asarray(beta), tp), 0)
+    # demodulation at the band centre: phase pi / 2 per sample
+    kernel = tp.sinc(offset) * window * tp.exp(0.5j * numpy.pi * offset)
+    kernel = xp.asarray(kernel)
+    half, parity = xp.asarray(index // 2), xp.asarray(index % 2 == 1)
+    values = xp.where(parity, odd[..., half], even[..., half])
+    return xp.sum(values * kernel, axis=-1)
+
+
+def _bessel_i0(x, xp):
+    if xp is numpy:
+        from scipy.special import i0
+        return i0(x)
+    from cupyx.scipy.special import i0
+    return i0(x)

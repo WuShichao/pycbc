@@ -5,6 +5,7 @@ import pytest
 from pycbc.filter.fstatistic import twof
 from pycbc.filter.subsample_arrival_time import (correlation_at,
                                                  fractional_correlations,
+                                                 interpolate_twice_sampled,
                                                  oversampling_for_loss,
                                                  refine_peak, rms_bandwidth)
 from pycbc.tdi.linear_exponent_surrogate import LinearExponentSurrogate
@@ -89,3 +90,38 @@ def test_oversampling_bounds_the_loss():
                                                                   abs=3e-3)
     assert oversampling_for_loss(0.640e-3, 142.678, 1e-3) == 10
     assert oversampling_for_loss(1e-6, 1.0, 1e-3) == 1
+
+
+def twice_sampled(xp=numpy):
+    fam = family()
+    rng = numpy.random.default_rng(6)
+    data = rng.normal(size=(2, fam.size)) + 1j * rng.normal(size=(2, fam.size))
+    spectrum = fam.correlation_spectrum(data, *fam.pieces(numpy.zeros(3)))
+    n = fam.size
+    turn = numpy.exp(1j * numpy.pi * numpy.arange(n) / n)
+    even = numpy.fft.ifft(spectrum, axis=-1, norm='forward')
+    odd = numpy.fft.ifft(spectrum * turn, axis=-1, norm='forward')
+    targets = rng.uniform(0, fam.grid.duration, 60)
+    exact = correlation_at(spectrum, targets, fam.grid.duration)
+    return fam, even, odd, targets, exact
+
+
+def test_twice_sampled_interpolation_reaches_any_delay():
+    fam, even, odd, targets, exact = twice_sampled()
+    got = interpolate_twice_sampled(even, odd, fam.grid.delta_t / 2, targets)
+    assert numpy.abs(got - exact).max() < 1e-6 * numpy.abs(exact).max()
+
+
+def test_twice_sampled_interpolation_on_the_gpu():
+    cupy = pytest.importorskip('cupy')
+    try:
+        cupy.cuda.runtime.getDeviceCount()
+    except Exception:
+        pytest.skip('no usable GPU')
+    fam, even, odd, targets, exact = twice_sampled()
+    step = fam.grid.delta_t / 2
+    for where in (targets, cupy.asarray(targets)):
+        got = interpolate_twice_sampled(cupy.asarray(even), cupy.asarray(odd),
+                                        step, where, xp=cupy)
+        got = cupy.asnumpy(got)
+        assert numpy.abs(got - exact).max() < 1e-6 * numpy.abs(exact).max()
