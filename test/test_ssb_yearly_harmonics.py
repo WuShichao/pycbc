@@ -51,12 +51,18 @@ def test_grid_spans_whole_periods():
     assert grid.in_data.sum() == math.ceil(730 * DAY / grid.delta_t)
 
 
-def test_resampling_evaluates_the_signal_at_detector_time():
+@pytest.mark.parametrize('guard', [0, 7])
+def test_resampling_evaluates_the_signal_at_detector_time(guard):
+    """With guard bins the band sits ``guard`` bins up the grid: the series
+    is basebanded at the grid's first frequency, below the data's."""
     pytest.importorskip('finufft')
     start, days, nbins = 2e6, 30.0, 40
     delta_f = 1 / (days * DAY)
     f0 = 0.0151
-    grid = SSBGrid(start, start + days * DAY, f0, nbins, delta_f, periods=1)
+    grid = SSBGrid(start, start + days * DAY, f0, nbins, delta_f, periods=1,
+                   guard=guard)
+    assert grid.first_frequency == pytest.approx(
+        f0 - guard * grid.delta_f, abs=1e-15)
     rng = numpy.random.default_rng(1)
     bins = rng.normal(size=(2, nbins)) + 1j * rng.normal(size=(2, nbins))
     series = resample_to_ssb(grid, bins, ORBIT, *SKY)
@@ -66,8 +72,8 @@ def test_resampling_evaluates_the_signal_at_detector_time():
     freqs = f0 + numpy.arange(nbins) * delta_f
     modes = numpy.exp(2j * numpy.pi * freqs[None, :]
                       * (t - start)[:, None])
-    expected = (bins @ modes.T) \
-        * numpy.exp(-2j * numpy.pi * f0 * (ssb - start))[None, :]
+    expected = (bins @ modes.T) * numpy.exp(
+        -2j * numpy.pi * grid.first_frequency * (ssb - start))[None, :]
     assert numpy.allclose(series[:, :n_in], expected, rtol=0, atol=1e-7)
     assert numpy.all(series[:, n_in:] == 0)
 
@@ -145,7 +151,8 @@ class _StillOrbit(object):
         return numpy.zeros((len(numpy.atleast_1d(t)), len(sc), 3))
 
 
-def test_ssb_spectrum_noise_gives_chi_squared_four():
+@pytest.mark.parametrize('guard', [0, 9])
+def test_ssb_spectrum_noise_gives_chi_squared_four(guard):
     """2F of two templates inside the data window averages 4 in noise once
     the correlation and the windowed Gram matrix are divided by the stated
     variance."""
@@ -153,7 +160,7 @@ def test_ssb_spectrum_noise_gives_chi_squared_four():
     from pycbc.tdi.ssb_yearly_harmonics import ssb_data_spectrum
     start, days, nbins = 0.0, 30.0, 200
     grid = SSBGrid(start, start + days * DAY, 0.0151, nbins,
-                   1 / (days * DAY), periods=1)
+                   1 / (days * DAY), periods=1, guard=guard)
     rng = numpy.random.default_rng(6)
     # two templates whose time series lie inside the data window
     series = numpy.zeros((2, 2, grid.size), complex)
@@ -172,13 +179,14 @@ def test_ssb_spectrum_noise_gives_chi_squared_four():
     assert numpy.mean(values) == pytest.approx(4.0, abs=4 * 2.0 / 20)
 
 
-def test_ssb_spectrum_of_a_signal_is_its_whitened_spectrum():
+@pytest.mark.parametrize('guard', [0, 9])
+def test_ssb_spectrum_of_a_signal_is_its_whitened_spectrum(guard):
     pytest.importorskip('finufft')
     from pycbc.tdi.ssb_yearly_harmonics import ssb_data_spectrum
     start, days, nbins = 0.0, 60.0, 600
     delta_f = 1 / (days * DAY)
     grid = SSBGrid(start, start + days * DAY, 0.0151, nbins, delta_f,
-                   periods=1)
+                   periods=1, guard=guard)
 
     def chirp(f):
         u = (f - 0.0151) / (nbins * delta_f)

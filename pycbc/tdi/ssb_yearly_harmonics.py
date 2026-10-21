@@ -80,6 +80,17 @@ def _smooth_length(need):
     return best
 
 
+def guard_bins(f_high, periods, kmax, period=ORBITAL_PERIOD,
+               orbital_speed=2.99e4):
+    """The guard bins an :class:`SSBGrid` needs either side of the band:
+    the Doppler spread ``(v / c) f_high`` of the resampled data, for the
+    orbital speed ``v`` (m/s), and the shift ``kmax * periods`` bins of the
+    orbit's highest harmonic, with a margin of half again."""
+    duration = periods * period
+    doppler = orbital_speed / C_SI * f_high * duration
+    return int(math.ceil(1.5 * (doppler + kmax * periods))) + 2
+
+
 class SSBGrid(object):
     """A uniform SSB time grid over a whole number of orbital periods.
 
@@ -105,20 +116,32 @@ class SSBGrid(object):
         A 5-smooth or a power-of-two number of samples.
     period : float, optional
         The orbital period, s. Default the sidereal year.
+    guard : int
+        Grid bins kept free either side of the data's band: the band sits
+        from bin ``guard``, and ``first_frequency`` is the grid's, ``guard``
+        bins below the data's (:attr:`data_first_frequency`). The Doppler
+        spread of the resampled data and the shifts of the orbit's
+        harmonics then stay inside the grid instead of wrapping round to
+        the band's other end (see :func:`guard_bins`).
     """
     def __init__(self, start, stop, first_frequency, nbins, delta_f,
-                 periods=5, length='smooth', period=ORBITAL_PERIOD):
+                 periods=5, length='smooth', period=ORBITAL_PERIOD,
+                 guard=0):
         if length not in ('smooth', 'pow2'):
             raise ValueError("length must be 'smooth' or 'pow2'")
         self.start, self.stop = float(start), float(stop)
         self.period = float(period)
         self.duration = int(periods) * self.period
-        need = nbins * self.duration / (self.stop - self.start)
+        self.guard = int(guard)
+        need = nbins * self.duration / (self.stop - self.start) \
+            + 2 * self.guard
         self.size = (_smooth_length(need) if length == 'smooth'
                      else 2 ** int(math.ceil(math.log2(need))))
         self.delta_t = self.duration / self.size
         self.delta_f = 1.0 / self.duration
-        self.first_frequency = float(first_frequency)
+        self.data_first_frequency = float(first_frequency)
+        self.first_frequency = self.data_first_frequency \
+            - self.guard * self.delta_f
         self.frequencies = (self.first_frequency
                             + numpy.arange(self.size) * self.delta_f)
         self.times = self.start + numpy.arange(self.size) * self.delta_t
@@ -132,7 +155,7 @@ def resample_to_ssb(grid, bins, orbit, longitude, latitude, epsilon=1e-10):
     """Detector-frame frequency bins to an SSB-time series on ``grid``.
 
     ``bins`` are the whitened data, shape ``(nchannels, grid.data_nbins)``,
-    on frequencies ``grid.first_frequency + j * grid.data_delta_f`` with
+    on frequencies ``grid.data_first_frequency + j * grid.data_delta_f`` with
     phases referenced to ``grid.start``. The series at SSB time ``t'`` is
     the detector-frame signal at the detector time ``t(t')``, basebanded by
     ``exp(-2 pi i f0 (t' - start))``; it is zero after the data end.
@@ -154,9 +177,13 @@ def resample_to_ssb(grid, bins, orbit, longitude, latitude, epsilon=1e-10):
     x = numpy.mod(2 * numpy.pi * dfd * (t - grid.start), 2 * numpy.pi)
     padded = nbins + (nbins % 2)
     centre = padded // 2
-    carrier = (numpy.exp(2j * numpy.pi * (grid.first_frequency + centre * dfd)
-                         * (t - ssb))
-               * numpy.exp(2j * numpy.pi * centre * dfd * (ssb - grid.start)))
+    # the modes at the data's frequencies, basebanded at the grid's first,
+    # guard bins below
+    f0 = getattr(grid, 'data_first_frequency', grid.first_frequency)
+    carrier = (numpy.exp(2j * numpy.pi * (f0 + centre * dfd) * (t - ssb))
+               * numpy.exp(2j * numpy.pi * (centre * dfd + f0
+                                            - grid.first_frequency)
+                           * (ssb - grid.start)))
     out = numpy.zeros((bins.shape[0], grid.size), dtype=complex)
     for ch, row in enumerate(bins):
         modes = numpy.zeros(padded, dtype=complex)
