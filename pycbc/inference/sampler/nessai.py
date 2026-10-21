@@ -71,13 +71,21 @@ class NessaiSampler(BaseSampler):
         """The raw nested samples including the corresponding weights"""
         # the importance nested sampler returns an array rather than a list,
         # so this cannot be a plain truth test
-        if len(self._sampler.ns.nested_samples) > 0:
-            ns = numpy.array(self._sampler.ns.nested_samples)
+        sampler = self._sampler.ns
+        if self.extra_kwds.get("importance_nested_sampler", False):
+            # the importance sampler's posterior weights belong to all its
+            # samples, live ones included, not to the discarded ones only
+            ns = numpy.array(sampler.samples)
+            logwt = sampler.log_posterior_weights
+        else:
+            ns = numpy.array(sampler.nested_samples)
+            logwt = sampler.state.log_posterior_weights
+        if len(ns) > 0:
             samples = nessai.livepoint.live_points_to_dict(
                 ns,
                 self.model.sampling_params,
             )
-            samples["logwt"] = self._sampler.ns.state.log_posterior_weights
+            samples["logwt"] = logwt
             samples["loglikelihood"] = ns["logL"]
             samples["logprior"] = ns["logP"]
             samples["it"] = ns["it"]
