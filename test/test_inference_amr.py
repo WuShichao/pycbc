@@ -274,3 +274,69 @@ def test_a_laplace_frame_integrates_a_thin_oblique_ridge():
                          posterior_samples=10)
     sampler.run()
     assert sampler.logz == pytest.approx(truth, abs=0.02)
+
+
+def test_exploration_finds_the_higher_of_two_peaks():
+    """A low broad peak and a high narrow one whose ln L rises over a basin
+    of about 1e-3 of the prior, as a match does: the pilot finds the broad
+    one; with the exploration the frame is about the narrow one."""
+    names = ['a', 'b', 'c']
+    narrow = numpy.array([2.5, -3.0, 1.0])
+    broad = numpy.array([-2.0, 2.0, -1.0])
+
+    class TwoPeaks(models.base.BaseModel):
+        name = 'test_two_peaks'
+
+        def _loglikelihood(self):
+            x = numpy.array([self.current_params[n] for n in names])
+            r2n = numpy.sum((x - narrow) ** 2)
+            r2b = numpy.sum((x - broad) ** 2)
+            return max(30.0 * numpy.exp(-r2n / (2 * 0.25 ** 2)),
+                       20.0 * numpy.exp(-r2b / 2.0))
+    prior = JointDistribution(names, *[Uniform(**{n: (-4.0, 4.0)})
+                                       for n in names])
+    peaks = {}
+    for explore in (0.0, 1e-3):
+        sampler = AMRSampler(TwoPeaks(names, prior=prior),
+                             initial_divisions=2, pilot_evaluations=500,
+                             laplace_frame=True, mass_fraction=1e-4,
+                             max_evaluations=30000, posterior_samples=2000,
+                             seed=3, explore_basin=explore)
+        sampler.run()
+        peaks[explore] = (sampler.diagnostics['frame_peak'],
+                          numpy.mean(sampler.samples['a']))
+    # without the exploration the frame is about the broad peak
+    assert peaks[0.0][0] < 21
+    assert peaks[1e-3][0] > 29.9
+    assert peaks[1e-3][1] == pytest.approx(narrow[0], abs=0.05)
+
+
+def test_an_exploration_beyond_the_budget_is_refused():
+    with pytest.raises(ValueError):
+        AMRSampler(normal_model(), max_evaluations=1000, explore_basin=1e-3)
+
+
+def test_a_partition_takes_no_exploration(tmp_path):
+    path = str(tmp_path / 'cells.hdf')
+    lattice_partition(path)
+    with pytest.raises(ValueError):
+        AMRSampler(normal_model(), partition_file=path, explore_basin=1e-3,
+                   max_evaluations=100000)
+
+
+def test_differences_at_the_edge_of_the_support_are_one_sided():
+    """A quadratic whose point sits on two bounds of its support: the
+    gradient and Hessian come out as inside, not zero."""
+    from pycbc.inference.sampler.amr import _finite_differences
+    A = numpy.array([[4.0, 1.0, 0.3], [1.0, 2.0, -0.5], [0.3, -0.5, 3.0]])
+    b = numpy.array([0.2, -0.1, 0.5])
+
+    def f(X):
+        X = numpy.atleast_2d(X)
+        v = -0.5 * numpy.einsum('ki,ij,kj->k', X - b, A, X - b)
+        v[(X[:, 0] > 0.2 + 1e-12) | (X[:, 2] < 0.5 - 1e-12)] = -numpy.inf
+        return v
+    x = numpy.array([0.2, 0.0, 0.5])
+    grad, hess = _finite_differences(f, x, numpy.full(3, 1e-3))
+    assert numpy.allclose(grad, -A @ (x - b), atol=1e-6)
+    assert numpy.allclose(hess, -A, atol=1e-6)

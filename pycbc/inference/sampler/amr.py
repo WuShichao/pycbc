@@ -114,7 +114,8 @@ class AMRSampler(BaseSampler):
         whitened by the Laplace approximation in ``y``. Needs uniform
         priors. Default False.
     shared_region : int, optional
-        After the frame is set, hand the model this many points drawn
+        After the frame is set (or the starting boxes are evaluated, when
+        there is no pilot), hand the model this many points drawn
         uniformly from the boxes whose log likelihood is within 20 of the
         largest (15, 10 or 6 when the model cannot hold that region, or
         again at twice the evaluations) through its ``share`` method, and
@@ -123,6 +124,16 @@ class AMRSampler(BaseSampler):
         (see
         :class:`pycbc.inference.models.bstatistic_surrogate.SharedLikelihood`).
         Default 0, off.
+    explore_basin : float, optional
+        Before the pilot, evaluate a scrambled Sobol sample of the prior
+        large enough to land in any region holding this fraction of the
+        prior's volume, but for a probability ``explore_miss``; the frame's
+        Newton climbs start from its best separate points as well as the
+        pilot's boxes. A likelihood with several peaks, of which the pilot's
+        refinement finds a lower one first, then has its frame about the
+        highest one whose basin is that large. Default 0, off.
+    explore_miss : float, optional
+        See ``explore_basin``. Default 0.01.
     whitening_rounds : int, optional
         Pilot refinements, each of ``pilot_evaluations`` more evaluations
         in the frame the previous one whitened. A thin ridge oblique to the
@@ -160,7 +171,7 @@ class AMRSampler(BaseSampler):
                  use_mpi=False, loglikelihood_function=None,
                  partition_file=None, whitening_rounds=1,
                  laplace_frame=False, curvilinear_frame=False,
-                 shared_region=0):
+                 shared_region=0, explore_basin=0.0, explore_miss=0.01):
         super().__init__(model)
         self.initial_divisions = int(initial_divisions)
         self.partition_file = partition_file
@@ -170,11 +181,23 @@ class AMRSampler(BaseSampler):
         self.laplace_frame = bool(laplace_frame)
         self.curvilinear_frame = bool(curvilinear_frame)
         self.shared_region = int(shared_region)
+        self.explore_basin = float(explore_basin)
+        self.explore_miss = float(explore_miss)
+        if not 0 <= self.explore_basin < 1 or not 0 < self.explore_miss < 1:
+            raise ValueError("explore-basin must be in [0, 1) and "
+                             "explore-miss in (0, 1)")
+        self._explored = None
         self._batched = False
         self._next_share = 0
         self.loglikelihood_step = float(loglikelihood_step)
         self.mass_fraction = float(mass_fraction)
         self.max_evaluations = int(max_evaluations)
+        if self.explore_basin > 0 and self._explore_points() >= \
+                self.max_evaluations:
+            raise ValueError(
+                "exploring for a basin of {} of the prior takes {} "
+                "evaluations, not fewer than max-evaluations".format(
+                    self.explore_basin, self._explore_points()))
         self.posterior_samples = int(posterior_samples)
         self.seed = int(seed)
         if self.initial_divisions < 1 or self.mass_fraction <= 0:
@@ -211,6 +234,9 @@ class AMRSampler(BaseSampler):
             if self.pilot_evaluations > 0:
                 raise ValueError("a partition sets the frame; it takes no "
                                  "pilot evaluations")
+            if self.explore_basin > 0:
+                raise ValueError("a partition locates the candidate; it "
+                                 "takes no exploration")
             self._start_from_partition(read_partition(partition_file))
 
     @property
@@ -316,9 +342,16 @@ class AMRSampler(BaseSampler):
     def _evaluate(self, index):
         cube, logjac = self._map(self._lower[index] + 0.5 * self._width[index])
         self._logjac[index] = logjac
-        inside = numpy.all((cube >= 0) & (cube <= 1), axis=1) \
-            & numpy.isfinite(logjac)
-        logl = numpy.full(len(index), -numpy.inf)
+        self._logl[index] = self._cube_loglikelihoods(cube, logjac)
+
+    def _cube_loglikelihoods(self, cube, logjac=None):
+        """The log likelihood at cube points, ``-inf`` outside the cube or
+        where a frame's map fails; through the model's batch method once it
+        shares a region's computations."""
+        inside = numpy.all((cube >= 0) & (cube <= 1), axis=1)
+        if logjac is not None:
+            inside &= numpy.isfinite(logjac)
+        logl = numpy.full(len(cube), -numpy.inf)
         if inside.any():
             points = [self._prior_transform(c) for c in cube[inside]]
             if self._batched:
@@ -326,8 +359,7 @@ class AMRSampler(BaseSampler):
                 logl[inside] = self.model.loglikelihoods(
                     [dict(zip(names, p)) for p in points])
                 self.nevaluations += int(inside.sum())
-                self._logl[index] = logl
-                return
+                return logl
             # a large batch in tenths, each logged with an estimate of the rest
             values, step, start = [], max(100, len(points) // 10), time.time()
             for k in range(0, len(points), step):
@@ -340,7 +372,51 @@ class AMRSampler(BaseSampler):
                                  elapsed / done * (len(points) - done))
             logl[inside] = values
         self.nevaluations += int(inside.sum())
-        self._logl[index] = logl
+        return logl
+
+    def _explore(self):
+        """A scrambled Sobol sample of the cube, as many points as miss a
+        region of the prior holding a fraction ``explore_basin`` of it with
+        probability ``explore_miss``: the local maxima the frame climbs
+        from include any peak whose basin is that large, wherever the
+        pilot's refinement went."""
+        from scipy.stats import qmc
+        n = self._explore_points()
+        cube = qmc.Sobol(self.ndim, seed=self.seed).random_base2(
+            int(numpy.log2(n)))
+        logl = self._cube_loglikelihoods(cube)
+        self._explored = (cube, logl)
+        self._diagnostics.update(explore_points=n,
+                                 explore_best=float(numpy.max(logl)))
+        logging.info("AMR: explored %d points of the prior, largest ln L "
+                     "%.3f", n, numpy.max(logl))
+
+    def _explore_points(self):
+        """The exploration's size: the power of two at least ``ln(miss) /
+        ln(1 - basin)``, which keeps the Sobol sample balanced."""
+        need = numpy.log(self.explore_miss) / numpy.log1p(-self.explore_basin)
+        return int(2 ** numpy.ceil(numpy.log2(need)))
+
+    def _climb_starts(self, starts, separation=0.05):
+        """Cube points to climb from: the pilot's best boxes and the
+        exploration's best points, at most ``starts``, in decreasing ln L,
+        each farther than ``separation`` (in the cube, per axis) from those
+        taken before it."""
+        leaves = self._leaves()
+        cube = self._to_cube(self._lower[leaves] + 0.5 * self._width[leaves])
+        logl = numpy.where(numpy.isfinite(self._logl[leaves]),
+                           self._logl[leaves], -numpy.inf)
+        if getattr(self, '_explored', None) is not None:
+            cube = numpy.vstack([cube, self._explored[0]])
+            logl = numpy.concatenate([logl, self._explored[1]])
+        taken = []
+        for k in numpy.argsort(-logl):
+            if not numpy.isfinite(logl[k]) or len(taken) >= starts:
+                break
+            if all(numpy.abs(cube[k] - cube[j]).max() > separation
+                   for j in taken):
+                taken.append(k)
+        return cube[taken]
 
     def _log_mass(self, index):
         logvol = (numpy.sum(numpy.log(self._width[index]), axis=1)
@@ -351,6 +427,11 @@ class AMRSampler(BaseSampler):
 
     def run(self):
         start = time.time()
+        # the model's counts are its own, over all runs: this run's are the
+        # change
+        before = dict(getattr(self.model, 'shared_statistics', None) or {})
+        if self.explore_basin > 0:
+            self._explore()
         self._grid()
         if self.pilot_evaluations > 0:
             for _ in range(self.whitening_rounds):
@@ -366,6 +447,10 @@ class AMRSampler(BaseSampler):
                     self._whiten()
                 if self.shared_region and not self._batched:
                     self._share()
+        elif self.shared_region and not self._batched:
+            # no pilot, as from a search's cells: share the starting boxes'
+            # region
+            self._share()
         leaves, logmass, logz, refine = self._refine(self.max_evaluations)
         self._logz = logz
         logerr = self._logerr[leaves]
@@ -387,6 +472,7 @@ class AMRSampler(BaseSampler):
                                                          1))
         stats = getattr(self.model, 'shared_statistics', None)
         if stats is not None:
+            stats = {k: v - before.get(k, 0) for k, v in stats.items()}
             diag.update(stats)
             used = stats['shared_points'] + stats['single_points']
             diag['shared_fraction'] = (stats['shared_points']
@@ -549,20 +635,22 @@ class AMRSampler(BaseSampler):
             """Newton steps of ln L in ``z``, ``y = y0 + unit z``, each
             halved while it lowers ln L: the end point, the precision
             there and ln L."""
-            def logl_z(z):
-                self.nevaluations += 1
-                theta = from_y((y0 + unit * z)[None])[0]
+            def logl_zs(z):
+                """ln L at the rows y = y0 + unit z, the map inverted and
+                the likelihood evaluated for all rows together."""
+                theta = from_y(y0 + unit * numpy.atleast_2d(z))
                 u = (theta - bottom) / prior_range
-                if not numpy.all(numpy.isfinite(u)) or numpy.any(
-                        (u < 0) | (u > 1)):
-                    return -numpy.inf
-                return float(self._loglikelihood(theta))
+                u[~numpy.all(numpy.isfinite(u), axis=1)] = -1.0
+                return self._cube_loglikelihoods(u)
+
+            def logl_z(z):
+                return float(logl_zs(z)[0])
             x = numpy.zeros(self.ndim)
             value = logl_z(x)
             step = numpy.full(self.ndim, 1e-3)
             precision = prior_precision
             for _ in range(iterations):
-                grad, hess = _finite_differences(logl_z, x, step)
+                grad, hess = _finite_differences(logl_zs, x, step)
                 values, vectors = numpy.linalg.eigh(-0.5 * (hess + hess.T))
                 precision = (vectors * numpy.maximum(values, 0)) @ vectors.T \
                     + prior_precision
@@ -583,15 +671,11 @@ class AMRSampler(BaseSampler):
                 if size < 0.05:
                     break
             return y0 + unit * x, precision, value
-        # from the pilot's best boxes, the highest maximum
-        leaves = self._leaves()
-        logl = numpy.where(numpy.isfinite(self._logl[leaves]),
-                           self._logl[leaves], -numpy.inf)
+        # from the pilot's and the exploration's best, separate points, the
+        # highest maximum
         best = None
-        for box in leaves[numpy.argsort(-logl)[:starts]]:
-            start = numpy.array(self._prior_transform(self._to_cube(
-                self._lower[box:box + 1]
-                + 0.5 * self._width[box:box + 1])[0]))
+        for point in self._climb_starts(starts):
+            start = numpy.array(self._prior_transform(point))
             y0 = to_y(start[None])[0]
             if not numpy.all(numpy.isfinite(y0)):
                 continue
@@ -628,44 +712,60 @@ class AMRSampler(BaseSampler):
                      self.nevaluations)
         self._start_frame(low, span, radius)
 
-    def _laplace(self, iterations=8):
+    def _laplace(self, iterations=8, starts=5):
         """Mean and covariance, in the cube, of the Laplace approximation
-        about the likelihood's maximum nearest the best box."""
-        leaves = self._leaves()
-        logl = numpy.where(numpy.isfinite(self._logl[leaves]),
-                           self._logl[leaves], -numpy.inf)
-        best = leaves[numpy.argmax(logl)]
-        x = self._to_cube(self._lower[best] + 0.5 * self._width[best])
+        about the likelihood's highest maximum the Newton climbs from the
+        pilot's (and the exploration's) best separate points reach, each
+        step halved while it lowers ln L."""
         # a uniform prior over the cube has variance 1 / 12 per axis
         prior = 12 * numpy.eye(self.ndim)
-        step = numpy.full(self.ndim, 1e-3)
+
+        def logl_us(u):
+            return self._cube_loglikelihoods(numpy.atleast_2d(u))
 
         def logl_at(u):
-            self.nevaluations += 1
-            if numpy.any((u < 0) | (u > 1)):
-                return -numpy.inf
-            return float(self._loglikelihood(self._prior_transform(u)))
-        for _ in range(iterations):
-            grad, hess = _finite_differences(logl_at, x, step)
-            precision = -hess
-            values, vectors = numpy.linalg.eigh(0.5 * (precision
-                                                       + precision.T))
-            precision = (vectors * numpy.maximum(values, 0)) @ vectors.T \
-                + prior
-            move = numpy.linalg.solve(precision, grad)
-            # at most three standard deviations, and inside the cube
-            size = numpy.sqrt(move @ precision @ move)
-            if size > 3:
-                move *= 3 / size
-            x = numpy.clip(x + move, 1e-9, 1 - 1e-9)
-            step = numpy.clip(0.5 / numpy.sqrt(numpy.diag(precision)), 1e-7,
-                              1e-2)
-            if size < 0.05:
-                break
-        cov = numpy.linalg.inv(precision)
-        logging.info("AMR: Laplace frame after %d evaluations",
-                     self.nevaluations)
-        return x, cov
+            return float(logl_us(u)[0])
+
+        def climb(x):
+            value = logl_at(x)
+            step = numpy.full(self.ndim, 1e-3)
+            precision = prior
+            for _ in range(iterations):
+                grad, hess = _finite_differences(logl_us, x, step)
+                values, vectors = numpy.linalg.eigh(-0.5 * (hess + hess.T))
+                precision = (vectors * numpy.maximum(values, 0)) @ vectors.T \
+                    + prior
+                move = numpy.linalg.solve(precision, grad)
+                # at most three standard deviations, and inside the cube
+                size = numpy.sqrt(move @ precision @ move)
+                if size > 3:
+                    move *= 3 / size
+                for _ in range(6):
+                    trial_x = numpy.clip(x + move, 1e-9, 1 - 1e-9)
+                    trial = logl_at(trial_x)
+                    if trial >= value:
+                        break
+                    move = 0.5 * move
+                else:
+                    break
+                x, value = trial_x, trial
+                step = numpy.clip(0.5 / numpy.sqrt(numpy.diag(precision)),
+                                  1e-7, 1e-2)
+                if size < 0.05:
+                    break
+            return x, precision, value
+        best = None
+        for point in self._climb_starts(starts):
+            found = climb(numpy.array(point, dtype=float))
+            if best is None or found[2] > best[2]:
+                best = found
+        x, precision, peak = best
+        self._diagnostics.update(frame_peak=float(peak),
+                                 frame_starts=int(starts),
+                                 frame_evaluations=self.nevaluations)
+        logging.info("AMR: Laplace frame about ln L %.3f after %d "
+                     "evaluations", peak, self.nevaluations)
+        return x, numpy.linalg.inv(precision)
 
     def _whiten(self, mean=None, cov=None, radius=4.0):
         """Partitions the cube again in the frame that whitens the current
@@ -904,7 +1004,8 @@ class AMRSampler(BaseSampler):
                  'pilot-evaluations': int, 'loglikelihood-step': float,
                  'mass-fraction': float, 'max-evaluations': int,
                  'posterior-samples': int, 'seed': int,
-                 'loglikelihood-function': str}
+                 'loglikelihood-function': str,
+                 'explore-basin': float, 'explore-miss': float}
         unknown = set(cp.options(section)) - set(types) - {'name'}
         if unknown:
             raise ValueError("unknown option(s) in [sampler] for amr: "
@@ -921,26 +1022,64 @@ def _boolean(value):
     return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
 
 
-def _finite_differences(f, x, step):
+def _finite_differences(f, x, step, shrink=6):
     """Gradient and Hessian of ``f`` at ``x``: central differences along
-    the axes and forward ones for the mixed terms."""
+    the axes and forward ones for the mixed terms. ``f`` takes the rows of
+    an array of points and returns their values, so that all the points
+    are evaluated together.
+
+    Next to the edge of the support (``f`` not finite on one side of an
+    axis, as at a prior bound) the differences along that axis are one-
+    sided, from the points at one and two steps on the other side, and the
+    mixed terms go to the sides that are inside; an axis with neither side
+    inside has its step halved, up to ``shrink`` times. A peak on a prior
+    bound then has the curvature it has inside rather than none."""
     n = len(x)
-    f0 = f(x)
-    plus, minus = numpy.empty(n), numpy.empty(n)
+    step = numpy.array(step, dtype=float)
+    eye = numpy.diag(step)
+    f0 = float(f(x[None])[0])
+    plus, minus = numpy.full(n, numpy.nan), numpy.full(n, numpy.nan)
+    todo = numpy.arange(n)
+    for _ in range(shrink + 1):
+        eye = numpy.diag(step)
+        values = numpy.asarray(f(numpy.array(
+            [x + eye[i] for i in todo] + [x - eye[i] for i in todo])),
+            dtype=float)
+        plus[todo], minus[todo] = values[:len(todo)], values[len(todo):]
+        lost = ~numpy.isfinite(plus[todo]) & ~numpy.isfinite(minus[todo])
+        todo = todo[lost]
+        if not len(todo):
+            break
+        step[todo] /= 2
+    # the side each axis is differenced on: 0 both, +1 or -1 one
+    side = numpy.where(numpy.isfinite(plus) & numpy.isfinite(minus), 0,
+                       numpy.where(numpy.isfinite(plus), 1, -1))
+    single = numpy.nonzero(side != 0)[0]
+    pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
+    sign = numpy.where(side == 0, 1, side)
+    eye = numpy.diag(step * sign)
+    extra = [x + 2 * eye[i] for i in single] \
+        + [x + eye[i] + eye[j] for i, j in pairs]
+    values = numpy.asarray(f(numpy.array(extra)), dtype=float) \
+        if extra else numpy.empty(0)
+    two = dict(zip(single, values[:len(single)]))
+    near = numpy.where(side >= 0, plus, minus)
+    grad = numpy.empty(n)
+    hess = numpy.zeros((n, n))
     for i in range(n):
-        e = numpy.zeros(n)
-        e[i] = step[i]
-        plus[i], minus[i] = f(x + e), f(x - e)
-    grad = (plus - minus) / (2 * step)
-    hess = numpy.diag((plus - 2 * f0 + minus) / step ** 2)
-    for i in range(n):
-        for j in range(i + 1, n):
-            e = numpy.zeros(n)
-            e[i], e[j] = step[i], step[j]
-            hess[i, j] = hess[j, i] = (f(x + e) - plus[i] - plus[j]
-                                       + f0) / (step[i] * step[j])
-    bad = ~numpy.isfinite(grad)
-    grad[bad] = 0.0
+        if side[i] == 0:
+            grad[i] = (plus[i] - minus[i]) / (2 * step[i])
+            hess[i, i] = (plus[i] - 2 * f0 + minus[i]) / step[i] ** 2
+        else:
+            # one-sided, second order: f(x), f(x + h), f(x + 2h)
+            h = side[i] * step[i]
+            grad[i] = (-3 * f0 + 4 * near[i] - two[i]) / (2 * h)
+            hess[i, i] = (f0 - 2 * near[i] + two[i]) / h ** 2
+    for k, (i, j) in enumerate(pairs):
+        hess[i, j] = hess[j, i] = (
+            values[len(single) + k] - near[i] - near[j] + f0) / (
+            sign[i] * step[i] * sign[j] * step[j])
+    grad[~numpy.isfinite(grad)] = 0.0
     hess[~numpy.isfinite(hess)] = 0.0
     return grad, hess
 
