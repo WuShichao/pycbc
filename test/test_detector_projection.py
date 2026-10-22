@@ -90,3 +90,18 @@ def test_finite_source_support_is_integrated_on_its_actual_endpoints():
     empty = DetectorBandProjector(grid, _StillOrbit(), *SKY,
                                    source_support=(2 * duration, 3 * duration))
     assert numpy.count_nonzero(empty.project(spectrum)) == 0
+
+
+def test_physical_source_support_does_not_move_with_sky_chart():
+    grid = SSBGrid(0., 30 * DAY, .015, 20, 1 / (30 * DAY), periods=1)
+    support = (5 * DAY, 25 * DAY)
+    left = DetectorBandProjector(grid, ORBIT, *SKY, source_support=support,
+                                 source_sky=SKY)
+    right = DetectorBandProjector(grid, ORBIT, SKY[0] + .1, SKY[1],
+                                  source_support=support, source_sky=SKY)
+    numpy.testing.assert_array_equal(left.detector_nodes, right.detector_nodes)
+    for options in (dict(source_sky=SKY),
+                    dict(source_support=support, source_sky=(numpy.nan, 0.)),
+                    dict(source_support=support, source_sky=(0.,))):
+        with pytest.raises(ValueError):
+            DetectorBandProjector(grid, ORBIT, *SKY, **options)

@@ -31,11 +31,13 @@ class DetectorBandProjector(object):
     signal; this operator does not supply missing source physics or edges.
     ``source_support``, when given, is the source's finite interval in SSB
     seconds. Its detector-time endpoints are solved before quadrature, so
-    a sharp source edge is not rounded to a sampling bin.
+    a sharp source edge is not rounded to a sampling bin. ``source_sky``
+    specifies the physical source's clock for those endpoints; it need not
+    equal the arbitrary sky chart used for the Fourier series.
     """
 
     def __init__(self, grid, orbit, longitude, latitude, oversampling=2,
-                 epsilon=1e-12, source_support=None):
+                 epsilon=1e-12, source_support=None, source_sky=None):
         import finufft
 
         if (not isinstance(oversampling, (int, numpy.integer)) or
@@ -52,12 +54,18 @@ class DetectorBandProjector(object):
         if duration <= 0 or grid.size < 1 or grid.data_nbins < 1:
             raise ValueError('invalid detector time or frequency domain')
         lo, hi = grid.start, grid.stop
+        if source_sky is not None and source_support is None:
+            raise ValueError('source_sky requires finite source support')
         if source_support is not None:
             support = numpy.asarray(source_support, dtype=float)
             if (support.shape != (2,) or not numpy.isfinite(support).all() or
                     support[0] >= support[1]):
                 raise ValueError('source support needs two increasing finite SSB times')
-            endpoints = detector_times(orbit, support, longitude, latitude)
+            sky = numpy.asarray((longitude, latitude) if source_sky is None
+                                else source_sky, dtype=float)
+            if sky.shape != (2,) or not numpy.isfinite(sky).all():
+                raise ValueError('invalid source sky for support clock')
+            endpoints = detector_times(orbit, support, *sky)
             lo, hi = max(lo, endpoints[0]), min(hi, endpoints[1])
         self.active_duration = max(float(hi - lo), 0.)
         effective_samples = grid.size * self.active_duration / grid.duration
