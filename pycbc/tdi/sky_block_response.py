@@ -102,6 +102,9 @@ class SkyBlockResponse(object):
         self._ratio = None if ratio is None else numpy.asarray(ratio)[:, pick]
         w = numpy.ones(n_out) if weight is None else \
             numpy.asarray(weight, float)
+        # every frequency kept in the basis, however little power it holds:
+        # the basis is interpolated between the exact frequencies
+        w = numpy.maximum(w, 1e-6 * w.max())
         w_out = w
         w = w[pick]
         self._root = numpy.sqrt(w / w.sum())
