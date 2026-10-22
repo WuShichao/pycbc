@@ -113,15 +113,22 @@ class SkyBlockResponse(object):
         test = rng.uniform(-1, 1, (int(test_points), 2))
         A = self._rows(self.exact(self._offsets(train)))
         B = self._rows(self.exact(self._offsets(test)))
-        # the basis: leading right singular vectors of the training rows
-        _, sig, vt = numpy.linalg.svd(A, full_matrices=False)
-        coords = A @ numpy.conj(vt.T)
+        # the basis: leading right singular vectors of the training rows,
+        # from the eigenvectors of the small matrix A A^H rather than a full
+        # SVD of A, whose work space is several times A
+        values, vectors = numpy.linalg.eigh(A @ numpy.conj(A.T))
+        order = numpy.argsort(values)[::-1]
+        values, vectors = numpy.maximum(values[order], 0), vectors[:, order]
+        keep = int(numpy.sum(values > values[0] * 1e-14))
+        coords = vectors[:, :keep] * numpy.sqrt(values[:keep])[None]
         norm2 = numpy.sum(numpy.abs(A) ** 2, axis=1)
         left = norm2[:, None] - numpy.cumsum(numpy.abs(coords) ** 2, axis=1)
         err = numpy.sqrt(numpy.maximum(left, 0) / norm2[:, None]).max(axis=0)
         good = numpy.nonzero(err <= self.tolerance / 3)[0]
-        self.rank = int(good[0]) + 1 if len(good) else len(sig)
-        self._vt = vt[:self.rank]
+        self.rank = int(good[0]) + 1 if len(good) else keep
+        self._vt = (numpy.conj(vectors[:, :self.rank].T) @ A) / numpy.sqrt(
+            values[:self.rank])[:, None]
+        del A
         coords = coords[:, :self.rank]
         # the coordinates as Chebyshev series in the block, the degree
         # raised until the held-out points meet the tolerance
@@ -146,21 +153,30 @@ class SkyBlockResponse(object):
                                        self.frequencies, v.real)
                 + 1j * numpy.interp(self.output_frequencies,
                                     self.frequencies, v.imag), -1, V)
-            # the error at every frequency, at a few held-out points
+            # the error at the midpoints between the exact frequencies, where
+            # linear interpolation is worst, at a few held-out points
+            mid = 0.5 * (self.frequencies[1:] + self.frequencies[:-1])
             full = SkyBlockResponse.__new__(SkyBlockResponse)
             full.__dict__.update(self.__dict__)
-            full.frequencies = self.output_frequencies
-            full._ratio = None if ratio is None else numpy.asarray(ratio)
+            full.frequencies = mid
+            full._ratio = None if ratio is None else numpy.array([
+                numpy.interp(mid, self.output_frequencies, r)
+                for r in numpy.asarray(ratio)])
             t = (numpy.arange(self.samples)[:, None] * ORBITAL_PERIOD
-                 / self.samples + 1e-3 * numpy.arange(n_out)[None])
+                 / self.samples + 1e-3 * numpy.arange(len(mid))[None])
             full._geometry = MultiChannelTermGeometry(orbit, t.ravel(), terms)
             full._shift = numpy.exp(-2j * numpy.pi * numpy.tile(
-                self.output_frequencies, self.samples) * ssb_delay(
-                    orbit, t.ravel(), *self.centre))
+                mid, self.samples) * ssb_delay(orbit, t.ravel(), *self.centre))
             some = test[:min(8, len(test))]
             exact = full.exact(self._offsets(some))
-            root = numpy.sqrt(w_out / w_out.sum())
-            approx = numpy.einsum('mr,r...->m...', self._coords(some), V)
+            del full
+            root = numpy.sqrt(numpy.interp(mid, self.output_frequencies,
+                                           w_out / w_out.sum()))
+            at_mid = numpy.apply_along_axis(
+                lambda v: numpy.interp(mid, self.output_frequencies, v.real)
+                + 1j * numpy.interp(mid, self.output_frequencies, v.imag),
+                -1, V)
+            approx = numpy.einsum('mr,r...->m...', self._coords(some), at_mid)
             diff = ((approx - exact) * root).reshape(len(some), -1)
             ref = (exact * root).reshape(len(some), -1)
             self.interpolation_error = float(numpy.max(
