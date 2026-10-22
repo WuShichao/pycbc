@@ -191,14 +191,26 @@ class PhaseNUFFTCorrelation(object):
         default the response at ``sky`` alone.
     sky_tolerance : float
         The largest relative error of the sky basis at ``sky_points``.
+    band_margin : float, optional
+        Keep only the frequencies whose reference stationary time lies
+        within this margin, s, of the data window: the others hold no
+        signal, and they set the transform's node extents and its frame.
+        A margin of 5 days changes a correlation by about 1e-3 of its
+        largest value (2 years of data, 13.5 to 20.5 mHz). Default all.
     """
     def __init__(self, family, data, sky=(0.0, 0.0), eps=1e-6,
-                 sky_points=None, sky_tolerance=1e-4):
+                 sky_points=None, sky_tolerance=1e-4, band_margin=None):
         self.family = family
         xp = self.xp = family.xp
         self.eps = float(eps)
         grid = family.grid
         f = numpy.asarray(grid.frequencies, dtype=float)
+        self._sel = None
+        if band_margin is not None:
+            t0 = _host(family.t0)
+            self._sel = numpy.nonzero(
+                (t0 >= grid.start - band_margin)
+                & (t0 <= grid.stop + band_margin))[0]
         self.f_lower = family.f_lower
         self.orders = family.orders
         self.sky = numpy.asarray(sky, dtype=float)
@@ -214,14 +226,19 @@ class PhaseNUFFTCorrelation(object):
         self._rho_at = family._response(self.sky)
         self.strengths = xp.stack([self.strength(i, -1) for i in range(
             len(self.orders))])
-        self.f = f
-        self._logf = xp.asarray(numpy.log(f))
+        self.f = f if self._sel is None else f[self._sel]
+        self._logf = xp.asarray(numpy.log(self.f))
         # weights of the batch geometry: the template power at each
         # frequency, on a coarse grid
         step = max(1, len(f) // 4000)
         coarse = slice(0, len(f), step)
         power = numpy.abs(family.b0[coarse].get() if hasattr(
             family.b0, 'get') else family.b0[coarse]) ** 2
+        if self._sel is not None:
+            # the frame from the observed band only
+            observed = numpy.zeros(len(f), dtype=bool)
+            observed[self._sel] = True
+            power = power * observed[coarse]
         self._fc = f[coarse]
         self._wc = power / power.sum()
         self._psic, _ = _basis(self._fc)
@@ -241,8 +258,9 @@ class PhaseNUFFTCorrelation(object):
         rho = (self._rho_at if vector < 0
                else self._rho[vector])[harmonic]
         weighted = xp.conj(fam.fine(rho)) * self._data[None]
-        return (xp.conj(xp.asarray(fam.b0)) * phase
-                * weighted.sum(axis=1)).astype(xp.complex64)
+        out = (xp.conj(xp.asarray(fam.b0)) * phase
+               * weighted.sum(axis=1)).astype(xp.complex64)
+        return out if self._sel is None else out[:, xp.asarray(self._sel)]
 
     def sky_weights(self, offsets):
         """The weights of the strength sets for each template's sky offsets,

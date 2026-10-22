@@ -62,14 +62,17 @@ def block_sky_points(model, radius, step):
 
 
 def search_sky_block(model, region, sky, top=20, sky_tolerance=1e-4,
-                     **grid_options):
+                     band_margin=5 * 86400.0, **grid_options):
     """The loudest ``top`` candidates of one block: the model's intrinsic
     ``region`` (points ``(M, 4)``: mchirp, q, spin1z, spin2z) at the sky
-    offsets ``sky``, every arrival time of the model."""
+    offsets ``sky``, every arrival time of the model, over the frequencies
+    observed within ``band_margin`` of the data window (see
+    :class:`pycbc.filter.nufft_correlation.PhaseNUFFTCorrelation`)."""
     fam = model.surrogate
     xp = fam.xp
     corr = PhaseNUFFTCorrelation(fam, model.data_spectrum, sky=(0.0, 0.0),
-                                 sky_points=sky, sky_tolerance=sky_tolerance)
+                                 sky_points=sky, sky_tolerance=sky_tolerance,
+                                 band_margin=band_margin)
 
     def gram(T, offset):
         g = model.daily_gram(fam.b0, fam.t0, fam._response(offset))
