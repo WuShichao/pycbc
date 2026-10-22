@@ -374,3 +374,56 @@ def test_shared_computation_matches_one_point_at_a_time():
         m.share(full, grid_options=dict(memory_limit=1.0))
     assert m.shared_statistics['regions_refused'] == 1
     assert m.shared_statistics['largest_refused_gb'] > 0
+
+
+def test_a_sky_block_gives_the_model_the_exact_response():
+    """With a sky block the model's response at a sky offset is the exact
+    one to the block's tolerance, and the shared computation agrees with
+    the per-point one there."""
+    from pycbc.inference import models
+    from pycbc.workflow import WorkflowConfigParser
+    lon = 3.5763564997428436
+    config = (CONFIG.replace('grid-periods = 1', 'grid-periods = 1\n'
+                             'harmonics = 8\nsky-block-radius = 0.02\n'
+                             'sky-block-points = 200\n'
+                             'reference-eclipticlongitude = %r\n'
+                             'amplitude-table-file = ' % lon + table_file())
+              .replace('[variable_params]\nmchirp =',
+                       '[variable_params]\nmchirp =\neclipticlongitude =')
+              .replace('\neclipticlongitude = %r\n' % lon, '\n')
+              .replace('[waveform_transforms', '[prior-eclipticlongitude]\n'
+                       'name = uniform\nmin-eclipticlongitude = %r\n'
+                       'max-eclipticlongitude = %r\n\n[waveform_transforms'
+                       % (lon - 0.02, lon + 0.02)))
+    cp = WorkflowConfigParser()
+    cp.read_string(config)
+    data, psds, snr2, mc = stbbh_data()
+    m = models.read_from_config(cp, data=data, psds=psds)
+    block = m.surrogate.sky_block
+    assert block is not None and block.error <= block.tolerance
+    off = numpy.array([[0.01 / m.scales['eclipticlongitude'], 0.0]])
+    exact = block.exact(off) if len(block.frequencies) == len(
+        block.output_frequencies) else None
+    if exact is not None:
+        got = m.surrogate.responses(off)
+        got = numpy.asarray(got.get() if hasattr(got, 'get') else got)
+        assert numpy.linalg.norm(got - exact) <= 3 * block.tolerance \
+            * numpy.linalg.norm(exact)
+    unit = m.scales['mchirp']
+    points = [dict(mchirp=mc + u * unit, eclipticlongitude=lon + d)
+              for u, d in zip(numpy.linspace(-1, 1, 41),
+                              numpy.linspace(-0.015, 0.015, 41)[::-1])]
+    full = []
+    for p in points:
+        q = dict(m.static_params)
+        q.update(p)
+        full.append(q)
+    m.share(full)
+    batch = m.loglikelihoods(points[::8])
+    single = []
+    for p in points[::8]:
+        m.update(**p)
+        single.append(m.loglikelihood)
+    single = numpy.array(single)
+    near = single > single.max() - 20
+    assert numpy.abs(batch - single)[near].max() < 0.02

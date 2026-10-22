@@ -496,8 +496,8 @@ class BStatisticSurrogate(BaseModel):
                   coarse_bins=1500, harmonics=4, response_samples=32,
                   derivative_step=0.05, max_time_loss=1e-3, precision='double',
                   expansion_order=2, source_derivatives=None,
-                  exact_source_phase=None,
-                  **kwargs):
+                  exact_source_phase=None, sky_block_radius=None,
+                  sky_block_points=600, **kwargs):
         """Build the model from frequency-domain TDI data.
 
         Parameters
@@ -544,6 +544,15 @@ class BStatisticSurrogate(BaseModel):
             the intrinsic part; default when the intrinsic coordinates are
             mchirp, q, spin1z and spin2z. ``expansion_order`` and
             ``derivative_step`` then concern only the tangents.
+        sky_block_radius : float, optional
+            Take the response harmonics over the sky within this half-width
+            of the reference, rad, from the exact response (see
+            :class:`pycbc.tdi.sky_block_response.SkyBlockResponse`), in
+            place of the first-order sky model, which holds to about 1%
+            only within 0.01 rad. ``harmonics`` must then cover the Doppler
+            phase across the block: 8 for 0.07 rad.
+        sky_block_points : int, optional
+            Sky points the block's basis is fitted to. Default 600.
         source_derivatives : {'taylorf2', 'stencil'}, optional
             How the family's derivatives are taken, see
             ``surrogate_from_source`` in
@@ -690,6 +699,18 @@ class BStatisticSurrogate(BaseModel):
         else:
             fam = build(scales, derivative_step, dtype, expansion_order,
                         directions, source_derivatives)
+        if sky_block_radius:
+            # the response harmonics over a block of the sky from the exact
+            # response, in place of the first-order sky model
+            from pycbc.filter.nufft_correlation import source_power_weights
+            from pycbc.tdi.sky_block_response import SkyBlockResponse
+            fam.sky_block = SkyBlockResponse(
+                orbit, terms, coarse, (lon, lat),
+                (scales['eclipticlongitude'], scales['eclipticlatitude']),
+                sky_block_radius, kmax=harmonics, samples=response_samples,
+                ratio=ratio, weight=source_power_weights(fam),
+                points=sky_block_points, test_points=100,
+                exact_frequencies=min(coarse_bins, 160))
         daily = DailyGram(fam)
         spectrum, noise = ssb_data_spectrum(grid, bins, orbit, lon, lat,
                                             xp=fam.xp)
@@ -711,7 +732,8 @@ class BStatisticSurrogate(BaseModel):
         'expansion-order': int, 'source-derivatives': str,
         'exact-source-phase': _boolean,
         'orientation-nodes': str, 'margin': float,
-        'amplitude-table-file': str}
+        'amplitude-table-file': str, 'sky-block-radius': float,
+        'sky-block-points': int}
 
     @classmethod
     def from_config(cls, cp, data_section='data', data=None, psds=None,
@@ -801,6 +823,8 @@ class BStatisticSurrogate(BaseModel):
             expansion_order=get.get('expansion-order', 2),
             source_derivatives=get.get('source-derivatives'),
             exact_source_phase=get.get('exact-source-phase'),
+            sky_block_radius=get.get('sky-block-radius'),
+            sky_block_points=get.get('sky-block-points', 600),
             max_time_loss=get.get('max-time-loss', 1e-3),
             orientation_nodes=nodes, margin=get.get('margin', 40.0),
             amplitude_table=get.get('amplitude-table-file', True), **args)
