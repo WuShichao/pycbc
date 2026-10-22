@@ -251,7 +251,15 @@ class SkyBlockResponse(object):
         """The harmonics at family ``offsets`` ``(M, 2)`` from the basis,
         shape ``(M, 2 kmax + 1, 2, nchannels, nfrequencies)``."""
         c = self._coords(self._unit(offsets))
-        return xp.asarray(numpy.einsum('mr,r...->m...', c, self._basis))
+        if xp is numpy:
+            return numpy.einsum('mr,r...->m...', c, self._basis)
+        # the product on the device, the basis kept there
+        cache = getattr(self, '_device_basis', None)
+        if cache is None or cache[0] is not xp:
+            cache = (xp, xp.asarray(self._basis.reshape(self.rank, -1)))
+            self._device_basis = cache
+        rows = xp.asarray(c) @ cache[1]
+        return rows.reshape((len(c),) + self._basis.shape[1:])
 
     def inside(self, offsets):
         """Whether each point lies in the block."""
