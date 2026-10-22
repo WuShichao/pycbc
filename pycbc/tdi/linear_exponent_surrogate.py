@@ -163,9 +163,23 @@ class LinearExponentSurrogate(object):
         t = self.t0 + xp.tensordot(weights, self._T, axes=1)
         return b, t
 
+    #: a :class:`pycbc.tdi.sky_block_response.SkyBlockResponse` that gives
+    #: the response harmonics in place of the first-order sky model
+    sky_block = None
+
+    def _block_responses(self, sky_offsets):
+        if len(self.sky_block.orders) != len(self.orders):
+            raise ValueError("the sky block keeps other harmonics than the "
+                             "family")
+        return self.sky_block.responses(sky_offsets, xp=self.xp).astype(
+            self.dtype)
+
     def _response(self, sky_offsets):
         """``rho_k`` at the two sky offsets."""
         xp = self.xp
+        if self.sky_block is not None:
+            return self._block_responses(
+                numpy.asarray(sky_offsets, dtype=float)[None])[0]
         sky = xp.exp(float(sky_offsets[0]) * self.L[0]
                      + float(sky_offsets[1]) * self.L[1])
         rho = xp.fft.fft(self.R0 * sky, axis=0) / self.samples
@@ -175,6 +189,9 @@ class LinearExponentSurrogate(object):
         """``rho_k`` at each row of sky offsets ``(M, 2)``, shape ``(M, 2
         kmax + 1, 2, nchannels, ncoarse)``."""
         xp = self.xp
+        if self.sky_block is not None:
+            return self._block_responses(numpy.atleast_2d(
+                numpy.asarray(sky_offsets, dtype=float)))
         d = xp.asarray(numpy.atleast_2d(sky_offsets), dtype=self.real)
         expo = (d[:, 0, None, None, None, None] * self.L[0][None]
                 + d[:, 1, None, None, None, None] * self.L[1][None])
