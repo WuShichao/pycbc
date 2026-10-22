@@ -102,6 +102,14 @@ def test_no_block_bad_network_and_memory_limits_are_explicit():
         SkyBlockFFT(fam, data, offsets)
 
 
+def test_roundtrip_corner_is_accepted_without_accepting_outside_points():
+    fam, data, _ = setup()
+    corner = numpy.array([[1 + 2 * numpy.finfo(float).eps, -1.]])
+    SkyBlockFFT(fam, data, corner)
+    with pytest.raises(ValueError):
+        SkyBlockFFT(fam, data, [[1 + 1e-10, 0]])
+
+
 def test_twof_equals_the_independent_complex_solve_and_gaussian_maximum():
     rng = numpy.random.default_rng(20267222)
     h = rng.normal(size=(2, 2, 15)) + 1j * rng.normal(size=(2, 2, 15))

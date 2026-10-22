@@ -39,7 +39,12 @@ class SkyBlockFFT(object):
         offsets = numpy.asarray(offsets, dtype=float)
         if offsets.ndim != 2 or offsets.shape[1] != 2 or not len(offsets):
             raise ValueError('sky offsets must have shape (P, 2)')
-        if not numpy.isfinite(offsets).all() or not block.inside(offsets).all():
+        unit = block._unit(offsets)
+        # Converting an exact corner to offsets and back can exceed one by a
+        # few ulps. This is a coordinate roundoff allowance, not a wider block.
+        edge_tolerance = 32 * numpy.finfo(float).eps
+        if (not numpy.isfinite(offsets).all() or not numpy.isfinite(unit).all()
+                or not (numpy.abs(unit) <= 1 + edge_tolerance).all()):
             raise ValueError('sky offsets lie outside the response block')
         if not numpy.array_equal(family.orders, block.orders):
             raise ValueError('family and response block harmonics differ')
@@ -51,7 +56,7 @@ class SkyBlockFFT(object):
         self.data = self.xp.asarray(data, dtype=family.dtype)
         self.offsets = offsets.copy()
         # Responses are C @ U, but the template argument of <h,d> is antilinear.
-        coords = block._coords(block._unit(offsets))
+        coords = block._coords(unit)
         self.weights = self.xp.asarray(numpy.conj(coords), dtype=family.dtype)
         self.basis = self.xp.asarray(block._basis, dtype=family.dtype)
         self.rank, self.required_field_bytes = block.rank, required
