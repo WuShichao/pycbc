@@ -3,7 +3,8 @@
 import numpy
 import pytest
 
-from pycbc.filter.sky_block_fft import SkyBlockFFT, network_twof
+from pycbc.filter.sky_block_fft import (SkyBlockFFT, network_twof,
+                                       search_sky_block_fft)
 from test_linear_exponent_surrogate import build
 
 
@@ -152,3 +153,89 @@ def test_network_shape_errors_are_rejected():
         network_twof(numpy.ones(2), numpy.eye(3))
     with pytest.raises(ValueError):
         network_twof(numpy.ones(2), numpy.eye(2), noise_variance=0)
+
+
+def test_search_global_top_equals_unshared_exhaustive_grid():
+    fam, data, offsets = setup()
+    engine = SkyBlockFFT(fam, data, offsets)
+    points = numpy.array([[0., 0., 0., 0.], [.1, -.2, .3, .4]])
+    lags = numpy.array([fam.size - 1, 10, 1, 0, fam.size // 2])
+    visited = []
+
+    def matrix(index, selected):
+        out = numpy.zeros((len(selected), 2, 2), complex)
+        out[:, 0, 0], out[:, 1, 1] = 2 + index, 3 + index
+        out[:, 0, 1], out[:, 1, 0] = .2j, -.2j
+        return out
+
+    def prepare(index, intrinsic, b, t):
+        expected = fam._source(intrinsic)
+        numpy.testing.assert_array_equal(b, expected[0])
+        numpy.testing.assert_array_equal(t, expected[1])
+        visited.append(index)
+
+        def at(sky, selected):
+            return numpy.broadcast_to(matrix(index, selected),
+                                      (sky.stop - sky.start, len(selected), 2, 2))
+        return at
+
+    full = []
+    for i, point in enumerate(points):
+        b, t = fam._source(point)
+        for p, rho in enumerate(fam.responses(offsets)):
+            z = fam.correlate(data, b, t, rho)[:, lags].T
+            fitted = numpy.linalg.solve(matrix(i, lags), z[..., None])[..., 0]
+            values = numpy.einsum('la,la->l', z.conj(), fitted).real / 2.5
+            for lag, value in zip(lags, values):
+                full.append(dict(template=i, sky=p, lag=int(lag), twof=float(value)))
+    full.sort(key=lambda c: (-c['twof'], c['template'], c['sky'], c['lag']))
+    for sky_chunk, lag_chunk in ((1, 2), (3, 3), (4, 20)):
+        result = search_sky_block_fft(engine, points, prepare, lags,
+                                     noise_variance=2.5, top=7,
+                                     sky_chunk=sky_chunk, lag_chunk=lag_chunk)
+        assert result['complete']
+        assert result['evaluated'] == 40
+        assert result['rank_counts'] == {'0': 40, '1': 0, '2': 0, '3': 0}
+        for actual, expected in zip(result['candidates'], full[:7]):
+            assert [actual[k] for k in ('template', 'sky', 'lag')] == [
+                expected[k] for k in ('template', 'sky', 'lag')]
+            assert actual['twof'] == pytest.approx(expected['twof'], rel=1e-10)
+    assert visited == [0, 1] * 3
+
+
+def test_search_unresolved_entry_cannot_be_a_complete_negative_result():
+    fam, data, offsets = setup()
+    engine = SkyBlockFFT(fam, data, offsets)
+
+    def prepare(index, intrinsic, b, t):
+        def at(sky, selected):
+            g = numpy.broadcast_to(numpy.eye(2),
+                                   (sky.stop - sky.start, len(selected), 2, 2)).copy()
+            if sky.start == 0 and selected[0] == 0:
+                g[0, 0] = numpy.nan
+            return g
+        return at
+    result = search_sky_block_fft(engine, [[0.] * 4], prepare, [0, 1, 5],
+                                 sky_chunk=2, lag_chunk=2)
+    assert not result['complete']
+    assert result['rank_counts'] == {'0': 11, '1': 0, '2': 0, '3': 1}
+    assert len(result['candidates']) == 11
+
+
+@pytest.mark.parametrize('lags', [[], [0, 0], [0., 1.], [-1], [10**8]])
+def test_search_rejects_invalid_time_domains(lags):
+    fam, data, offsets = setup()
+    with pytest.raises(ValueError):
+        search_sky_block_fft(SkyBlockFFT(fam, data, offsets), [[0.] * 4],
+                             None, lags)
+
+
+def test_search_rejects_invalid_points_and_chunk_sizes():
+    fam, data, offsets = setup()
+    engine = SkyBlockFFT(fam, data, offsets)
+    for points in ([], [0, 1], [[numpy.nan] * 4]):
+        with pytest.raises(ValueError):
+            search_sky_block_fft(engine, points, None, [0])
+    for options in (dict(top=0), dict(sky_chunk=.5), dict(lag_chunk=0)):
+        with pytest.raises(ValueError):
+            search_sky_block_fft(engine, [[0.] * 4], None, [0], **options)

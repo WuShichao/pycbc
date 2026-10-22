@@ -137,3 +137,101 @@ def network_twof(z, gram, noise_variance=1.0, xp=numpy):
     rank = xp.sum(positive, axis=-1)
     status = xp.where(valid, xp.where(rank == 2, 0, xp.where(rank == 1, 1, 2)), 3)
     return xp.where(valid, value, xp.nan), status
+
+
+def search_sky_block_fft(engine, intrinsics, prepare_gram, lag_indices,
+                         noise_variance=1.0, top=20, sky_chunk=4,
+                         lag_chunk=4096):
+    """Search a finite template/sky/delay grid without pruning any entries.
+
+    ``prepare_gram(index, intrinsic, b, t)`` returns a callable taking a sky
+    slice and FFT indices and returning raw Gram matrices of shape (P,L,2,2).
+    The caller owns its approximation and physical-time convention. In
+    particular, it must use this template's b,t and the data's normalization.
+
+    ``lag_indices`` is the explicit time-domain mask; it must contain unique
+    integer FFT indices. The output lists the largest ``top`` finite 2F
+    values, with template, sky and lag indices. Rank counts cover EVERY grid
+    entry, not just returned candidates. Any unresolved entry sets
+    ``complete=False``: finite candidates are retained for diagnosis but
+    cannot certify the global maximum. This is not a continuous-domain or
+    false-alarm guarantee.
+    """
+    from time import perf_counter
+
+    xp = engine.xp
+    points = numpy.asarray(intrinsics, dtype=float)
+    lags = numpy.asarray(lag_indices)
+    if (points.ndim != 2 or not len(points) or
+            not numpy.isfinite(points).all()):
+        raise ValueError('intrinsics must be a finite, nonempty matrix')
+    if (lags.ndim != 1 or not len(lags) or
+            not numpy.issubdtype(lags.dtype, numpy.integer) or
+            len(numpy.unique(lags)) != len(lags) or
+            numpy.any(lags < 0) or numpy.any(lags >= engine.family.size)):
+        raise ValueError('time domain needs unique, valid integer FFT indices')
+    if (not all(isinstance(v, (int, numpy.integer)) and v > 0
+                for v in (top, sky_chunk, lag_chunk))):
+        raise ValueError('top and chunk sizes must be positive integers')
+    lags = numpy.sort(lags)
+
+    def host(value):
+        return value.get() if hasattr(value, 'get') else numpy.asarray(value)
+
+    def synchronize():
+        if xp is not numpy:
+            xp.cuda.get_current_stream().synchronize()
+
+    counts = {str(k): 0 for k in range(4)}
+    timings = dict(source_seconds=0., fft_seconds=0., gram_prepare_seconds=0.,
+                   scan_seconds=0.)
+    candidates = []
+    began = perf_counter()
+    for index, intrinsic in enumerate(points):
+        synchronize()
+        tick = perf_counter()
+        b, t = engine.family._source(intrinsic)
+        synchronize()
+        timings['source_seconds'] += perf_counter() - tick
+        tick = perf_counter()
+        fields = engine.correlate_basis(b, t)
+        synchronize()
+        timings['fft_seconds'] += perf_counter() - tick
+        tick = perf_counter()
+        gram_at = prepare_gram(index, intrinsic, b, t)
+        synchronize()
+        timings['gram_prepare_seconds'] += perf_counter() - tick
+        tick = perf_counter()
+        for sky, selected, values in engine.chunks(
+                fields, lags, sky_chunk=sky_chunk, lag_chunk=lag_chunk):
+            # The network component axis is last for the quadratic form.
+            z = xp.moveaxis(values, 1, -1)
+            matrix = gram_at(sky, selected)
+            twof, status = network_twof(z, matrix, noise_variance, xp=xp)
+            for label in counts:
+                counts[label] += int(xp.count_nonzero(status == int(label)))
+            finite = xp.flatnonzero(xp.isfinite(twof.ravel()))
+            if not int(finite.size):
+                continue
+            # Include ties deterministically. Only scalar candidates return
+            # to the host; no full sky-by-time statistic array is stored.
+            order = xp.argsort(-twof.ravel()[finite], kind='stable')[:top]
+            locations = host(finite[order])
+            strengths = host(twof.ravel()[finite[order]])
+            for location, strength in zip(locations, strengths):
+                p, j = divmod(int(location), len(selected))
+                candidates.append(dict(template=index, sky=sky.start + p,
+                                       lag=int(selected[j]), twof=float(strength)))
+            candidates.sort(key=lambda c: (-c['twof'], c['template'],
+                                            c['sky'], c['lag']))
+            del candidates[top:]
+        synchronize()
+        timings['scan_seconds'] += perf_counter() - tick
+        del fields
+    expected = len(points) * len(engine.offsets) * len(lags)
+    if sum(counts.values()) != expected:
+        raise RuntimeError('rank counts do not account for the search domain')
+    return dict(complete=counts['3'] == 0, candidates=candidates,
+                rank_counts=counts, evaluated=expected, templates=len(points),
+                sky_points=len(engine.offsets), lag_count=len(lags),
+                timings=timings, elapsed_seconds=perf_counter() - began)
