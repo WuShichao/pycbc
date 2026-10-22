@@ -105,3 +105,35 @@ def test_physical_source_support_does_not_move_with_sky_chart():
                     dict(source_support=support, source_sky=(0.,))):
         with pytest.raises(ValueError):
             DetectorBandProjector(grid, ORBIT, *SKY, **options)
+
+
+@pytest.mark.parametrize('nbins', [9, 10])
+def test_adjoint_matches_independent_dense_fourier_matrix(nbins):
+    duration = 2 * DAY
+    grid = SSBGrid(1e6, 1e6 + duration, .015, nbins, 1 / duration,
+                   periods=2, period=duration, guard=2)
+    projector = DetectorBandProjector(grid, ORBIT, *SKY, oversampling=4)
+    rng = numpy.random.default_rng(20267243)
+    detector = projector.detector_nodes
+    ssb = detector + ssb_delay(ORBIT, detector, *SKY)
+    forward = (numpy.exp(-2j * numpy.pi *
+               (grid.data_first_frequency + numpy.arange(nbins) * grid.data_delta_f)[:, None] *
+               (detector - grid.start)[None]) @
+               numpy.exp(2j * numpy.pi * (ssb - grid.start)[:, None] * grid.frequencies[None]))
+    forward *= projector._scale
+    x = rng.normal(size=(2, 2, grid.size)) + 1j * rng.normal(size=(2, 2, grid.size))
+    d = rng.normal(size=(2, 2, nbins)) + 1j * rng.normal(size=(2, 2, nbins))
+    expected = numpy.einsum('mf,acm->acf', forward.conj(), d)
+    numpy.testing.assert_allclose(projector.adjoint(d), expected, rtol=1e-9, atol=1e-9)
+    numpy.testing.assert_allclose(numpy.vdot(projector.project(x), d),
+                                  numpy.vdot(x, projector.adjoint(d)), rtol=1e-10, atol=1e-10)
+
+
+def test_adjoint_validates_input_and_retains_empty_window():
+    grid = SSBGrid(0., DAY, .015, 8, 1 / DAY, periods=1, period=DAY)
+    projection = DetectorBandProjector(grid, _StillOrbit(), *SKY,
+                                       source_support=(2 * DAY, 3 * DAY))
+    assert not numpy.any(projection.adjoint(numpy.ones((2, 8))))
+    for data in (numpy.ones(7), numpy.full(8, numpy.nan)):
+        with pytest.raises(ValueError):
+            projection.adjoint(data)

@@ -107,3 +107,28 @@ class DetectorBandProjector(object):
             n_modes=self._padded, isign=-1, eps=self.epsilon, nthreads=1) * self._scale
         return transformed[:, :self.grid.data_nbins].reshape(
             leading + (self.grid.data_nbins,))
+
+    def adjoint(self, bins):
+        """Adjoint for Euclidean complex inner products on the two grids.
+
+        The quadrature scale is the same as in :meth:`project`. This is
+        not inverse resampling or a covariance approximation. For whitened
+        detector data d and detector whitening W, the physical correlation
+        is ``<P Y, W d> = <Y, P.adjoint(W d)>``.
+        """
+        bins = numpy.asarray(bins, dtype=numpy.complex128)
+        if (bins.ndim < 1 or bins.shape[-1] != self.grid.data_nbins or
+                not bins.size or not numpy.isfinite(bins).all()):
+            raise ValueError('invalid original detector frequency array')
+        leading = bins.shape[:-1]
+        if not self.time_samples:
+            return numpy.zeros(leading + (self.grid.size,), complex)
+        modes = numpy.zeros((bins.reshape(-1, self.grid.data_nbins).shape[0],
+                             self._padded), dtype=complex)
+        modes[:, :self.grid.data_nbins] = bins.reshape(-1, self.grid.data_nbins)
+        values = self._finufft.nufft1d2(
+            self._detector_x, modes, isign=1, eps=self.epsilon, nthreads=1)
+        transformed = self._finufft.nufft1d1(
+            self._x, numpy.ascontiguousarray(values * self._carrier.conj()),
+            n_modes=self.grid.size, isign=-1, eps=self.epsilon, nthreads=1) * self._scale
+        return transformed.reshape(leading + (self.grid.size,))
