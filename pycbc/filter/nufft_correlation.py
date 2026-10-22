@@ -548,9 +548,10 @@ class PhaseGrid(object):
         if need > memory_limit:
             err = MemoryError(
                 "the region needs a grid of {:.2f} GB ({} Taylor terms, "
-                "grid {}); split it into smaller regions".format(
-                    need / 1e9, self.terms, self.size))
-            err.need = need
+                "{} sky vectors, grid {}) and {:.2f} GB are allowed; split it "
+                "into smaller regions".format(need / 1e9, self.terms, npoly,
+                                              self.size, memory_limit / 1e9))
+            err.need, err.size = need, list(self.size)
             raise err
         # the grid first, while the device memory is free: an array
         # allocated after the transforms' work space may land in host-shared
@@ -1160,9 +1161,16 @@ def phase_grid_search(correlator, region, delay_range, gram,
                                  "grid's directions")
             raise MemoryError("the region's phase leaves the grid's "
                               "directions")
-    except MemoryError:
+        size = None
+    except MemoryError as err:
         if depth >= max_depth:
             raise
+        size = True
+    if size is not None:
+        # split outside the handler, whose traceback would keep the refused
+        # grid's arrays on the device through every level; along the first
+        # phase direction, which also narrows the arrival times the
+        # templates' offsets spread over
         if len(region) >= 4:
             frame = correlator.frame(region, 1)
             s, _, _ = correlator.project(region, frame)
