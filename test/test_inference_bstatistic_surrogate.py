@@ -455,3 +455,39 @@ def test_a_recentred_model_is_the_model_built_there():
               for u in (-0.5, 0.0, 0.7)]
     numpy.testing.assert_allclose(moved.loglikelihoods(points),
                                   there.loglikelihoods(points), atol=0.02)
+
+
+def test_a_sky_block_search_finds_the_source_in_its_block():
+    """Two blocks of the sky, the injection inside the second: the merged
+    candidates put the source there, once."""
+    from pycbc.filter.sky_block_search import (sky_block_centres,
+                                               sky_block_search)
+    from pycbc.inference import models
+    from pycbc.workflow import WorkflowConfigParser
+    lon, lat = 3.5763564997428436, 0.3429283438977949
+    cp = WorkflowConfigParser()
+    cp.read_string(CONFIG.replace(
+        'grid-periods = 1', 'grid-periods = 1\nharmonics = 8\n'
+        'amplitude-table-file = ' + table_file()))
+    data, psds, snr2, mc = stbbh_data()
+    m = models.read_from_config(cp, data=data, psds=psds)
+    radius = 0.02
+    centres = sky_block_centres((lon - 0.05, lon + 0.03),
+                                (lat - 0.01, lat + 0.01), radius)
+    assert len(centres) == 2
+    inside = [abs(numpy.angle(numpy.exp(1j * (c[0] - lon)))) * numpy.cos(
+        c[1]) <= radius for c in centres]
+    assert inside == [False, True]
+    s = m.static_params
+    unit = m.scales['mchirp']
+    region = numpy.array([[mc + u * unit, s['q'], s['spin1z'], s['spin2z']]
+                          for u in numpy.linspace(-2, 2, 21)])
+    found, blocks = sky_block_search(m, centres, radius, region, sky_step=1.0,
+                                     top=5, sky_block_points=200)
+    assert len(blocks) == 2
+    best = found[0]
+    assert best['block'] == 1
+    assert abs(best['longitude'] - lon) < radius
+    # the source once: no other candidate this close to it
+    assert all(abs(c['longitude'] - best['longitude']) > 2 * radius
+               or abs(c['time'] - best['time']) > 600 for c in found[1:])
