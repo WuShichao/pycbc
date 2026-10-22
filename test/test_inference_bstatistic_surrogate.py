@@ -427,3 +427,31 @@ def test_a_sky_block_gives_the_model_the_exact_response():
     single = numpy.array(single)
     near = single > single.max() - 20
     assert numpy.abs(batch - single)[near].max() < 0.02
+
+
+def test_a_recentred_model_is_the_model_built_there():
+    """A model recentred on another sky, sharing the family's intrinsic
+    part, gives the log likelihoods of a model built with that reference
+    sky, at points of it."""
+    from pycbc.inference import models
+    from pycbc.workflow import WorkflowConfigParser
+    lon, lat = 3.5763564997428436, 0.3429283438977949
+    shifted = lon + 0.03
+
+    def build(longitude):
+        cp = WorkflowConfigParser()
+        cp.read_string(CONFIG.replace(
+            'grid-periods = 1', 'grid-periods = 1\nharmonics = 8\n'
+            'amplitude-table-file = ' + table_file()).replace(
+            'eclipticlongitude = %r' % lon,
+            'eclipticlongitude = %r' % longitude))
+        return models.read_from_config(cp, data=data, psds=psds)
+    data, psds, snr2, mc = stbbh_data()
+    there = build(shifted)
+    moved = build(lon).recentred(shifted, lat, 0.02, sky_block_points=200)
+    assert moved.reference['eclipticlongitude'] == shifted
+    unit = moved.scales['mchirp']
+    points = [dict(mchirp=mc + u * unit, eclipticlongitude=shifted)
+              for u in (-0.5, 0.0, 0.7)]
+    numpy.testing.assert_allclose(moved.loglikelihoods(points),
+                                  there.loglikelihoods(points), atol=0.02)

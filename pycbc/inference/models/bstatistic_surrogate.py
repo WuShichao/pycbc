@@ -718,9 +718,52 @@ class BStatisticSurrogate(BaseModel):
         oversampling = oversampling_for_loss(sigma_f, grid.delta_t,
                                              max_time_loss)
         point = {k: reference[k] for k in keys}
-        return cls(variable_params, fam, daily, spectrum, noise, point,
-                   scales, distance_prior, time_window,
-                   oversampling=oversampling, **kwargs)
+        model = cls(variable_params, fam, daily, spectrum, noise, point,
+                    scales, distance_prior, time_window,
+                    oversampling=oversampling, **kwargs)
+        model._recentre_args = dict(
+            grid=grid, bins=bins, orbit=orbit, terms=terms, coarse=coarse,
+            ratio=ratio, harmonics=harmonics, samples=response_samples,
+            time_window=time_window, kwargs=kwargs)
+        return model
+
+    def recentred(self, longitude, latitude, sky_block_radius,
+                  sky_block_points=600):
+        """The model of a block of the sky centred at ``longitude`` and
+        ``latitude``: the same family's intrinsic part, a sky block about the
+        new centre (see :class:`pycbc.tdi.sky_block_response.SkyBlockResponse`)
+        and the data resampled to SSB time there, the block's phase
+        centre."""
+        import copy
+        from pycbc.filter.nufft_correlation import source_power_weights
+        from pycbc.tdi.linear_exponent_surrogate import DailyGram
+        from pycbc.tdi.ssb_yearly_harmonics import ssb_data_spectrum
+        from pycbc.tdi.sky_block_response import SkyBlockResponse
+        a = getattr(self, '_recentre_args', None)
+        if a is None:
+            raise ValueError("only a model from from_data can be recentred")
+        fam = copy.copy(self.surrogate)
+        fam.sky_block = SkyBlockResponse(
+            a['orbit'], a['terms'], a['coarse'], (longitude, latitude),
+            (self.scales['eclipticlongitude'],
+             self.scales['eclipticlatitude']), sky_block_radius,
+            kmax=a['harmonics'], samples=a['samples'], ratio=a['ratio'],
+            weight=source_power_weights(fam), points=sky_block_points,
+            test_points=100, exact_frequencies=min(len(a['coarse']), 160))
+        spectrum, noise = ssb_data_spectrum(a['grid'], a['bins'], a['orbit'],
+                                            longitude, latitude, xp=fam.xp)
+        point = dict(self.reference)
+        point.update(eclipticlongitude=float(longitude),
+                     eclipticlatitude=float(latitude))
+        kwargs = dict(a['kwargs'])
+        if self.table is not None:
+            kwargs['amplitude_table'] = self.table
+        model = type(self)(list(self.variable_params), fam, DailyGram(fam),
+                           spectrum, noise, point, self.scales,
+                           self.distance_prior, a['time_window'],
+                           oversampling=self.oversampling, **kwargs)
+        model._recentre_args = a
+        return model
 
     _CONFIG_OPTIONS = {
         'low-frequency-cutoff': float, 'high-frequency-cutoff': float,
