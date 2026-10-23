@@ -1587,17 +1587,68 @@ def project_frequency_tdi_series(
     return (output, diagnostics) if return_diagnostics else output
 
 
-def interpolant(x, y, order=3, extrapolate=False):
+def _local_endpoint_derivative(x, y, right=False):
+    """Cubic-exact endpoint slope from a separated local stencil.
+
+    Merging prepared grids can put three almost coincident knots next to a
+    long endpoint interval. Divided differences on those four knots amplify
+    source roundoff. Grow the local stencil until the dimensionless slope
+    weights have bounded one-norm instead of trusting their point count.
+    """
+    x, y = np.asarray(x, dtype=float), np.asarray(y)
+    if (x.ndim != 1 or len(x) < 4 or len(y) != len(x)
+            or not np.all(np.isfinite(x)) or not np.all(np.diff(x) > 0)
+            or not np.all(np.isfinite(y))):
+        raise ValueError("finite data on at least four increasing knots required")
+    if right:
+        x, y = x[::-1], y[::-1]
+    count = 4
+    while True:
+        span = x[count - 1] - x[0]
+        nodes = (x[:count] - x[0]) / span
+        # Leja ordering starts at the endpoint, then chooses knots with the
+        # largest product of distances from the ones already chosen.
+        selected = [0]
+        score = np.ones(count)
+        for _ in range(3):
+            score *= np.abs(nodes - nodes[selected[-1]])
+            selected.append(int(np.argmax(score)))
+        matrix = np.polynomial.polynomial.polyvander(nodes[selected], 3)
+        try:
+            weights = np.linalg.solve(matrix.T, np.array([0., 1., 0., 0.]))
+        except np.linalg.LinAlgError:
+            weights = np.full(4, np.inf)
+        # For sample errors bounded by eta, this limits the slope error to
+        # 64 eta / abs(span). No waveform values enter stencil selection.
+        if np.linalg.norm(weights, 1) <= 64:
+            return np.tensordot(weights, y[selected], axes=(0, 0)) / span
+        if count == len(x):
+            raise ValueError("no numerically separated cubic endpoint stencil")
+        count = min(2 * count, len(x))
+
+
+def interpolant(x, y, order=3, extrapolate=False, endpoint_condition=None):
     """``order``-degree interpolating spline through ``(x, y)``.
 
     Cubic is the default. A quintic resolves an oscillation with fewer knots,
     but scipy builds one at 0.21 us per point against 0.06, so whether it pays
-    depends on how much the grid actually shrinks.
+    depends on how much the grid actually shrinks. ``endpoint_condition``
+    defaults to the existing not-a-knot convention. ``'local-cubic'`` uses
+    cubic-exact endpoint slopes whose noise amplification is checked.
     """
     from scipy.interpolate import CubicSpline, make_interp_spline
 
+    if endpoint_condition not in (None, 'local-cubic'):
+        raise ValueError("unknown endpoint condition")
+    if endpoint_condition is not None and order != 3:
+        raise ValueError("local-cubic endpoint conditions require cubic order")
     if order == 3:
-        return CubicSpline(x, y, extrapolate=extrapolate or None)
+        boundary = 'not-a-knot'
+        if endpoint_condition == 'local-cubic':
+            boundary = ((1, _local_endpoint_derivative(x, y)),
+                        (1, _local_endpoint_derivative(x, y, right=True)))
+        return CubicSpline(x, y, bc_type=boundary,
+                           extrapolate=extrapolate or None)
     return make_interp_spline(x, y, k=order)
 
 
@@ -1610,10 +1661,15 @@ class SparseTDIResponse:
     """
 
     def __init__(self, source, responses, diagnostics=None,
-                 interpolation_order=3):
+                 interpolation_order=3, endpoint_condition=None):
         if interpolation_order not in (3, 5):
             raise ValueError("interpolation_order must be 3 or 5")
+        if endpoint_condition not in (None, 'local-cubic'):
+            raise ValueError("unknown endpoint condition")
+        if endpoint_condition is not None and interpolation_order != 3:
+            raise ValueError("local-cubic endpoint conditions require cubic order")
         self.interpolation_order = interpolation_order
+        self.endpoint_condition = endpoint_condition
         self.source = source
         self.responses = tuple(responses)
         self.diagnostics = {} if diagnostics is None else diagnostics
@@ -1704,7 +1760,8 @@ class SparseTDIResponse:
             if np.count_nonzero(nodes) < order + 1:
                 continue
             pieces.append((float(low), float(high),
-                           interpolant(grid[nodes], bracket[nodes], order)))
+                           interpolant(grid[nodes], bracket[nodes], order,
+                                       endpoint_condition=self.endpoint_condition)))
         self._splines[index][name] = tuple(pieces)
         return self._splines[index][name]
 
