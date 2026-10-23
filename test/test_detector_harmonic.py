@@ -84,3 +84,19 @@ def test_cached_adjoint_is_consistent_with_owned_data_and_grid_periods():
                                likelihood.correlations(source, rho, [0], periods=2))
     with pytest.raises(ValueError):
         likelihood.correlations(source, rho, [0], periods=1)
+
+
+def test_finite_interval_uses_the_same_original_detector_inner_product():
+    rng = np.random.default_rng(20267272)
+    grid = SSBGrid(0., DAY, .015, 9, 1 / DAY, periods=2, period=DAY)
+    projection = DetectorBandProjector(grid, ORBIT, *SKY, oversampling=4)
+    data = rng.normal(size=(2, 9)) + 1j * rng.normal(size=(2, 9))
+    weight = rng.uniform(.2, 2., size=data.shape)
+    likelihood = DetectorHarmonicLikelihood(projection, data, weight)
+    source = rng.normal(size=grid.size) + 1j * rng.normal(size=grid.size)
+    rho = rng.normal(size=(3, 2, 2, grid.size)) + 1j * rng.normal(size=(3, 2, 2, grid.size))
+    orders = np.array([-1, 0, 2])
+    polynomial = likelihood.correlation_polynomial(source, rho, orders)
+    t, fields = polynomial.interval(-.3 * DAY, .4 * DAY, 19)
+    direct, _ = likelihood.statistics(source, rho, orders, t)
+    np.testing.assert_allclose(fields[0], direct.T, atol=1e-9, rtol=1e-9)

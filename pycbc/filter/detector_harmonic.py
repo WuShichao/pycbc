@@ -53,6 +53,14 @@ class DetectorHarmonicLikelihood(object):
         return harmonic_correlation_spectrum(source, responses, orders,
                                              self.adjoint_data, self._periods(periods))
 
+    def correlation_polynomial(self, source, responses, orders, periods=None):
+        """Original-band correlation for finite-interval time quadrature."""
+        from pycbc.filter.correlation_polynomial import CorrelationPolynomial
+
+        spectrum = self.correlation_spectrum(source, responses, orders, periods)
+        return CorrelationPolynomial(spectrum, self.grid.first_frequency,
+                                     self.grid.delta_f)
+
     def delays(self, oversampling=1, signed=False):
         """The physical delays of the periodic FFT, optionally signed."""
         if not isinstance(oversampling, (int, numpy.integer)) or oversampling < 1:
