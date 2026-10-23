@@ -485,6 +485,12 @@ def test_prepared_multiband_reuses_geometry_for_projection():
     projected = prepared.project(source, 1.1, -0.4)
     assert projected.channels == ("X",)
 
+    stable = prepared.project(source, 1.1, -0.4,
+                              endpoint_condition='local-cubic')
+    assert all(b.response.endpoint_condition == 'local-cubic'
+               for b in stable.bands)
+    assert all(b.response.endpoint_condition is None for b in projected.bands)
+
     times = np.linspace(1000.0, 3000.0, 301)
     values = projected.sample(times)["X"]
     assert np.max(np.abs(values)) > 0

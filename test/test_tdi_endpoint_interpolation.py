@@ -101,3 +101,33 @@ def test_unknown_or_inapplicable_boundary_modes_are_rejected():
     with pytest.raises(ValueError, match='require cubic'):
         interpolant(np.arange(6.), np.ones(6), order=5,
                     endpoint_condition='local-cubic')
+
+
+def test_inference_endpoint_modes_do_not_share_candidate_projections(monkeypatch):
+    from types import SimpleNamespace
+    from pycbc.tdi import inference
+    class Prepared:
+        harmonics = (2,)
+        def __init__(self):
+            self.calls = []
+        def project(self, source, lon, lat, **kwargs):
+            self.calls.append(kwargs)
+            return object()
+    prepared = Prepared()
+    source = SimpleNamespace(harmonics=(2,))
+    params = dict(tdi_preparation_id='endpoint-test',
+                  eclipticlongitude=1., eclipticlatitude=.2)
+    inference.clear_cache()
+    monkeypatch.setattr(inference, '_build_source', lambda p: source)
+    monkeypatch.setattr(inference, '_narrow', lambda s, p: s)
+    try:
+        old = inference._projection(params, prepared)
+        stable = inference._projection(dict(params, tdi_endpoint_condition='local-cubic'), prepared)
+        assert old is not stable
+        assert inference._projection(params, prepared) is old
+        assert inference._projection(dict(params, tdi_endpoint_condition='local-cubic'), prepared) is stable
+        assert prepared.calls == [{}, dict(endpoint_condition='local-cubic')]
+        with pytest.raises(ValueError, match='tdi_endpoint_condition'):
+            inference._projection(dict(params, tdi_endpoint_condition='guess'), prepared)
+    finally:
+        inference.clear_cache()

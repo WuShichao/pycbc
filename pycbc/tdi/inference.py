@@ -25,6 +25,10 @@ The coverage is fail-closed. A candidate whose band support leaves what the
 preparation covers is refused rather than extrapolated, and since a chirp-mass
 change of one part in 1e5 moves t(f) by weeks, the prior's own boundary has to
 be declared through ``tdi_coverage_sources``.
+
+``tdi_endpoint_condition='local-cubic'`` selects bounded cubic-exact spline
+endpoint slopes on merged preparation grids. The default remains not-a-knot;
+changing this option gives a separate candidate projection and spectrum.
 """
 import gc
 import logging
@@ -615,6 +619,9 @@ def _projection(params, prepared):
     channel of a candidate already projected costs nothing while a genuinely
     new candidate is never served a stale response.
     """
+    endpoint = params.get('tdi_endpoint_condition')
+    if endpoint not in (None, 'local-cubic'):
+        raise ValueError("unknown tdi_endpoint_condition")
     key = (params.get('tdi_preparation_id', 'default'),
            id(prepared), _signature(params))
     response = _PROJECTED.get(key)
@@ -634,9 +641,10 @@ def _projection(params, prepared):
             "falls outside")
     if set(wanted) != set(source.harmonics):
         source = RestrictedHarmonicSource(source, wanted)
+    extra = {} if endpoint is None else dict(endpoint_condition=endpoint)
     response = prepared.project(source,
                                 float(params['eclipticlongitude']),
-                                float(params['eclipticlatitude']))
+                                float(params['eclipticlatitude']), **extra)
     if len(_PROJECTED) >= _PROJECTED_LIMIT:
         _PROJECTED.pop(next(iter(_PROJECTED)))
     _PROJECTED[key] = response

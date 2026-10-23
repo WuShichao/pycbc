@@ -255,7 +255,8 @@ class PreparedMultibandTDI:
         self.t_end = response.t_end
 
     def project(self, source, lamb, beta, matrix=None, channels=None,
-                source_batch_size=1, source_workers=1):
+                source_batch_size=1, source_workers=1,
+                endpoint_condition=None):
         """Project one candidate on the fixed multiband geometry grids.
 
         A constant ``matrix`` may form named output ``channels`` before the
@@ -265,8 +266,12 @@ class PreparedMultibandTDI:
         optimum; larger source arrays are not always faster.
         ``source_workers`` optionally evaluates independent batches in a
         thread pool. Keep it at one unless the source implementation supports
-        concurrent read-only evaluation.
+        concurrent read-only evaluation. ``endpoint_condition='local-cubic'``
+        uses bounded cubic-exact endpoint slopes on merged grids; the
+        default retains the existing not-a-knot interpolation.
         """
+        if endpoint_condition not in (None, 'local-cubic'):
+            raise ValueError("unknown endpoint condition")
         if matrix is None:
             if channels is not None:
                 raise ValueError("channels requires a channel-transform matrix")
@@ -387,7 +392,7 @@ class PreparedMultibandTDI:
                 "grid": geometry.grid,
                 "brackets": brackets,
                 "support": candidate_support,
-            },))
+            },), endpoint_condition=endpoint_condition)
             bands.append(replace(template, response=projected))
         return MultibandSparseTDIResponse(
             source, bands, self.padding,
