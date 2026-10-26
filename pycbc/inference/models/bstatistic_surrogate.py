@@ -890,6 +890,116 @@ def grid_periods_needed(source, start, duration, f_low, f_high, window,
     return max(1, int(numpy.ceil(need / ORBITAL_PERIOD)))
 
 
+class SkyBlockMixture(object):
+    """Blocks of the sky as one model: each point's log likelihood comes from
+    the model of the block holding its sky position (or the nearest block's
+    centre when none does), each block a
+    :meth:`BStatisticSurrogate.recentred` model with its own sky block.
+
+    It offers what :class:`pycbc.inference.sampler.amr.AMRSampler` asks of
+    a model, and :meth:`reconstruct` from the point's block; batches and
+    shared regions are split by block."""
+    names = ('eclipticlongitude', 'eclipticlatitude')
+
+    def __init__(self, blocks, prior_distribution=None):
+        if not blocks:
+            raise ValueError("need at least one block")
+        self.blocks = list(blocks)
+        first = self.blocks[0]
+        self.variable_params = first.variable_params
+        self.static_params = first.static_params
+        self.prior_distribution = (first.prior_distribution
+                                   if prior_distribution is None
+                                   else prior_distribution)
+        self.sampling_transforms = None
+        self.sampling_params = self.variable_params
+        self.curvilinear_coordinates = getattr(
+            first, 'curvilinear_coordinates', None)
+        self.current_params = {}
+
+    def _full(self, point):
+        q = dict(self.static_params)
+        q.update(point)
+        return q
+
+    def block_of(self, points):
+        """The index of the block of each point (parameter dicts)."""
+        out = numpy.empty(len(points), dtype=int)
+        for i, p in enumerate(points):
+            q = self._full(p)
+            n = _sky_unit(q[self.names[0]], q[self.names[1]])
+            best, chosen = -2.0, 0
+            for j, b in enumerate(self.blocks):
+                off = numpy.array([[(q[k] - b.reference[k]) / b.scales[k]
+                                    for k in self.names]])
+                if b.surrogate.sky_block.inside(off)[0]:
+                    chosen = j
+                    break
+                c = n @ _sky_unit(b.reference[self.names[0]],
+                                  b.reference[self.names[1]])
+                if c > best:
+                    best, chosen = c, j
+            out[i] = chosen
+        return out
+
+    def update(self, **params):
+        self.current_params = dict(params)
+
+    @property
+    def logprior(self):
+        return self.prior_distribution(**self.current_params)
+
+    @property
+    def loglikelihood(self):
+        block = self.blocks[self.block_of([self.current_params])[0]]
+        block.update(**self.current_params)
+        return block.loglikelihood
+
+    def loglikelihoods(self, points):
+        index = self.block_of(points)
+        out = numpy.empty(len(points))
+        for j in numpy.unique(index):
+            sel = numpy.nonzero(index == j)[0]
+            out[sel] = self.blocks[j].loglikelihoods([points[i]
+                                                      for i in sel])
+        return out
+
+    def share(self, region, **kwargs):
+        """Share each block's part of ``region``; a part too large for one
+        grid is left to the point-by-point path. Raises ``MemoryError`` only
+        when no block could share its part."""
+        index = self.block_of(region)
+        shared = 0
+        for j in numpy.unique(index):
+            part = [region[i] for i in numpy.nonzero(index == j)[0]]
+            try:
+                self.blocks[j].share(part, **kwargs)
+                shared += 1
+            except MemoryError:
+                pass
+        if not shared:
+            raise MemoryError("no block could share its part of the region")
+
+    @property
+    def shared_statistics(self):
+        total = {}
+        for b in self.blocks:
+            for k, v in b.shared_statistics.items():
+                total[k] = (max(total.get(k, 0), v) if k.startswith('largest')
+                            else total.get(k, 0) + v)
+        return total
+
+    def reconstruct(self, rec=None, seed=None):
+        block = self.blocks[self.block_of([self.current_params])[0]]
+        block.update(**self.current_params)
+        return block.reconstruct(rec=rec, seed=seed)
+
+
+def _sky_unit(lon, lat):
+    return numpy.array([numpy.cos(lat) * numpy.cos(lon),
+                        numpy.cos(lat) * numpy.sin(lon), numpy.sin(lat)])
+
+
 class SharedLikelihood(object):
     """The marginal log likelihood of :class:`BStatisticSurrogate` for many
     points of a region at once, from computations they share.

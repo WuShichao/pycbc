@@ -491,3 +491,30 @@ def test_a_sky_block_search_finds_the_source_in_its_block():
     # the source once: no other candidate this close to it
     assert all(abs(c['longitude'] - best['longitude']) > 2 * radius
                or abs(c['time'] - best['time']) > 600 for c in found[1:])
+
+
+def test_a_sky_block_mixture_takes_each_point_from_its_block():
+    from pycbc.inference import models
+    from pycbc.inference.models.bstatistic_surrogate import SkyBlockMixture
+    from pycbc.workflow import WorkflowConfigParser
+    lon, lat = 3.5763564997428436, 0.3429283438977949
+    cp = WorkflowConfigParser()
+    cp.read_string(CONFIG.replace(
+        'grid-periods = 1', 'grid-periods = 1\nharmonics = 8\n'
+        'amplitude-table-file = ' + table_file()))
+    data, psds, snr2, mc = stbbh_data()
+    m = models.read_from_config(cp, data=data, psds=psds)
+    blocks = [m.recentred(lon - 0.04, lat, 0.02, sky_block_points=200),
+              m.recentred(lon, lat, 0.02, sky_block_points=200)]
+    mix = SkyBlockMixture(blocks)
+    points = [dict(mchirp=mc, eclipticlongitude=lon + d)
+              for d in (-0.05, -0.035, -0.01, 0.005)]
+    numpy.testing.assert_array_equal(mix.block_of(points), [0, 0, 1, 1])
+    got = mix.loglikelihoods(points)
+    own = [blocks[j].loglikelihoods([p])[0]
+           for j, p in zip((0, 0, 1, 1), points)]
+    numpy.testing.assert_allclose(got, own)
+    mix.update(**points[2])
+    assert mix.loglikelihood == pytest.approx(own[2])
+    # the source's own block gives it the larger likelihood
+    assert got[3] > got[0]
