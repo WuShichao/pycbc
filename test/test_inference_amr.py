@@ -432,7 +432,7 @@ class SkewedNormal(models.base.BaseModel):
 
 
 def test_the_curvilinear_box_masses_take_the_jacobian_across_the_box():
-    from scipy.special import erf
+    from scipy.special import erf, logsumexp
     prior = JointDistribution(['x', 'y'], Uniform(x=(0.2, 4.0)),
                               Uniform(y=(-3.0, 3.0)))
 
@@ -452,6 +452,13 @@ def test_the_curvilinear_box_masses_take_the_jacobian_across_the_box():
         3 * sampler.logz_err, 2e-3))
     assert abs(sampler.diagnostics['midpoint_logz'] - exact) < 0.01
     assert sampler.diagnostics['check_uncovered'] < 1e-3
+    x = sampler.samples['x']
+    weight = numpy.exp(sampler.samples['logwt']
+                       - logsumexp(sampler.samples['logwt']))
+    normal = gauss(0.2, 4.0, 1.2, 0.6)
+    for edge in (0.6, 1.2, 1.8, 2.4):
+        assert weight @ (x <= edge) == pytest.approx(
+            gauss(0.2, edge, 1.2, 0.6) / normal, abs=0.02)
 
 
 def test_a_peak_on_the_prior_edge_keeps_its_mass_in_a_tilted_frame():

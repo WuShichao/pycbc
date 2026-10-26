@@ -40,15 +40,17 @@ becoming small. With ``pilot-evaluations`` set, a first refinement of that
 many evaluations gives the posterior's mean and covariance, and the cube is
 partitioned again in the affine frame that whitens them: boxes there are
 parallelepipeds in the cube, about one standard deviation wide around the
-mean to start with. The frame's boxes cover the cube; their prior mass is
-their volume in the cube, and a box whose centre lies outside the cube has
-none.
+mean to start with. The frame's boxes cover the cube; only their parts
+inside the original prior contribute mass, including boxes whose centres
+fall outside it.
 
 The evidence is the midpoint sum over the boxes; its error estimate is the
-summed error of the final boxes. Posterior samples are drawn by choosing
-boxes in proportion to their mass and a point uniformly inside each chosen
-box, mapped back through the prior; each sample carries the likelihood of
-its box centre.
+summed error of the final boxes. Posterior points are drawn by choosing
+boxes in proportion to their mass. In an affine frame a point is uniform
+over the part of its box inside the prior. In a curved frame its importance
+weight also accounts for the varying Jacobian and the box's admitted
+fraction. Each point carries the likelihood stored for its box;
+the usual file reader resamples the raw points with their ``logwt``.
 
 With ``partition-file``, the output of an adaptive cell search, the
 quadrature starts from the search's candidate cells instead: boxes in the
@@ -162,7 +164,8 @@ class AMRSampler(BaseSampler):
     max_evaluations : int, optional
         Budget of likelihood evaluations. Default 100000.
     posterior_samples : int, optional
-        Number of posterior samples to draw. Default 10000.
+        Number of raw posterior points to draw. Curved-frame points have
+        unequal ``logwt`` and must be weighted or resampled. Default 10000.
     seed : int, optional
         Seed for drawing the posterior samples. Default 0.
     nprocesses : int, optional
@@ -268,7 +271,7 @@ class AMRSampler(BaseSampler):
 
     @property
     def samples(self):
-        """The posterior samples, with equal weights in ``logwt``."""
+        """Raw posterior points and their ``logwt`` importance weights."""
         return self._samples
 
     @property
@@ -1116,6 +1119,8 @@ class AMRSampler(BaseSampler):
         return leaves, logmass, logz, refine
 
     def _draw_posterior(self, leaves, logmass):
+        if self._curve is not None and self.posterior_samples > 0:
+            return self._draw_curved_posterior(leaves, logmass)
         rng = numpy.random.default_rng(self.seed)
         weights = numpy.exp(logmass - self._logz)
         weights /= weights.sum()
@@ -1138,6 +1143,78 @@ class AMRSampler(BaseSampler):
         samples['logwt'] = numpy.full(len(boxes),
                                       self._logz - numpy.log(len(boxes)))
         self._samples = samples
+
+    def _draw_curved_posterior(self, leaves, logmass):
+        """Weighted points from the represented curved-frame boxes.
+
+        A box's stored mean Jacobian includes points outside the prior.
+        Uniform rejection draws inside it therefore need both their own
+        Jacobian and its admitted fraction ``f``. For ``k`` requested points
+        in a box, draw one more accepted point: the total number of trials
+        ``T`` then gives the unbiased estimate ``k / (T - 1)`` of ``f``.
+        The trial count is independent of the accepted positions. The
+        extra point is not returned, and no likelihood is evaluated here.
+        Failed inverse trials are counted; neither this correction nor the
+        weight concentration diagnostic proves that the map covers the prior.
+        """
+        rng = numpy.random.default_rng(self.seed)
+        tree_logz = float(logsumexp(logmass))
+        weights = numpy.exp(logmass - tree_logz)
+        weights /= weights.sum()
+        boxes = leaves[rng.choice(len(weights), size=self.posterior_samples,
+                                  p=weights)]
+        occupied, inverse, counts = numpy.unique(
+            boxes, return_inverse=True, return_counts=True)
+        trial_boxes = numpy.concatenate([boxes, occupied])
+        group = numpy.concatenate([inverse, numpy.arange(len(occupied))])
+        trials = numpy.zeros(len(occupied), dtype=numpy.int64)
+        cube = numpy.empty((len(trial_boxes), self.ndim))
+        logjac = numpy.empty(len(trial_boxes))
+        todo = numpy.arange(len(trial_boxes))
+        failed_inverse = 0
+        while len(todo):
+            chosen = trial_boxes[todo]
+            mapped, jacobian = self._map(
+                self._lower[chosen]
+                + rng.random((len(chosen), self.ndim)) * self._width[chosen])
+            if (mapped.shape != (len(todo), self.ndim)
+                    or jacobian.shape != (len(todo),)):
+                raise ValueError(
+                    "the frame returned incompatible posterior points")
+            finite = numpy.all(numpy.isfinite(mapped), axis=1)
+            failed_inverse += int((~finite).sum())
+            inside = finite & numpy.all((mapped >= 0) & (mapped <= 1), axis=1)
+            if numpy.any(inside & ~numpy.isfinite(jacobian)):
+                raise ArithmeticError(
+                    "posterior Jacobian unresolved inside the prior")
+            trials += numpy.bincount(group[todo], minlength=len(occupied))
+            accepted = todo[inside]
+            cube[accepted], logjac[accepted] = mapped[inside], jacobian[inside]
+            todo = todo[~inside]
+        number = len(boxes)
+        log_fraction = numpy.log(counts) - numpy.log(trials - 1)
+        correction = (logjac[:number] - self._logjac[boxes]
+                      + log_fraction[inverse])
+        if not numpy.all(numpy.isfinite(correction)):
+            raise ArithmeticError("posterior geometry weights are unresolved")
+        norm = float(logsumexp(correction))
+        points = numpy.array([self._prior_transform(c) for c in cube[:number]])
+        samples = {p: points[:, i]
+                   for i, p in enumerate(self.model.variable_params)}
+        samples['loglikelihood'] = self._logl[boxes]
+        samples['log_geometry_weight'] = correction
+        # The file convention scales posterior weights by the reported
+        # evidence. Keep the independent geometry estimate in diagnostics.
+        samples['logwt'] = self._logz + correction - norm
+        self._samples = samples
+        self._diagnostics.update(
+            posterior_weighting='curved prior geometry',
+            posterior_extra_points=int(len(occupied)),
+            posterior_trials=int(trials.sum()),
+            posterior_inverse_failures=failed_inverse,
+            posterior_geometry_logz=tree_logz + norm - numpy.log(number),
+            posterior_effective_samples=float(1 / numpy.sum(
+                numpy.exp(2 * (correction - norm)))))
 
     def checkpoint(self):
         pass

@@ -20,9 +20,10 @@ from .dynesty import DynestyFile
 class AMRFile(DynestyFile):
     """Output of the ``amr`` sampler.
 
-    The posterior samples are written as equal-weight raw samples with a
-    ``logwt`` column, read back the way the nested samplers' are. The final
-    boxes of the refinement are kept in ``sampler_info/cells``.
+    Raw posterior points carry a ``logwt`` column, read back the way the
+    nested samplers' are. Curved-frame points may have unequal weights;
+    the default reader resamples them into a posterior. The final boxes
+    of the refinement are kept in ``sampler_info/cells``.
     """
     name = 'amr_file'
 
