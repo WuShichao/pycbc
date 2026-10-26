@@ -311,6 +311,34 @@ def test_exploration_finds_the_higher_of_two_peaks():
     assert peaks[1e-3][1] == pytest.approx(narrow[0], abs=0.05)
 
 
+def test_a_start_point_leads_the_frame_to_the_higher_peak():
+    """The two-peak likelihood without exploration, but with a start point
+    near the narrow peak, as a search would give: the frame is about it."""
+    names = ['a', 'b', 'c']
+    narrow = numpy.array([2.5, -3.0, 1.0])
+    broad = numpy.array([-2.0, 2.0, -1.0])
+
+    class TwoPeaks(models.base.BaseModel):
+        name = 'test_two_peaks_start'
+
+        def _loglikelihood(self):
+            x = numpy.array([self.current_params[n] for n in names])
+            return max(30.0 * numpy.exp(-numpy.sum((x - narrow) ** 2)
+                                        / (2 * 0.25 ** 2)),
+                       20.0 * numpy.exp(-numpy.sum((x - broad) ** 2) / 2.0))
+    prior = JointDistribution(names, *[Uniform(**{n: (-4.0, 4.0)})
+                                       for n in names])
+    start = ((narrow + 0.1) + 4.0) / 8.0
+    sampler = AMRSampler(TwoPeaks(names, prior=prior), initial_divisions=2,
+                         pilot_evaluations=500, laplace_frame=True,
+                         mass_fraction=1e-4, max_evaluations=30000,
+                         posterior_samples=2000, seed=3, start_cube=[start])
+    sampler.run()
+    assert sampler.diagnostics['frame_peak'] > 29.9
+    with pytest.raises(ValueError):
+        AMRSampler(TwoPeaks(names, prior=prior), start_cube=[[1.5, 0, 0]])
+
+
 def test_an_exploration_beyond_the_budget_is_refused():
     with pytest.raises(ValueError):
         AMRSampler(normal_model(), max_evaluations=1000, explore_basin=1e-3)

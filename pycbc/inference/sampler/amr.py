@@ -148,6 +148,12 @@ class AMRSampler(BaseSampler):
         round, up to ``max_evaluations``. Default 0, off.
     check_tolerance : float, optional
         The error in ``log Z`` the check must reach. Default 0.1.
+    start_cube : array, optional
+        Points of the prior's unit cube, ``(n, ndim)``, such as a search's
+        loudest templates, evaluated before the pilot and offered to the
+        frame's Newton climbs as starts beside the pilot's and the
+        exploration's best points. They only seed the climbs: the
+        quadrature still covers the whole prior.
     whitening_rounds : int, optional
         Pilot refinements, each of ``pilot_evaluations`` more evaluations
         in the frame the previous one whitened. A thin ridge oblique to the
@@ -187,7 +193,7 @@ class AMRSampler(BaseSampler):
                  partition_file=None, whitening_rounds=1,
                  laplace_frame=False, curvilinear_frame=False,
                  shared_region=0, explore_basin=0.0, explore_miss=0.01,
-                 check_points=0, check_tolerance=0.1):
+                 check_points=0, check_tolerance=0.1, start_cube=None):
         super().__init__(model)
         self.initial_divisions = int(initial_divisions)
         self.partition_file = partition_file
@@ -209,6 +215,13 @@ class AMRSampler(BaseSampler):
             raise ValueError("check-points must be 0 or at least 2 and "
                              "check-tolerance positive")
         self._explored = None
+        self.start_cube = None if start_cube is None else numpy.atleast_2d(
+            numpy.asarray(start_cube, dtype=float))
+        if self.start_cube is not None and (
+                self.start_cube.shape[1] != len(model.variable_params)
+                or numpy.any((self.start_cube < 0) | (self.start_cube > 1))):
+            raise ValueError("start-cube points must lie in the unit cube, "
+                             "one coordinate per variable parameter")
         self._batched = False
         self._next_share = 0
         self.loglikelihood_step = float(loglikelihood_step)
@@ -506,6 +519,15 @@ class AMRSampler(BaseSampler):
             before['largest_refused_gb'] = 0.0
         if self.explore_basin > 0:
             self._explore()
+        if self.start_cube is not None:
+            logl = self._cube_loglikelihoods(self.start_cube)
+            if self._explored is None:
+                self._explored = (self.start_cube, logl)
+            else:
+                self._explored = (numpy.vstack([self._explored[0],
+                                                self.start_cube]),
+                                  numpy.concatenate([self._explored[1],
+                                                     logl]))
         self._grid()
         if self.pilot_evaluations > 0:
             for _ in range(self.whitening_rounds):
