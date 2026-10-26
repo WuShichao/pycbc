@@ -208,9 +208,15 @@ def _unit(lon, lat):
 
 def sky_block_search(model, centres, radius, region, sky_step, top=20,
                      sky_distance=None, time_distance=600.0,
-                     sky_block_points=600, **grid_options):
+                     sky_block_points=600, route='fft', **options):
     """Search the blocks of ``centres`` (from :func:`sky_block_centres`),
     each with ``model`` recentred there, and merge the candidates.
+
+    ``route`` is ``'fft'`` (:func:`fft_search_sky_block`: ``region`` lists
+    the intrinsic templates; every arrival time at once, the route for
+    full-length data) or ``'grid'`` (:func:`search_sky_block`: ``region``
+    spans the intrinsic region, a NUFFT grid over it; for a short window of
+    arrival times); ``options`` go to the route.
 
     Returns the merged candidates, loudest first, each with its block, and
     the blocks' statistics (seconds, templates, sky points)."""
@@ -222,7 +228,12 @@ def sky_block_search(model, centres, radius, region, sky_step, top=20,
         block = model.recentred(lon, lat, radius,
                                 sky_block_points=sky_block_points)
         sky = block_sky_points(block, radius, sky_step)
-        out = search_sky_block(block, region, sky, top=top, **grid_options)
+        if route == 'fft':
+            out = fft_search_sky_block(block, region, sky, top=top, **options)
+        elif route == 'grid':
+            out = search_sky_block(block, region, sky, top=top, **options)
+        else:
+            raise ValueError("route must be 'fft' or 'grid'")
         for c in out['candidates']:
             c['block'] = i
         found.extend(out['candidates'])
