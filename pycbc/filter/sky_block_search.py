@@ -90,6 +90,97 @@ def search_sky_block(model, region, sky, top=20, sky_tolerance=1e-4,
     return out
 
 
+def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
+                         anchors=5, lag_chunk=1 << 18):
+    """The loudest ``top`` candidates of one sky block by one FFT per
+    intrinsic template and sky-basis vector.
+
+    Each template's correlation with the data for each of the block's
+    ``R`` basis vectors comes from one inverse FFT, every arrival time at
+    once; the block's ``P`` sky points ``sky`` are combinations of those, so
+    a template costs ``R`` FFTs whatever ``P``. The Gram matrix of each sky
+    point comes from ``anchors x anchors`` Chebyshev nodes of the block on a
+    daily grid, interpolated in the sky (2F within about 1.7% of its peak at
+    5 x 5 for a 0.07 rad block).
+
+    ``thetas`` are rows (mchirp, q, spin1z, spin2z); ``delay_range`` the
+    arrival-time offsets searched, s, by default the model's."""
+    from numpy.polynomial import chebyshev
+    fam, dg = model.surrogate, model.daily_gram
+    xp, blk = fam.xp, fam.sky_block
+    if blk is None:
+        raise ValueError("the model has no sky block")
+    var = model.noise_variance
+    lo, hi = (float(model.delays.min()), float(model.delays.max())) \
+        if delay_range is None else delay_range
+    dt, size = fam.grid.delta_t, fam.size
+    lags = numpy.arange(numpy.ceil(lo / dt), numpy.floor(hi / dt) + 1)
+    index = xp.asarray(lags.astype(numpy.int64) % size)
+    delays = lags * dt
+    day = dg.day
+    days = numpy.arange(numpy.floor(lo / day), numpy.ceil(hi / day) + 1) * day
+    lag_day = xp.asarray(numpy.clip(((delays - days[0]) / day).round(), 0,
+                                    len(days) - 1).astype(numpy.int64))
+    C = xp.asarray(blk._coords(blk._unit(sky)))                     # (P, R)
+    U = xp.asarray(blk._basis)
+    nodes = numpy.cos(numpy.pi * (numpy.arange(anchors) + 0.5) / anchors)
+    unit = numpy.array([[a, b] for a in nodes for b in nodes])
+    degree = [anchors - 1, anchors - 1]
+    W = xp.asarray(chebyshev.chebvander2d(*blk._unit(sky).T, degree)
+                   @ numpy.linalg.inv(chebyshev.chebvander2d(*unit.T,
+                                                             degree)))
+    anchor_rho = fam.responses(blk._offsets(unit))
+    found, start = [], time.time()
+    for n, theta in enumerate(numpy.atleast_2d(thetas)):
+        point = dict(model.static_params)
+        point.update(dict(zip(['mchirp', 'q', 'spin1z', 'spin2z'], theta)))
+        point.update({k: model.reference[k] for k in
+                      ('eclipticlongitude', 'eclipticlatitude')})
+        xi = model._shape_coordinates(point)
+        b, t = fam._source(xi[:fam.nintrinsic])
+        # the Gram at the anchors, a day at a time, interpolated to the sky
+        g = [[], [], []]
+        for r in anchor_rho:
+            q = dg.prepare(b, t, r)
+            for c, v in enumerate(dg.at_prepared(q, days)):
+                g[c].append(xp.asarray(v))
+        G = [W @ xp.stack(v) / var for v in g]                     # (P, days)
+        det = G[0] * G[1] - xp.abs(G[2]) ** 2
+        # z(Delta) = sum_m a_m exp(2 pi i m Delta / T): the inverse FFT
+        # times its length
+        Z = xp.stack([xp.fft.ifft(fam.correlation_spectrum(
+            model.data_spectrum, b, t, U[r]), axis=-1)[:, index] * size
+            for r in range(blk.rank)])                              # (R, 2, L)
+        best, where = -numpy.inf, None
+        for c0 in range(0, len(lags), lag_chunk):
+            cut = slice(c0, c0 + lag_chunk)
+            z = (C @ Z[:, :, cut].reshape(blk.rank, -1)).reshape(
+                len(sky), 2, -1) / var
+            d = lag_day[cut]
+            g00, g11, g01, dd = G[0][:, d], G[1][:, d], G[2][:, d], det[:, d]
+            twof = (g11 * xp.abs(z[:, 0]) ** 2 + g00 * xp.abs(z[:, 1]) ** 2
+                    - 2 * xp.real(xp.conj(z[:, 0]) * g01 * z[:, 1])) / dd
+            k = int(xp.argmax(twof))
+            v = float(twof.reshape(-1)[k])
+            if v > best:
+                best, where = v, (k // twof.shape[1], c0 + k % twof.shape[1])
+        p, j = where
+        found.append(dict(twof=best, theta=list(map(float, theta)),
+                          sky=[float(x) for x in sky[p]],
+                          time=float(delays[j]), longitude=float(
+                              model.reference['eclipticlongitude']
+                              + sky[p][0] * model.scales['eclipticlongitude']),
+                          latitude=float(model.reference['eclipticlatitude']
+                                         + sky[p][1]
+                                         * model.scales['eclipticlatitude'])))
+        if (n + 1) % 50 == 0:
+            logging.info("FFT block search: %d/%d templates, %.0f s",
+                         n + 1, len(thetas), time.time() - start)
+    found.sort(key=lambda c: -c['twof'])
+    return dict(candidates=found[:top],
+                templates=len(found) * len(sky) * len(lags))
+
+
 def merge_candidates(candidates, sky_distance, time_distance):
     """Each source once: from the loudest down, a candidate within
     ``sky_distance`` (rad, on the sphere) and ``time_distance`` (s) of one

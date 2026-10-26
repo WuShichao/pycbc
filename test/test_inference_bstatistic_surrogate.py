@@ -518,3 +518,32 @@ def test_a_sky_block_mixture_takes_each_point_from_its_block():
     assert mix.loglikelihood == pytest.approx(own[2])
     # the source's own block gives it the larger likelihood
     assert got[3] > got[0]
+
+
+def test_the_fft_block_search_agrees_with_the_grid_search():
+    """One FFT per template and sky-basis vector finds the source where the
+    NUFFT grid search does, with the same 2F to the Gram interpolation."""
+    from pycbc.filter.sky_block_search import (block_sky_points,
+                                               fft_search_sky_block,
+                                               search_sky_block)
+    from pycbc.inference import models
+    from pycbc.workflow import WorkflowConfigParser
+    lon, lat = 3.5763564997428436, 0.3429283438977949
+    cp = WorkflowConfigParser()
+    cp.read_string(CONFIG.replace(
+        'grid-periods = 1', 'grid-periods = 1\nharmonics = 8\n'
+        'amplitude-table-file = ' + table_file()))
+    data, psds, snr2, mc = stbbh_data()
+    m = models.read_from_config(cp, data=data, psds=psds)
+    block = m.recentred(lon, lat, 0.02, sky_block_points=200)
+    sky = block_sky_points(block, 0.02, 0.5)
+    s = m.static_params
+    unit = m.scales['mchirp']
+    region = numpy.array([[mc + u * unit, s['q'], s['spin1z'], s['spin2z']]
+                          for u in numpy.linspace(-1, 1, 11)])
+    fft = fft_search_sky_block(block, region, sky, top=3)
+    grid = search_sky_block(block, region, sky, top=3)
+    best, ref = fft['candidates'][0], grid['candidates'][0]
+    assert best['twof'] == pytest.approx(ref['twof'], rel=0.05)
+    assert abs(best['theta'][0] - mc) < 0.3 * unit
+    assert abs(best['time'] - ref['time']) < 3 * m.grid_step
