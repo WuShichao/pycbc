@@ -187,8 +187,13 @@ class MetricChart(object):
         if not numpy.allclose(metric, metric.T, rtol=1e-10, atol=0):
             raise ValueError("the metric is not symmetric")
         values, vectors = numpy.linalg.eigh(0.5 * (metric + metric.T))
-        if values[0] <= 0:
+        # an eigenvalue within roundoff of zero is a direction the mismatch
+        # does not measure: floored there, it gives that direction one
+        # cell; a negative one beyond roundoff is an error
+        floor = 1e-12 * abs(values[-1])
+        if values[0] < -floor or values[-1] <= 0:
             raise ValueError("the metric is not positive definite")
+        values = numpy.maximum(values, floor)
         self.metric = metric
         self.eigenvalues = values[::-1]
         self.eigenvectors = vectors[:, ::-1]

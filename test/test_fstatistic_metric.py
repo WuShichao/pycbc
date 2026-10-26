@@ -99,3 +99,16 @@ def test_bad_inputs_are_refused():
     with pytest.raises(ValueError):
         fstatistic_metric(bases(numpy.zeros(3)), derivatives(numpy.zeros(3)),
                           orientation_weights(0, 0), F, project='sky')
+
+
+def test_a_chart_takes_a_direction_the_metric_does_not_measure():
+    """An eigenvalue within roundoff of zero, as a degenerate direction gives,
+    is floored; a negative one beyond roundoff is refused."""
+    import numpy
+    import pytest
+    from pycbc.tmpltbank.fstatistic_metric import MetricChart
+    V = numpy.linalg.qr(numpy.random.default_rng(0).normal(size=(3, 3)))[0]
+    chart = MetricChart(V @ numpy.diag([4.0, 1.0, -2e-14]) @ V.T)
+    assert chart.eigenvalues.min() > 0
+    with pytest.raises(ValueError):
+        MetricChart(V @ numpy.diag([4.0, 1.0, -1e-6]) @ V.T)
