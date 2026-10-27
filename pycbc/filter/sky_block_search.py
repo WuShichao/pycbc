@@ -121,7 +121,9 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
     days = numpy.arange(numpy.floor(lo / day), numpy.ceil(hi / day) + 1) * day
     lag_day = xp.asarray(numpy.clip(((delays - days[0]) / day).round(), 0,
                                     len(days) - 1).astype(numpy.int64))
-    C = xp.asarray(blk._coords(blk._unit(sky)))                     # (P, R)
+    # a template's correlation conjugates its response: each sky point weighs
+    # the basis vectors' correlations by its coordinates' conjugates
+    C = xp.asarray(numpy.conj(blk._coords(blk._unit(sky))))         # (P, R)
     U = xp.asarray(blk._basis)
     nodes = numpy.cos(numpy.pi * (numpy.arange(anchors) + 0.5) / anchors)
     unit = numpy.array([[a, b] for a in nodes for b in nodes])
