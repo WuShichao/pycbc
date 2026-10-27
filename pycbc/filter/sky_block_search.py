@@ -92,7 +92,8 @@ def search_sky_block(model, region, sky, top=20, sky_tolerance=1e-4,
 
 def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
                          anchors=5, lag_chunk=1 << 18, refine=0,
-                         subsamples=8, coefficients=None):
+                         subsamples=8, coefficients=None, sky_set=None,
+                         lag_shift=None, oversample=1):
     """The loudest ``top`` candidates of one sky block by one FFT per
     intrinsic template and sky-basis vector.
 
@@ -109,7 +110,11 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
     ``refine`` candidates are refined by :func:`refine_candidate`. With
     ``coefficients`` (rows of the 16 basis-coefficient changes, as
     :func:`phase_lattice` gives) the templates are those points of the
-    coefficient space and ``thetas`` only label them."""
+    coefficient space and ``thetas`` only label them. ``sky`` may be a list
+    of sky sets, each template searching the set ``sky_set`` gives it (as
+    :func:`joint_lattice` lays them out), with its lags shifted by
+    ``lag_shift`` lag steps. ``oversample`` pads the transform so the lag
+    step is the grid's over that factor."""
     from numpy.polynomial import chebyshev
     fam, dg = model.surrogate, model.daily_gram
     xp, blk = fam.xp, fam.sky_block
@@ -118,7 +123,8 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
     var = model.noise_variance
     lo, hi = (float(model.delays.min()), float(model.delays.max())) \
         if delay_range is None else delay_range
-    dt, size = fam.grid.delta_t, fam.size
+    oversample = int(oversample)
+    dt, size = fam.grid.delta_t / oversample, fam.size * oversample
     lags = numpy.arange(numpy.ceil(lo / dt), numpy.floor(hi / dt) + 1)
     index = xp.asarray(lags.astype(numpy.int64) % size)
     delays = lags * dt
@@ -128,17 +134,28 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
                                     len(days) - 1).astype(numpy.int64))
     # a template's correlation conjugates its response: each sky point weighs
     # the basis vectors' correlations by its coordinates' conjugates
-    C = xp.asarray(numpy.conj(blk._coords(blk._unit(sky))))         # (P, R)
+    if isinstance(sky, (list, tuple)) and numpy.ndim(sky[0]) == 2:
+        sets = [numpy.asarray(v, dtype=float) for v in sky]
+    else:
+        sets = [numpy.atleast_2d(numpy.asarray(sky, dtype=float))]
     U = xp.asarray(blk._basis)
     nodes = numpy.cos(numpy.pi * (numpy.arange(anchors) + 0.5) / anchors)
     unit = numpy.array([[a, b] for a in nodes for b in nodes])
     degree = [anchors - 1, anchors - 1]
-    W = xp.asarray(chebyshev.chebvander2d(*blk._unit(sky).T, degree)
-                   @ numpy.linalg.inv(chebyshev.chebvander2d(*unit.T,
-                                                             degree)))
+    inverse = numpy.linalg.inv(chebyshev.chebvander2d(*unit.T, degree))
+    Cs = [xp.asarray(numpy.conj(blk._coords(blk._unit(p)))) for p in sets]
+    Ws = [xp.asarray(chebyshev.chebvander2d(*blk._unit(p).T, degree)
+                     @ inverse) for p in sets]
+    shifts = [0.0] * len(sets) if lag_shift is None else list(lag_shift)
+    # a shift of the lags is a phase ramp on the spectrum
+    ramps = [None if v == 0 else xp.exp(2j * numpy.pi * v / size
+                                        * xp.arange(fam.size))
+             for v in shifts]
     anchor_rho = fam.responses(blk._offsets(unit))
     found, start = [], time.time()
     for n, theta in enumerate(numpy.atleast_2d(thetas)):
+        ks = 0 if sky_set is None else int(sky_set[n])
+        sky, C, W = sets[ks], Cs[ks], Ws[ks]
         if coefficients is not None:
             # a template of the coefficient space, labelled by ``theta``
             dC = numpy.asarray(coefficients[n], dtype=float)
@@ -161,8 +178,10 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
         det = G[0] * G[1] - xp.abs(G[2]) ** 2
         # z(Delta) = sum_m a_m exp(2 pi i m Delta / T): the inverse FFT
         # times its length
+        ramp = ramps[ks]
         Z = xp.stack([xp.fft.ifft(fam.correlation_spectrum(
-            model.data_spectrum, b, t, U[r]), axis=-1)[:, index] * size
+            model.data_spectrum, b, t, U[r]) * (1 if ramp is None else ramp),
+            n=size, axis=-1)[:, index] * size
             for r in range(blk.rank)])                              # (R, 2, L)
         best, where = -numpy.inf, None
         for c0 in range(0, len(lags), lag_chunk):
@@ -182,7 +201,8 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
                           coefficients=(None if coefficients is None else
                                         [float(v) for v in coefficients[n]]),
                           sky=[float(x) for x in sky[p]],
-                          time=float(delays[j]), longitude=float(
+                          time=float(delays[j] + shifts[ks] * dt),
+                          longitude=float(
                               model.reference['eclipticlongitude']
                               + sky[p][0] * model.scales['eclipticlongitude']),
                           latitude=float(model.reference['eclipticlatitude']
@@ -196,8 +216,9 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
         refine_candidate(model, c, anchors=anchors, subsamples=subsamples)
     if refine:
         found.sort(key=lambda c: -c['twof'])
-    return dict(candidates=found[:top],
-                templates=len(found) * len(sky) * len(lags))
+    points = sum(len(sets[0 if sky_set is None else int(sky_set[n])])
+                 for n in range(len(found)))
+    return dict(candidates=found[:top], templates=points * len(lags))
 
 
 def refine_candidate(model, candidate, anchors=5, subsamples=8, chunk=1 << 18):
@@ -316,6 +337,155 @@ def aligned_lattice(s, metric, mean_mismatch, reach=1.0):
     return s.mean(axis=0) + nodes @ vectors.T, near, numpy.full(ndir, h)
 
 
+# normalised second moments (Conway and Sloane, Sphere Packings, Lattices
+# and Groups, table 2.3) of the cubic lattice and of Z^n with its cells'
+# centres added: bcc in three dimensions, D4* (similar to D4) in four, D5*
+_SECOND_MOMENT = {'cubic': 1 / 12.0, 3: 0.0785433, 4: 0.0766032,
+                  5: 0.0756254}
+
+
+def joint_lattice(s, metric, sky_metric, sky_half, mean_mismatch=None,
+                  time_step=None, reach=1.0, lattice='centred'):
+    """One lattice over a region's phase coordinates, a sky block and,
+    optionally, the arrival time, so the mismatch budget is shared between
+    them and the best lattice quantizer of the joint dimension covers all.
+
+    ``s`` (M, n) are the region's phase coordinates and ``metric`` the loss
+    of 2F per unit of them squared; ``sky_metric`` (2, 2) the loss per
+    shape unit squared of the sky offsets and ``sky_half`` the block's
+    half-widths, shape units. Along the region's principal axes (as
+    :func:`aligned_lattice`) an axis narrower than a layer gets one and its
+    spread is taken from the budget; the axes it fills, the two sky axes
+    and, with ``time_step`` (the search's lag step, whitened: the root of
+    the loss per lag step squared), the arrival time carry the lattice.
+
+    ``lattice`` is ``'cubic'`` or ``'centred'``: Z^n with its cells'
+    centres, every index of a point of one parity, which is bcc in three
+    dimensions and D4* in four. A centred lattice gives each intrinsic node
+    one of two sky grids, the second shifted half a cell, and the lags of
+    the second shifted half a lag step: the search still shares its FFTs
+    over the sky, and the shift is a phase ramp.
+
+    The scale is set by ``mean_mismatch`` or, with the time axis, by the lag
+    step. Returns the intrinsic nodes (phase coordinates), the index of the
+    region point nearest each, each node's set (0 or 1), the sets' sky
+    offsets (shape units) and lag shifts (lag steps), the index step, the
+    lattice and its mean mismatch."""
+    from scipy.spatial import cKDTree
+    ndir = s.shape[1]
+    L = numpy.linalg.cholesky(metric)
+    u = (s - s.mean(axis=0)) @ L
+    _, _, axes_t = numpy.linalg.svd(u, full_matrices=False)
+    u = u @ axes_t.T
+    lo, hi = u.min(axis=0), u.max(axis=0)
+    extent, centre = hi - lo, 0.5 * (lo + hi)
+    spread = numpy.mean((u - centre) ** 2, axis=0)
+    timed = time_step is not None
+    filled = numpy.ones(ndir, dtype=bool)
+    for _ in range(ndir + 1):
+        n = int(filled.sum()) + 2 + int(timed)
+        kind = n if (lattice == 'centred' and n in _SECOND_MOMENT) \
+            else 'cubic'
+        # index step c: a point per c^n (cubic) or per (2 c)^n / 2
+        if timed:
+            c = time_step if kind == 'cubic' else 0.5 * time_step
+        else:
+            budget = max(mean_mismatch - spread[~filled].sum(),
+                         0.25 * mean_mismatch)
+            volume = (budget / (n * _SECOND_MOMENT[kind])) ** (n / 2.0)
+            c = volume ** (1.0 / n) if kind == 'cubic' else \
+                0.5 * (2 * volume) ** (1.0 / n)
+        layer = c if kind == 'cubic' else 2 * c
+        new = extent > layer
+        if (new == filled).all():
+            break
+        filled = new
+    volume = c ** n if kind == 'cubic' else (2 * c) ** n / 2.0
+    mean = n * _SECOND_MOMENT[kind] * volume ** (2.0 / n) \
+        + spread[~filled].sum()
+    # the deep holes: a cell's corner (cubic), (1/2, 1/4, 0) of a side 2 c
+    # cell (bcc), (1/2, 1/2, 0, ...) (four and five dimensions)
+    covering = 0.5 * c * numpy.sqrt(n) if kind == 'cubic' else \
+        (0.5 * c * numpy.sqrt(5) if n == 3 else c * numpy.sqrt(2))
+    axes = []
+    for d in range(ndir):
+        if filled[d]:
+            k = numpy.arange(numpy.floor((lo[d] - covering - centre[d]) / c),
+                             numpy.ceil((hi[d] + covering - centre[d]) / c)
+                             + 1)
+            axes.append(centre[d] + k * c)
+        else:
+            axes.append(numpy.array([centre[d]]))
+    nodes = numpy.array(numpy.meshgrid(*axes, indexing='ij')).reshape(
+        ndir, -1).T
+    index = numpy.round((nodes - centre) / c).astype(int)[:, filled]
+    parity = numpy.mod(index[:, 0], 2) if index.shape[1] else \
+        numpy.zeros(len(nodes), dtype=int)
+    if kind == 'cubic':
+        parity = numpy.zeros(len(nodes), dtype=int)
+        same = numpy.ones(len(nodes), dtype=bool)
+    else:
+        same = numpy.all(numpy.mod(index, 2) == parity[:, None], axis=1)
+    dist, near = cKDTree(u).query(nodes)
+    keep = same & (dist <= reach * covering)
+    nodes, near, parity = nodes[keep], near[keep], parity[keep]
+    if kind != 'cubic' and not filled.any():
+        # no intrinsic axis: the sky and time carry both parities
+        nodes, near = numpy.repeat(nodes, 2, axis=0), numpy.repeat(near, 2)
+        parity = numpy.tile([0, 1], len(parity))
+    vectors = numpy.linalg.solve(L.T, axes_t.T)
+    # the sky, whitened by its metric: the grid of index step c inside the
+    # block widened by the covering radius, each set the points of its
+    # parity
+    Ls = numpy.linalg.cholesky(sky_metric)
+    half = numpy.asarray(sky_half, dtype=float)
+    widen = covering * numpy.sqrt(numpy.diag(numpy.linalg.inv(sky_metric)))
+    corners = numpy.array([[a, b] for a in (-1, 1) for b in (-1, 1)]) \
+        * (half + widen)
+    w = corners @ Ls
+    j = [numpy.arange(numpy.floor(w[:, d].min() / c),
+                      numpy.ceil(w[:, d].max() / c) + 1) for d in range(2)]
+    grid = numpy.array(numpy.meshgrid(*j, indexing='ij')).reshape(
+        2, -1).T.astype(int)
+    offsets = (grid * c) @ numpy.linalg.inv(Ls)
+    inside = numpy.all(numpy.abs(offsets) <= half + widen, axis=1)
+    sets, shifts = [], []
+    for p in (0, 1):
+        mine = inside if kind == 'cubic' else inside & numpy.all(
+            numpy.mod(grid, 2) == p, axis=1)
+        sets.append(offsets[mine])
+        shifts.append(0.5 * p if (timed and kind != 'cubic') else 0.0)
+    name = 'cubic' if kind == 'cubic' else \
+        {3: 'bcc', 4: 'D4*', 5: 'D5*'}[n]
+    return (s.mean(axis=0) + nodes @ vectors.T, near, parity, sets, shifts,
+            c, name, mean)
+
+
+def phase_frame(model, region, ndir=3, band_margin=5 * 86400.0):
+    """The phase frame of ``region`` (points ``(M, 4)``: mchirp, q,
+    spin1z, spin2z) over the observed band: the points' phase coordinates,
+    the metric in them from the template power with the arrival time
+    projected out, the frame and its correlator."""
+    fam = model.surrogate
+    corr = PhaseNUFFTCorrelation(fam, model.data_spectrum, sky=(0.0, 0.0),
+                                 band_margin=band_margin)
+    region = numpy.atleast_2d(numpy.asarray(region, dtype=float))
+    frame = corr.frame(region, ndir)
+    ndir = frame['directions'].shape[1]
+    s, _, _ = corr.project(region, frame)
+    parts = corr.nodes(frame)
+    rows = [_host(corr.node_row(parts, d, 0)) for d in range(ndir)] \
+        + [_host(corr.node_row(parts, -1, 0))]
+    b0 = numpy.abs(_host(fam.b0)) ** 2
+    power = b0 if corr._sel is None else b0[corr._sel]
+    power = power / power.sum()
+    x = numpy.array(rows)
+    x = x - (x @ power)[:, None]
+    g = (x * power) @ x.T
+    gs = g[:ndir, :ndir] - numpy.outer(g[:ndir, -1], g[-1, :ndir]) / g[-1, -1]
+    return s, gs, frame, corr
+
+
 def phase_lattice(model, region, mean_mismatch, ndir=3,
                   band_margin=5 * 86400.0, reach=1.0, full=False):
     """A template bank of the PN family in its phase coordinates, where the
@@ -336,23 +506,8 @@ def phase_lattice(model, region, mean_mismatch, ndir=3,
     Returns the nodes' 16 basis-coefficient changes, the region point
     nearest each (its label), and the spacings; with ``full``, also the
     nodes' phase coordinates, the frame and its correlator."""
-    fam = model.surrogate
-    corr = PhaseNUFFTCorrelation(fam, model.data_spectrum, sky=(0.0, 0.0),
-                                 band_margin=band_margin)
     region = numpy.atleast_2d(numpy.asarray(region, dtype=float))
-    frame = corr.frame(region, ndir)
-    ndir = frame['directions'].shape[1]
-    s, _, _ = corr.project(region, frame)
-    parts = corr.nodes(frame)
-    rows = [_host(corr.node_row(parts, d, 0)) for d in range(ndir)] \
-        + [_host(corr.node_row(parts, -1, 0))]
-    b0 = numpy.abs(_host(fam.b0)) ** 2
-    power = b0 if corr._sel is None else b0[corr._sel]
-    power = power / power.sum()
-    x = numpy.array(rows)
-    x = x - (x @ power)[:, None]
-    g = (x * power) @ x.T
-    gs = g[:ndir, :ndir] - numpy.outer(g[:ndir, -1], g[-1, :ndir]) / g[-1, -1]
+    s, gs, frame, corr = phase_frame(model, region, ndir, band_margin)
     s_nodes, near, h = aligned_lattice(s, gs, mean_mismatch, reach)
     dC = s_nodes @ frame['directions'].T
     # the reference's own coefficients carry over unchanged at s = 0: the

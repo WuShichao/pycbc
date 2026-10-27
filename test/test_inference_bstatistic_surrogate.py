@@ -569,6 +569,44 @@ def test_an_aligned_lattice_lays_one_layer_across_a_thin_sheet():
     assert 0.6 * 0.01 < m.mean() < 1.2 * 0.01
 
 
+def test_a_joint_lattice_reaches_its_mismatch_with_fewer_points():
+    """Over a line of templates and a sky block, the joint lattice's mean
+    mismatch to the nearest (template, sky point) is the one asked for, and
+    the centred lattice (bcc) needs about 8% fewer points than the cubic
+    one, as their second moments say."""
+    from scipy.spatial import cKDTree
+    from pycbc.filter.sky_block_search import joint_lattice
+    rng = numpy.random.default_rng(4)
+    s = numpy.column_stack([rng.uniform(0, 20, 3000), numpy.zeros(3000)])
+    metric = numpy.eye(2)
+    sky_metric = numpy.array([[0.5, 0.1], [0.1, 0.8]])
+    half = (6.0, 5.0)
+    test = numpy.column_stack([rng.uniform(4, 16, 20000),
+                               numpy.zeros(20000),
+                               rng.uniform(-4, 4, 20000),
+                               rng.uniform(-3, 3, 20000)])
+    g = numpy.zeros((4, 4))
+    g[:2, :2], g[2:, 2:] = metric, sky_metric
+    white = numpy.linalg.cholesky(g)
+    points = {}
+    for kind in ('cubic', 'centred'):
+        nodes, _, parity, sets, _, _, used, mean = joint_lattice(
+            s, metric, sky_metric, half, 0.05, lattice=kind)
+        joint = numpy.vstack([numpy.column_stack(
+            [numpy.repeat(n[None], len(sets[p]), axis=0), sets[p]])
+            for n, p in zip(nodes, parity)])
+        w = joint @ white
+        m = cKDTree(w).query(test @ white)[0] ** 2
+        assert abs(mean - 0.05) < 1e-9
+        assert 0.95 * 0.05 < m.mean() < 1.05 * 0.05, (kind, m.mean())
+        # points in a box of the whitened space, well inside the block
+        inner = (w[:, 0] > 4) & (w[:, 0] < 16) \
+            & (numpy.abs(w[:, 2]) < 2.5) & (numpy.abs(w[:, 3]) < 2.5)
+        points[kind] = inner.sum()
+    assert used == 'bcc'
+    assert 0.86 < points['centred'] / points['cubic'] < 0.96
+
+
 def test_a_phase_lattice_bank_finds_the_source_and_refinement_helps():
     """A bank laid out in the family's phase coordinates, searched by the
     FFT route, finds the injection; refining the loudest candidate in
