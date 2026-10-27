@@ -91,7 +91,8 @@ def search_sky_block(model, region, sky, top=20, sky_tolerance=1e-4,
 
 
 def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
-                         anchors=5, lag_chunk=1 << 18):
+                         anchors=5, lag_chunk=1 << 18, refine=0,
+                         subsamples=8, coefficients=None):
     """The loudest ``top`` candidates of one sky block by one FFT per
     intrinsic template and sky-basis vector.
 
@@ -104,7 +105,11 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
     5 x 5 for a 0.07 rad block).
 
     ``thetas`` are rows (mchirp, q, spin1z, spin2z); ``delay_range`` the
-    arrival-time offsets searched, s, by default the model's."""
+    arrival-time offsets searched, s, by default the model's. The loudest
+    ``refine`` candidates are refined by :func:`refine_candidate`. With
+    ``coefficients`` (rows of the 16 basis-coefficient changes, as
+    :func:`phase_lattice` gives) the templates are those points of the
+    coefficient space and ``thetas`` only label them."""
     from numpy.polynomial import chebyshev
     fam, dg = model.surrogate, model.daily_gram
     xp, blk = fam.xp, fam.sky_block
@@ -134,12 +139,18 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
     anchor_rho = fam.responses(blk._offsets(unit))
     found, start = [], time.time()
     for n, theta in enumerate(numpy.atleast_2d(thetas)):
-        point = dict(model.static_params)
-        point.update(dict(zip(['mchirp', 'q', 'spin1z', 'spin2z'], theta)))
-        point.update({k: model.reference[k] for k in
-                      ('eclipticlongitude', 'eclipticlatitude')})
-        xi = model._shape_coordinates(point)
-        b, t = fam._source(xi[:fam.nintrinsic])
+        if coefficients is not None:
+            # a template of the coefficient space, labelled by ``theta``
+            dC = numpy.asarray(coefficients[n], dtype=float)
+            b, t = fam.source_from_coefficients(dC[:8], dC[8:])
+        else:
+            point = dict(model.static_params)
+            point.update(dict(zip(['mchirp', 'q', 'spin1z', 'spin2z'],
+                                  theta)))
+            point.update({k: model.reference[k] for k in
+                          ('eclipticlongitude', 'eclipticlatitude')})
+            xi = model._shape_coordinates(point)
+            b, t = fam._source(xi[:fam.nintrinsic])
         # the Gram at the anchors, a day at a time, interpolated to the sky
         g = [[], [], []]
         for r in anchor_rho:
@@ -168,6 +179,8 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
                 best, where = v, (k // twof.shape[1], c0 + k % twof.shape[1])
         p, j = where
         found.append(dict(twof=best, theta=list(map(float, theta)),
+                          coefficients=(None if coefficients is None else
+                                        [float(v) for v in coefficients[n]]),
                           sky=[float(x) for x in sky[p]],
                           time=float(delays[j]), longitude=float(
                               model.reference['eclipticlongitude']
@@ -179,8 +192,152 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
             logging.info("FFT block search: %d/%d templates, %.0f s",
                          n + 1, len(thetas), time.time() - start)
     found.sort(key=lambda c: -c['twof'])
+    for c in found[:refine]:
+        refine_candidate(model, c, anchors=anchors, subsamples=subsamples)
+    if refine:
+        found.sort(key=lambda c: -c['twof'])
     return dict(candidates=found[:top],
                 templates=len(found) * len(sky) * len(lags))
+
+
+def refine_candidate(model, candidate, anchors=5, subsamples=8, chunk=1 << 18):
+    """Refine a candidate of :func:`fft_search_sky_block` in place: its
+    arrival time between the grid's lags and its sky offset continuous in
+    the block, for its intrinsic template. The correlations of each sky
+    basis vector at ``subsamples`` fractions of a lag either side of the
+    candidate's lag come from their spectra directly, ``z(Delta) = sum_m a_m
+    exp(2 pi i m Delta / T)``; the sky point's correlation and Gram are
+    smooth in its offset (Chebyshev coordinates, Chebyshev anchors), so the
+    sky offset is optimised for each arrival time and the largest 2F kept."""
+    from numpy.polynomial import chebyshev
+    from scipy.optimize import minimize
+    fam, dg = model.surrogate, model.daily_gram
+    xp, blk = fam.xp, fam.sky_block
+    var, dt, size = model.noise_variance, fam.grid.delta_t, fam.size
+    point = dict(model.static_params)
+    point.update(dict(zip(['mchirp', 'q', 'spin1z', 'spin2z'],
+                          candidate['theta'])))
+    point.update({k: model.reference[k] for k in
+                  ('eclipticlongitude', 'eclipticlatitude')})
+    if candidate.get('coefficients') is not None:
+        dC = numpy.asarray(candidate['coefficients'])
+        b, t = fam.source_from_coefficients(dC[:8], dC[8:])
+    else:
+        xi = model._shape_coordinates(point)
+        b, t = fam._source(xi[:fam.nintrinsic])
+    delays = candidate['time'] + dt * numpy.linspace(-1, 1, 2 * subsamples + 1)
+    phase = xp.asarray(numpy.exp(2j * numpy.pi * numpy.outer(
+        numpy.arange(size), delays / (size * dt))).astype(fam.dtype))
+    U = xp.asarray(blk._basis)
+    Z = []
+    for r in range(blk.rank):
+        a = fam.correlation_spectrum(model.data_spectrum, b, t, U[r])
+        z = 0
+        for c0 in range(0, size, chunk):
+            z = z + a[:, c0:c0 + chunk] @ phase[c0:c0 + chunk]
+        Z.append(z)
+    Z = xp.stack(Z) / var                                    # (R, 2, delays)
+    nodes = numpy.cos(numpy.pi * (numpy.arange(anchors) + 0.5) / anchors)
+    unit = numpy.array([[u, v] for u in nodes for v in nodes])
+    degree = [anchors - 1, anchors - 1]
+    inverse = numpy.linalg.inv(chebyshev.chebvander2d(*unit.T, degree))
+    g = [[], [], []]
+    for rho in fam.responses(blk._offsets(unit)):
+        q = dg.prepare(b, t, rho)
+        for c, v in enumerate(dg.at_prepared(q, delays)):
+            g[c].append(xp.asarray(v))
+    g = [xp.stack(v) / var for v in g]                        # (A^2, delays)
+
+    def twof(offset):
+        u = blk._unit(numpy.atleast_2d(offset))
+        if numpy.any(numpy.abs(u) > 1):
+            return -numpy.inf, 0
+        c = xp.asarray(numpy.conj(blk._coords(u)))[0]         # (R,)
+        w = xp.asarray(chebyshev.chebvander2d(*u.T, degree) @ inverse)[0]
+        z = xp.tensordot(c, Z, axes=1)                         # (2, delays)
+        g00, g11, g01 = (w @ v for v in g)
+        f = (g11 * xp.abs(z[0]) ** 2 + g00 * xp.abs(z[1]) ** 2
+             - 2 * xp.real(xp.conj(z[0]) * g01 * z[1])) / (
+                 g00 * g11 - xp.abs(g01) ** 2)
+        k = int(xp.argmax(f))
+        return float(f[k]), k
+    res = minimize(lambda o: -twof(o)[0], numpy.asarray(candidate['sky']),
+                   method='Nelder-Mead',
+                   options=dict(xatol=1e-4, fatol=1e-3, maxiter=200))
+    value, k = twof(res.x)
+    if value > candidate['twof']:
+        candidate.update(
+            twof=value, time=float(delays[k]), sky=[float(v) for v in res.x],
+            longitude=float(model.reference['eclipticlongitude']
+                            + res.x[0] * model.scales['eclipticlongitude']),
+            latitude=float(model.reference['eclipticlatitude']
+                           + res.x[1] * model.scales['eclipticlatitude']),
+            refined=True)
+    return candidate
+
+
+def phase_lattice(model, region, mean_mismatch, ndir=3,
+                  band_margin=5 * 86400.0, reach=2.0, full=False):
+    """A template bank of the PN family in its phase coordinates, where the
+    phase is linear in the basis coefficients and the mismatch therefore an
+    exact quadratic form: the frame of ``region`` (points ``(M, 4)``:
+    mchirp, q, spin1z, spin2z) over the observed band, its metric from the
+    template power with the arrival time projected out (the search
+    maximises over it), and a lattice along the metric's eigenvectors with
+    the spacing that gives the cubic lattice a mean mismatch of
+    ``mean_mismatch``. Only nodes within ``reach`` spacings, in the metric,
+    of a region point are kept: the physical part of the frame.
+
+    Returns the nodes' 16 basis-coefficient changes, the region point
+    nearest each (its label), and the spacings; with ``full``, also the
+    nodes' phase coordinates, the frame and its correlator."""
+    from scipy.spatial import cKDTree
+    fam = model.surrogate
+    corr = PhaseNUFFTCorrelation(fam, model.data_spectrum, sky=(0.0, 0.0),
+                                 band_margin=band_margin)
+    region = numpy.atleast_2d(numpy.asarray(region, dtype=float))
+    frame = corr.frame(region, ndir)
+    ndir = frame['directions'].shape[1]
+    s, _, _ = corr.project(region, frame)
+    parts = corr.nodes(frame)
+    rows = [_host(corr.node_row(parts, d, 0)) for d in range(ndir)] \
+        + [_host(corr.node_row(parts, -1, 0))]
+    b0 = numpy.abs(_host(fam.b0)) ** 2
+    power = b0 if corr._sel is None else b0[corr._sel]
+    power = power / power.sum()
+    x = numpy.array(rows)
+    x = x - (x @ power)[:, None]
+    g = (x * power) @ x.T
+    gs = g[:ndir, :ndir] - numpy.outer(g[:ndir, -1], g[-1, :ndir]) / g[-1, -1]
+    values, vectors = numpy.linalg.eigh(gs)
+    values = numpy.maximum(values, 1e-300)
+    h = numpy.sqrt(12 * mean_mismatch / (ndir * values))
+    u = (s - s.mean(axis=0)) @ vectors                       # eigen coordinates
+    axes = []
+    for d in range(ndir):
+        lo, hi = u[:, d].min(), u[:, d].max()
+        n = int(numpy.ceil((hi - lo) / h[d]))
+        axes.append(0.5 * (lo + hi) + (numpy.arange(n + 1) - n / 2) * h[d]
+                    if n > 0 else numpy.array([0.5 * (lo + hi)]))
+    nodes = numpy.array(numpy.meshgrid(*axes, indexing='ij')).reshape(
+        ndir, -1).T
+    # in metric units, the region's points and the nodes; nodes near none dropped
+    scale = numpy.sqrt(values)
+    tree = cKDTree(u * scale)
+    dist, near = tree.query(nodes * scale)
+    keep = dist <= reach * numpy.sqrt(numpy.sum(values * h ** 2))
+    nodes, near = nodes[keep], near[keep]
+    s_nodes = s.mean(axis=0) + nodes @ vectors.T
+    dC = s_nodes @ frame['directions'].T
+    # the reference's own coefficients carry over unchanged at s = 0: the
+    # frame's s are changes from the reference
+    if full:
+        return dC, region[near], h, s_nodes, frame, corr
+    return dC, region[near], h
+
+
+def _host(a):
+    return a.get() if hasattr(a, 'get') else numpy.asarray(a)
 
 
 def merge_candidates(candidates, sky_distance, time_distance):

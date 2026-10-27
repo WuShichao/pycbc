@@ -547,3 +547,35 @@ def test_the_fft_block_search_agrees_with_the_grid_search():
     assert best['twof'] == pytest.approx(ref['twof'], rel=0.05)
     assert abs(best['theta'][0] - mc) < 0.3 * unit
     assert abs(best['time'] - ref['time']) < 3 * m.grid_step
+
+
+def test_a_phase_lattice_bank_finds_the_source_and_refinement_helps():
+    """A bank laid out in the family's phase coordinates, searched by the
+    FFT route, finds the injection; refining the loudest candidate in
+    arrival time and sky does not lower its 2F."""
+    from pycbc.filter.sky_block_search import (block_sky_points,
+                                               fft_search_sky_block,
+                                               phase_lattice)
+    from pycbc.inference import models
+    from pycbc.workflow import WorkflowConfigParser
+    lon, lat = 3.5763564997428436, 0.3429283438977949
+    cp = WorkflowConfigParser()
+    cp.read_string(CONFIG.replace(
+        'grid-periods = 1', 'grid-periods = 1\nharmonics = 8\n'
+        'amplitude-table-file = ' + table_file()))
+    data, psds, snr2, mc = stbbh_data()
+    m = models.read_from_config(cp, data=data, psds=psds)
+    block = m.recentred(lon, lat, 0.02, sky_block_points=200)
+    s = m.static_params
+    unit = m.scales['mchirp']
+    region = numpy.array([[mc + u * unit, s['q'], s['spin1z'], s['spin2z']]
+                          for u in numpy.linspace(-2, 2, 41)])
+    dC, labels, h = phase_lattice(block, region, 0.02, ndir=1)
+    assert len(dC) >= 3 and len(labels) == len(dC)
+    sky = block_sky_points(block, 0.02, 0.5)
+    plain = fft_search_sky_block(block, labels, sky, top=1, coefficients=dC)
+    fine = fft_search_sky_block(block, labels, sky, top=1, coefficients=dC,
+                                refine=1)
+    best, refined = plain['candidates'][0], fine['candidates'][0]
+    assert abs(best['theta'][0] - mc) < 0.5 * unit
+    assert refined['twof'] >= best['twof'] - 1e-6

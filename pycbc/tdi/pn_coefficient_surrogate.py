@@ -86,7 +86,16 @@ class PNCoefficientSurrogate(LinearExponentSurrogate):
         theta = self.theta0 + self.units * numpy.asarray(
             intrinsic, dtype=float)[self.order]
         A, B, la = taylorf2_basis_coefficients(*theta)
-        dA, dB, dla = A - self._A0, B - self._B0, la - self._la0
+        return self.source_from_coefficients(A - self._A0, B - self._B0,
+                                             la - self._la0)
+
+    def source_from_coefficients(self, dA, dB, dla=0.0):
+        """``b`` and ``t`` of the template whose basis coefficients differ
+        from the reference's by ``dA`` and ``dB`` (eight each) and whose log
+        amplitude by ``dla``: any point of the coefficient space, physical
+        or not, as a template bank laid out there needs."""
+        dA, dB = numpy.asarray(dA, dtype=float), numpy.asarray(dB, dtype=float)
+        dla = float(dla)
         xp = self.xp
         if xp is numpy:
             phase, dt = basis_phase_and_time(dA, dB, self.grid.frequencies,
