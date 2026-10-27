@@ -276,22 +276,66 @@ def refine_candidate(model, candidate, anchors=5, subsamples=8, chunk=1 << 18):
     return candidate
 
 
+def aligned_lattice(s, metric, mean_mismatch, reach=1.0):
+    """A cubic lattice covering the points ``s`` (M, n) of a space with
+    constant ``metric``, aligned with their principal axes in the metric,
+    with mean mismatch ``mean_mismatch``; nodes farther than ``reach``
+    covering radii from every point are dropped. Returns the nodes, the
+    index of the point nearest each and the spacings."""
+    from scipy.spatial import cKDTree
+    ndir = s.shape[1]
+    # metric coordinates u = L^T s, then the region's principal axes in them
+    L = numpy.linalg.cholesky(metric)
+    u = (s - s.mean(axis=0)) @ L
+    _, _, axes_t = numpy.linalg.svd(u, full_matrices=False)
+    u = u @ axes_t.T
+    lo, hi = u.min(axis=0), u.max(axis=0)
+    extent, centre = hi - lo, 0.5 * (lo + hi)
+    spread = numpy.mean((u - centre) ** 2, axis=0)
+    # an axis narrower than the spacing gets one layer, and its spread is
+    # mismatch the filled axes' spacing need not supply
+    h = numpy.sqrt(12 * mean_mismatch / ndir)
+    for _ in range(ndir):
+        thin = extent <= h
+        budget = max(mean_mismatch - spread[thin].sum(), 0.25 * mean_mismatch)
+        h = numpy.sqrt(12 * budget / max(1, int(numpy.sum(~thin))))
+    axes = []
+    for d in range(ndir):
+        n = max(1, int(numpy.ceil(extent[d] / h)))
+        axes.append(centre[d] + (numpy.arange(n) - (n - 1) / 2.0) * h)
+    nodes = numpy.array(numpy.meshgrid(*axes, indexing='ij')).reshape(
+        ndir, -1).T
+    tree = cKDTree(u)
+    half = numpy.array([0.5 * h if len(a) > 1 else 0.5 * e
+                        for a, e in zip(axes, extent)])
+    covering = numpy.sqrt(numpy.sum(half ** 2))
+    dist, near = tree.query(nodes)
+    keep = dist <= reach * covering
+    nodes, near = nodes[keep], near[keep]
+    vectors = numpy.linalg.solve(L.T, axes_t.T)            # u -> s
+    return s.mean(axis=0) + nodes @ vectors.T, near, numpy.full(ndir, h)
+
+
 def phase_lattice(model, region, mean_mismatch, ndir=3,
-                  band_margin=5 * 86400.0, reach=2.0, full=False):
+                  band_margin=5 * 86400.0, reach=1.0, full=False):
     """A template bank of the PN family in its phase coordinates, where the
     phase is linear in the basis coefficients and the mismatch therefore an
     exact quadratic form: the frame of ``region`` (points ``(M, 4)``:
     mchirp, q, spin1z, spin2z) over the observed band, its metric from the
     template power with the arrival time projected out (the search
-    maximises over it), and a lattice along the metric's eigenvectors with
-    the spacing that gives the cubic lattice a mean mismatch of
-    ``mean_mismatch``. Only nodes within ``reach`` spacings, in the metric,
-    of a region point are kept: the physical part of the frame.
+    maximises over it), and an :func:`aligned_lattice` of mean mismatch
+    ``mean_mismatch``.
+
+    The region's image is far thinner than it is long (over two years the
+    mass ratio and spins move the phase by a fraction of a radian), so the
+    lattice follows its principal axes: an axis it spans less than a
+    spacing gets one layer. Only nodes within ``reach`` covering radii of a
+    region point are kept; every point is nearer one of them than any
+    dropped node.
 
     Returns the nodes' 16 basis-coefficient changes, the region point
     nearest each (its label), and the spacings; with ``full``, also the
     nodes' phase coordinates, the frame and its correlator."""
-    from scipy.spatial import cKDTree
     fam = model.surrogate
     corr = PhaseNUFFTCorrelation(fam, model.data_spectrum, sky=(0.0, 0.0),
                                  band_margin=band_margin)
@@ -309,25 +353,7 @@ def phase_lattice(model, region, mean_mismatch, ndir=3,
     x = x - (x @ power)[:, None]
     g = (x * power) @ x.T
     gs = g[:ndir, :ndir] - numpy.outer(g[:ndir, -1], g[-1, :ndir]) / g[-1, -1]
-    values, vectors = numpy.linalg.eigh(gs)
-    values = numpy.maximum(values, 1e-300)
-    h = numpy.sqrt(12 * mean_mismatch / (ndir * values))
-    u = (s - s.mean(axis=0)) @ vectors                       # eigen coordinates
-    axes = []
-    for d in range(ndir):
-        lo, hi = u[:, d].min(), u[:, d].max()
-        n = int(numpy.ceil((hi - lo) / h[d]))
-        axes.append(0.5 * (lo + hi) + (numpy.arange(n + 1) - n / 2) * h[d]
-                    if n > 0 else numpy.array([0.5 * (lo + hi)]))
-    nodes = numpy.array(numpy.meshgrid(*axes, indexing='ij')).reshape(
-        ndir, -1).T
-    # in metric units, the region's points and the nodes; nodes near none dropped
-    scale = numpy.sqrt(values)
-    tree = cKDTree(u * scale)
-    dist, near = tree.query(nodes * scale)
-    keep = dist <= reach * numpy.sqrt(numpy.sum(values * h ** 2))
-    nodes, near = nodes[keep], near[keep]
-    s_nodes = s.mean(axis=0) + nodes @ vectors.T
+    s_nodes, near, h = aligned_lattice(s, gs, mean_mismatch, reach)
     dC = s_nodes @ frame['directions'].T
     # the reference's own coefficients carry over unchanged at s = 0: the
     # frame's s are changes from the reference

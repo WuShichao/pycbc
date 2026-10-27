@@ -549,6 +549,26 @@ def test_the_fft_block_search_agrees_with_the_grid_search():
     assert abs(best['time'] - ref['time']) < 3 * m.grid_step
 
 
+def test_an_aligned_lattice_lays_one_layer_across_a_thin_sheet():
+    """A sheet thinner than the spacing in a skewed metric gets one layer;
+    every point is within the covering radius of a kept node and the mean
+    mismatch to the nearest node is about the one asked for."""
+    from pycbc.filter.sky_block_search import aligned_lattice
+    rng = numpy.random.default_rng(3)
+    u = numpy.column_stack([rng.uniform(0, 20, 4000),
+                            rng.uniform(0, 0.05, 4000), numpy.zeros(4000)])
+    L = numpy.array([[1.0, 0, 0], [0.3, 2.0, 0], [0.1, -0.2, 0.5]])
+    metric = L @ L.T
+    s = numpy.linalg.solve(L.T, u.T).T            # metric distance = |u|
+    nodes, near, h = aligned_lattice(s, metric, 0.01)
+    assert len(near) == len(nodes)
+    assert len(nodes) <= int(numpy.ceil(20 / h[0])) + 1
+    d = s[:, None, :] - nodes[None]
+    m = numpy.einsum('pni,ij,pnj->pn', d, metric, d).min(axis=1)
+    assert m.max() <= (0.5 * h[0]) ** 2 + 0.03 ** 2 + 1e-9
+    assert 0.6 * 0.01 < m.mean() < 1.2 * 0.01
+
+
 def test_a_phase_lattice_bank_finds_the_source_and_refinement_helps():
     """A bank laid out in the family's phase coordinates, searched by the
     FFT route, finds the injection; refining the loudest candidate in
