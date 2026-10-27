@@ -728,12 +728,13 @@ class BStatisticSurrogate(BaseModel):
         return model
 
     def recentred(self, longitude, latitude, sky_block_radius,
-                  sky_block_points=600):
+                  sky_block_points=600, sky_block_tolerance=1e-4):
         """The model of a block of the sky centred at ``longitude`` and
         ``latitude``: the same family's intrinsic part, a sky block about the
         new centre (see :class:`pycbc.tdi.sky_block_response.SkyBlockResponse`)
         and the data resampled to SSB time there, the block's phase
-        centre."""
+        centre. A looser ``sky_block_tolerance`` gives a block of lower rank,
+        as a coarse first stage can use."""
         import copy
         from pycbc.filter.nufft_correlation import source_power_weights
         from pycbc.tdi.linear_exponent_surrogate import DailyGram
@@ -749,7 +750,8 @@ class BStatisticSurrogate(BaseModel):
              self.scales['eclipticlatitude']), sky_block_radius,
             kmax=a['harmonics'], samples=a['samples'], ratio=a['ratio'],
             weight=source_power_weights(fam), points=sky_block_points,
-            test_points=100, exact_frequencies=min(len(a['coarse']), 160))
+            test_points=100, exact_frequencies=min(len(a['coarse']), 160),
+            tolerance=sky_block_tolerance)
         spectrum, noise = ssb_data_spectrum(a['grid'], a['bins'], a['orbit'],
                                             longitude, latitude, xp=fam.xp)
         point = dict(self.reference)

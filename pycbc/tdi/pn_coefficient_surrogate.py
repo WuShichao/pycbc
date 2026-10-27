@@ -104,6 +104,20 @@ class PNCoefficientSurrogate(LinearExponentSurrogate):
             return b, self.t0 + dt
         return self._source_kernel(dA, dB, dla)
 
+    def coefficient_factor(self, dA, dB, dla=0.0):
+        """The factor ``b / b0`` of :meth:`source_from_coefficients` on every
+        bin, also where the reference vanishes: the template's spectrum
+        relative to the reference's, which correlations share."""
+        dA, dB = numpy.asarray(dA, dtype=float), numpy.asarray(dB, dtype=float)
+        xp = self.xp
+        if xp is numpy:
+            phase, _ = basis_phase_and_time(dA, dB, self.grid.frequencies,
+                                            self.f_lower)
+            return numpy.exp(float(dla) + 1j * phase).astype(self.dtype)
+        if not hasattr(self, '_ones'):
+            self._ones = xp.ones(self.size, dtype=self.dtype)
+        return self._source_kernel(dA, dB, float(dla), base=self._ones)[0]
+
     _PN_KERNEL = r"""
     #include <cupy/complex.cuh>
     typedef complex<{real}> cplx;
@@ -137,7 +151,7 @@ class PNCoefficientSurrogate(LinearExponentSurrogate):
     }
     """
 
-    def _source_kernel(self, dA, dB, dla, threads=256):
+    def _source_kernel(self, dA, dB, dla, threads=256, base=None):
         xp = self.xp
         if not hasattr(self, '_pn_kernel'):
             real = 'float' if self.dtype == numpy.complex64 else 'double'
@@ -152,7 +166,7 @@ class PNCoefficientSurrogate(LinearExponentSurrogate):
         b = xp.empty(self.size, dtype=self.dtype)
         t = xp.empty(self.size, dtype=xp.float64)
         self._pn_kernel(((self.size + threads - 1) // threads,), (threads,), (
-            self.b0, self.t0, self._f, self._cbrt, self._logf,
+            self.b0 if base is None else base, self.t0, self._f, self._cbrt, self._logf,
             xp.asarray(numpy.concatenate([dA, dB])), numpy.float64(c0),
             numpy.float64(c1), numpy.float64(fl),
             numpy.float64(numpy.exp(dla)), numpy.int64(self.size), b, t))

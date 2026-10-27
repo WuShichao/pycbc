@@ -93,7 +93,9 @@ def search_sky_block(model, region, sky, top=20, sky_tolerance=1e-4,
 def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
                          anchors=5, lag_chunk=1 << 18, refine=0,
                          subsamples=8, coefficients=None, sky_set=None,
-                         lag_shift=None, oversample=1):
+                         lag_shift=None, oversample=1, gram_reuse=1,
+                         basis_chunk=16, kernels=None, share_spectra=True,
+                         decimate=1, threshold=None):
     """The loudest ``top`` candidates of one sky block by one FFT per
     intrinsic template and sky-basis vector.
 
@@ -123,8 +125,19 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
     var = model.noise_variance
     lo, hi = (float(model.delays.min()), float(model.delays.max())) \
         if delay_range is None else delay_range
-    oversample = int(oversample)
-    dt, size = fam.grid.delta_t / oversample, fam.size * oversample
+    oversample, decimate = int(oversample), int(decimate)
+    if decimate > 1 and (oversample > 1 or fam.size % decimate):
+        raise ValueError("decimate needs oversample 1 and to divide the "
+                         "grid")
+    dt = fam.grid.delta_t * decimate / oversample
+    size = fam.size * oversample // decimate
+
+    def fold(a):
+        # every decimate-th lag: the spectrum's folds summed, a transform
+        # decimate times shorter
+        if decimate == 1:
+            return a
+        return a.reshape(a.shape[:-1] + (decimate, size)).sum(axis=-2)
     lags = numpy.arange(numpy.ceil(lo / dt), numpy.floor(hi / dt) + 1)
     index = xp.asarray(lags.astype(numpy.int64) % size)
     delays = lags * dt
@@ -152,7 +165,21 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
                                         * xp.arange(fam.size))
              for v in shifts]
     anchor_rho = fam.responses(blk._offsets(unit))
-    found, start = [], time.time()
+    fast = xp is not numpy and fam.dtype == numpy.complex64 \
+        if kernels is None else bool(kernels)
+    if fast:
+        from pycbc.filter.sky_block_kernels import (correlation_spectra,
+                                                    multiply_fold, twof_max)
+        Ub = xp.asarray(blk._basis, dtype=xp.complex64)
+        lag_day = lag_day.astype(xp.int32)
+        shared = None
+        if coefficients is not None and share_spectra:
+            shared = xp.empty((blk.rank, 2, fam.size), dtype=xp.complex64)
+            for r0 in range(0, blk.rank, basis_chunk):
+                nr = min(basis_chunk, blk.rank - r0)
+                correlation_spectra(fam, model.data_spectrum, fam.b0, fam.t0,
+                                    Ub, r0, nr, out=shared[r0:r0 + nr])
+    found, start, survivors = [], time.time(), []
     for n, theta in enumerate(numpy.atleast_2d(thetas)):
         ks = 0 if sky_set is None else int(sky_set[n])
         sky, C, W = sets[ks], Cs[ks], Ws[ks]
@@ -169,22 +196,58 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
             xi = model._shape_coordinates(point)
             b, t = fam._source(xi[:fam.nintrinsic])
         # the Gram at the anchors, a day at a time, interpolated to the sky
-        g = [[], [], []]
-        for r in anchor_rho:
-            q = dg.prepare(b, t, r)
-            for c, v in enumerate(dg.at_prepared(q, days)):
-                g[c].append(xp.asarray(v))
-        G = [W @ xp.stack(v) / var for v in g]                     # (P, days)
+        if n % max(1, int(gram_reuse)) == 0:
+            g = [[], [], []]
+            for r in anchor_rho:
+                q = dg.prepare(b, t, r)
+                for c, v in enumerate(dg.at_prepared(q, days)):
+                    g[c].append(xp.asarray(v))
+            g = [xp.stack(v) for v in g]
+        G = [W @ v / var for v in g]                                # (P, days)
         det = G[0] * G[1] - xp.abs(G[2]) ** 2
         # z(Delta) = sum_m a_m exp(2 pi i m Delta / T): the inverse FFT
         # times its length
         ramp = ramps[ks]
-        Z = xp.stack([xp.fft.ifft(fam.correlation_spectrum(
-            model.data_spectrum, b, t, U[r]) * (1 if ramp is None else ramp),
-            n=size, axis=-1)[:, index] * size
-            for r in range(blk.rank)])                              # (R, 2, L)
-        best, where = -numpy.inf, None
-        for c0 in range(0, len(lags), lag_chunk):
+        if fast:
+            Z = xp.empty((blk.rank, 2, len(lags)), dtype=xp.complex64)
+            if shared is not None:
+                factor = xp.conj(fam.coefficient_factor(dC[:8], dC[8:]))
+                if ramp is not None:
+                    factor = factor * ramp
+            for r0 in range(0, blk.rank, basis_chunk):
+                nr = min(basis_chunk, blk.rank - r0)
+                if shared is not None:
+                    # the template's spectra are the reference's times its
+                    # factor, to second order in the harmonics' shift
+                    a = multiply_fold(shared[r0:r0 + nr], factor, decimate)
+                else:
+                    a = correlation_spectra(fam, model.data_spectrum, b, t,
+                                            Ub, r0, nr)
+                    if ramp is not None:
+                        a *= ramp
+                    a = fold(a)
+                Z[r0:r0 + nr] = xp.fft.ifft(a, n=size, axis=-1)[
+                    :, :, index] * size
+                del a
+            tb, ta = twof_max(Z, C, G[0], G[1], G[2], det, lag_day, 1 / var)
+            if threshold is not None:
+                ps, tiles = xp.nonzero(tb > threshold)
+                if len(ps):
+                    js = _host(ta[ps, tiles])
+                    survivors.append(numpy.column_stack([
+                        numpy.full(len(js), n), _host(ps), js,
+                        _host(tb[ps, tiles]), numpy.full(len(js), ks)]))
+            k = int(xp.argmax(tb))
+            p, tile = divmod(k, tb.shape[1])
+            best, where = float(tb[p, tile]), (p, int(ta[p, tile]))
+            del Z
+        else:
+            Z = xp.stack([xp.fft.ifft(fold(fam.correlation_spectrum(
+                model.data_spectrum, b, t, U[r])
+                * (1 if ramp is None else ramp)), n=size, axis=-1)[
+                    :, index] * size for r in range(blk.rank)])     # (R, 2, L)
+            best, where = -numpy.inf, None
+        for c0 in (range(0, len(lags), lag_chunk) if not fast else []):
             cut = slice(c0, c0 + lag_chunk)
             z = (C @ Z[:, :, cut].reshape(blk.rank, -1)).reshape(
                 len(sky), 2, -1) / var
@@ -218,7 +281,14 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
         found.sort(key=lambda c: -c['twof'])
     points = sum(len(sets[0 if sky_set is None else int(sky_set[n])])
                  for n in range(len(found)))
-    return dict(candidates=found[:top], templates=points * len(lags))
+    out = dict(candidates=found[:top], templates=points * len(lags))
+    if threshold is not None:
+        # rows: template, sky point, lag index, 2F, sky set; the lag's
+        # time is delays[lag] plus the set's shift
+        out['survivors'] = numpy.vstack(survivors) if survivors else \
+            numpy.zeros((0, 5))
+        out['delays'] = delays
+    return out
 
 
 def refine_candidate(model, candidate, anchors=5, subsamples=8, chunk=1 << 18):
