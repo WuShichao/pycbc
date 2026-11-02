@@ -132,6 +132,18 @@ class SkyBasis(object):
                                                           1e-300), 0)
         self._vectors = [(u.reshape(self._shape) * inverse).astype(
             family.R0.dtype) for u in self._U]
+        # a sky-block family's responses are its block's basis rows mixed
+        # by the block's coordinates: projections and their errors are
+        # then small products in those coordinates
+        self._block = None
+        block = getattr(family, 'sky_block', None)
+        if block is not None and len(block.orders) == nk:
+            B = xp.asarray(block._basis, dtype=xp.complex128) * self._root
+            B = B.reshape(block.rank, -1)
+            P = B @ xp.conj(self._U.T)                    # (block, rank)
+            Q = B - P @ self._U
+            self._block = (block, P, Q @ xp.conj(Q.T), B @ xp.conj(B.T))
+            del B, Q
 
     def _rows(self, points, chunk=64):
         xp = self.xp
@@ -155,6 +167,14 @@ class SkyBasis(object):
         """The coordinates ``(M, rank)`` of each point's response on the
         basis and their exact relative errors ``(M,)``."""
         xp = self.xp
+        if self._block is not None:
+            block, P, Hres, Hall = self._block
+            c = xp.asarray(block._coords(block._unit(points)),
+                           dtype=xp.complex128)
+            C = c @ P
+            res = xp.sum(xp.conj(c) * (c @ Hres), axis=1).real
+            norm = xp.sum(xp.conj(c) * (c @ Hall), axis=1).real
+            return _host(C), _host(xp.sqrt(xp.maximum(res, 0) / norm))
         coords, errors = [], []
         for i in range(0, len(points), chunk):
             A = self._rows(points[i:i + chunk])

@@ -475,6 +475,20 @@ def test_a_sky_block_gives_the_model_the_exact_response():
     single = numpy.array(single)
     near = single > single.max() - 20
     assert numpy.abs(batch - single)[near].max() < 0.02
+    # a sky block's projections from its coordinates are those of the
+    # full response rows
+    basis = m._shared_regions[-1].correlator.sky_basis
+    assert basis._block is not None
+    off = numpy.column_stack([numpy.linspace(-1, 1, 9) * 0.015
+                              / m.scales['eclipticlongitude'],
+                              numpy.zeros(9)])
+    coords, err = basis.project(off)
+    basis._block, kept = None, basis._block
+    rows_coords, rows_err = basis.project(off)
+    basis._block = kept
+    assert numpy.abs(coords - rows_coords).max() <= 1e-6 * numpy.abs(
+        rows_coords).max()
+    numpy.testing.assert_allclose(err, rows_err, rtol=1e-3, atol=1e-9)
 
 
 def test_a_recentred_model_is_the_model_built_there():
