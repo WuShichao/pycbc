@@ -94,6 +94,9 @@ class EccentricModeFamily(object):
                 for i in levels[0] for j in levels[1] for l in levels[2]}
         self._circ = {(i, l): self._circular(i, l)
                       for i in levels[0] for l in levels[2]}
+        self._circ_amp = _tensor_quadratic(
+            {(i, 0, l): c[0] for (i, l), c in self._circ.items()},
+            (self.steps[0], 0.0, self.steps[2]))
         self.keys = [k for k in grid[0, 0, 0]
                      if all(k in g for g in grid.values())]
         self._expansions = {}
@@ -187,6 +190,34 @@ class EccentricModeFamily(object):
             a = amp(d, de, dq)
             c = corr(d, de, dq) - corr(0.0, 0.0, 0.0)
             out[k] = (numpy.where(have, a, 0), psi0 + r * dc + c, have)
+        return out
+
+    def dominant_correction(self, d, de, dq=0.0, frequencies=None):
+        """The dominant mode's eccentric factor at ``(d, de, dq)``: its
+        complex amplitude over the circular binary's and ``exp(-i (psi -
+        psi_circ))``, on ``frequencies`` (by default the family's),
+        interpolated linearly from the family's grid (the factor is smooth
+        in frequency) and 1 outside it. Times a circular template it is
+        the eccentric one; the circular part is the search's own family."""
+        key = (2, 2, 2) if (2, 2, 2) in self._expansions else max(
+            self._expansions, key=lambda k: numpy.sum(
+                abs(self._expansions[k][1](0.0, 0.0, 0.0)) ** 2))
+        r, amp, corr, psi0, have = self._expansions[key]
+        # constant and linear parts of the correction (pyEFPEHM's pinning)
+        # are a phase and an arrival time, which the search maximises over
+        a = amp(d, de, dq)[0]
+        a0 = self._circ_amp(d, 0.0, dq)[0]
+        ratio = numpy.where(have & (abs(a0) > 0), a / numpy.where(
+            abs(a0) > 0, a0, 1), 1)
+        factor = ratio * numpy.exp(-1j * numpy.where(have, corr(d, de, dq),
+                                                     0))
+        if frequencies is None:
+            return factor
+        f = numpy.asarray(frequencies, dtype=float)
+        out = numpy.ones(len(f), dtype=complex)
+        inside = (f >= self.f[0]) & (f <= self.f[-1])
+        out[inside] = numpy.interp(f[inside], self.f, factor.real) + 1j * \
+            numpy.interp(f[inside], self.f, factor.imag)
         return out
 
     def polarizations(self, d, de, dq=0.0, circular=None):

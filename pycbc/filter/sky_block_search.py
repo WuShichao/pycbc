@@ -95,7 +95,7 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
                          subsamples=8, coefficients=None, sky_set=None,
                          lag_shift=None, oversample=1, gram_reuse=1,
                          basis_chunk=16, kernels=None, share_spectra=None,
-                         decimate=1, threshold=None):
+                         decimate=1, threshold=None, factors=None):
     """The loudest ``top`` candidates of one sky block by one FFT per
     intrinsic template and sky-basis vector.
 
@@ -193,10 +193,15 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
     for n, theta in enumerate(numpy.atleast_2d(thetas)):
         ks = 0 if sky_set is None else int(sky_set[n])
         sky, C, W = sets[ks], Cs[ks], Ws[ks]
+        extra = None if factors is None else xp.asarray(
+            factors(n) if callable(factors) else factors[n],
+            dtype=fam.dtype)
         if coefficients is not None:
             # a template of the coefficient space, labelled by ``theta``
             dC = numpy.asarray(coefficients[n], dtype=float)
             b, t = fam.source_from_coefficients(dC[:8], dC[8:])
+            if extra is not None:
+                b = b * extra
         else:
             point = dict(model.static_params)
             point.update(dict(zip(['mchirp', 'q', 'spin1z', 'spin2z'],
@@ -205,6 +210,8 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
                           ('eclipticlongitude', 'eclipticlatitude')})
             xi = model._shape_coordinates(point)
             b, t = fam._source(xi[:fam.nintrinsic])
+            if extra is not None:
+                b = b * extra
         # the Gram at the anchors, a day at a time, interpolated to the sky
         if n % max(1, int(gram_reuse)) == 0:
             g = [[], [], []]
@@ -221,7 +228,10 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
         if fast:
             Z = xp.empty((blk.rank, 2, len(lags)), dtype=xp.complex64)
             if shared is not None:
-                factor = xp.conj(fam.coefficient_factor(dC[:8], dC[8:]))
+                factor = fam.coefficient_factor(dC[:8], dC[8:])
+                if extra is not None:
+                    factor = factor * extra
+                factor = xp.conj(factor)
                 if ramp is not None:
                     factor = factor * ramp
             for r0 in range(0, blk.rank, basis_chunk):

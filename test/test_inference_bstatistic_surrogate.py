@@ -644,6 +644,45 @@ def test_the_two_stage_block_search_finds_what_the_fine_grid_finds():
     assert abs(best['time'] - fine['time']) < 3 * m.grid_step
 
 
+def test_template_factors_enter_the_fft_block_search():
+    """A factor of one changes nothing; a phase ramp exp(-2 pi i f tau) on
+    the template moves the found arrival time by tau, as any factor on the
+    frequencies (an eccentric correction for one) enters the template."""
+    from pycbc.filter.sky_block_search import (block_sky_points,
+                                               fft_search_sky_block,
+                                               phase_lattice)
+    from pycbc.inference import models
+    from pycbc.workflow import WorkflowConfigParser
+    lon, lat = 3.5763564997428436, 0.3429283438977949
+    cp = WorkflowConfigParser()
+    cp.read_string(CONFIG.replace(
+        'grid-periods = 1', 'grid-periods = 1\nharmonics = 8\n'
+        'amplitude-table-file = ' + table_file()))
+    data, psds, snr2, mc = stbbh_data()
+    m = models.read_from_config(cp, data=data, psds=psds)
+    block = m.recentred(lon, lat, 0.02, sky_block_points=200)
+    s = m.static_params
+    unit = m.scales['mchirp']
+    region = numpy.array([[mc + u * unit, s['q'], s['spin1z'], s['spin2z']]
+                          for u in numpy.linspace(-1, 1, 21)])
+    dC, labels, _ = phase_lattice(block, region, 0.02, ndir=1)
+    sky = block_sky_points(block, 0.02, 0.5)
+    plain = fft_search_sky_block(block, labels, sky, top=1, coefficients=dC)
+    ones = numpy.ones((len(dC), block.surrogate.size), dtype=complex)
+    same = fft_search_sky_block(block, labels, sky, top=1, coefficients=dC,
+                                factors=ones)
+    assert same['candidates'][0]['twof'] == plain['candidates'][0]['twof']
+    tau = 5 * m.grid_step
+    f = numpy.asarray(block.surrogate.grid.frequencies)
+    ramp = numpy.exp(-2j * numpy.pi * f * tau)
+    moved = fft_search_sky_block(block, labels, sky, top=1, coefficients=dC,
+                                 factors=lambda n: ramp)
+    shift = moved['candidates'][0]['time'] - plain['candidates'][0]['time']
+    assert abs(abs(shift) - tau) < m.grid_step
+    numpy.testing.assert_allclose(moved['candidates'][0]['twof'],
+                                  plain['candidates'][0]['twof'], rtol=0.05)
+
+
 def test_a_phase_lattice_bank_finds_the_source_and_refinement_helps():
     """A bank laid out in the family's phase coordinates, searched by the
     FFT route, finds the injection; refining the loudest candidate in
