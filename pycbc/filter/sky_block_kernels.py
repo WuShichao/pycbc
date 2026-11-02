@@ -151,7 +151,7 @@ extern "C" __global__ void multiply_fold(
   complex<float> acc(0, 0);
   for (int j = 0; j < q; j++) {
     long long i = m + j * size;
-    acc += shared[row * n + i] * factor[i];
+    if (i < n) acc += shared[row * n + i] * factor[i];
   }
   out[row * size + m] = acc;
 }
@@ -226,13 +226,14 @@ def twof_max(Z, C, g00, g11, g01, det, lag_day, inv_var, tile=16,
     return best, arg
 
 
-def multiply_fold(shared, factor, decimate=1, out=None):
-    """``shared`` (rows..., N) times ``factor`` (N), its ``decimate`` folds
-    summed: the spectra of a template from the reference's, ready for a
-    transform ``decimate`` times shorter."""
+def multiply_fold(shared, factor, size=None, out=None):
+    """``shared`` (rows..., N) times ``factor`` (N), its folds of period
+    ``size`` (default N) summed: the spectra of a template from the
+    reference's, ready for a transform of length ``size``."""
     import cupy
     n = shared.shape[-1]
-    size = n // decimate
+    size = n if size is None else int(size)
+    decimate = -(-n // size)
     rows = int(numpy.prod(shared.shape[:-1]))
     if out is None:
         out = cupy.empty(shared.shape[:-1] + (size,), dtype=cupy.complex64)

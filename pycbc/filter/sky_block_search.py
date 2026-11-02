@@ -94,7 +94,7 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
                          anchors=5, lag_chunk=1 << 18, refine=0,
                          subsamples=8, coefficients=None, sky_set=None,
                          lag_shift=None, oversample=1, gram_reuse=1,
-                         basis_chunk=16, kernels=None, share_spectra=True,
+                         basis_chunk=16, kernels=None, share_spectra=None,
                          decimate=1, threshold=None):
     """The loudest ``top`` candidates of one sky block by one FFT per
     intrinsic template and sky-basis vector.
@@ -126,18 +126,20 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
     lo, hi = (float(model.delays.min()), float(model.delays.max())) \
         if delay_range is None else delay_range
     oversample, decimate = int(oversample), int(decimate)
-    if decimate > 1 and (oversample > 1 or fam.size % decimate):
-        raise ValueError("decimate needs oversample 1 and to divide the "
-                         "grid")
-    dt = fam.grid.delta_t * decimate / oversample
-    size = fam.size * oversample // decimate
+    if decimate > 1 and oversample > 1:
+        raise ValueError("decimate needs oversample 1")
+    # decimating: the spectrum's folds of period size summed give the lags
+    # at step T / size exactly, whatever size divides
+    size = fam.size * oversample if decimate == 1 else \
+        -(-fam.size // decimate)
+    dt = fam.grid.delta_t * fam.size / size
 
     def fold(a):
-        # every decimate-th lag: the spectrum's folds summed, a transform
-        # decimate times shorter
         if decimate == 1:
             return a
-        return a.reshape(a.shape[:-1] + (decimate, size)).sum(axis=-2)
+        q = -(-a.shape[-1] // size)
+        pad = [(0, 0)] * (a.ndim - 1) + [(0, q * size - a.shape[-1])]
+        return xp.pad(a, pad).reshape(a.shape[:-1] + (q, size)).sum(axis=-2)
     lags = numpy.arange(numpy.ceil(lo / dt), numpy.floor(hi / dt) + 1)
     index = xp.asarray(lags.astype(numpy.int64) % size)
     delays = lags * dt
@@ -173,6 +175,14 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
         Ub = xp.asarray(blk._basis, dtype=xp.complex64)
         lag_day = lag_day.astype(xp.int32)
         shared = None
+        if share_spectra is None:
+            # worth it for several templates, and only if it fits: at most
+            # 40% of the pool's limit (or of the device's free memory)
+            need = blk.rank * 2 * fam.size * 8
+            limit = xp.get_default_memory_pool().get_limit() or \
+                xp.cuda.Device().mem_info[0]
+            share_spectra = len(numpy.atleast_2d(thetas)) >= 4 and \
+                need <= 0.4 * limit
         if coefficients is not None and share_spectra:
             shared = xp.empty((blk.rank, 2, fam.size), dtype=xp.complex64)
             for r0 in range(0, blk.rank, basis_chunk):
@@ -219,7 +229,7 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
                 if shared is not None:
                     # the template's spectra are the reference's times its
                     # factor, to second order in the harmonics' shift
-                    a = multiply_fold(shared[r0:r0 + nr], factor, decimate)
+                    a = multiply_fold(shared[r0:r0 + nr], factor, size)
                 else:
                     a = correlation_spectra(fam, model.data_spectrum, b, t,
                                             Ub, r0, nr)
@@ -649,8 +659,8 @@ def phase_frame(model, region, ndir=3, band_margin=5 * 86400.0):
     parts = corr.nodes(frame)
     rows = [_host(corr.node_row(parts, d, 0)) for d in range(ndir)] \
         + [_host(corr.node_row(parts, -1, 0))]
-    b0 = numpy.abs(_host(fam.b0)) ** 2
-    power = b0 if corr._sel is None else b0[corr._sel]
+    power = corr.template_power()
+    power = power if corr._sel is None else power[corr._sel]
     power = power / power.sum()
     x = numpy.array(rows)
     x = x - (x @ power)[:, None]

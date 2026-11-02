@@ -232,8 +232,7 @@ class PhaseNUFFTCorrelation(object):
         # frequency, on a coarse grid
         step = max(1, len(f) // 4000)
         coarse = slice(0, len(f), step)
-        power = numpy.abs(family.b0[coarse].get() if hasattr(
-            family.b0, 'get') else family.b0[coarse]) ** 2
+        power = self.template_power()[coarse]
         if self._sel is not None:
             # the frame from the observed band only
             observed = numpy.zeros(len(f), dtype=bool)
@@ -245,6 +244,20 @@ class PhaseNUFFTCorrelation(object):
         self._A0 = family._A0
         self._B0 = family._B0
         self._la0 = family._la0
+
+    def template_power(self):
+        """The template's power at each bin of the grid, on the host: the
+        whitened source's, ``|b0|^2``, times the response's at ``sky``
+        summed over harmonics, bases and channels. The whitening alone
+        would weigh the zeros of the noise's transfer function, where the
+        response vanishes too, as the loudest frequencies."""
+        if getattr(self, '_template_power', None) is None:
+            fam = self.family
+            rho = _host(self._rho_at)
+            coarse = numpy.sum(numpy.abs(rho) ** 2, axis=(0, 1, 2))
+            response = _host(fam.fine(fam.xp.asarray(coarse)))
+            self._template_power = numpy.abs(_host(fam.b0)) ** 2 * response
+        return self._template_power
 
     def strength(self, harmonic, vector):
         """Node strengths ``(2, N)`` of harmonic index ``harmonic`` for sky

@@ -43,6 +43,12 @@ def test_multiply_fold_sums_the_folds_of_the_product():
     from pycbc.filter.sky_block_kernels import multiply_fold
     rng = numpy.random.default_rng(1)
     shared, factor = complex_normal(rng, 3, 2, 1200), complex_normal(rng, 1200)
-    got = multiply_fold(cupy.asarray(shared), cupy.asarray(factor), 3).get()
+    got = multiply_fold(cupy.asarray(shared), cupy.asarray(factor), 400).get()
     want = (shared * factor).reshape(3, 2, 3, 400).sum(axis=2)
+    numpy.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-5)
+    # a period that does not divide: the last fold padded with zeros
+    got = multiply_fold(cupy.asarray(shared), cupy.asarray(factor), 500).get()
+    prod = numpy.concatenate([shared * factor, numpy.zeros((3, 2, 300))],
+                             axis=-1)
+    want = prod.reshape(3, 2, 3, 500).sum(axis=2)
     numpy.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-5)
