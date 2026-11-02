@@ -703,8 +703,8 @@ class BStatisticSurrogate(BaseModel):
             # the response harmonics over a block of the sky from the exact
             # response, in place of the first-order sky model
             from pycbc.filter.nufft_correlation import source_power_weights
-            from pycbc.tdi.sky_block_response import SkyBlockResponse
-            fam.sky_block = SkyBlockResponse(
+            from pycbc.tdi.sky_block_response import sky_block
+            fam.sky_block = sky_block(
                 orbit, terms, coarse, (lon, lat),
                 (scales['eclipticlongitude'], scales['eclipticlatitude']),
                 sky_block_radius, kmax=harmonics, samples=response_samples,
@@ -734,17 +734,18 @@ class BStatisticSurrogate(BaseModel):
         new centre (see :class:`pycbc.tdi.sky_block_response.SkyBlockResponse`)
         and the data resampled to SSB time there, the block's phase
         centre. A looser ``sky_block_tolerance`` gives a block of lower rank,
-        as a coarse first stage can use."""
+        as a coarse first stage can use. The block comes from the directory
+        ``PYCBC_SKY_BLOCK_CACHE`` names when it has been fitted before."""
         import copy
         from pycbc.filter.nufft_correlation import source_power_weights
         from pycbc.tdi.linear_exponent_surrogate import DailyGram
         from pycbc.tdi.ssb_yearly_harmonics import ssb_data_spectrum
-        from pycbc.tdi.sky_block_response import SkyBlockResponse
+        from pycbc.tdi.sky_block_response import sky_block
         a = getattr(self, '_recentre_args', None)
         if a is None:
             raise ValueError("only a model from from_data can be recentred")
         fam = copy.copy(self.surrogate)
-        fam.sky_block = SkyBlockResponse(
+        fam.sky_block = sky_block(
             a['orbit'], a['terms'], a['coarse'], (longitude, latitude),
             (self.scales['eclipticlongitude'],
              self.scales['eclipticlatitude']), sky_block_radius,

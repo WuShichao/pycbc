@@ -261,6 +261,63 @@ class SkyBlockResponse(object):
         rows = xp.asarray(c) @ cache[1]
         return rows.reshape((len(c),) + self._basis.shape[1:])
 
+    _SAVED = ('output_frequencies', 'frequencies', 'centre', 'scales',
+              'radius', 'kmax', 'samples', 'orders', 'tolerance', 'rank',
+              '_series', 'degree', 'error', '_basis', '_root', '_vt')
+
+    def save(self, path):
+        """Store the fitted block (not its orbit geometry, which only the
+        fit needs) in an ``.npz`` file."""
+        numpy.savez(path, **{k: numpy.asarray(getattr(self, k))
+                             for k in self._SAVED})
+
+    @classmethod
+    def load(cls, path):
+        """A block stored by :meth:`save`; :meth:`exact` is not available
+        on it."""
+        data = numpy.load(path)
+        self = cls.__new__(cls)
+        for k in cls._SAVED:
+            v = data[k]
+            setattr(self, k, v.item() if v.ndim == 0 else v)
+        self.centre, self.scales = tuple(self.centre), tuple(self.scales)
+        self.kmax, self.samples = int(self.kmax), int(self.samples)
+        self.rank, self.degree = int(self.rank), int(self.degree)
+        self._geometry = None
+        return self
+
+    @classmethod
+    def cached(cls, directory, *args, **kwargs):
+        """The block of ``args`` and ``kwargs`` (as the constructor takes
+        them), fitted once and kept in ``directory`` under a hash of every
+        input to the fit; a block depends on no data."""
+        import hashlib
+        import os
+        h = hashlib.sha256()
+        for v in list(args[2:]) + [kwargs[k] for k in sorted(kwargs)]:
+            h.update(numpy.ascontiguousarray(
+                numpy.asarray(v, dtype=float) if v is not None
+                else numpy.zeros(0)).tobytes())
+        h.update(repr(args[1]).encode())
+        path = os.path.join(directory, 'sky_block_%s.npz' % h.hexdigest()[:24])
+        if os.path.exists(path):
+            return cls.load(path)
+        block = cls(*args, **kwargs)
+        os.makedirs(directory, exist_ok=True)
+        block.save(path)
+        return block
+
     def inside(self, offsets):
         """Whether each point lies in the block."""
         return numpy.all(numpy.abs(self._unit(offsets)) <= 1, axis=1)
+
+
+def sky_block(*args, cache=None, **kwargs):
+    """A :class:`SkyBlockResponse`, from ``cache`` (a directory; by default
+    the environment's ``PYCBC_SKY_BLOCK_CACHE``) when it has been fitted
+    before."""
+    import os
+    cache = cache or os.environ.get('PYCBC_SKY_BLOCK_CACHE')
+    if cache:
+        return SkyBlockResponse.cached(cache, *args, **kwargs)
+    return SkyBlockResponse(*args, **kwargs)

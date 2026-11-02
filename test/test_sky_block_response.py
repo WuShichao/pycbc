@@ -73,3 +73,22 @@ def test_the_basis_interpolated_in_frequency_keeps_its_error_honest():
                              axis=1)
            / numpy.linalg.norm(exact.reshape(2, -1), axis=1))
     assert err.max() < 3 * max(blk.error, 1e-6)
+
+
+def test_a_cached_block_is_the_block_it_stored(tmp_path):
+    """sky_block fits a block once into its cache directory and loads it
+    again: the same rank, coordinates and responses, without refitting."""
+    from pycbc.tdi.sky_block_response import sky_block
+    args = (ORBIT, TERMS, F, CENTRE, SCALES, 0.03)
+    kw = dict(kmax=4, points=200, test_points=40)
+    first = sky_block(*args, cache=str(tmp_path), **kw)
+    files = list(tmp_path.iterdir())
+    assert len(files) == 1
+    again = sky_block(*args, cache=str(tmp_path), **kw)
+    assert again._geometry is None and again.rank == first.rank
+    offsets = numpy.array([[0.3, -0.2], [-1.0, 0.5]]) * 0.03 / numpy.array(SCALES)
+    numpy.testing.assert_allclose(again.responses(offsets),
+                                  first.responses(offsets))
+    # another block, another file
+    sky_block(ORBIT, TERMS, F, CENTRE, SCALES, 0.02, cache=str(tmp_path), **kw)
+    assert len(list(tmp_path.iterdir())) == 2
