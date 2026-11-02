@@ -242,6 +242,9 @@ class AMRSampler(BaseSampler):
         self._loglikelihood, self._prior_transform = setup_calls(
             model, loglikelihood_function=loglikelihood_function,
             copy_prior=True)
+        # the model's batches give its loglikelihood only
+        self._default_loglikelihood = loglikelihood_function in (
+            None, 'loglikelihood')
         self.pool = choose_pool(mpi=use_mpi, processes=nprocesses)
         self.nevaluations = 0
         self.history = []
@@ -437,7 +440,8 @@ class AMRSampler(BaseSampler):
         logl = numpy.full(len(cube), -numpy.inf)
         if inside.any():
             points = [self._prior_transform(c) for c in cube[inside]]
-            if self._batched:
+            if self._batched or (self._default_loglikelihood and getattr(
+                    self.model, 'batches_points', False)):
                 names = list(self.model.variable_params)
                 logl[inside] = self.model.loglikelihoods(
                     [dict(zip(names, p)) for p in points])

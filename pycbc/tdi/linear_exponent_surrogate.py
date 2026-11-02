@@ -171,8 +171,8 @@ class LinearExponentSurrogate(object):
         if len(self.sky_block.orders) != len(self.orders):
             raise ValueError("the sky block keeps other harmonics than the "
                              "family")
-        return self.sky_block.responses(sky_offsets, xp=self.xp).astype(
-            self.dtype)
+        return self.sky_block.responses(sky_offsets, xp=self.xp,
+                                        dtype=self.dtype)
 
     def _response(self, sky_offsets):
         """``rho_k`` at the two sky offsets."""

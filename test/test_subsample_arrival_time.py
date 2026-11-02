@@ -112,6 +112,17 @@ def test_twice_sampled_interpolation_reaches_any_delay():
     assert numpy.abs(got - exact).max() < 1e-6 * numpy.abs(exact).max()
 
 
+def test_twice_sampled_interpolation_reads_each_target_from_its_row():
+    fam, even, odd, targets, exact = twice_sampled()
+    rows = numpy.arange(len(targets)) % 2
+    got = interpolate_twice_sampled(numpy.stack([even, 2j * even]),
+                                    numpy.stack([odd, 2j * odd]),
+                                    fam.grid.delta_t / 2, targets, rows=rows)
+    want = exact * numpy.where(rows == 1, 2j, 1)
+    assert got.shape == exact.shape
+    assert numpy.abs(got - want).max() < 1e-6 * numpy.abs(want).max()
+
+
 def test_twice_sampled_interpolation_on_the_gpu():
     cupy = pytest.importorskip('cupy')
     try:

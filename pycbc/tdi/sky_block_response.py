@@ -253,18 +253,22 @@ class SkyBlockResponse(object):
         return numpy.max(numpy.linalg.norm(approx - rows, axis=1)
                          / numpy.linalg.norm(rows, axis=1))
 
-    def responses(self, offsets, xp=numpy):
+    def responses(self, offsets, xp=numpy, dtype=None):
         """The harmonics at family ``offsets`` ``(M, 2)`` from the basis,
-        shape ``(M, 2 kmax + 1, 2, nchannels, nfrequencies)``."""
+        shape ``(M, 2 kmax + 1, 2, nchannels, nfrequencies)``; on the
+        device in ``dtype`` (the basis's own by default), the basis kept
+        there in it."""
         c = self._coords(self._unit(offsets))
         if xp is numpy:
-            return numpy.einsum('mr,r...->m...', c, self._basis)
-        # the product on the device, the basis kept there
+            out = numpy.einsum('mr,r...->m...', c, self._basis)
+            return out if dtype is None else out.astype(dtype)
+        dtype = numpy.dtype(self._basis.dtype if dtype is None else dtype)
         cache = getattr(self, '_device_basis', None)
-        if cache is None or cache[0] is not xp:
-            cache = (xp, xp.asarray(self._basis.reshape(self.rank, -1)))
+        if cache is None or cache[0] is not xp or cache[1].dtype != dtype:
+            cache = (xp, xp.asarray(self._basis.reshape(self.rank, -1),
+                                    dtype=dtype))
             self._device_basis = cache
-        rows = xp.asarray(c) @ cache[1]
+        rows = xp.asarray(c, dtype=dtype) @ cache[1]
         return rows.reshape((len(c),) + self._basis.shape[1:])
 
     _SAVED = ('output_frequencies', 'frequencies', 'centre', 'scales',

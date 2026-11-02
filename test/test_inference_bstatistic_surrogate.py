@@ -167,6 +167,31 @@ def test_the_model_runs_on_the_gpu():
     assert 0 <= rec['polarization'] < 2 * numpy.pi
 
 
+
+def test_batches_on_the_gpu_match_points_one_at_a_time():
+    cupy = pytest.importorskip('cupy')
+    from pycbc.scheme import CUPYScheme
+    try:
+        scheme = CUPYScheme()
+    except Exception:
+        pytest.skip('no usable GPU')
+    fam, daily = family()
+    data, _ = inject(fam, numpy.array([0.3, 0.0, 0.0]), noise=0.1)
+    with scheme:
+        gpu = LinearExponentSurrogate(
+            fam.grid, fam.coarse_frequencies, fam.R0, fam.L, fam.b0, fam.t0,
+            fam.D, fam.T, kmax=3)
+        mg = model(gpu, DailyGram(gpu), cupy.asarray(data), noise=0.1)
+        assert mg.batches_points
+        points = [dict(x=x) for x in numpy.linspace(-0.2, 0.8, 11)]
+        single = []
+        for p in points:
+            mg.update(**p)
+            single.append(mg.loglikelihood)
+        numpy.testing.assert_allclose(mg.loglikelihoods(points), single,
+                                      rtol=0, atol=1e-8)
+
+
 CONFIG = """
 [model]
 name = bstatistic_surrogate

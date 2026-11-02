@@ -198,64 +198,170 @@ class BStatisticSurrogate(BaseModel):
         b, t, rho = s.pieces(self._shape_coordinates(params))
         spectrum = s.correlation_spectrum(self.data_spectrum, b, t, rho)
         xp = self.xp
-        n = spectrum.shape[-1]
         q = self.daily_gram.prepare(b, t, rho)
         var = self.noise_variance
-        table = self.table
-        margin = None if table is not None else self.margin
-
-        def samples(correlation, lags, delays):
-            z = correlation[:, lags].astype(xp.complex128) / var
-            g = tuple(v / var for v in self.daily_gram.at_prepared(q, delays))
-            return z, g
         coarse = xp.fft.ifft(spectrum, axis=-1, norm='forward')
-        z, g = samples(coarse, self._lags_xp, xp.asarray(self.delays))
+        z = coarse[:, self._lags_xp].astype(xp.complex128) / var
+        g = tuple(v / var for v in self.daily_gram.at_prepared(
+            q, xp.asarray(self.delays)))
         nodes = self._orientation_nodes(z, g)
+        lnb = self._marginal(z, g, nodes)
+        return self._refine_peak(spectrum, coarse, q, nodes, z, g, lnb)
 
-        def marginal(z, g):
-            return log_orientation_marginal(
-                z, *g, self.distance_prior, nodes, margin=margin,
-                table=table, xp=xp)
-        lnb = marginal(z, g)
-        width = numpy.full(len(self.delays), self.grid_step)
-        delays = self.delays
-        values = _to_numpy(lnb)
+    def _marginal(self, z, g, nodes):
+        table = self.table
+        return log_orientation_marginal(
+            z, *g, self.distance_prior, nodes,
+            margin=None if table is not None else self.margin, table=table,
+            xp=self.xp)
+
+    def _fine_delays(self, values):
+        """The grid's lags that do not resolve the peak of ``ln B``
+        (``values`` at them), the step of their finer samples and those
+        samples' delays; ``None`` when the grid resolves it."""
         top = values.max()
         need = (values >= top - self._tau) & (values >= self._narrow)
         need = need | numpy.roll(need, 1) | numpy.roll(need, -1)
-        if need.any():
-            # a peak of width sigma_t = 1 / (2 pi sigma_f sqrt(2 ln B)) is
-            # integrated to e^-2pi^2 by samples sigma_t apart
-            peak = max(float(values[need].max()), 0.5)
-            sigma_t = 1 / (2 * numpy.pi * self._sigma_f * numpy.sqrt(
-                2 * peak))
-            P = int(numpy.ceil(self.grid_step / sigma_t))
-        if need.any() and P > 1:
-            k = numpy.nonzero(need)[0]
-            step = self.grid_step / P
+        if not need.any():
+            return None
+        # a peak of width sigma_t = 1 / (2 pi sigma_f sqrt(2 ln B)) is
+        # integrated to e^-2pi^2 by samples sigma_t apart
+        peak = max(float(values[need].max()), 0.5)
+        sigma_t = 1 / (2 * numpy.pi * self._sigma_f * numpy.sqrt(2 * peak))
+        P = int(numpy.ceil(self.grid_step / sigma_t))
+        if P <= 1:
+            return None
+        k = numpy.nonzero(need)[0]
+        step = self.grid_step / P
+        return k, step, numpy.concatenate([self.delays[k] + p * step
+                                           for p in range(1, P)])
+
+    def _half_step_ifft(self, spectrum):
+        """The correlation at the grid's lags shifted by half a step."""
+        xp = self.xp
+        if getattr(self, '_half_step', None) is None:
+            n = spectrum.shape[-1]
+            m = xp.arange(n, dtype=xp.float64)
+            self._half_step = xp.exp(1j * numpy.pi * m / n).astype(
+                spectrum.dtype)
+        return xp.fft.ifft(spectrum * self._half_step, axis=-1,
+                           norm='forward')
+
+    def _fine_correlation(self, coarse, half, df, rows=None):
+        """``z`` at delays ``df`` by band-limited interpolation between the
+        grid's and the half-step lags, the taps where they are cheaper:
+        many on the device."""
+        targets = numpy.mod(df, coarse.shape[-1] * self.grid_step)
+        if len(targets) > 64:
+            targets = self.xp.asarray(targets)
+        return interpolate_twice_sampled(
+            coarse, half, self.grid_step / 2, targets, rows=rows,
+            xp=self.xp) / self.noise_variance
+
+    def _refine_peak(self, spectrum, coarse, q, nodes, z, g, lnb):
+        """Add samples between the grid's lags where they do not resolve the
+        peak of ``ln B`` (``z``, ``g``, ``lnb`` at the grid's lags); returns
+        what :meth:`_time_samples` does."""
+        xp = self.xp
+        var = self.noise_variance
+        width = numpy.full(len(self.delays), self.grid_step)
+        delays = self.delays
+        fine = self._fine_delays(_to_numpy(lnb))
+        if fine is not None:
+            k, step, df = fine
             width[k] = step
-            # the correlation at half steps from one more transform, and
-            # any finer delay by band-limited interpolation between them
-            if getattr(self, '_half_step', None) is None:
-                m = xp.arange(n, dtype=xp.float64)
-                self._half_step = xp.exp(1j * numpy.pi * m / n).astype(
-                    spectrum.dtype)
-            half = xp.fft.ifft(spectrum * self._half_step, axis=-1,
-                               norm='forward')
-            df = numpy.concatenate([self.delays[k] + p * step
-                                    for p in range(1, P)])
-            duration = n * self.grid_step
-            zf = interpolate_twice_sampled(
-                coarse, half, self.grid_step / 2, numpy.mod(df, duration),
-                xp=xp) / var
+            half = self._half_step_ifft(spectrum)
+            zf = self._fine_correlation(coarse, half, df)
             gf = tuple(v / var for v in self.daily_gram.at_prepared(q, df))
-            lf = marginal(zf, gf)
+            lf = self._marginal(zf, gf, nodes)
             z = xp.concatenate([z, zf], axis=1)
             g = tuple(xp.concatenate([a, c]) for a, c in zip(g, gf))
             lnb = xp.concatenate([lnb, lf])
             delays = numpy.concatenate([delays, df])
             width = numpy.concatenate([width, numpy.full(len(df), step)])
         return z, g, lnb, (spectrum, q, delays, width)
+
+    #: points evaluated together by :meth:`_batch_loglikelihoods`
+    batch_size = 8
+
+    @property
+    def batches_points(self):
+        """Whether :meth:`loglikelihoods` evaluates points no shared region
+        covers in batches through the device (an amplitude table on cupy),
+        so a sampler should hand it whole batches."""
+        return self.table is not None and self.xp is not numpy
+
+    def _batch_loglikelihoods(self, params_list):
+        """The marginal log likelihood of each of ``params_list`` (full
+        parameter dicts), as :meth:`_loglikelihood` gives it, with the
+        responses, the correlations' transforms, the orientation quadrature's
+        choice and its marginal done for the batch at once; the peak's finer
+        samples then point by point."""
+        s, xp = self.surrogate, self.xp
+        var = self.noise_variance
+        xis = [self._shape_coordinates(p) for p in params_list]
+        nint = s.nintrinsic
+        sources = [s._source(xi[:nint]) for xi in xis]
+        rhos = s.responses(numpy.array([xi[nint:nint + 2] for xi in xis]))
+        spectra = xp.stack([s.correlation_spectrum(self.data_spectrum, b, t,
+                                                   rhos[i])
+                            for i, (b, t) in enumerate(sources)])
+        coarse = xp.fft.ifft(spectra, axis=-1, norm='forward')
+        z = coarse[:, :, self._lags_xp].astype(xp.complex128) / var
+        delays = xp.asarray(self.delays)
+        qs = [self.daily_gram.prepare(b, t, rhos[i])
+              for i, (b, t) in enumerate(sources)]
+        gs = [tuple(v / var for v in self.daily_gram.at_prepared(q, delays))
+              for q in qs]
+        G = tuple(xp.stack([g[c] for g in gs]) for c in range(3))
+        sets = self._candidate_node_sets()
+        choice = self._node_choice(xp.moveaxis(z, 0, 1), G, sets)
+        L = z.shape[-1]
+        lnb = xp.empty((len(xis), L), dtype=xp.float64)
+        for c in numpy.unique(choice):
+            idx = numpy.nonzero(choice == c)[0]
+            sel = xp.asarray(idx)
+            zz = xp.moveaxis(z[sel], 0, 1).reshape(2, -1)
+            gg = tuple(v[sel].reshape(-1) for v in G)
+            lnb[sel] = self._marginal(zz, gg, sets[int(c)]).reshape(
+                len(idx), L)
+        values = _to_numpy(lnb)
+        # the finer samples of every point at once
+        terms = [values[i] + numpy.log(self.grid_step) for i in range(len(xis))]
+        plans = [self._fine_delays(values[i]) for i in range(len(xis))]
+        refine = [i for i, f in enumerate(plans) if f is not None]
+        if refine:
+            if len(refine) < len(xis):
+                sel = xp.asarray(refine)
+                spectra, coarse = spectra[sel], coarse[sel]
+            half = self._half_step_ifft(spectra)
+            del spectra
+            df = numpy.concatenate([plans[i][2] for i in refine])
+            rows = numpy.concatenate([numpy.full(len(plans[i][2]), r)
+                                      for r, i in enumerate(refine)])
+            zf = self._fine_correlation(coarse, half, df, rows=rows)
+            del coarse, half
+            gf = [tuple(v / var for v in self.daily_gram.at_prepared(
+                qs[i], plans[i][2])) for i in refine]
+            gf = tuple(xp.concatenate([g[c] for g in gf]) for c in range(3))
+            lf = xp.empty(len(df), dtype=xp.float64)
+            which = choice[numpy.array(refine)][rows]
+            for c in numpy.unique(which):
+                at = xp.asarray(numpy.nonzero(which == c)[0])
+                lf[at] = self._marginal(zf[:, at], tuple(v[at] for v in gf),
+                                        sets[int(c)])
+            lf = _to_numpy(lf)
+            for r, i in enumerate(refine):
+                k, step, d = plans[i]
+                terms[i][k] = values[i][k] + numpy.log(step)
+                terms[i] = numpy.concatenate(
+                    [terms[i], lf[rows == r] + numpy.log(step)])
+        out = numpy.empty(len(xis))
+        for i, t in enumerate(terms):
+            top = t.max()
+            out[i] = float(top + numpy.log(numpy.sum(numpy.exp(t - top))
+                                           / self.window_width))
+        return out
 
     def _orientation_nodes(self, z, g):
         """The coarsest orientation quadrature, doubling from 8 x 4 up to
@@ -414,9 +520,16 @@ class BStatisticSurrogate(BaseModel):
                 todo[sel] = ~numpy.isfinite(out[sel])
         middle = time.time()
         nshared = int((~todo).sum())
-        for i in numpy.nonzero(todo)[0]:
-            self.update(**points[i])
-            out[i] = self.loglikelihood
+        rest = numpy.nonzero(todo)[0]
+        if self.table is not None and self.xp is not numpy:
+            # batches through the device
+            for k0 in range(0, len(rest), self.batch_size):
+                idx = rest[k0:k0 + self.batch_size]
+                out[idx] = self._batch_loglikelihoods([full[i] for i in idx])
+        else:
+            for i in rest:
+                self.update(**points[i])
+                out[i] = self.loglikelihood
         stats = self.shared_statistics
         stats['shared_points'] += nshared
         stats['single_points'] += int(todo.sum())

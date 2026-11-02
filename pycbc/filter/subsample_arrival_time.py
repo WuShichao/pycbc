@@ -101,7 +101,7 @@ def refine_peak(statistic, low, high, tolerance=1e-3):
 
 
 def interpolate_twice_sampled(even, odd, step, targets, half_width=24,
-                              beta=14.0, xp=numpy):
+                              beta=14.0, rows=None, xp=numpy):
     """A correlation at arbitrary ``targets`` from its samples at half the
     grid step.
 
@@ -115,7 +115,9 @@ def interpolate_twice_sampled(even, odd, step, targets, half_width=24,
     the defaults). The samples are periodic, as an inverse FFT's are;
     ``targets`` are in seconds from sample 0. The taps are computed where
     ``targets`` live, so a few targets on the host cost no device work but
-    the final gather and sum.
+    the final gather and sum. With ``rows``, ``even`` and ``odd`` hold
+    several correlations along their first axis, and target ``i`` reads
+    row ``rows[i]``.
     """
     tp = numpy if isinstance(targets, numpy.ndarray) else xp
     targets = tp.asarray(targets, dtype=tp.float64)
@@ -134,8 +136,14 @@ def interpolate_twice_sampled(even, odd, step, targets, half_width=24,
     kernel = tp.sinc(offset) * window * tp.exp(0.5j * numpy.pi * offset)
     kernel = xp.asarray(kernel)
     half, parity = xp.asarray(index // 2), xp.asarray(index % 2 == 1)
-    values = xp.where(parity, odd[..., half], even[..., half])
-    return xp.sum(values * kernel, axis=-1)
+    if rows is None:
+        values = xp.where(parity, odd[..., half], even[..., half])
+        return xp.sum(values * kernel, axis=-1)
+    r = xp.asarray(rows)[:, None]
+    # the advanced indices around the slice go first: (targets, taps, ...)
+    values = xp.where(parity[..., None], odd[r, ..., half],
+                      even[r, ..., half])
+    return xp.moveaxis(xp.sum(values * kernel[..., None], axis=1), 0, -1)
 
 
 _KAISER = {}

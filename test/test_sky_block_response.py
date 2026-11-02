@@ -75,6 +75,16 @@ def test_the_basis_interpolated_in_frequency_keeps_its_error_honest():
     assert err.max() < 3 * max(blk.error, 1e-6)
 
 
+def test_responses_in_single_precision():
+    blk = SkyBlockResponse(ORBIT, TERMS, F, CENTRE, SCALES, radius=0.03,
+                           kmax=4, points=200, test_points=40)
+    off = numpy.array([[0.3, -0.2], [-1.0, 0.5]]) * 0.03 / numpy.array(SCALES)
+    double = blk.responses(off)
+    single = blk.responses(off, dtype=numpy.complex64)
+    assert single.dtype == numpy.complex64
+    assert numpy.abs(single - double).max() < 1e-6 * numpy.abs(double).max()
+
+
 def test_a_cached_block_is_the_block_it_stored(tmp_path):
     """sky_block fits a block once into its cache directory and loads it
     again: the same rank, coordinates and responses, without refitting."""
