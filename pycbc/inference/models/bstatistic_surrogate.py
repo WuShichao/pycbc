@@ -501,6 +501,13 @@ class BStatisticSurrogate(BaseModel):
             stats['regions_refused'] += 1
             stats['largest_refused_gb'] = max(stats['largest_refused_gb'],
                                               getattr(err, 'need', 0) / 1e9)
+            # what the refused region made goes with its frames, before
+            # the next one is tried
+            err.__traceback__ = None
+            import gc
+            gc.collect()
+            if self.xp is not numpy:
+                self.xp.get_default_memory_pool().free_all_blocks()
             raise
         stats['regions'] += 1
         stats['region_seconds'] += time.time() - tick
