@@ -125,17 +125,32 @@ def interpolate_twice_sampled(even, odd, step, targets, half_width=24,
     index = base[:, None] + taps[None, :]
     offset = x[:, None] - index
     index = index % (2 * even.shape[-1])
-    # Kaiser window over the taps
+    # Kaiser window over the taps, from a table (its Bessel function
+    # evaluated once; linear interpolation errs by about 1e-8)
     u = offset / half_width
-    window = tp.where(tp.abs(u) < 1, _bessel_i0(
-        beta * tp.sqrt(tp.maximum(1 - u * u, 0)), tp)
-        / _bessel_i0(tp.asarray(beta), tp), 0)
+    grid, table = _kaiser_table(float(beta), tp)
+    window = tp.where(tp.abs(u) < 1, tp.interp(u, grid, table), 0)
     # demodulation at the band centre: phase pi / 2 per sample
     kernel = tp.sinc(offset) * window * tp.exp(0.5j * numpy.pi * offset)
     kernel = xp.asarray(kernel)
     half, parity = xp.asarray(index // 2), xp.asarray(index % 2 == 1)
     values = xp.where(parity, odd[..., half], even[..., half])
     return xp.sum(values * kernel, axis=-1)
+
+
+_KAISER = {}
+
+
+def _kaiser_table(beta, xp, size=16385):
+    """The Kaiser window ``I0(beta sqrt(1 - u^2)) / I0(beta)`` on ``size``
+    points of ``[-1, 1]``, on ``xp``'s device, computed once."""
+    key = (beta, xp.__name__)
+    if key not in _KAISER:
+        u = numpy.linspace(-1, 1, size)
+        w = _bessel_i0(beta * numpy.sqrt(numpy.maximum(1 - u * u, 0)),
+                       numpy) / _bessel_i0(numpy.asarray(beta), numpy)
+        _KAISER[key] = (xp.asarray(u), xp.asarray(w))
+    return _KAISER[key]
 
 
 def _bessel_i0(x, xp):

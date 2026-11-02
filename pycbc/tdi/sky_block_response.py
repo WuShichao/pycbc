@@ -236,11 +236,17 @@ class SkyBlockResponse(object):
         return numpy.array(out)
 
     def _coords(self, unit):
-        """The series' coordinates at points of the unit square."""
-        n = self.degree + 1
-        return numpy.stack([chebyshev.chebval2d(
-            unit[:, 0], unit[:, 1], self._series[:, r].reshape(n, n))
-            for r in range(self.rank)], axis=1)
+        """The series' coordinates at points of the unit square: one
+        product of the points' Chebyshev Vandermonde rows with the series'
+        coefficients, column ``i (degree + 1) + j`` of the one being the
+        coefficient ``[i, j]`` of the other."""
+        unit = numpy.clip(numpy.atleast_2d(unit), -1, 1)
+        k = numpy.arange(self.degree + 1)
+        # T_k(x) = cos(k arccos x), the Vandermonde rows as an outer product
+        tx = numpy.cos(k * numpy.arccos(unit[:, :1]))
+        ty = numpy.cos(k * numpy.arccos(unit[:, 1:2]))
+        V = (tx[:, :, None] * ty[:, None, :]).reshape(len(unit), -1)
+        return V @ self._series[:, :self.rank]
 
     def _error(self, unit, rows):
         approx = self._coords(unit) @ self._vt

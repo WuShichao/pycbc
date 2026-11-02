@@ -363,7 +363,7 @@ def phase_coordinates(mchirp, q, spin1z, spin2z):
     return numpy.array(out)
 
 
-def from_phase_coordinates(y, guess, iterations=30, tolerance=1e-12,
+def from_phase_coordinates(y, guess, iterations=30, tolerance=1e-10,
                            forward=phase_coordinates, scale=None,
                            max_step=None):
     """Invert ``forward`` (default :func:`phase_coordinates`) by Newton
@@ -371,40 +371,50 @@ def from_phase_coordinates(y, guess, iterations=30, tolerance=1e-12,
     columns that do not converge, or leave ``q >= 1`` or spins within one,
     come back as NaN. The residuals are relative to ``|y|``, or to
     ``scale`` when given; ``max_step`` bounds each parameter's step, which
-    keeps the iteration on the root nearest the guess."""
+    keeps the iteration on the root nearest the guess. Each step evaluates
+    ``forward`` once, at the columns still unconverged and their four
+    finite-difference neighbours together."""
     y = numpy.asarray(y, dtype=float)
     theta = numpy.array(guess, dtype=float, copy=True)
     theta = numpy.broadcast_to(theta, y.shape).copy()
+    shape = y.shape[1:]
+    y2, theta2 = y.reshape(4, -1), theta.reshape(4, -1)
+    n = y2.shape[1]
     steps = numpy.array([1e-7, 1e-6, 1e-6, 1e-6])[:, None] * numpy.maximum(
-        numpy.abs(theta), 1.0)
-    scale = numpy.abs(y) + 1e-30 if scale is None else \
+        numpy.abs(theta2), 1.0)
+    scale2 = numpy.abs(y2) + 1e-30 if scale is None else \
         numpy.broadcast_to(numpy.asarray(scale, dtype=float).reshape(
-            (-1,) + (1,) * (y.ndim - 1)), y.shape)
+            (-1,) + (1,) * (y.ndim - 1)), y.shape).reshape(4, -1)
+    bound = None if max_step is None else \
+        numpy.asarray(max_step, dtype=float)[:, None]
+    active = numpy.arange(n)
     for _ in range(iterations):
-        f0 = forward(*theta)
-        res = (f0 - y) / scale
-        if numpy.all(numpy.abs(res) < tolerance):
-            break
-        jac = numpy.empty((4, 4) + y.shape[1:])
+        t, k = theta2[:, active], len(active)
+        moved = numpy.repeat(t[:, None, :], 5, axis=1)       # (4, 5, k)
         for j in range(4):
-            moved = theta.copy()
-            moved[j] = moved[j] + steps[j]
-            jac[:, j] = (forward(*moved) - f0) / steps[j]
-        delta = numpy.linalg.solve(numpy.moveaxis(jac, (0, 1), (-2, -1)),
-                                   numpy.moveaxis(f0 - y, 0, -1)[..., None])
-        delta = numpy.moveaxis(delta[..., 0], -1, 0)
-        if max_step is not None:
-            bound = numpy.asarray(max_step, dtype=float).reshape(
-                (4,) + (1,) * (y.ndim - 1))
+            moved[j, j + 1] += steps[j, active]
+        values = forward(*moved.reshape(4, -1)).reshape(4, 5, k)
+        f0 = values[:, 0]
+        res = (f0 - y2[:, active]) / scale2[:, active]
+        done = numpy.all(numpy.abs(res) < tolerance, axis=0)
+        if done.all():
+            break
+        jac = (values[:, 1:] - f0[:, None]) / steps[None, :, active]
+        delta = numpy.linalg.solve(numpy.moveaxis(jac, -1, 0),
+                                   (f0 - y2[:, active]).T[..., None])[..., 0].T
+        if bound is not None:
             with numpy.errstate(invalid='ignore', divide='ignore'):
                 shrink = numpy.nanmin(numpy.where(
                     numpy.abs(delta) > bound, bound / numpy.abs(delta), 1.0),
                     axis=0)
             delta = delta * shrink
-        theta = theta - delta
+        delta[:, done] = 0
+        theta2[:, active] = t - delta
+        active = active[~done]
+    theta = theta2.reshape((4,) + shape)
     with numpy.errstate(invalid='ignore'):
-        bad = ~numpy.all(numpy.abs((forward(*theta) - y) / scale) < 1e-9,
-                         axis=0) | ~(theta[1] >= 1) | ~(
+        bad = ~numpy.all(numpy.abs((forward(*theta) - y) / scale2.reshape(
+            y.shape)) < 1e-9, axis=0) | ~(theta[1] >= 1) | ~(
             numpy.abs(theta[2]) <= 1) | ~(numpy.abs(theta[3]) <= 1)
     theta[:, bad] = numpy.nan
     return theta
