@@ -66,3 +66,40 @@ def test_swapping_the_configuration_swaps_the_population():
     assert abs(numpy.diff(flat.logpdf(numpy.array([far, near])))[0]) < 0.3
     d = dict(zip(PARAMS, numpy.array([near]).T))
     numpy.testing.assert_allclose(peaked.logpdf(d), peaked.logpdf([near]))
+
+
+MASSES = """
+[variable_params]
+mass1 =
+mass2 =
+
+[prior-mass1]
+name = uniform
+min-mass1 = 20
+max-mass1 = 40
+
+[prior-mass2]
+name = uniform
+min-mass2 = 20
+max-mass2 = 40
+
+[waveform_transforms-mchirp]
+name = custom
+inputs = mass1, mass2
+mchirp = mchirp_from_mass1_mass2(mass1, mass2)
+"""
+
+
+def test_transforms_in_subsections_map_the_draws():
+    """A prior on the masses becomes a density over the chirp mass, through
+    a transform given only as a [waveform_transforms-*] subsection."""
+    cp = WorkflowConfigParser()
+    cp.read_string(MASSES)
+    w = TemplatePriorWeights.from_config(cp, ['mchirp'], size=20000)
+    m = numpy.linspace(19, 33, 15)
+    p = numpy.exp(w.logpdf(m[:, None]))
+    # equal masses at 30: mchirp 26.1, the middle of the distribution
+    assert abs(m[numpy.argmax(p)] - 26.1) < 1.5
+    # outside the support, 17.4 to 34.8, only the kernel's leak
+    out = numpy.exp(w.logpdf(numpy.array([[15.0], [37.0]])))
+    assert (out < 0.1 * p.max()).all()

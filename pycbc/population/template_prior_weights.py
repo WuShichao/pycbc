@@ -70,10 +70,13 @@ class TemplatePriorWeights(object):
         numpy.random.seed(seed)
         draws = joint.rvs(size=size)
         samples = {p: draws[p] for p in variable}
-        if cp.has_section(transforms_section):
+        if cp.has_section(transforms_section) or \
+                cp.get_subsections(transforms_section):
+            # in the order their inputs need, not the sections' order
             samples = transforms.apply_transforms(
-                samples, transforms.read_transforms_from_config(
-                    cp, transforms_section))
+                samples, transforms.order_transforms(
+                    transforms.read_transforms_from_config(
+                        cp, transforms_section)))
         return cls(samples, params, **kwargs)
 
     def logpdf(self, points):
