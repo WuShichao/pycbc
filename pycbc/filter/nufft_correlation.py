@@ -662,7 +662,13 @@ class PhaseGrid(object):
                 getattr(fam, '_index', None) is not None and \
                 hasattr(correlator, '_rho'):
             cells = _CellRuns.layouts(_host(fam._index), xp)
-        for i, k in enumerate(orders):
+        mids = [0.5 * (hi[d] + lo[d]) for d in range(len(rows))]
+        todo = list(enumerate(orders))
+        if cells is not None and self._cell_build(
+                correlator, parts, rows, third, mids, cells, npoly, shape,
+                lib, options, cplx, real, upsampfac):
+            todo, widths = [], [self._cell_width]
+        for i, k in todo:
             phase = 0.0
             scaled = []
             for d, row in enumerate(rows):
@@ -677,22 +683,6 @@ class PhaseGrid(object):
                 ix3 = (1j * x3).astype(cplx)
             centring = xp.exp(1j * phase).astype(cplx)
             del x, phase
-            blocked = None
-            if cells is not None:
-                blocked = _CellRuns(scaled, cells, self.size, correlator.eps,
-                                    xp)
-                if not blocked.width:
-                    blocked = None
-            if blocked is not None:
-                del scaled
-                blocked.plan(lib, options, cplx, upsampfac, correlator.eps)
-                widths.append(blocked.width)
-                self._cell_harmonic(blocked, correlator, i, centring, ix3,
-                                    npoly, shape)
-                del centring, ix3, blocked
-                if xp is not numpy:
-                    xp.get_default_memory_pool().free_all_blocks()
-                continue
             blocked = _BlockedNodes(scaled, 1, N, self.size, correlator.eps,
                                     xp)
             del scaled
@@ -732,53 +722,125 @@ class PhaseGrid(object):
         logging.info("PhaseGrid %s, %d vectors, %.2f s", self.size,
                      len(grids), time.time() - tick)
 
-    def _cell_harmonic(self, runs, correlator, i, centring, ix3, npoly,
-                       shape, rows=4):
-        """Add harmonic index ``i`` to the grid over cell-aligned ``runs``:
-        the moments of the data part times each interpolation weight and
-        Taylor factor, then each sky vector's and basis's as their
-        combination with the response's coarse values at the run's cell
-        and the next."""
+    def _cell_build(self, correlator, parts, rows, third, mids, layouts,
+                    npoly, shape, lib, options, cplx, real, upsampfac,
+                    rows_at_once=4, vectors_at_once=4, max_order=8):
+        """Fill the grid over runs of coarse frequency cells, every
+        harmonic's runs in one transform: the response is linear in
+        frequency over a run, so each sky vector's and basis's moments are
+        the data part's moments (times each interpolation weight and
+        Taylor factor) combined with the response at the run's cell ends.
+        The layout and moment order are the cheapest that converge for
+        every harmonic. Returns ``False`` when none does."""
         xp = self.xp
         fam = correlator.family
-        data = correlator.data_part(i) * centring[None]       # (nch, N)
-        w = xp.asarray(fam._weight, dtype=xp.float32)
-        sets = []                                   # (q, c, s) rows
-        for c in range(len(data)):
-            sets.append(data[c] * (1 - w))
-            sets.append(data[c] * w)
-        del data
-        moments = []                                # per Taylor term
-        current = xp.stack(sets)
-        del sets
+        orders = correlator.orders
+        nk, D = len(orders), len(rows)
+        half = [n // 2 for n in self.size]
+        eps = correlator.eps
+
+        def nodes_of(k):
+            scaled, phase = [], 0.0
+            for d, row in enumerate(rows):
+                x = correlator.node_row(parts, row, k)
+                scaled.append(((x - self.centre[d]) * self.step[d]).astype(
+                    real))
+                phase = phase + mids[d] * (x - self.centre[d])
+            ix3 = None
+            if third:
+                x3 = correlator.node_row(parts, self.ndir, k)
+                phase = phase + self.middle * x3
+                ix3 = (1j * x3).astype(cplx)
+            return scaled, xp.exp(1j * phase).astype(cplx), ix3
+        # the worst harmonic's reach of each layout's runs
+        reach = []
+        for k in orders:
+            scaled, _, _ = nodes_of(k)
+            for j, (_, _, middle, take, _) in enumerate(layouts):
+                mid = xp.asarray(middle)
+                e = 0
+                for d in range(D):
+                    e = e + half[d] * xp.abs(scaled[d][take]
+                                             - scaled[d][mid][:, None])
+                reach.append(e.max())
+            del scaled
+        # one transfer for all of them
+        worst = _host(xp.stack(reach)).reshape(nk, len(layouts)).max(axis=0)
+        kernel = (int(numpy.ceil(-numpy.log10(eps))) + 1) ** D
+        N = len(correlator.f)
+        best = None
+        for j, e in enumerate(worst):
+            order = next((R for R in range(1, max_order + 1)
+                          if e ** (R + 1) * numpy.exp(e)
+                          / math.factorial(R + 1) <= eps), None)
+            if order is None:
+                continue
+            runs_k = len(layouts[j][2])
+            cost = math.comb(order + D, D) * nk * (runs_k * kernel + N)
+            if best is None or cost < best[0]:
+                best = (cost, j, order)
+        if best is None:
+            return False
+        _, j, order = best
+        _, index, middle, take, cell = layouts[j]
+        runs = _CellRuns.__new__(_CellRuns)
+        runs.xp, runs.size, runs.order = xp, list(self.size), order
+        runs.index, runs.cell_of_run = index, cell
+        runs.width = index.shape[1]
+        runs.alphas = _nested(order, D)
+        R, A = len(middle), len(runs.alphas)
+        mid = xp.asarray(middle)
+        w = xp.asarray(fam._weight, dtype=real)
+        node_rows = [[] for _ in range(D)]
+        data_moments = []                          # (terms, 2 nch, A, R)
+        for i, k in enumerate(orders):
+            scaled, centring, ix3 = nodes_of(k)
+            runs.deltas = [y[take] - y[mid][:, None] for y in scaled]
+            for d in range(D):
+                node_rows[d].append(xp.ascontiguousarray(scaled[d][mid]))
+            del scaled
+            data = correlator.data_part(i) * centring[None]
+            current = xp.stack([v for c in range(len(data))
+                                for v in (data[c] * (1 - w), data[c] * w)])
+            del data, centring
+            per_term = []
+            for q in range(self.terms):
+                if q:
+                    current = current * ix3[None] / q
+                parts_q = []
+                for r0 in range(0, len(current), rows_at_once):
+                    c = runs._runs(current[r0:r0 + rows_at_once], runs.width,
+                                   zero=True)
+                    parts_q.append(xp.stack(list(runs._moments(c)), axis=1))
+                    del c
+                per_term.append(xp.concatenate(parts_q))
+            data_moments.append(xp.stack(per_term))
+            del current, ix3, per_term, runs.deltas
+        runs.nodes = [xp.concatenate(v) for v in node_rows]
+        del node_rows
+        runs.plan(lib, options, cplx, upsampfac, eps)
+        nch = data_moments[0].shape[1] // 2
         for q in range(self.terms):
-            if q:
-                current = current * ix3[None] / q
-            parts = []
-            for r0 in range(0, len(current), rows):
-                c = runs._runs(current[r0:r0 + rows], runs.width, zero=True)
-                parts.append(xp.stack(list(runs._moments(c)), axis=1))
-                del c
-            moments.append(xp.concatenate(parts))   # (2 nch, alphas, runs)
-        del current
-        nch = moments[0].shape[0] // 2
-        cell = runs.cell_of_run
-        for q, M in enumerate(moments):
-            M = M.reshape(nch, 2, len(runs.alphas), -1)
-            out = xp.zeros((npoly, 2, len(runs.alphas), M.shape[-1]),
-                           dtype=self.grid.dtype)
-            for p in range(npoly):
-                rho = xp.conj(correlator._rho[p][i])      # (2, nch, coarse)
-                left, right = rho[..., cell], rho[..., cell + 1]
-                out[p] = (xp.einsum('acr,cgr->agr', left, M[:, 0])
-                          + xp.einsum('acr,cgr->agr', right, M[:, 1]))
-            grids = runs.transform_moments(out.reshape(
-                npoly * 2, len(runs.alphas), -1))
-            for p in range(npoly):
-                for a in range(2):
-                    self.grid[(q * npoly + p) * 2 + a] += \
-                        grids[p * 2 + a].reshape(shape)
-            del out, grids
+            for p0 in range(0, npoly, vectors_at_once):
+                ps = list(range(p0, min(npoly, p0 + vectors_at_once)))
+                mu = xp.empty((len(ps), 2, A, nk * R), dtype=cplx)
+                for i in range(nk):
+                    M = data_moments[i][q].reshape(nch, 2, A, R)
+                    for jp, p in enumerate(ps):
+                        rho = xp.conj(correlator._rho[p][i])
+                        mu[jp, :, :, i * R:(i + 1) * R] = (
+                            xp.einsum('acr,cgr->agr', rho[..., cell], M[:, 0])
+                            + xp.einsum('acr,cgr->agr', rho[..., cell + 1],
+                                        M[:, 1]))
+                grids = runs.transform_moments(mu.reshape(len(ps) * 2, A, -1))
+                del mu
+                for jp, p in enumerate(ps):
+                    for a in range(2):
+                        self.grid[(q * npoly + p) * 2 + a] += \
+                            grids[jp * 2 + a].reshape(shape)
+                del grids
+        self._cell_width = runs.width
+        return True
 
     def grid_twof(self, gram, noise_variance=1.0, s3_values=(0.0,),
                   sky=None, chunk=None):
