@@ -610,8 +610,12 @@ class PhaseGrid(object):
             self.size.append(n)
         npoly = correlator.sky_sets
         item = numpy.dtype(cplx).itemsize
-        need = 2 * self.terms * npoly * numpy.prod(self.size) * item * (
+        cells = numpy.prod(self.size)
+        need = 2 * self.terms * npoly * cells * item * (
             1 + upsampfac ** len(self.size) / (2 * self.terms * npoly))
+        # the build's transients: a stack of vectors' sums, the transform's
+        # upsampled grid and output batch, the moments
+        need += cells * item * (8 + upsampfac ** len(self.size)) + 4.5e8
         logging.info("PhaseGrid: grid %s, %d Taylor terms, about %.2f GB",
                      self.size, self.terms, need / 1e9)
         if xp is not numpy:
@@ -623,7 +627,7 @@ class PhaseGrid(object):
             if pool.get_limit():
                 # the pool's own limit, less what it holds
                 memory_limit = min(memory_limit, pool.get_limit()
-                                   - pool.used_bytes() - 4e8)
+                                   - pool.used_bytes() - 2e8)
         if need > memory_limit:
             err = MemoryError(
                 "the region needs a grid of {:.2f} GB ({} Taylor terms, "
@@ -658,10 +662,12 @@ class PhaseGrid(object):
         # every sky vector's moments from the data's
         fam = getattr(correlator, 'family', None)
         cells = None
-        if getattr(correlator, '_sel', None) is None and \
-                getattr(fam, '_index', None) is not None and \
+        sel = getattr(correlator, '_sel', None)
+        if getattr(fam, '_index', None) is not None and \
                 hasattr(correlator, '_rho'):
-            cells = _CellRuns.layouts(_host(fam._index), xp)
+            index = _host(fam._index)
+            cells = _CellRuns.layouts(index if sel is None else index[sel],
+                                      xp)
         mids = [0.5 * (hi[d] + lo[d]) for d in range(len(rows))]
         todo = list(enumerate(orders))
         if cells is not None and self._cell_build(
@@ -790,7 +796,11 @@ class PhaseGrid(object):
         runs.alphas = _nested(order, D)
         R, A = len(middle), len(runs.alphas)
         mid = xp.asarray(middle)
+        sel = getattr(correlator, '_sel', None)
+        sel = None if sel is None else xp.asarray(sel)
         w = xp.asarray(fam._weight, dtype=real)
+        if sel is not None:
+            w = w[sel]
         node_rows = [[] for _ in range(D)]
         data_moments = []                          # (terms, 2 nch, A, R)
         for i, k in enumerate(orders):
@@ -799,7 +809,10 @@ class PhaseGrid(object):
             for d in range(D):
                 node_rows[d].append(xp.ascontiguousarray(scaled[d][mid]))
             del scaled
-            data = correlator.data_part(i) * centring[None]
+            data = correlator.data_part(i)
+            if sel is not None:
+                data = data[:, sel]
+            data = data * centring[None]
             current = xp.stack([v for c in range(len(data))
                                 for v in (data[c] * (1 - w), data[c] * w)])
             del data, centring
@@ -1160,10 +1173,13 @@ class _BlockedNodes(object):
             n = len(self.alphas[g:g + group])
             for i in range(n):
                 stack[i * C:(i + 1) * C] = next(moments)
-            out = plan.execute(stack).reshape(group, C, cells)[:n]
-            # every moment's i^|a| m^a / a! at once
-            total += xp.einsum('gcx,gx->cx', out,
-                               self._mode_weights(g, group)[:n])
+            out = plan.execute(stack).reshape(group, C, cells)
+            weights = self._mode_weights(g, group)
+            # each moment's i^|a| m^a / a!, one at a time to keep the
+            # temporaries a vector's size
+            for i in range(n):
+                total += out[i] * weights[i][None]
+            del out
         return total.reshape((C,) + tuple(self.size))
 
     def transform_moments(self, moments, memory=2.5e8):
@@ -1181,9 +1197,11 @@ class _BlockedNodes(object):
             n = len(self.alphas[g:g + group])
             stack[:n * C] = xp.swapaxes(moments[:, g:g + n], 0, 1).reshape(
                 n * C, -1)
-            out = plan.execute(stack).reshape(group, C, cells)[:n]
-            total += xp.einsum('gcx,gx->cx', out,
-                               self._mode_weights(g, group)[:n])
+            out = plan.execute(stack).reshape(group, C, cells)
+            weights = self._mode_weights(g, group)
+            for i in range(n):
+                total += out[i] * weights[i][None]
+            del out
         return total.reshape((C,) + tuple(self.size))
 
     def _many_plan(self, C, group):
@@ -1259,11 +1277,14 @@ class _CellRuns(_BlockedNodes):
         length = numpy.repeat(lengths, lengths)
         out = []
         for m in parts:
-            if m > lengths.min():
+            # cells cut by a band's ends may be shorter: their runs fewer
+            if m > numpy.median(lengths):
                 break
             sub = pos * m // length
             run = numpy.repeat(numpy.arange(len(starts)), lengths) * m + sub
-            first = numpy.flatnonzero(numpy.r_[True, run[1:] != run[:-1]])
+            change = numpy.r_[True, run[1:] != run[:-1]]
+            first = numpy.flatnonzero(change)
+            run = numpy.cumsum(change) - 1
             rl = numpy.diff(numpy.r_[first, N])
             slot = numpy.arange(N) - numpy.repeat(first, rl)
             index = numpy.full((len(first), int(rl.max())), -1,
