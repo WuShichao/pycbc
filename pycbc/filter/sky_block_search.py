@@ -411,7 +411,8 @@ def two_stage_block_search(model, coarse_model, region, delay_range=None,
                            fine_mismatch=0.01, coarse_sky_step=0.3,
                            decimate=2, threshold=55.0, top=20,
                            coarse_options=None, fine_sky_step=0.2,
-                           merge_time=86400.0, refine_threshold=65.0):
+                           merge_time=86400.0, refine_threshold=65.0,
+                           log_weight=None):
     """A block searched in two stages. A coarse grid (phase lattice of mean
     mismatch ``coarse_mismatch``, sky step ``coarse_sky_step``, every
     ``decimate``-th lag) is searched exhaustively on ``coarse_model``, the
@@ -424,7 +425,10 @@ def two_stage_block_search(model, coarse_model, region, delay_range=None,
     loudest refined in arrival time and continuous sky
     (:func:`refine_candidate`) when its 2F exceeds ``refine_threshold``, so
     noise survivors cost the local search only. ``coarse_options`` go to the coarse
-    :func:`fft_search_sky_block`.
+    :func:`fft_search_sky_block`. With ``log_weight`` (a function of the
+    candidates' parameter rows, e.g. a population's
+    :meth:`~pycbc.population.template_prior_weights.TemplatePriorWeights.logpdf`)
+    the candidates are ranked by half their 2F plus it.
 
     Returns the ``top`` candidates and the stages' counts and seconds."""
     start = time.time()
@@ -474,7 +478,16 @@ def two_stage_block_search(model, coarse_model, region, delay_range=None,
             refine_candidate(model, best)
         best['coarse_twof'] = float(v)
         found.append(best)
-    found.sort(key=lambda c: -c['twof'])
+    if log_weight is not None and found:
+        # a population's weight on top of the likelihood ratio, half of 2F
+        lw = numpy.atleast_1d(log_weight(numpy.array(
+            [c['theta'] for c in found])))
+        for c, v in zip(found, lw):
+            c['log_weight'] = float(v)
+            c['ranking'] = 0.5 * c['twof'] + float(v)
+        found.sort(key=lambda c: -c['ranking'])
+    else:
+        found.sort(key=lambda c: -c['twof'])
     return dict(candidates=found[:top], survivors=len(surv),
                 followed=len(kept), coarse_seconds=coarse_seconds,
                 seconds=time.time() - start)
