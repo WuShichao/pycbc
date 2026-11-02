@@ -224,8 +224,6 @@ class PhaseNUFFTCorrelation(object):
         self.sky_sets = len(self._rho)
         # (harmonic, basis, bin) at the sky offsets ``sky``
         self._rho_at = family._response(self.sky)
-        self.strengths = xp.stack([self.strength(i, -1) for i in range(
-            len(self.orders))])
         self.f = f if self._sel is None else f[self._sel]
         self._logf = xp.asarray(numpy.log(self.f))
         # weights of the batch geometry: the template power at each
@@ -258,6 +256,19 @@ class PhaseNUFFTCorrelation(object):
             response = _host(fam.fine(fam.xp.asarray(coarse)))
             self._template_power = numpy.abs(_host(fam.b0)) ** 2 * response
         return self._template_power
+
+    @property
+    def strengths(self):
+        """Node strengths ``(nk, 2, N)`` of the response at ``sky``, for
+        :meth:`direct`; made when first asked for (300 MB at two years)."""
+        if getattr(self, '_strengths', None) is None:
+            self._strengths = self.xp.stack([self.strength(i, -1) for i in
+                                             range(len(self.orders))])
+        return self._strengths
+
+    @strengths.setter
+    def strengths(self, value):
+        self._strengths = value
 
     def strength(self, harmonic, vector):
         """Node strengths ``(2, N)`` of harmonic index ``harmonic`` for sky
@@ -456,6 +467,18 @@ class PhaseNUFFTCorrelation(object):
         x_slope = x_slope - L[:, 1:]
         return x_phase, x_slope, 2 * numpy.pi * df_lower
 
+    def data_part(self, harmonic):
+        """``conj(b0) exp(-i k Omega t0) X_c`` of harmonic index
+        ``harmonic``, ``(nchannels, N)``: :meth:`strength` is this times the
+        conjugate response, interpolated from its coarse values, summed
+        over the channels."""
+        xp, fam = self.xp, self.family
+        k = self.orders[harmonic]
+        phase = xp.exp(-1j * k * ORBITAL_ANGULAR_FREQUENCY
+                       * xp.asarray(fam.t0))
+        return ((xp.conj(xp.asarray(fam.b0)) * phase)[None]
+                * self._data).astype(xp.complex64)
+
     def node_row(self, parts, d, harmonic):
         """Row ``d`` of the nodes of one harmonic from :meth:`nodes`'
         parts: a phase direction, or the arrival time for ``d = -1``."""
@@ -576,6 +599,11 @@ class PhaseGrid(object):
             xp.get_default_memory_pool().free_all_blocks()
             free = xp.cuda.runtime.memGetInfo()[0]
             memory_limit = min(memory_limit, free - 4e8)
+            pool = xp.get_default_memory_pool()
+            if pool.get_limit():
+                # the pool's own limit, less what it holds
+                memory_limit = min(memory_limit, pool.get_limit()
+                                   - pool.used_bytes() - 4e8)
         if need > memory_limit:
             err = MemoryError(
                 "the region needs a grid of {:.2f} GB ({} Taylor terms, "
@@ -606,6 +634,14 @@ class PhaseGrid(object):
         self.grid[...] = 0
         tick, widths = time.time(), []
         stack_rows = 4
+        # runs over coarse frequency cells, where the response is linear:
+        # every sky vector's moments from the data's
+        fam = getattr(correlator, 'family', None)
+        cells = None
+        if getattr(correlator, '_sel', None) is None and \
+                getattr(fam, '_index', None) is not None and \
+                hasattr(correlator, '_rho'):
+            cells = _CellRuns.layouts(_host(fam._index), xp)
         for i, k in enumerate(orders):
             phase = 0.0
             scaled = []
@@ -621,6 +657,22 @@ class PhaseGrid(object):
                 ix3 = (1j * x3).astype(cplx)
             centring = xp.exp(1j * phase).astype(cplx)
             del x, phase
+            blocked = None
+            if cells is not None:
+                blocked = _CellRuns(scaled, cells, self.size, correlator.eps,
+                                    xp)
+                if not blocked.width:
+                    blocked = None
+            if blocked is not None:
+                del scaled
+                blocked.plan(lib, options, cplx, upsampfac, correlator.eps)
+                widths.append(blocked.width)
+                self._cell_harmonic(blocked, correlator, i, centring, ix3,
+                                    npoly, shape)
+                del centring, ix3, blocked
+                if xp is not numpy:
+                    xp.get_default_memory_pool().free_all_blocks()
+                continue
             blocked = _BlockedNodes(scaled, 1, N, self.size, correlator.eps,
                                     xp)
             del scaled
@@ -659,6 +711,54 @@ class PhaseGrid(object):
         grids = self.grid
         logging.info("PhaseGrid %s, %d vectors, %.2f s", self.size,
                      len(grids), time.time() - tick)
+
+    def _cell_harmonic(self, runs, correlator, i, centring, ix3, npoly,
+                       shape, rows=4):
+        """Add harmonic index ``i`` to the grid over cell-aligned ``runs``:
+        the moments of the data part times each interpolation weight and
+        Taylor factor, then each sky vector's and basis's as their
+        combination with the response's coarse values at the run's cell
+        and the next."""
+        xp = self.xp
+        fam = correlator.family
+        data = correlator.data_part(i) * centring[None]       # (nch, N)
+        w = xp.asarray(fam._weight, dtype=xp.float32)
+        sets = []                                   # (q, c, s) rows
+        for c in range(len(data)):
+            sets.append(data[c] * (1 - w))
+            sets.append(data[c] * w)
+        del data
+        moments = []                                # per Taylor term
+        current = xp.stack(sets)
+        del sets
+        for q in range(self.terms):
+            if q:
+                current = current * ix3[None] / q
+            parts = []
+            for r0 in range(0, len(current), rows):
+                c = runs._runs(current[r0:r0 + rows], runs.width, zero=True)
+                parts.append(xp.stack(list(runs._moments(c)), axis=1))
+                del c
+            moments.append(xp.concatenate(parts))   # (2 nch, alphas, runs)
+        del current
+        nch = moments[0].shape[0] // 2
+        cell = runs.cell_of_run
+        for q, M in enumerate(moments):
+            M = M.reshape(nch, 2, len(runs.alphas), -1)
+            out = xp.zeros((npoly, 2, len(runs.alphas), M.shape[-1]),
+                           dtype=self.grid.dtype)
+            for p in range(npoly):
+                rho = xp.conj(correlator._rho[p][i])      # (2, nch, coarse)
+                left, right = rho[..., cell], rho[..., cell + 1]
+                out[p] = (xp.einsum('acr,cgr->agr', left, M[:, 0])
+                          + xp.einsum('acr,cgr->agr', right, M[:, 1]))
+            grids = runs.transform_moments(out.reshape(
+                npoly * 2, len(runs.alphas), -1))
+            for p in range(npoly):
+                for a in range(2):
+                    self.grid[(q * npoly + p) * 2 + a] += \
+                        grids[p * 2 + a].reshape(shape)
+            del out, grids
 
     def grid_twof(self, gram, noise_variance=1.0, s3_values=(0.0,),
                   sky=None, chunk=None):
@@ -896,13 +996,15 @@ class _BlockedNodes(object):
         self.cplx = cplx
         self._lib, self._options, self._eps = lib, options, eps
         self._upsampfac = upsampfac
+        self._modes = [self.xp.arange(n, dtype=numpy.float64) - n // 2
+                       for n in self.size]
+        if getattr(self, 'lazy_plan', False):
+            return
         self._plan = lib.Plan(1, tuple(self.size), n_trans=self.batch,
                               eps=eps, isign=1,
                               dtype=numpy.dtype(cplx).name,
                               upsampfac=upsampfac, **options)
         self._plan.setpts(*self.nodes)
-        self._modes = [self.xp.arange(n, dtype=numpy.float64) - n // 2
-                       for n in self.size]
 
     def _mode_power(self, alpha):
         out = None
@@ -982,6 +1084,39 @@ class _BlockedNodes(object):
                                self._mode_weights(g, group)[:n])
         return total.reshape((C,) + tuple(self.size))
 
+    def transform_moments(self, moments, memory=2.5e8):
+        """The transform of rows whose moments at the runs are given,
+        ``moments`` ``(C, len(alphas), runs)``; shape ``(C,) + grid``."""
+        xp = self.xp
+        C = moments.shape[0]
+        cells = int(numpy.prod(self.size))
+        group = int(max(1, min(len(self.alphas),
+                               memory // (8 * cells * C))))
+        plan = self._many_plan(C, group)
+        total = xp.zeros((C, cells), dtype=self.cplx)
+        stack = xp.zeros((C * group, moments.shape[2]), dtype=self.cplx)
+        for g in range(0, len(self.alphas), group):
+            n = len(self.alphas[g:g + group])
+            stack[:n * C] = xp.swapaxes(moments[:, g:g + n], 0, 1).reshape(
+                n * C, -1)
+            out = plan.execute(stack).reshape(group, C, cells)[:n]
+            total += xp.einsum('gcx,gx->cx', out,
+                               self._mode_weights(g, group)[:n])
+        return total.reshape((C,) + tuple(self.size))
+
+    def _many_plan(self, C, group):
+        plans = getattr(self, '_many_plans', {})
+        if (C, group) not in plans:
+            plan = self._lib.Plan(1, tuple(self.size), n_trans=C * group,
+                                  eps=self._eps, isign=1,
+                                  dtype=numpy.dtype(self.cplx).name,
+                                  upsampfac=self._upsampfac,
+                                  **self._options)
+            plan.setpts(*self.nodes)
+            plans[(C, group)] = plan
+            self._many_plans = plans
+        return plans[(C, group)]
+
     def _mode_weights(self, start, group):
         """``i^|alpha| m^alpha / alpha!`` on the grid's modes for the
         moments ``start`` to ``start + group``, ``(group, cells)``, kept."""
@@ -1017,6 +1152,91 @@ class _BlockedNodes(object):
                 yield from walk(w, d + 1, left - a)
                 w = w * self.deltas[d]
         return walk(c, 0, self.order)
+
+
+class _CellRuns(_BlockedNodes):
+    """:class:`_BlockedNodes` whose runs are the bins of a coarse frequency
+    cell, or of one of ``m`` equal parts of it: a quantity linear in
+    frequency over a coarse cell (the response, interpolated from its
+    coarse values) is then linear over every run, and the moments of any
+    such quantity times a node strength follow from two moments of the
+    strength. ``cell`` gives each bin's coarse cell; the part count of
+    least cost whose moments converge is chosen, ``width`` is ``0`` when
+    none does."""
+    @staticmethod
+    def layouts(cell, xp, parts=(1, 2, 3, 4, 6, 8, 12, 16, 24, 48)):
+        """The runs of each part count ``m``: ``(m, index, middle, take)``,
+        ``index`` ``(runs, width)`` of bins (``-1`` pads), ``take`` the same
+        with pads at the run's middle bin, on the device; the same for
+        every harmonic, so computed once."""
+        cell = numpy.asarray(cell)
+        N = len(cell)
+        starts = numpy.flatnonzero(numpy.r_[True, cell[1:] != cell[:-1]])
+        lengths = numpy.diff(numpy.r_[starts, N])
+        pos = numpy.arange(N) - numpy.repeat(starts, lengths)
+        length = numpy.repeat(lengths, lengths)
+        out = []
+        for m in parts:
+            if m > lengths.min():
+                break
+            sub = pos * m // length
+            run = numpy.repeat(numpy.arange(len(starts)), lengths) * m + sub
+            first = numpy.flatnonzero(numpy.r_[True, run[1:] != run[:-1]])
+            rl = numpy.diff(numpy.r_[first, N])
+            slot = numpy.arange(N) - numpy.repeat(first, rl)
+            index = numpy.full((len(first), int(rl.max())), -1,
+                               dtype=numpy.int64)
+            index[run, slot] = numpy.arange(N)
+            middle = first + rl // 2
+            take = numpy.where(index < 0, middle[:, None], index)
+            out.append((m, xp.asarray(index), middle, xp.asarray(take),
+                        xp.asarray(cell[middle])))
+        return out
+
+    def __init__(self, scaled, layouts, size, eps, xp, max_order=8):
+        self.xp, self.size = xp, list(size)
+        D = len(scaled)
+        half = [n // 2 for n in size]
+        kernel = (int(numpy.ceil(-numpy.log10(eps))) + 1) ** D
+        N = len(scaled[0])
+        best, self.width = None, 0
+        for m, index, middle, take, cell_of_run in layouts:
+            e = 0
+            for d in range(D):
+                y = scaled[d][take]
+                e = e + half[d] * xp.abs(y - scaled[d][xp.asarray(
+                    middle)][:, None])
+            e = float(e.max())
+            order = None
+            for R in range(1, max_order + 1):
+                if e ** (R + 1) * numpy.exp(e) / math.factorial(R + 1) \
+                        <= eps:
+                    order = R
+                    break
+            if order is None:
+                continue
+            terms = math.comb(order + D, D)
+            cost = terms * (len(middle) * kernel + N)
+            if best is None or cost < best[0]:
+                best = (cost, m, order, index, middle, take, cell_of_run)
+        if best is None:
+            return
+        _, self.parts, self.order, self.index, middle, take, \
+            self.cell_of_run = best
+        self.width = self.index.shape[1]
+        mid = xp.asarray(middle)
+        self.nodes = [xp.ascontiguousarray(y[mid]) for y in scaled]
+        # padding slots carry zero strength, so their deltas do not matter
+        self.deltas = [y[take] - y[mid][:, None] for y in scaled]
+        self.alphas = _nested(self.order, D)
+
+    #: the single-row plan is not made: rows go through transform_moments
+    lazy_plan = True
+
+    def _runs(self, values, width, zero=False):
+        xp = self.xp
+        out = values[..., xp.maximum(self.index, 0)]
+        return xp.where(self.index < 0, 0, out) if zero else out
 
 
 def _nested(order, D):
