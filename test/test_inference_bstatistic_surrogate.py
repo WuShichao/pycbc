@@ -607,6 +607,43 @@ def test_a_joint_lattice_reaches_its_mismatch_with_fewer_points():
     assert 0.86 < points['centred'] / points['cubic'] < 0.96
 
 
+def test_the_two_stage_block_search_finds_what_the_fine_grid_finds():
+    """A coarse grid with a threshold, then the follow-up of its merged
+    survivors, finds the source the fine grid finds, at least as loud and at
+    the same arrival time."""
+    from pycbc.filter.sky_block_search import (block_sky_points,
+                                               fft_search_sky_block,
+                                               phase_lattice,
+                                               two_stage_block_search)
+    from pycbc.inference import models
+    from pycbc.workflow import WorkflowConfigParser
+    lon, lat = 3.5763564997428436, 0.3429283438977949
+    cp = WorkflowConfigParser()
+    cp.read_string(CONFIG.replace(
+        'grid-periods = 1', 'grid-periods = 1\nharmonics = 8\n'
+        'amplitude-table-file = ' + table_file()))
+    data, psds, snr2, mc = stbbh_data()
+    m = models.read_from_config(cp, data=data, psds=psds)
+    block = m.recentred(lon, lat, 0.02, sky_block_points=200)
+    s = m.static_params
+    unit = m.scales['mchirp']
+    region = numpy.array([[mc + u * unit, s['q'], s['spin1z'], s['spin2z']]
+                          for u in numpy.linspace(-2, 2, 41)])
+    dC, labels, _ = phase_lattice(block, region, 0.02, ndir=1)
+    fine = fft_search_sky_block(block, labels, block_sky_points(block, 0.02,
+                                                                0.5),
+                                top=1, coefficients=dC)['candidates'][0]
+    out = two_stage_block_search(block, block, region, radius=0.02,
+                                 coarse_mismatch=0.1, fine_mismatch=0.02,
+                                 coarse_sky_step=1.0, fine_sky_step=0.5,
+                                 decimate=1, threshold=0.25 * fine['twof'],
+                                 refine_threshold=0.5 * fine['twof'])
+    best = out['candidates'][0]
+    assert out['survivors'] >= 1 and out['followed'] >= 1
+    assert best['twof'] >= 0.99 * fine['twof']
+    assert abs(best['time'] - fine['time']) < 3 * m.grid_step
+
+
 def test_a_phase_lattice_bank_finds_the_source_and_refinement_helps():
     """A bank laid out in the family's phase coordinates, searched by the
     FFT route, finds the injection; refining the loudest candidate in

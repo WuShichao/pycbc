@@ -255,6 +255,20 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
             g00, g11, g01, dd = G[0][:, d], G[1][:, d], G[2][:, d], det[:, d]
             twof = (g11 * xp.abs(z[:, 0]) ** 2 + g00 * xp.abs(z[:, 1]) ** 2
                     - 2 * xp.real(xp.conj(z[:, 0]) * g01 * z[:, 1])) / dd
+            if threshold is not None:
+                # each sky point's largest 2F in each tile of 128 lags, as
+                # the fused kernel gives them (chunks are whole tiles)
+                pad = (-twof.shape[1]) % 128
+                tiles = xp.pad(twof, ((0, 0), (0, pad)),
+                               constant_values=-numpy.inf).reshape(
+                                   len(sky), -1, 128)
+                tb, ta = tiles.max(axis=2), tiles.argmax(axis=2)
+                ps, ts = xp.nonzero(tb > threshold)
+                if len(ps):
+                    survivors.append(numpy.column_stack([
+                        numpy.full(len(ps), n), _host(ps),
+                        c0 + 128 * _host(ts) + _host(ta[ps, ts]),
+                        _host(tb[ps, ts]), numpy.full(len(ps), ks)]))
             k = int(xp.argmax(twof))
             v = float(twof.reshape(-1)[k])
             if v > best:
@@ -291,12 +305,14 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
     return out
 
 
-def refine_candidate(model, candidate, anchors=5, subsamples=8, chunk=1 << 18):
+def refine_candidate(model, candidate, anchors=5, subsamples=8, chunk=1 << 18,
+                     span=1):
     """Refine a candidate of :func:`fft_search_sky_block` in place: its
     arrival time between the grid's lags and its sky offset continuous in
     the block, for its intrinsic template. The correlations of each sky
     basis vector at ``subsamples`` fractions of a lag either side of the
-    candidate's lag come from their spectra directly, ``z(Delta) = sum_m a_m
+    candidate's lag (``span`` lags either side) come from their spectra
+    directly, ``z(Delta) = sum_m a_m
     exp(2 pi i m Delta / T)``; the sky point's correlation and Gram are
     smooth in its offset (Chebyshev coordinates, Chebyshev anchors), so the
     sky offset is optimised for each arrival time and the largest 2F kept."""
@@ -316,18 +332,31 @@ def refine_candidate(model, candidate, anchors=5, subsamples=8, chunk=1 << 18):
     else:
         xi = model._shape_coordinates(point)
         b, t = fam._source(xi[:fam.nintrinsic])
-    delays = candidate['time'] + dt * numpy.linspace(-1, 1, 2 * subsamples + 1)
-    phase = xp.asarray(numpy.exp(2j * numpy.pi * numpy.outer(
-        numpy.arange(size), delays / (size * dt))).astype(fam.dtype))
+    delays = candidate['time'] + dt * numpy.linspace(
+        -span, span, 2 * span * subsamples + 1)
     U = xp.asarray(blk._basis)
-    Z = []
-    for r in range(blk.rank):
-        a = fam.correlation_spectrum(model.data_spectrum, b, t, U[r])
-        z = 0
+    fast = xp is not numpy and fam.dtype == numpy.complex64
+    if fast:
+        from pycbc.filter.sky_block_kernels import correlation_spectra
+        U = U.astype(xp.complex64)
+    turns = xp.asarray(delays / (size * dt))
+    Z = xp.zeros((blk.rank, 2, len(delays)), dtype=fam.dtype)
+    for r0 in range(0, blk.rank, 8):
+        nr = min(8, blk.rank - r0)
+        if fast:
+            a = correlation_spectra(fam, model.data_spectrum, b, t, U, r0, nr)
+        else:
+            a = xp.stack([fam.correlation_spectrum(model.data_spectrum, b, t,
+                                                   U[r])
+                          for r in range(r0, r0 + nr)])
+        # the phases a chunk of bins at a time, never all at once
         for c0 in range(0, size, chunk):
-            z = z + a[:, c0:c0 + chunk] @ phase[c0:c0 + chunk]
-        Z.append(z)
-    Z = xp.stack(Z) / var                                    # (R, 2, delays)
+            m = xp.arange(c0, min(c0 + chunk, size), dtype=xp.float64)
+            phase = xp.exp(2j * numpy.pi * xp.outer(m, turns)).astype(
+                fam.dtype)
+            Z[r0:r0 + nr] += a[:, :, c0:c0 + chunk] @ phase
+        del a
+    Z = Z / var                                               # (R, 2, delays)
     nodes = numpy.cos(numpy.pi * (numpy.arange(anchors) + 0.5) / anchors)
     unit = numpy.array([[u, v] for u in nodes for v in nodes])
     degree = [anchors - 1, anchors - 1]
@@ -365,6 +394,80 @@ def refine_candidate(model, candidate, anchors=5, subsamples=8, chunk=1 << 18):
                            + res.x[1] * model.scales['eclipticlatitude']),
             refined=True)
     return candidate
+
+
+def two_stage_block_search(model, coarse_model, region, delay_range=None,
+                           radius=0.07, coarse_mismatch=0.1,
+                           fine_mismatch=0.01, coarse_sky_step=0.3,
+                           decimate=2, threshold=55.0, top=20,
+                           coarse_options=None, fine_sky_step=0.2,
+                           merge_time=86400.0, refine_threshold=65.0):
+    """A block searched in two stages. A coarse grid (phase lattice of mean
+    mismatch ``coarse_mismatch``, sky step ``coarse_sky_step``, every
+    ``decimate``-th lag) is searched exhaustively on ``coarse_model``, the
+    same block at a looser sky tolerance; each sky point's largest 2F in a
+    tile of lags above ``threshold`` survives. Survivors of one source are
+    merged, from the loudest; each is followed up on ``model`` by one FFT
+    search over the nodes of the fine lattice (``fine_mismatch``) within one
+    and a half coarse spacings of its template, the fine sky points
+    (``fine_sky_step``) near its sky point and the lags near its own, the
+    loudest refined in arrival time and continuous sky
+    (:func:`refine_candidate`) when its 2F exceeds ``refine_threshold``, so
+    noise survivors cost the local search only. ``coarse_options`` go to the coarse
+    :func:`fft_search_sky_block`.
+
+    Returns the ``top`` candidates and the stages' counts and seconds."""
+    start = time.time()
+    s, gs, frame, _ = phase_frame(model, region)
+    coarse, cnear, hc = aligned_lattice(s, gs, coarse_mismatch)
+    fine, fnear, _ = aligned_lattice(s, gs, fine_mismatch)
+    sky = block_sky_points(model, radius, coarse_sky_step)
+    res = fft_search_sky_block(
+        coarse_model, region[cnear], sky, delay_range=delay_range, top=1,
+        coefficients=coarse @ frame['directions'].T, decimate=decimate,
+        threshold=threshold, gram_reuse=len(coarse),
+        **(coarse_options or {}))
+    surv, delays = res['survivors'], res['delays']
+    coarse_seconds = time.time() - start
+    # one source fires many templates (its mass trades against its arrival
+    # time), neighbouring sky points and lag tiles: survivors within
+    # ``merge_time`` and two coarse sky steps of a louder one are its
+    kept = []
+    for n, p, j, v, _ in surv[numpy.argsort(-surv[:, 3])]:
+        n, p, j = int(n), int(p), int(j)
+        if not any(numpy.linalg.norm(sky[p] - sky[k[1]])
+                   <= 2.01 * coarse_sky_step
+                   and abs(delays[j] - delays[k[2]]) <= merge_time
+                   for k in kept):
+            kept.append((n, p, j, v))
+    fine_sky = block_sky_points(model, radius, fine_sky_step)
+    found = []
+    for n, p, j, v in kept:
+        # the follow-up: the fine nodes near its template, the fine sky
+        # points near its sky point and the lags near its own, one FFT
+        # search; then the loudest refined
+        d = fine - coarse[n]
+        near = numpy.nonzero(numpy.sqrt(numpy.einsum(
+            'ni,ij,nj->n', d, gs, d)) <= 1.5 * hc[0])[0]
+        local = fine_sky[numpy.linalg.norm(fine_sky - sky[p], axis=1)
+                         <= 1.5 * coarse_sky_step]
+        if not len(near) or not len(local):
+            continue
+        window = decimate * 8 * (delays[1] - delays[0])
+        out = fft_search_sky_block(
+            model, region[fnear[near]], local,
+            delay_range=(delays[j] - window, delays[j] + window), top=1,
+            coefficients=fine[near] @ frame['directions'].T,
+            gram_reuse=len(near), share_spectra=False, basis_chunk=8)
+        best = out['candidates'][0]
+        if best['twof'] > refine_threshold:
+            refine_candidate(model, best)
+        best['coarse_twof'] = float(v)
+        found.append(best)
+    found.sort(key=lambda c: -c['twof'])
+    return dict(candidates=found[:top], survivors=len(surv),
+                followed=len(kept), coarse_seconds=coarse_seconds,
+                seconds=time.time() - start)
 
 
 def aligned_lattice(s, metric, mean_mismatch, reach=1.0):
