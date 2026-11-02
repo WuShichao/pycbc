@@ -168,6 +168,29 @@ def test_the_model_runs_on_the_gpu():
 
 
 
+def test_lags_left_out_by_the_f_statistic_bound_do_not_matter():
+    """ln B never exceeds the F-statistic at any lag, so leaving out the
+    lags far below the peak changes nothing visible."""
+    fam, daily = family()
+    data, _ = inject(fam, numpy.array([0.3, 0.0, 0.0]), noise=0.05)
+    m = model(fam, daily, data, noise=0.05)
+    m.skip_tolerance = None
+    full = dict(m.static_params, x=0.3)
+    z, g, lnb, _ = m._time_samples(full)
+    L = len(m.delays)
+    f = m._f_statistic(z[:, :L], tuple(v[:L] for v in g))
+    assert numpy.all(lnb[:L] <= f + 1e-9)
+    assert lnb.max() > 20
+    m.update(x=0.3)
+    every = m.loglikelihood
+    m.skip_tolerance = 1e-6
+    _, _, lnb, _ = m._time_samples(full)
+    assert numpy.isinf(lnb[:L]).any()
+    m.update(x=0.31)
+    m.update(x=0.3)
+    assert m.loglikelihood == pytest.approx(every, abs=1e-6)
+
+
 def test_batches_on_the_gpu_match_points_one_at_a_time():
     cupy = pytest.importorskip('cupy')
     from pycbc.scheme import CUPYScheme

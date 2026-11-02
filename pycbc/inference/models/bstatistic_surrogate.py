@@ -203,12 +203,48 @@ class BStatisticSurrogate(BaseModel):
         coarse = xp.fft.ifft(spectrum, axis=-1, norm='forward')
         z = coarse[:, self._lags_xp].astype(xp.complex128) / var
         g = tuple(v / var for v in self.daily_gram.at_prepared(
-            q, xp.asarray(self.delays)))
-        nodes = self._orientation_nodes(z, g)
-        lnb = self._marginal(z, g, nodes)
+            q, self.delays))
+        sets = self._candidate_node_sets()
+        choice, floor = self._node_choice(
+            z[:, None], tuple(v[None] for v in g), sets, floor=True)
+        nodes = sets[int(choice[0])]
+        lnb = self._marginal(z, g, nodes, floor=floor[0])
         return self._refine_peak(spectrum, coarse, q, nodes, z, g, lnb)
 
-    def _marginal(self, z, g, nodes):
+    #: lags whose F-statistic, an upper bound on their ``ln B``, lies more
+    #: than ``ln(lags / skip_tolerance)`` below a known ``ln B`` add less
+    #: than ``skip_tolerance`` of the integral together; they are left out
+    #: (``None`` keeps every lag)
+    skip_tolerance = 1e-6
+
+    def _f_statistic(self, z, g):
+        """``z^H G^-1 z / 2``: no orientation and amplitude give more than
+        this log likelihood ratio, so ``ln B`` at any prior is below it."""
+        g00, g11, g01 = g
+        det = g00 * g11 - g01.real ** 2 - g01.imag ** 2
+        cross = (z[0].conj() * g01 * z[1]).real
+        num = g11 * abs(z[0]) ** 2 + g00 * abs(z[1]) ** 2 - 2 * cross
+        return 0.5 * num / det
+
+    def _marginal(self, z, g, nodes, floor=None, lags=None):
+        """``ln B`` of ``z`` and ``g`` at ``nodes``; with ``floor``, a
+        known ``ln B`` of the template of each sample (one number, or one
+        per sample) whose window holds ``lags`` samples (all of them by
+        default), ``-inf`` where :attr:`skip_tolerance` leaves them out."""
+        if floor is None or self.skip_tolerance is None:
+            return self._marginal_all(z, g, nodes)
+        xp = self.xp
+        lags = z.shape[-1] if lags is None else lags
+        cut = floor - numpy.log(lags / self.skip_tolerance)
+        # a bound that is not a number leaves its lag in
+        keep = xp.nonzero(~(self._f_statistic(z, g) < cut))[0]
+        out = xp.full(z.shape[-1], -numpy.inf)
+        if len(keep):
+            out[keep] = self._marginal_all(
+                z[:, keep], tuple(v[keep] for v in g), nodes)
+        return out
+
+    def _marginal_all(self, z, g, nodes):
         table = self.table
         return log_orientation_marginal(
             z, *g, self.distance_prior, nodes,
@@ -308,23 +344,27 @@ class BStatisticSurrogate(BaseModel):
                             for i, (b, t) in enumerate(sources)])
         coarse = xp.fft.ifft(spectra, axis=-1, norm='forward')
         z = coarse[:, :, self._lags_xp].astype(xp.complex128) / var
-        delays = xp.asarray(self.delays)
         qs = [self.daily_gram.prepare(b, t, rhos[i])
               for i, (b, t) in enumerate(sources)]
-        gs = [tuple(v / var for v in self.daily_gram.at_prepared(q, delays))
-              for q in qs]
+        gs = [tuple(v / var for v in self.daily_gram.at_prepared(
+            q, self.delays)) for q in qs]
         G = tuple(xp.stack([g[c] for g in gs]) for c in range(3))
         sets = self._candidate_node_sets()
-        choice = self._node_choice(xp.moveaxis(z, 0, 1), G, sets)
+        zt = xp.moveaxis(z, 0, 1)
+        choice, floor = self._node_choice(zt, G, sets, floor=True)
         L = z.shape[-1]
         lnb = xp.empty((len(xis), L), dtype=xp.float64)
+        # each point's floor, repeated over its lags
+        floors = xp.asarray(numpy.repeat(floor, L))
         for c in numpy.unique(choice):
             idx = numpy.nonzero(choice == c)[0]
             sel = xp.asarray(idx)
-            zz = xp.moveaxis(z[sel], 0, 1).reshape(2, -1)
+            zz = zt[:, sel].reshape(2, -1)
             gg = tuple(v[sel].reshape(-1) for v in G)
-            lnb[sel] = self._marginal(zz, gg, sets[int(c)]).reshape(
-                len(idx), L)
+            lnb[sel] = self._marginal(
+                zz, gg, sets[int(c)], lags=L,
+                floor=floors.reshape(len(xis), L)[sel].reshape(-1)).reshape(
+                    len(idx), L)
         values = _to_numpy(lnb)
         # the finer samples of every point at once
         terms = [values[i] + numpy.log(self.grid_step) for i in range(len(xis))]
@@ -390,10 +430,11 @@ class BStatisticSurrogate(BaseModel):
             self._node_sets = sets
         return self._node_sets
 
-    def _node_choice(self, z, g, sets):
+    def _node_choice(self, z, g, sets, floor=False):
         """The index of the quadrature :meth:`_orientation_nodes` chooses
         for each row of ``z`` ``(2, M, L)`` and ``g`` (three ``(M, L)``),
-        ``-inf`` entries of no weight."""
+        ``-inf`` entries of no weight; with ``floor``, also each row's
+        largest ``ln B`` it evaluated with that quadrature."""
         xp = self.xp
         M, L = z.shape[1:]
         x = _to_numpy(xp.abs(z[0]) ** 2 / xp.maximum(g[0], 1e-300)
@@ -417,6 +458,10 @@ class BStatisticSurrogate(BaseModel):
             done = numpy.all(numpy.abs(values[i + 1] - values[i]) < 1e-3,
                              axis=1)
             choice[done] = i
+        if floor:
+            best = values[choice, numpy.arange(M)]
+            best = numpy.where(numpy.isfinite(best), best, -numpy.inf)
+            return choice, best.max(axis=1)
         return choice
 
     def share(self, region, **kwargs):
