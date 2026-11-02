@@ -272,16 +272,33 @@ class BStatisticSurrogate(BaseModel):
         return k, step, numpy.concatenate([self.delays[k] + p * step
                                            for p in range(1, P)])
 
-    def _half_step_ifft(self, spectrum):
-        """The correlation at the grid's lags shifted by half a step."""
+    def _half_step_factor(self, spectrum):
+        """The spectrum's factor that shifts its correlation by half a
+        grid step."""
         xp = self.xp
         if getattr(self, '_half_step', None) is None:
             n = spectrum.shape[-1]
             m = xp.arange(n, dtype=xp.float64)
             self._half_step = xp.exp(1j * numpy.pi * m / n).astype(
                 spectrum.dtype)
-        return xp.fft.ifft(spectrum * self._half_step, axis=-1,
-                           norm='forward')
+        return self._half_step
+
+    def _half_step_ifft(self, spectrum):
+        """The correlation at the grid's lags shifted by half a step."""
+        return self.xp.fft.ifft(spectrum * self._half_step_factor(spectrum),
+                                axis=-1, norm='forward')
+
+    def _batch_ifft(self, spectra):
+        """The inverse transforms of a stack of spectra, padded with zeros
+        to :attr:`batch_size` rows so that every batch shares one cached
+        FFT plan (each plan holds a work area the size of its input)."""
+        xp, n = self.xp, len(spectra)
+        if n < self.batch_size:
+            pad = xp.zeros((self.batch_size,) + spectra.shape[1:],
+                           dtype=spectra.dtype)
+            pad[:n] = spectra
+            spectra = pad
+        return xp.fft.ifft(spectra, axis=-1, norm='forward')[:n]
 
     def _fine_correlation(self, coarse, half, df, rows=None):
         """``z`` at delays ``df`` by band-limited interpolation between the
@@ -342,7 +359,7 @@ class BStatisticSurrogate(BaseModel):
         spectra = xp.stack([s.correlation_spectrum(self.data_spectrum, b, t,
                                                    rhos[i])
                             for i, (b, t) in enumerate(sources)])
-        coarse = xp.fft.ifft(spectra, axis=-1, norm='forward')
+        coarse = self._batch_ifft(spectra)
         z = coarse[:, :, self._lags_xp].astype(xp.complex128) / var
         qs = [self.daily_gram.prepare(b, t, rhos[i])
               for i, (b, t) in enumerate(sources)]
@@ -374,7 +391,8 @@ class BStatisticSurrogate(BaseModel):
             if len(refine) < len(xis):
                 sel = xp.asarray(refine)
                 spectra, coarse = spectra[sel], coarse[sel]
-            half = self._half_step_ifft(spectra)
+            half = self._batch_ifft(spectra * self._half_step_factor(
+                spectra))
             del spectra
             df = numpy.concatenate([plans[i][2] for i in refine])
             rows = numpy.concatenate([numpy.full(len(plans[i][2]), r)

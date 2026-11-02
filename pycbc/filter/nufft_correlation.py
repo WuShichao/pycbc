@@ -594,23 +594,6 @@ class PhaseGrid(object):
         # precision: F(mid + m h) = sum c exp(i mid (x - xc)) exp(i m h (x -
         # xc)), times exp(i (mid + m h) xc), applied in evaluate
         N = len(correlator.f)
-        total = N * len(orders)
-        scaled = [xp.empty(total, dtype=real) for _ in rows]
-        ix3 = xp.empty(total, dtype=cplx) if third else None
-        centring = []
-        for i, k in enumerate(orders):
-            cut = slice(i * N, (i + 1) * N)
-            phase = 0.0
-            for d, row in enumerate(rows):
-                x = correlator.node_row(parts, row, k)
-                scaled[d][cut] = ((x - self.centre[d]) * self.step[d])
-                phase = phase + 0.5 * (hi[d] + lo[d]) * (x - self.centre[d])
-            if third:
-                x3 = correlator.node_row(parts, ndir, k)
-                phase = phase + self.middle * x3
-                ix3[cut] = 1j * x3
-            centring.append(xp.exp(1j * phase).astype(cplx))
-        parts = None
         if xp is numpy:
             import finufft as lib
             options = dict(nufft_options or {})
@@ -618,27 +601,58 @@ class PhaseGrid(object):
             import cufinufft as lib
             options = dict(gpu_method=1, gpu_sort=0, gpu_maxbatchsize=1)
             options.update(nufft_options or {})
-        blocked = _BlockedNodes(scaled, len(orders), N, self.size,
-                                correlator.eps, xp)
-        del scaled
-        blocked.plan(lib, options, cplx, upsampfac, correlator.eps)
-        self.blocks = blocked.width
-        logging.info("PhaseGrid: %d bins a block, moments to order %d",
-                     blocked.width, blocked.order)
-        tick = time.time()
-        base = xp.empty((2, total), dtype=cplx)
-        for p in range(npoly):
-            for i in range(len(orders)):
-                cut = slice(i * N, (i + 1) * N)
-                base[:, cut] = correlator.strength(i, p) * centring[i][None]
-            current = base
-            for q in range(self.terms):
-                if q:
-                    current = current * ix3[None] / q
-                for a in range(2):
-                    self.grid[(q * npoly + p) * 2 + a] = blocked.transform(
-                        current[a]).reshape(shape)
-        del current, base, ix3, centring, blocked
+        # the transform is a sum over the nodes, so the grid is the sum of
+        # every harmonic's own: one harmonic's nodes on the device at a time
+        self.grid[...] = 0
+        tick, widths = time.time(), []
+        stack_rows = 4
+        for i, k in enumerate(orders):
+            phase = 0.0
+            scaled = []
+            for d, row in enumerate(rows):
+                x = correlator.node_row(parts, row, k)
+                scaled.append(((x - self.centre[d]) * self.step[d]).astype(
+                    real))
+                phase = phase + 0.5 * (hi[d] + lo[d]) * (x - self.centre[d])
+            ix3 = None
+            if third:
+                x3 = correlator.node_row(parts, ndir, k)
+                phase = phase + self.middle * x3
+                ix3 = (1j * x3).astype(cplx)
+            centring = xp.exp(1j * phase).astype(cplx)
+            del x, phase
+            blocked = _BlockedNodes(scaled, 1, N, self.size, correlator.eps,
+                                    xp)
+            del scaled
+            blocked.plan(lib, options, cplx, upsampfac, correlator.eps)
+            widths.append(blocked.width)
+            # the strengths of every sky vector, Taylor term and basis
+            # share this harmonic's nodes: transformed in stacks of rows
+            rows_at, stack = [], []
+
+            def flush():
+                out = blocked.transform_many(xp.stack(stack))
+                for r, v in zip(rows_at, out):
+                    self.grid[r] += v.reshape(shape)
+                rows_at.clear()
+                stack.clear()
+            for p in range(npoly):
+                current = correlator.strength(i, p) * centring[None]
+                for q in range(self.terms):
+                    if q:
+                        current = current * ix3[None] / q
+                    for a in range(2):
+                        rows_at.append((q * npoly + p) * 2 + a)
+                        stack.append(current[a])
+                        if len(stack) == stack_rows:
+                            flush()
+            if stack:
+                flush()
+            del current, centring, ix3, blocked
+            if xp is not numpy:
+                xp.get_default_memory_pool().free_all_blocks()
+        parts = None
+        self.blocks = max(widths)
         if xp is not numpy:
             xp.cuda.Stream.null.synchronize()
             xp.get_default_memory_pool().free_all_blocks()
@@ -880,6 +894,8 @@ class _BlockedNodes(object):
         self.batch = int(max(1, min(len(self.alphas),
                                     memory // (8 * cells))))
         self.cplx = cplx
+        self._lib, self._options, self._eps = lib, options, eps
+        self._upsampfac = upsampfac
         self._plan = lib.Plan(1, tuple(self.size), n_trans=self.batch,
                               eps=eps, isign=1,
                               dtype=numpy.dtype(cplx).name,
@@ -928,13 +944,73 @@ class _BlockedNodes(object):
                 total = term if total is None else total + term
         return total
 
+    def transform_many(self, strengths, memory=2.5e8):
+        """:meth:`transform` of each row of ``strengths`` ``(C, nodes)``,
+        shape ``(C,) + grid``: the rows share the nodes, so each moment is
+        one pass over all rows and each batch of moments one transform."""
+        xp = self.xp
+        strengths = xp.asarray(strengths, dtype=self.cplx)
+        C = len(strengths)
+        if self.width == 1:
+            return xp.stack([self.transform(v) for v in strengths])
+        c = xp.stack([self._runs(v, self.width, zero=True)
+                      for v in strengths])                 # (C, runs, w)
+        cells = int(numpy.prod(self.size))
+        group = int(max(1, min(len(self.alphas),
+                               memory // (8 * cells * C))))
+        plans = getattr(self, '_many_plans', {})
+        if (C, group) not in plans:
+            plan = self._lib.Plan(1, tuple(self.size), n_trans=C * group,
+                                  eps=self._eps, isign=1,
+                                  dtype=numpy.dtype(self.cplx).name,
+                                  upsampfac=self._upsampfac,
+                                  **self._options)
+            plan.setpts(*self.nodes)
+            plans[(C, group)] = plan
+            self._many_plans = plans
+        plan = plans[(C, group)]
+        moments = self._moments(c)
+        total = xp.zeros((C, cells), dtype=self.cplx)
+        stack = xp.zeros((C * group, c.shape[1]), dtype=self.cplx)
+        for g in range(0, len(self.alphas), group):
+            n = len(self.alphas[g:g + group])
+            for i in range(n):
+                stack[i * C:(i + 1) * C] = next(moments)
+            out = plan.execute(stack).reshape(group, C, cells)[:n]
+            # every moment's i^|a| m^a / a! at once
+            total += xp.einsum('gcx,gx->cx', out,
+                               self._mode_weights(g, group)[:n])
+        return total.reshape((C,) + tuple(self.size))
+
+    def _mode_weights(self, start, group):
+        """``i^|alpha| m^alpha / alpha!`` on the grid's modes for the
+        moments ``start`` to ``start + group``, ``(group, cells)``, kept."""
+        cache = getattr(self, '_weights', {})
+        if (start, group) not in cache:
+            xp = self.xp
+            cells = int(numpy.prod(self.size))
+            rows = []
+            for alpha in self.alphas[start:start + group]:
+                factor = 1j ** sum(alpha) / numpy.prod(
+                    [math.factorial(a) for a in alpha])
+                power = self._mode_power(alpha)
+                row = xp.full(cells, factor, dtype=self.cplx) if power is None \
+                    else (factor * xp.broadcast_to(power, self.size)).reshape(
+                        -1).astype(self.cplx)
+                rows.append(row)
+            while len(rows) < group:
+                rows.append(xp.zeros(cells, dtype=self.cplx))
+            cache[(start, group)] = xp.stack(rows)
+            self._weights = cache
+        return cache[(start, group)]
+
     def _moments(self, c):
         """The moments ``sum_{j in b} c_j delta_j^alpha`` in the order of
         :attr:`alphas`, each power one product from the last."""
         def walk(w, d, left):
             if d == len(self.deltas) - 1:
                 for _ in range(left + 1):
-                    yield w.sum(axis=1)
+                    yield w.sum(axis=-1)
                     w = w * self.deltas[d]
                 return
             for a in range(left + 1):
