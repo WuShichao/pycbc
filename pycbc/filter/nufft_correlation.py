@@ -1595,13 +1595,15 @@ def phase_grid_search(correlator, region, delay_range, gram,
     except MemoryError as err:
         if depth >= max_depth:
             raise
-        size = True
+        size = getattr(err, 'size', None) or True
     if size is not None:
         # split outside the handler, whose traceback would keep the refused
         # grid's arrays on the device through every level; along the first
         # phase direction, which also narrows the arrival times the
-        # templates' offsets spread over
-        if len(region) >= 4:
+        # templates' offsets spread over, unless the arrival times hold
+        # most of the grid: halving them halves it
+        by_time = size is not True and size[-1] >= 4 * max(size[:-1])
+        if len(region) >= 4 and not by_time:
             frame = correlator.frame(region, 1)
             s, _, _ = correlator.project(region, frame)
             half = numpy.median(s[:, 0])
