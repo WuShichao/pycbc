@@ -105,15 +105,28 @@ class SkyBasis(object):
         if weight is None:
             weight = source_power_weights(family)
         self._root = xp.sqrt(xp.asarray(weight))
-        A = self._rows(points, chunk)                  # (M, D) weighted
-        K = A @ xp.conj(A.T)
+        nk = len(family.orders)
+        block = getattr(family, 'sky_block', None)
+        if block is not None and len(block.orders) == nk:
+            # a sky block's rows are its basis rows B mixed by the block's
+            # coordinates c: A = c B, so A A^H = c (B B^H) c^H and A is
+            # never formed
+            B = xp.asarray(block._basis, dtype=xp.complex128) * self._root
+            B = B.reshape(block.rank, -1)
+            c = xp.asarray(block._coords(block._unit(points)),
+                           dtype=xp.complex128)
+            A = None
+            K = c @ (B @ xp.conj(B.T)) @ xp.conj(c.T)
+        else:
+            A = self._rows(points, chunk)              # (M, D) weighted
+            K = A @ xp.conj(A.T)
         values, vectors = xp.linalg.eigh(K)
         order = xp.argsort(values)[::-1]
         values, vectors = values[order], vectors[:, order]
         keep = int(min(max_rank, xp.sum(values > values[0] * 1e-14)))
         # the points' coordinates on the leading vectors, A V / sqrt(l)
         C = vectors[:, :keep] * xp.sqrt(values[:keep])[None]
-        norm2 = xp.sum(xp.abs(A) ** 2, axis=1)
+        norm2 = xp.diagonal(K).real
         left = norm2[:, None] - xp.cumsum(xp.abs(C) ** 2, axis=1)
         err = _host(xp.sqrt(xp.maximum(left, 0) / norm2[:, None]))
         # a third of the tolerance at the training points, so that points
@@ -122,10 +135,13 @@ class SkyBasis(object):
         rank = int(good[0]) + 1 if len(good) else keep
         self.rank = rank
         self.tolerance = float(tolerance)
-        self._U = (xp.conj(vectors[:, :rank].T) @ A) / xp.sqrt(
+        if A is None:
+            A_rows = (xp.conj(vectors[:, :rank].T) @ c) @ B
+        else:
+            A_rows = xp.conj(vectors[:, :rank].T) @ A
+        self._U = A_rows / xp.sqrt(
             values[:rank])[:, None]                    # (rank, D)
         del A
-        nk = len(family.orders)
         self._shape = (nk,) + tuple(family.R0.shape[1:])
         # coarse frequencies no fine bin uses have no weight: zero there
         inverse = xp.where(self._root > 0, 1 / xp.maximum(self._root,
@@ -136,10 +152,7 @@ class SkyBasis(object):
         # by the block's coordinates: projections and their errors are
         # then small products in those coordinates
         self._block = None
-        block = getattr(family, 'sky_block', None)
         if block is not None and len(block.orders) == nk:
-            B = xp.asarray(block._basis, dtype=xp.complex128) * self._root
-            B = B.reshape(block.rank, -1)
             P = B @ xp.conj(self._U.T)                    # (block, rank)
             Q = B - P @ self._U
             self._block = (block, P, Q @ xp.conj(Q.T), B @ xp.conj(B.T))
