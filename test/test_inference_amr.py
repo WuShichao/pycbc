@@ -502,3 +502,76 @@ def test_a_peak_on_the_prior_edge_keeps_its_mass_in_a_tilted_frame():
                          max_evaluations=40000, seed=1)
     sampler.run()
     assert sampler.logz == pytest.approx(exact, abs=0.01)
+
+
+class _SharingNormal(models.TestNormal):
+    """A normal model with the batch interface of a sharing model: ``share``
+    records when it is called, ``loglikelihoods`` evaluates point by point."""
+
+    batches_points = False
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.share_calls = []
+        self.batched_points = 0
+
+    def share(self, region):
+        self.share_calls.append(len(region))
+
+    def loglikelihoods(self, points):
+        out = []
+        for p in points:
+            self.update(**p)
+            out.append(self.loglikelihood)
+        self.batched_points += len(points)
+        return numpy.array(out)
+
+
+def _sharing_run(share_after_pilot):
+    prior = JointDistribution(
+        ['x', 'y'], Uniform(x=(-HALF, HALF)), Uniform(y=(-HALF, HALF)))
+    model = _SharingNormal(['x', 'y'], mean=[0.4, -0.3], cov=[0.2, 0.5],
+                           prior=prior)
+    sampler = AMRSampler(model, initial_divisions=2, pilot_evaluations=400,
+                         laplace_frame=True, shared_region=200,
+                         share_after_pilot=share_after_pilot,
+                         mass_fraction=1e-5, max_evaluations=6000,
+                         posterior_samples=2000, seed=2)
+    marks = {}
+    laplace = sampler._laplace
+
+    def recorded(*args, **kwargs):
+        marks['frame_start'] = model.batched_points
+        out = laplace(*args, **kwargs)
+        marks['frame_end'] = model.batched_points
+        return out
+    sampler._laplace = recorded
+    sampler.run()
+    return sampler, model, marks
+
+
+def test_sharing_after_the_pilot_batches_the_frame_and_changes_nothing_else():
+    early, m_early, marks_early = _sharing_run(True)
+    late, m_late, marks_late = _sharing_run(False)
+    # one region each; the early one is handed over before the frame's
+    # finite differences, which then go through the batch method
+    assert len(m_early.share_calls) == 1 and len(m_late.share_calls) == 1
+    assert marks_early['frame_end'] > marks_early['frame_start'] == 0
+    assert m_early.batched_points > m_late.batched_points
+    # without the option the frame is evaluated one point at a time
+    assert marks_late['frame_start'] == marks_late['frame_end'] == 0
+    assert m_late.batched_points > 0
+    # an exact batch method leaves the result unchanged
+    assert early.logz == pytest.approx(late.logz, abs=1e-12)
+    assert numpy.allclose(early.samples['x'], late.samples['x'])
+
+
+def test_share_after_pilot_is_read_from_the_config(tmp_path):
+    cp = WorkflowConfigParser()
+    cp.add_section('sampler')
+    cp.set('sampler', 'name', 'amr')
+    cp.set('sampler', 'shared-region', '100')
+    cp.set('sampler', 'share-after-pilot', 'true')
+    sampler = AMRSampler.from_config(cp, normal_model(),
+                                     output_file=str(tmp_path / 'amr.hdf'))
+    assert sampler.share_after_pilot is True

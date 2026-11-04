@@ -126,6 +126,14 @@ class AMRSampler(BaseSampler):
         (see
         :class:`pycbc.inference.models.bstatistic_surrogate.SharedLikelihood`).
         Default 0, off.
+    share_after_pilot : bool, optional
+        With ``shared_region``, hand the model the pilot's region already,
+        before the frame is set, so that the frame's own evaluations (the
+        curvilinear frame's Newton climbs, or the Laplace frame's finite
+        differences) go through the model's batch method too. The pilot's
+        region is wider than the framed one, so its shared computation
+        needs more memory; when it does not fit, the region is offered
+        again after the frame as without this option. Default False.
     explore_basin : float, optional
         Before the pilot, evaluate a scrambled Sobol sample of the prior
         large enough to land in any region holding this fraction of the
@@ -193,7 +201,8 @@ class AMRSampler(BaseSampler):
                  partition_file=None, whitening_rounds=1,
                  laplace_frame=False, curvilinear_frame=False,
                  shared_region=0, explore_basin=0.0, explore_miss=0.01,
-                 check_points=0, check_tolerance=0.1, start_cube=None):
+                 check_points=0, check_tolerance=0.1, start_cube=None,
+                 share_after_pilot=False):
         super().__init__(model)
         self.initial_divisions = int(initial_divisions)
         self.partition_file = partition_file
@@ -203,6 +212,7 @@ class AMRSampler(BaseSampler):
         self.laplace_frame = bool(laplace_frame)
         self.curvilinear_frame = bool(curvilinear_frame)
         self.shared_region = int(shared_region)
+        self.share_after_pilot = bool(share_after_pilot)
         self.explore_basin = float(explore_basin)
         self.explore_miss = float(explore_miss)
         if not 0 <= self.explore_basin < 1 or not 0 < self.explore_miss < 1:
@@ -539,6 +549,12 @@ class AMRSampler(BaseSampler):
                 if budget >= self.max_evaluations:
                     break
                 self._refine(budget)
+                if (self.share_after_pilot and self.shared_region
+                        and not self._batched):
+                    # the frame's evaluations batched too; a region that
+                    # does not fit is offered again after the frame
+                    self._share()
+                    self._next_share = 0
                 if self.curvilinear_frame:
                     self._curvilinear()
                 elif self.laplace_frame:
@@ -1286,6 +1302,7 @@ class AMRSampler(BaseSampler):
         types = {'initial-divisions': int, 'max-level': int,
                  'whitening-rounds': int, 'laplace-frame': _boolean,
                  'curvilinear-frame': _boolean, 'shared-region': int,
+                 'share-after-pilot': _boolean,
                  'partition-file': str,
                  'pilot-evaluations': int, 'loglikelihood-step': float,
                  'mass-fraction': float, 'max-evaluations': int,
