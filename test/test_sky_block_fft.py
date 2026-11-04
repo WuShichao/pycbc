@@ -25,8 +25,9 @@ class ComplexBlock(object):
         x, y = offsets.T
         return numpy.column_stack([1 + .2j * x, x + 1j * y, .4j + x * y])
 
-    def responses(self, offsets, xp=numpy):
-        return xp.asarray(numpy.einsum('pr,r...->p...', self._coords(offsets), self._basis))
+    def responses(self, offsets, xp=numpy, dtype=None):
+        out = numpy.einsum('pr,r...->p...', self._coords(offsets), self._basis)
+        return xp.asarray(out if dtype is None else out.astype(dtype))
 
 
 def setup():
