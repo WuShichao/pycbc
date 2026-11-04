@@ -423,7 +423,7 @@ def two_stage_block_search(model, coarse_model, region, delay_range=None,
                            coarse_options=None, fine_sky_step=0.2,
                            merge_time=86400.0, refine_threshold=65.0,
                            log_weight=None, followup_lags=8,
-                           followup_reach=1.5):
+                           followup_reach=1.5, followup_per_source=1):
     """A block searched in two stages. A coarse grid (phase lattice of mean
     mismatch ``coarse_mismatch``, sky step ``coarse_sky_step``, every
     ``decimate``-th lag) is searched exhaustively on ``coarse_model``, the
@@ -448,7 +448,16 @@ def two_stage_block_search(model, coarse_model, region, delay_range=None,
     source peaks at a shifted time; at high frequency the defaults (1.5
     spacings, 8 lags) can then miss the source's peak.
 
-    Returns the ``top`` candidates and the stages' counts and seconds."""
+    The loudest survivor of a source is not always the one nearest its
+    peak: a coarse grid also catches the secondary maxima along the
+    mass--time--sky ridge, and one of those can outshine the coarse
+    template at the peak. ``followup_per_source`` follows that many of a
+    source's loudest survivors (distinct template and sky point) and keeps
+    the loudest follow-up, so the peak is reached from whichever survivor
+    lies nearest it.
+
+    Returns the ``top`` candidates and the stages' counts and seconds:
+    ``followed`` sources, ``followups`` follow-up searches."""
     start = time.time()
     s, gs, frame, _ = phase_frame(model, region)
     coarse, cnear, hc = aligned_lattice(s, gs, coarse_mismatch)
@@ -464,37 +473,54 @@ def two_stage_block_search(model, coarse_model, region, delay_range=None,
     # one source fires many templates (its mass trades against its arrival
     # time), neighbouring sky points and lag tiles: survivors within
     # ``merge_time`` and two coarse sky steps of a louder one are its
+    # (the first of each source is its loudest; up to
+    # ``followup_per_source`` of them, distinct in template and sky point,
+    # are followed up)
     kept = []
     for n, p, j, v, _ in surv[numpy.argsort(-surv[:, 3])]:
         n, p, j = int(n), int(p), int(j)
-        if not any(numpy.linalg.norm(sky[p] - sky[k[1]])
-                   <= 2.01 * coarse_sky_step
-                   and abs(delays[j] - delays[k[2]]) <= merge_time
-                   for k in kept):
-            kept.append((n, p, j, v))
+        for k in kept:
+            h = k[0]
+            if (numpy.linalg.norm(sky[p] - sky[h[1]]) <= 2.01 * coarse_sky_step
+                    and abs(delays[j] - delays[h[2]]) <= merge_time):
+                if len(k) < followup_per_source and not any(
+                        (n, p) == x[:2] for x in k):
+                    k.append((n, p, j, v))
+                break
+        else:
+            kept.append([(n, p, j, v)])
     fine_sky = block_sky_points(model, radius, fine_sky_step)
-    found = []
-    for n, p, j, v in kept:
-        # the follow-up: the fine nodes near its template, the fine sky
-        # points near its sky point and the lags near its own, one FFT
-        # search; then the loudest refined
-        d = fine - coarse[n]
-        near = numpy.nonzero(numpy.sqrt(numpy.einsum(
-            'ni,ij,nj->n', d, gs, d)) <= followup_reach * hc[0])[0]
-        local = fine_sky[numpy.linalg.norm(fine_sky - sky[p], axis=1)
-                         <= 1.5 * coarse_sky_step]
-        if not len(near) or not len(local):
+    window = decimate * followup_lags * (delays[1] - delays[0])
+    found, followups = [], 0
+    for source in kept:
+        best = None
+        for n, p, j, v in source:
+            # the follow-up: the fine nodes near its template, the fine sky
+            # points near its sky point and the lags near its own, one FFT
+            # search
+            d = fine - coarse[n]
+            near = numpy.nonzero(numpy.sqrt(numpy.einsum(
+                'ni,ij,nj->n', d, gs, d)) <= followup_reach * hc[0])[0]
+            local = fine_sky[numpy.linalg.norm(fine_sky - sky[p], axis=1)
+                             <= 1.5 * coarse_sky_step]
+            if not len(near) or not len(local):
+                continue
+            out = fft_search_sky_block(
+                model, region[fnear[near]], local,
+                delay_range=(delays[j] - window, delays[j] + window), top=1,
+                coefficients=fine[near] @ frame['directions'].T,
+                gram_reuse=len(near), share_spectra=False, basis_chunk=8)
+            followups += 1
+            c = out['candidates'][0]
+            c['coarse_twof'] = float(v)
+            if best is None or c['twof'] > best['twof']:
+                best = c
+        if best is None:
             continue
-        window = decimate * followup_lags * (delays[1] - delays[0])
-        out = fft_search_sky_block(
-            model, region[fnear[near]], local,
-            delay_range=(delays[j] - window, delays[j] + window), top=1,
-            coefficients=fine[near] @ frame['directions'].T,
-            gram_reuse=len(near), share_spectra=False, basis_chunk=8)
-        best = out['candidates'][0]
+        # the loudest refined
         if best['twof'] > refine_threshold:
             refine_candidate(model, best)
-        best['coarse_twof'] = float(v)
+        best['followups'] = len(source)
         found.append(best)
     if log_weight is not None and found:
         # a population's weight on top of the likelihood ratio, half of 2F
@@ -507,7 +533,8 @@ def two_stage_block_search(model, coarse_model, region, delay_range=None,
     else:
         found.sort(key=lambda c: -c['twof'])
     return dict(candidates=found[:top], survivors=len(surv),
-                followed=len(kept), coarse_seconds=coarse_seconds,
+                followed=len(kept), followups=followups,
+                coarse_seconds=coarse_seconds,
                 seconds=time.time() - start)
 
 

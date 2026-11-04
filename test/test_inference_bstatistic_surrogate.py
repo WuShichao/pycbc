@@ -713,6 +713,19 @@ def test_the_two_stage_block_search_finds_what_the_fine_grid_finds():
                                   followup_lags=32, followup_reach=3.0)
     assert wide['followed'] == out['followed']
     assert wide['candidates'][0]['twof'] >= 0.999 * best['twof']
+    # following several survivors of each source: the same sources, more
+    # follow-ups, each source's candidate the loudest of its follow-ups
+    assert out['followups'] == out['followed']
+    several = two_stage_block_search(block, block, region, radius=0.02,
+                                     coarse_mismatch=0.1, fine_mismatch=0.02,
+                                     coarse_sky_step=1.0, fine_sky_step=0.5,
+                                     decimate=1, threshold=0.25 * fine['twof'],
+                                     refine_threshold=0.5 * fine['twof'],
+                                     followup_per_source=4)
+    assert several['followed'] == out['followed']
+    assert out['followed'] < several['followups'] <= 4 * out['followed']
+    assert several['candidates'][0]['twof'] >= 0.999 * best['twof']
+    assert max(c['followups'] for c in several['candidates']) > 1
 
 
 def test_template_factors_enter_the_fft_block_search():
