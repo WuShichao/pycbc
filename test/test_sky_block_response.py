@@ -190,3 +190,29 @@ def test_the_exact_harmonics_on_the_gpu_are_the_cpus(block):
     off = block._offsets(numpy.random.default_rng(4).uniform(-1, 1, (5, 2)))
     numpy.testing.assert_allclose(gpu.exact(off), block.exact(off),
                                   rtol=1e-10, atol=1e-13)
+
+
+def test_exact_frequency_indices_and_the_all_frequency_check():
+    from pycbc.tdi.sky_block_response import exact_frequency_count
+    kw = dict(kmax=8, samples=32, points=300, test_points=60, tolerance=1e-3)
+    by_count = SkyBlockResponse(ORBIT, TERMS, F, CENTRE, SCALES, radius=0.03,
+                                exact_frequencies=4, **kw)
+    by_index = SkyBlockResponse(ORBIT, TERMS, F, CENTRE, SCALES, radius=0.03,
+                                exact_frequencies=[4, 7], **kw)
+    numpy.testing.assert_array_equal(by_index.frequencies, F[[0, 4, 7, 11]])
+    numpy.testing.assert_array_equal(by_count.frequencies, F[[0, 4, 7, 11]])
+    everywhere = SkyBlockResponse(ORBIT, TERMS, F, CENTRE, SCALES, radius=0.03,
+                                  exact_frequencies=4,
+                                  interpolation_check='all', **kw)
+    assert len(everywhere._fit_state['mid']) == len(F) - 4
+    assert numpy.isfinite(everywhere.interpolation_error)
+    # the same fit, only the check differs
+    numpy.testing.assert_allclose(everywhere._basis, by_count._basis)
+    with pytest.raises(ValueError):
+        SkyBlockResponse(ORBIT, TERMS, F, CENTRE, SCALES, radius=0.03,
+                         exact_frequencies=[20], **kw)
+    assert exact_frequency_count(F, 4e-5) == len(F)
+    assert exact_frequency_count(numpy.linspace(0.0136, 0.01361, 100),
+                                 4e-5) == 5
+    assert exact_frequency_count(numpy.linspace(0.02, 0.03, 1500),
+                                 4e-5) == 251

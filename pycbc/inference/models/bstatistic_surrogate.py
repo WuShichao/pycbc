@@ -680,7 +680,9 @@ class BStatisticSurrogate(BaseModel):
                   derivative_step=0.05, max_time_loss=1e-3, precision='double',
                   expansion_order=2, source_derivatives=None,
                   exact_source_phase=None, sky_block_radius=None,
-                  sky_block_points=600, notches=None, **kwargs):
+                  sky_block_points=600, notches=None,
+                  sky_block_exact_spacing=None, sky_block_check=None,
+                  **kwargs):
         """Build the model from frequency-domain TDI data.
 
         Parameters
@@ -759,6 +761,15 @@ class BStatisticSurrogate(BaseModel):
             a zero of the TDI-2 PSD it is not, and the whitened template
             then concentrates there (see
             :func:`pycbc.tdi.noise.tdi2_zero_notches`). Default none.
+        sky_block_exact_spacing : float, optional
+            Space the sky blocks' exact frequencies by at most this, Hz
+            (:func:`pycbc.tdi.sky_block_response.exact_frequency_count`, at
+            least 5), here and in :meth:`recentred_stages`; default 160 of
+            them whatever the band.
+        sky_block_check : {'midpoints', 'all'}, optional
+            Where the blocks measure their interpolation error, see
+            :class:`pycbc.tdi.sky_block_response.SkyBlockResponse`; default
+            the midpoints.
         """
         from pycbc.coordinates.space_orbit import LisaEqualArmOrbit
         from pycbc.filter.subsample_arrival_time import (
@@ -911,7 +922,8 @@ class BStatisticSurrogate(BaseModel):
                 sky_block_radius, kmax=harmonics, samples=response_samples,
                 ratio=ratio, weight=source_power_weights(fam),
                 points=sky_block_points, test_points=100,
-                exact_frequencies=min(coarse_bins, 160), xp=fam.xp)
+                **_exact_options(coarse, sky_block_exact_spacing,
+                                 sky_block_check), xp=fam.xp)
         daily = DailyGram(fam)
         spectrum, noise = ssb_data_spectrum(grid, bins, orbit, lon, lat,
                                             xp=fam.xp)
@@ -923,6 +935,7 @@ class BStatisticSurrogate(BaseModel):
                     scales, distance_prior, time_window,
                     oversampling=oversampling, **kwargs)
         model._recentre_args = dict(
+            exact_spacing=sky_block_exact_spacing, check=sky_block_check,
             grid=grid, bins=bins, orbit=orbit, terms=terms, coarse=coarse,
             ratio=ratio, harmonics=harmonics, samples=response_samples,
             time_window=time_window, kwargs=kwargs)
@@ -965,7 +978,8 @@ class BStatisticSurrogate(BaseModel):
             samples=a['samples'], ratio=a['ratio'],
             weight=source_power_weights(self.surrogate),
             points=sky_block_points, test_points=100,
-            exact_frequencies=min(len(a['coarse']), 160),
+            **_exact_options(a['coarse'], a.get('exact_spacing'),
+                             a.get('check')),
             xp=self.surrogate.xp)
         spectrum, noise = ssb_data_spectrum(a['grid'], a['bins'], a['orbit'],
                                             longitude, latitude,
@@ -1495,3 +1509,16 @@ class SharedLikelihood(object):
                 xp=xp)[0]
             out.reshape(-1)[sel] = vals
         return out, choice
+
+
+def _exact_options(coarse, spacing, check):
+    """The sky blocks' exact-frequency options: 160 of the coarse
+    frequencies unless spaced by ``spacing`` Hz, and the interpolation check
+    only when asked, so that a block fitted before these options existed
+    keeps its cache key."""
+    from pycbc.tdi.sky_block_response import exact_frequency_count
+    out = dict(exact_frequencies=min(len(coarse), 160) if spacing is None
+               else exact_frequency_count(coarse, spacing))
+    if check is not None:
+        out['interpolation_check'] = check
+    return out

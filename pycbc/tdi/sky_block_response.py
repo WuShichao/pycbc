@@ -135,22 +135,40 @@ class SkyBlockResponse(object):
         Largest relative error of a point's harmonics accepted from the
         basis; the series' degree grows until the held-out points meet it
         too, or ``max_degree`` is reached.
-    exact_frequencies : int, optional
+    exact_frequencies : int or array of int, optional
         Compute the exact response at this many of the frequencies, evenly
-        spread, and interpolate the basis linearly to the rest: the
-        response changes slowly with frequency. Its error at the held-out
-        points is measured at every frequency. Default all.
+        spread, or at these indices of them (the first and last are always
+        added), and interpolate the basis linearly to the rest: the
+        response changes slowly with frequency. Default all.
+    interpolation_check : {'midpoints', 'all'}
+        Where the interpolation error is measured, at a few held-out
+        points: the midpoints between exact frequencies (default), or every
+        frequency that is not exact. A narrow feature between exact
+        frequencies (the source's power at a TDI-2 zero, say) can hide from
+        the midpoints; 'all' costs the exact response at every frequency at
+        those few points.
     """
     def __init__(self, orbit, terms, frequencies, centre, scales, radius,
                  kmax=8, samples=32, ratio=None, weight=None, points=400,
                  test_points=100, tolerance=1e-4, max_degree=24, seed=0,
-                 exact_frequencies=None, xp=None):
+                 exact_frequencies=None, xp=None,
+                 interpolation_check='midpoints'):
         from pycbc.tdi.onthefly import MultiChannelTermGeometry
         self.output_frequencies = numpy.asarray(frequencies, dtype=float)
         n_out = len(self.output_frequencies)
-        pick = numpy.arange(n_out) if exact_frequencies is None or \
-            exact_frequencies >= n_out else numpy.unique(numpy.linspace(
-                0, n_out - 1, int(exact_frequencies)).round().astype(int))
+        if interpolation_check not in ('midpoints', 'all'):
+            raise ValueError("interpolation_check is 'midpoints' or 'all'")
+        if exact_frequencies is None:
+            pick = numpy.arange(n_out)
+        elif numpy.ndim(exact_frequencies) == 0:
+            pick = numpy.arange(n_out) if exact_frequencies >= n_out else \
+                numpy.unique(numpy.linspace(0, n_out - 1, int(
+                    exact_frequencies)).round().astype(int))
+        else:
+            pick = numpy.asarray(exact_frequencies, dtype=int)
+            if pick.min() < 0 or pick.max() >= n_out:
+                raise ValueError("exact frequency index out of range")
+            pick = numpy.unique(numpy.concatenate([pick, [0, n_out - 1]]))
         self.frequencies = self.output_frequencies[pick]
         self.centre = (float(centre[0]), float(centre[1]))
         self.scales = (float(scales[0]), float(scales[1]))
@@ -207,10 +225,14 @@ class SkyBlockResponse(object):
                                max_degree=int(max_degree), n_out=n_out,
                                pick=pick, w_out=w_out)
         if len(pick) < n_out:
-            # the exact harmonics at the midpoints between the exact
-            # frequencies, where linear interpolation is worst, at a few
-            # held-out points
-            mid = 0.5 * (self.frequencies[1:] + self.frequencies[:-1])
+            # the exact harmonics at a few held-out points: at the
+            # midpoints between the exact frequencies, where linear
+            # interpolation is worst for a smooth response, or at every
+            # frequency that is not exact
+            if interpolation_check == 'all':
+                mid = numpy.delete(self.output_frequencies, pick)
+            else:
+                mid = 0.5 * (self.frequencies[1:] + self.frequencies[:-1])
             full = SkyBlockResponse.__new__(SkyBlockResponse)
             full.__dict__.update(self.__dict__)
             full.frequencies = mid
@@ -495,3 +517,17 @@ def sky_blocks(*args, tolerances=(1e-4,), cache=None, **kwargs):
             if not os.path.exists(f):
                 b.save(f)
     return out
+
+
+def exact_frequency_count(frequencies, spacing, minimum=5):
+    """Exact frequencies for :class:`SkyBlockResponse` spaced by at most
+    ``spacing`` Hz over the band of ``frequencies``, at least ``minimum``,
+    at most all of them.
+
+    The count follows the band: a long-tau reference's band of 1e-4 Hz
+    needs a handful where a short one of 1e-2 Hz needs hundreds, and a fixed
+    count spends the same exact response on both.
+    """
+    f = numpy.asarray(frequencies, dtype=float)
+    n = int(numpy.ceil((f[-1] - f[0]) / float(spacing))) + 1
+    return int(min(len(f), max(int(minimum), n)))
