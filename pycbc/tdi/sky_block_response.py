@@ -28,6 +28,76 @@ from numpy.polynomial import chebyshev
 from pycbc.tdi.ssb_yearly_harmonics import ORBITAL_PERIOD, ssb_delay
 
 
+def _device_geometry(geometry, xp):
+    """The arrays of a :class:`~pycbc.tdi.onthefly.MultiChannelTermGeometry`
+    the frequency-domain response needs, on ``xp``, kept on the geometry."""
+    cache = getattr(geometry, '_sky_block_arrays', None)
+    if cache is not None and cache[0] is xp:
+        return cache[1]
+    g = dict(coefficient=geometry.coefficient[:, 0], ltt=geometry.ltt,
+             chain_delay=geometry.chain_delay, n_hat=geometry.n_hat,
+             r_emit=geometry.r_emit, r_recv=geometry.r_recv)
+    if geometry.velocity_order:
+        g.update(v_emit=geometry.v_emit, v_recv=geometry.v_recv,
+                 n_dot_v_recv=geometry.n_dot_v_recv,
+                 n_dot_v_mix=geometry.n_dot_v_mix)
+    g = {k: xp.asarray(v) for k, v in g.items()}
+    g['velocity_order'] = geometry.velocity_order
+    g['channels'] = [xp.asarray(numpy.nonzero(geometry.term_channel == i)[0])
+                     for i in range(len(geometry.channel_names))]
+    geometry._sky_block_arrays = (xp, g)
+    return g
+
+
+def _response_factors(g, omega, lon, lat, xp):
+    """:func:`pycbc.tdi.onthefly.frequency_response_factors` at several sky
+    points at once: shape ``(M, 2, nchannels, ngrid)``, plus then cross."""
+    from pycbc.tdi.response import C_SI
+    lon, lat = xp.asarray(lon), xp.asarray(lat)
+    sl, cl, sb, cb = xp.sin(lon), xp.cos(lon), xp.sin(lat), xp.cos(lat)
+    zero = xp.zeros_like(lon)
+    # polarization_basis, one column per point
+    u = xp.stack([sl, -cl, zero])
+    v = xp.stack([-sb * cl, -sb * sl, cb])
+    k = xp.stack([-cb * cl, -cb * sl, -sb])
+
+    def dot(a, w):
+        # (T, G, 3) against (3, M) -> (M, T, G)
+        t, n = a.shape[:2]
+        return xp.moveaxis((a.reshape(-1, 3) @ w).reshape(t, n, -1), -1, 0)
+    nu, nv, nk = dot(g['n_hat'], u), dot(g['n_hat'], v), dot(g['n_hat'], k)
+    # antenna_prefactor, its removable singularity near n = k elementwise
+    plus, cross = nu ** 2 - nv ** 2, 2 * nu * nv
+    gap = 1 - nk
+    limit = gap < 1e-4
+    transverse = nu ** 2 + nv ** 2
+    resolved = transverse > (64 * numpy.finfo(float).eps) ** 2
+    scale = xp.where(resolved, 0.5 * (1 + nk)
+                     / xp.where(resolved, transverse, 1.0), 0.0)
+    half = 1 / (2 * xp.where(limit, 1.0, gap))
+    pp = xp.where(limit, scale * plus, plus * half)
+    pc = xp.where(limit, scale * cross, cross * half)
+    del nu, nv, plus, cross, gap, limit, transverse, resolved, scale, half
+    tau_emit = g['ltt'][None] + dot(g['r_emit'], k) / C_SI
+    tau_recv = dot(g['r_recv'], k) / C_SI
+    chain = g['chain_delay'][None]
+    phase = -1j * omega[None, None]
+    transfer = xp.exp(phase * (chain + tau_emit))
+    recv = xp.exp(phase * (chain + tau_recv))
+    if g['velocity_order']:
+        transfer *= 1 + (-dot(g['v_emit'], k) + g['n_dot_v_recv'][None]) / C_SI
+        recv *= 1 + (-dot(g['v_recv'], k) + g['n_dot_v_mix'][None]) / C_SI
+    transfer -= recv
+    del recv, tau_emit, tau_recv
+    transfer *= g['coefficient'][None, :, None]
+    out = xp.empty((len(lon), 2, len(g['channels']), transfer.shape[-1]),
+                   dtype=transfer.dtype)
+    for c, sel in enumerate(g['channels']):
+        out[:, 0, c] = (transfer[:, sel] * pp[:, sel]).sum(axis=1)
+        out[:, 1, c] = (transfer[:, sel] * pc[:, sel]).sum(axis=1)
+    return out
+
+
 class SkyBlockResponse(object):
     """The response harmonics over a block of the sky.
 
@@ -74,7 +144,7 @@ class SkyBlockResponse(object):
     def __init__(self, orbit, terms, frequencies, centre, scales, radius,
                  kmax=8, samples=32, ratio=None, weight=None, points=400,
                  test_points=100, tolerance=1e-4, max_degree=24, seed=0,
-                 exact_frequencies=None):
+                 exact_frequencies=None, xp=None):
         from pycbc.tdi.onthefly import MultiChannelTermGeometry
         self.output_frequencies = numpy.asarray(frequencies, dtype=float)
         n_out = len(self.output_frequencies)
@@ -90,6 +160,7 @@ class SkyBlockResponse(object):
             raise ValueError("too few response samples for kmax")
         self.orders = numpy.arange(-self.kmax, self.kmax + 1)
         self.tolerance = float(tolerance)
+        self._xp = numpy if xp is None else xp
         nf = len(self.frequencies)
         # the times of pycbc.tdi.ssb_yearly_harmonics.yearly_response_samples
         t = (numpy.arange(self.samples)[:, None] * ORBITAL_PERIOD
@@ -123,38 +194,22 @@ class SkyBlockResponse(object):
         coords = vectors[:, :keep] * numpy.sqrt(values[:keep])[None]
         norm2 = numpy.sum(numpy.abs(A) ** 2, axis=1)
         left = norm2[:, None] - numpy.cumsum(numpy.abs(coords) ** 2, axis=1)
+        # the training rows' worst relative error at each rank
         err = numpy.sqrt(numpy.maximum(left, 0) / norm2[:, None]).max(axis=0)
-        good = numpy.nonzero(err <= self.tolerance / 3)[0]
-        self.rank = int(good[0]) + 1 if len(good) else keep
-        self._vt = (numpy.conj(vectors[:, :self.rank].T) @ A) / numpy.sqrt(
-            values[:self.rank])[:, None]
+        rank = self._rank_at(err, self.tolerance)
+        vt = (numpy.conj(vectors[:, :rank].T) @ A) / numpy.sqrt(
+            values[:rank])[:, None]
         del A
-        coords = coords[:, :self.rank]
-        # the coordinates as Chebyshev series in the block, the degree
-        # raised until the held-out points meet the tolerance
-        for degree in range(2, int(max_degree) + 1, 2):
-            V = chebyshev.chebvander2d(train[:, 0], train[:, 1],
-                                       [degree, degree])
-            if V.shape[1] > len(train) // 2:
-                break
-            self._series = numpy.linalg.lstsq(V, coords, rcond=None)[0]
-            self.degree = degree
-            self.error = float(self._error(test, B))
-            if self.error <= self.tolerance:
-                break
-        # the basis on every frequency, unweighted, by linear interpolation
-        nk = len(self.orders)
-        inverse = numpy.where(self._root > 0, 1 / numpy.maximum(self._root,
-                                                                 1e-300), 0)
-        V = (self._vt.reshape(self.rank, nk, 2, -1, nf) * inverse)
+        # what a looser block (:meth:`coarsened`) is fitted from: a looser
+        # tolerance keeps the leading part of the same basis
+        self._fit_state = dict(train=train, test=test, B=B, err=err,
+                               coords=coords[:, :rank], vt=vt,
+                               max_degree=int(max_degree), n_out=n_out,
+                               pick=pick, w_out=w_out)
         if len(pick) < n_out:
-            V = numpy.apply_along_axis(
-                lambda v: numpy.interp(self.output_frequencies,
-                                       self.frequencies, v.real)
-                + 1j * numpy.interp(self.output_frequencies,
-                                    self.frequencies, v.imag), -1, V)
-            # the error at the midpoints between the exact frequencies, where
-            # linear interpolation is worst, at a few held-out points
+            # the exact harmonics at the midpoints between the exact
+            # frequencies, where linear interpolation is worst, at a few
+            # held-out points
             mid = 0.5 * (self.frequencies[1:] + self.frequencies[:-1])
             full = SkyBlockResponse.__new__(SkyBlockResponse)
             full.__dict__.update(self.__dict__)
@@ -168,8 +223,50 @@ class SkyBlockResponse(object):
             full._shift = numpy.exp(-2j * numpy.pi * numpy.tile(
                 mid, self.samples) * ssb_delay(orbit, t.ravel(), *self.centre))
             some = test[:min(8, len(test))]
-            exact = full.exact(self._offsets(some))
+            self._fit_state.update(mid=mid, some=some,
+                                   mid_exact=full.exact(self._offsets(some)))
             del full
+        self._fit(rank)
+
+    @staticmethod
+    def _rank_at(err, tolerance):
+        good = numpy.nonzero(err <= tolerance / 3)[0]
+        return int(good[0]) + 1 if len(good) else len(err)
+
+    def _fit(self, rank):
+        """The block at ``rank`` from the stored fit: the coordinates as
+        Chebyshev series in the block, the basis on every frequency and the
+        held-out error."""
+        st = self._fit_state
+        self.rank = int(rank)
+        self._vt = st['vt'][:self.rank]
+        coords = st['coords'][:, :self.rank]
+        train, test = st['train'], st['test']
+        # the coordinates as Chebyshev series in the block, the degree
+        # raised until the held-out points meet the tolerance
+        for degree in range(2, st['max_degree'] + 1, 2):
+            V = chebyshev.chebvander2d(train[:, 0], train[:, 1],
+                                       [degree, degree])
+            if V.shape[1] > len(train) // 2:
+                break
+            self._series = numpy.linalg.lstsq(V, coords, rcond=None)[0]
+            self.degree = degree
+            self.error = float(self._error(test, st['B']))
+            if self.error <= self.tolerance:
+                break
+        # the basis on every frequency, unweighted, by linear interpolation
+        nk, nf = len(self.orders), len(self.frequencies)
+        inverse = numpy.where(self._root > 0, 1 / numpy.maximum(self._root,
+                                                                 1e-300), 0)
+        V = (self._vt.reshape(self.rank, nk, 2, -1, nf) * inverse)
+        if len(st['pick']) < st['n_out']:
+            V = numpy.apply_along_axis(
+                lambda v: numpy.interp(self.output_frequencies,
+                                       self.frequencies, v.real)
+                + 1j * numpy.interp(self.output_frequencies,
+                                    self.frequencies, v.imag), -1, V)
+            mid, some, exact = st['mid'], st['some'], st['mid_exact']
+            w_out = st['w_out']
             root = numpy.sqrt(numpy.interp(mid, self.output_frequencies,
                                            w_out / w_out.sum()))
             at_mid = numpy.apply_along_axis(
@@ -184,6 +281,7 @@ class SkyBlockResponse(object):
                 / numpy.linalg.norm(ref, axis=1)))
             self.error = max(self.error, self.interpolation_error)
         self._basis = V
+        self.__dict__.pop('_device_basis', None)
         logging.info("sky block at (%.4f, %.4f) of radius %.3f rad: rank "
                      "%d, Chebyshev degree %d, held-out error %.2g",
                      self.centre[0], self.centre[1], self.radius, self.rank,
@@ -192,6 +290,29 @@ class SkyBlockResponse(object):
             logging.warning("sky block error %.2g above the tolerance %.2g: "
                             "more points or a smaller block", self.error,
                             self.tolerance)
+
+    def coarsened(self, tolerance):
+        """The same block at a looser ``tolerance``, from this fit: the
+        leading part of its basis, the series refitted. The same as fitting
+        the block afresh at ``tolerance`` (same points, same seed) without
+        computing the exact response again."""
+        st = getattr(self, '_fit_state', None)
+        if st is None:
+            raise ValueError("a block keeps its fit only until it is saved, "
+                             "loaded or released")
+        if tolerance < self.tolerance:
+            raise ValueError("a coarsened block cannot be tighter")
+        out = SkyBlockResponse.__new__(SkyBlockResponse)
+        out.__dict__.update(self.__dict__)
+        out.__dict__.pop('_device_basis', None)
+        out.tolerance = float(tolerance)
+        out._fit(self._rank_at(st['err'], out.tolerance))
+        return out
+
+    def release(self):
+        """Drop what :meth:`coarsened` needs (the held-out rows, the
+        coordinates of the training points)."""
+        self.__dict__.pop('_fit_state', None)
 
     def _offsets(self, unit):
         """Family offsets of points of the unit square."""
@@ -212,28 +333,35 @@ class SkyBlockResponse(object):
         """Weighted, flattened harmonics ``(M, D)``."""
         return (rho * self._root).reshape(len(rho), -1)
 
-    def exact(self, offsets):
+    def exact(self, offsets, chunk=None):
         """The exact harmonics at family ``offsets`` ``(M, 2)``, shape ``(M, 2
-        kmax + 1, 2, nchannels, nfrequencies)``."""
-        from pycbc.tdi.onthefly import frequency_response_factors
+        kmax + 1, 2, nchannels, nfrequencies)``: the response at the block's
+        times and frequencies, ``chunk`` points at a time (by default as many
+        as fit in about 256 MB of work space), on the block's array module
+        ``xp``."""
         offsets = numpy.atleast_2d(numpy.asarray(offsets, dtype=float))
-        nf = len(self.frequencies)
-        f = numpy.tile(self.frequencies, self.samples)
+        xp = getattr(self, '_xp', numpy)
+        g = _device_geometry(self._geometry, xp)
+        nf, ns = len(self.frequencies), self.samples
+        nt, ng = g['ltt'].shape
+        omega = xp.asarray(2 * numpy.pi * numpy.tile(self.frequencies, ns))
+        shift = xp.asarray(self._shift)
+        ratio = None if self._ratio is None else xp.asarray(self._ratio)
+        pick = xp.asarray(self.orders % ns)
+        if chunk is None:
+            chunk = max(1, int(256 * 1024 ** 2 // (160 * nt * ng)))
+        lon = self.centre[0] + offsets[:, 0] * self.scales[0]
+        lat = self.centre[1] + offsets[:, 1] * self.scales[1]
         out = []
-        for d in offsets:
-            lon = self.centre[0] + d[0] * self.scales[0]
-            lat = self.centre[1] + d[1] * self.scales[1]
-            factors = frequency_response_factors(self._geometry, f, lon, lat)
-            names = self._geometry.channel_names
-            r = numpy.array([[factors[c][a] for c in names]
-                             for a in range(2)]) * self._shift
-            r = r.reshape(2, len(names), self.samples, nf).transpose(2, 0, 1,
-                                                                     3)
-            if self._ratio is not None:
-                r = r * self._ratio[None, None]
-            rho = numpy.fft.fft(r, axis=0) / self.samples
-            out.append(rho[self.orders % self.samples])
-        return numpy.array(out)
+        for i in range(0, len(offsets), chunk):
+            r = _response_factors(g, omega, lon[i:i + chunk],
+                                  lat[i:i + chunk], xp) * shift
+            r = r.reshape(len(r), 2, -1, ns, nf).transpose(0, 3, 1, 2, 4)
+            if ratio is not None:
+                r = r * ratio[None, None, None]
+            rho = xp.fft.fft(r, axis=1)[:, pick] / ns
+            out.append(rho.get() if hasattr(rho, 'get') else rho)
+        return numpy.concatenate(out)
 
     def _coords(self, unit):
         """The series' coordinates at points of the unit square: one
@@ -294,6 +422,7 @@ class SkyBlockResponse(object):
         self.kmax, self.samples = int(self.kmax), int(self.samples)
         self.rank, self.degree = int(self.rank), int(self.degree)
         self._geometry = None
+        self._xp = numpy
         return self
 
     @classmethod
@@ -301,21 +430,29 @@ class SkyBlockResponse(object):
         """The block of ``args`` and ``kwargs`` (as the constructor takes
         them), fitted once and kept in ``directory`` under a hash of every
         input to the fit; a block depends on no data."""
-        import hashlib
         import os
-        h = hashlib.sha256()
-        for v in list(args[2:]) + [kwargs[k] for k in sorted(kwargs)]:
-            h.update(numpy.ascontiguousarray(
-                numpy.asarray(v, dtype=float) if v is not None
-                else numpy.zeros(0)).tobytes())
-        h.update(repr(args[1]).encode())
-        path = os.path.join(directory, 'sky_block_%s.npz' % h.hexdigest()[:24])
+        path = cls._cache_path(directory, args, kwargs)
         if os.path.exists(path):
             return cls.load(path)
         block = cls(*args, **kwargs)
         os.makedirs(directory, exist_ok=True)
         block.save(path)
         return block
+
+    @staticmethod
+    def _cache_path(directory, args, kwargs):
+        """The file of a block in ``directory``: a hash of every input to
+        the fit but the array module it runs on."""
+        import hashlib
+        import os
+        h = hashlib.sha256()
+        for v in list(args[2:]) + [kwargs[k] for k in sorted(kwargs)
+                                   if k != 'xp']:
+            h.update(numpy.ascontiguousarray(
+                numpy.asarray(v, dtype=float) if v is not None
+                else numpy.zeros(0)).tobytes())
+        h.update(repr(args[1]).encode())
+        return os.path.join(directory, 'sky_block_%s.npz' % h.hexdigest()[:24])
 
     def inside(self, offsets):
         """Whether each point lies in the block."""
@@ -331,3 +468,30 @@ def sky_block(*args, cache=None, **kwargs):
     if cache:
         return SkyBlockResponse.cached(cache, *args, **kwargs)
     return SkyBlockResponse(*args, **kwargs)
+
+
+def sky_blocks(*args, tolerances=(1e-4,), cache=None, **kwargs):
+    """The blocks of ``args`` and ``kwargs`` (as :class:`SkyBlockResponse`
+    takes them) at each of ``tolerances``, from one fit at the tightest
+    (:meth:`SkyBlockResponse.coarsened`), as a two-stage search wants its
+    fine and coarse blocks; from ``cache`` (as :func:`sky_block`) when all
+    have been fitted before, and stored there."""
+    import os
+    cache = cache or os.environ.get('PYCBC_SKY_BLOCK_CACHE')
+    tolerances = [float(t) for t in tolerances]
+    paths = [SkyBlockResponse._cache_path(cache, args, dict(kwargs,
+                                                            tolerance=t))
+             for t in tolerances] if cache else None
+    if paths and all(os.path.exists(f) for f in paths):
+        return [SkyBlockResponse.load(f) for f in paths]
+    tight = min(tolerances)
+    block = SkyBlockResponse(*args, tolerance=tight, **kwargs)
+    out = [block if t == tight else block.coarsened(t) for t in tolerances]
+    for b in out:
+        b.release()
+    if paths:
+        os.makedirs(cache, exist_ok=True)
+        for b, f in zip(out, paths):
+            if not os.path.exists(f):
+                b.save(f)
+    return out

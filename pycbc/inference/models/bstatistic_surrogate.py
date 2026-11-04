@@ -893,7 +893,7 @@ class BStatisticSurrogate(BaseModel):
                 sky_block_radius, kmax=harmonics, samples=response_samples,
                 ratio=ratio, weight=source_power_weights(fam),
                 points=sky_block_points, test_points=100,
-                exact_frequencies=min(coarse_bins, 160))
+                exact_frequencies=min(coarse_bins, 160), xp=fam.xp)
         daily = DailyGram(fam)
         spectrum, noise = ssb_data_spectrum(grid, bins, orbit, lon, lat,
                                             xp=fam.xp)
@@ -919,37 +919,57 @@ class BStatisticSurrogate(BaseModel):
         centre. A looser ``sky_block_tolerance`` gives a block of lower rank,
         as a coarse first stage can use. The block comes from the directory
         ``PYCBC_SKY_BLOCK_CACHE`` names when it has been fitted before."""
+        return self.recentred_stages(
+            longitude, latitude, sky_block_radius, sky_block_points,
+            (sky_block_tolerance,))[0]
+
+    def recentred_stages(self, longitude, latitude, sky_block_radius,
+                         sky_block_points=600,
+                         sky_block_tolerances=(1e-4, 1e-2)):
+        """:meth:`recentred` at each of ``sky_block_tolerances``, the
+        stages of a two-stage search: the blocks from one fit at the
+        tightest (:func:`pycbc.tdi.sky_block_response.sky_blocks`), the
+        exact response computed on the family's array module, and the data
+        resampled once."""
         import copy
         from pycbc.filter.nufft_correlation import source_power_weights
         from pycbc.tdi.linear_exponent_surrogate import DailyGram
         from pycbc.tdi.ssb_yearly_harmonics import ssb_data_spectrum
-        from pycbc.tdi.sky_block_response import sky_block
+        from pycbc.tdi.sky_block_response import sky_blocks
         a = getattr(self, '_recentre_args', None)
         if a is None:
             raise ValueError("only a model from from_data can be recentred")
-        fam = copy.copy(self.surrogate)
-        fam.sky_block = sky_block(
+        blocks = sky_blocks(
             a['orbit'], a['terms'], a['coarse'], (longitude, latitude),
             (self.scales['eclipticlongitude'],
              self.scales['eclipticlatitude']), sky_block_radius,
-            kmax=a['harmonics'], samples=a['samples'], ratio=a['ratio'],
-            weight=source_power_weights(fam), points=sky_block_points,
-            test_points=100, exact_frequencies=min(len(a['coarse']), 160),
-            tolerance=sky_block_tolerance)
+            tolerances=sky_block_tolerances, kmax=a['harmonics'],
+            samples=a['samples'], ratio=a['ratio'],
+            weight=source_power_weights(self.surrogate),
+            points=sky_block_points, test_points=100,
+            exact_frequencies=min(len(a['coarse']), 160),
+            xp=self.surrogate.xp)
         spectrum, noise = ssb_data_spectrum(a['grid'], a['bins'], a['orbit'],
-                                            longitude, latitude, xp=fam.xp)
+                                            longitude, latitude,
+                                            xp=self.surrogate.xp)
         point = dict(self.reference)
         point.update(eclipticlongitude=float(longitude),
                      eclipticlatitude=float(latitude))
         kwargs = dict(a['kwargs'])
         if self.table is not None:
             kwargs['amplitude_table'] = self.table
-        model = type(self)(list(self.variable_params), fam, DailyGram(fam),
-                           spectrum, noise, point, self.scales,
-                           self.distance_prior, a['time_window'],
-                           oversampling=self.oversampling, **kwargs)
-        model._recentre_args = a
-        return model
+        models = []
+        for block in blocks:
+            fam = copy.copy(self.surrogate)
+            fam.sky_block = block
+            model = type(self)(list(self.variable_params), fam,
+                               DailyGram(fam), spectrum, noise, point,
+                               self.scales, self.distance_prior,
+                               a['time_window'],
+                               oversampling=self.oversampling, **kwargs)
+            model._recentre_args = a
+            models.append(model)
+        return models
 
     _CONFIG_OPTIONS = {
         'low-frequency-cutoff': float, 'high-frequency-cutoff': float,

@@ -102,3 +102,91 @@ def test_a_cached_block_is_the_block_it_stored(tmp_path):
     # another block, another file
     sky_block(ORBIT, TERMS, F, CENTRE, SCALES, 0.02, cache=str(tmp_path), **kw)
     assert len(list(tmp_path.iterdir())) == 2
+
+
+def _exact_one_point_at_a_time(blk, offsets):
+    """The exact harmonics as frequency_response_factors gives them, one
+    sky point per call."""
+    from pycbc.tdi.onthefly import frequency_response_factors
+    nf, ns = len(blk.frequencies), blk.samples
+    f = numpy.tile(blk.frequencies, ns)
+    out = []
+    for d in numpy.atleast_2d(offsets):
+        lon = blk.centre[0] + d[0] * blk.scales[0]
+        lat = blk.centre[1] + d[1] * blk.scales[1]
+        factors = frequency_response_factors(blk._geometry, f, lon, lat)
+        r = numpy.array([[factors[c][a] for c in blk._geometry.channel_names]
+                         for a in range(2)]) * blk._shift
+        r = r.reshape(2, -1, ns, nf).transpose(2, 0, 1, 3)
+        rho = numpy.fft.fft(r, axis=0) / ns
+        out.append(rho[blk.orders % ns])
+    return numpy.array(out)
+
+
+def test_the_batched_exact_harmonics_are_the_pointwise_ones(block):
+    """exact() works on several sky points at once; chunked or not, it is
+    the response computed one point at a time."""
+    rng = numpy.random.default_rng(3)
+    off = block._offsets(rng.uniform(-1, 1, (7, 2)))
+    expected = _exact_one_point_at_a_time(block, off)
+    for chunk in (None, 1, 3):
+        numpy.testing.assert_allclose(block.exact(off, chunk=chunk), expected,
+                                      rtol=1e-12, atol=1e-14)
+
+
+def test_a_coarsened_block_is_the_block_fitted_at_its_tolerance():
+    """One fit gives the fine and the coarse block: the coarse one is the
+    block fitted afresh at the looser tolerance."""
+    args = (ORBIT, TERMS, F, CENTRE, SCALES, 0.03)
+    kw = dict(kmax=4, points=200, test_points=40)
+    fine = SkyBlockResponse(*args, tolerance=1e-4, **kw)
+    coarse = fine.coarsened(1e-2)
+    fresh = SkyBlockResponse(*args, tolerance=1e-2, **kw)
+    assert coarse.rank == fresh.rank < fine.rank
+    assert coarse.degree == fresh.degree
+    assert coarse.error == pytest.approx(fresh.error, rel=1e-8)
+    off = numpy.array([[0.3, -0.2], [-1.0, 0.5]]) * 0.03 / numpy.array(SCALES)
+    numpy.testing.assert_allclose(coarse.responses(off), fresh.responses(off),
+                                  rtol=1e-10, atol=1e-13)
+    # the fine block is untouched by it
+    assert fine.rank > coarse.rank and fine.tolerance == 1e-4
+    with pytest.raises(ValueError):
+        fine.coarsened(1e-5)
+    fine.release()
+    with pytest.raises(ValueError):
+        fine.coarsened(1e-2)
+
+
+def test_sky_blocks_fit_once_and_share_the_cache_of_sky_block(tmp_path):
+    """sky_blocks stores each tolerance's block under the file sky_block
+    would use, so a cache filled either way serves the other."""
+    from pycbc.tdi.sky_block_response import sky_block, sky_blocks
+    args = (ORBIT, TERMS, F, CENTRE, SCALES, 0.03)
+    kw = dict(kmax=4, points=200, test_points=40)
+    fine, coarse = sky_blocks(*args, tolerances=(1e-4, 1e-2),
+                              cache=str(tmp_path), **kw)
+    assert len(list(tmp_path.iterdir())) == 2
+    assert not hasattr(fine, '_fit_state')
+    alone = sky_block(*args, cache=str(tmp_path), tolerance=1e-2, **kw)
+    assert alone._geometry is None and alone.rank == coarse.rank
+    assert len(list(tmp_path.iterdir())) == 2
+    again = sky_blocks(*args, tolerances=(1e-4, 1e-2), cache=str(tmp_path),
+                       **kw)
+    assert [b._geometry for b in again] == [None, None]
+    off = numpy.array([[0.3, -0.2], [-1.0, 0.5]]) * 0.03 / numpy.array(SCALES)
+    for a, b in zip(again, (fine, coarse)):
+        numpy.testing.assert_allclose(a.responses(off), b.responses(off))
+
+
+def test_the_exact_harmonics_on_the_gpu_are_the_cpus(block):
+    cupy = pytest.importorskip('cupy')
+    try:
+        cupy.zeros(1)
+    except Exception:  # noqa: BLE001 -- no device
+        pytest.skip('no GPU')
+    gpu = SkyBlockResponse.__new__(SkyBlockResponse)
+    gpu.__dict__.update(block.__dict__)
+    gpu._xp = cupy
+    off = block._offsets(numpy.random.default_rng(4).uniform(-1, 1, (5, 2)))
+    numpy.testing.assert_allclose(gpu.exact(off), block.exact(off),
+                                  rtol=1e-10, atol=1e-13)
