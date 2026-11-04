@@ -422,7 +422,8 @@ def two_stage_block_search(model, coarse_model, region, delay_range=None,
                            decimate=2, threshold=55.0, top=20,
                            coarse_options=None, fine_sky_step=0.2,
                            merge_time=86400.0, refine_threshold=65.0,
-                           log_weight=None):
+                           log_weight=None, followup_lags=8,
+                           followup_reach=1.5):
     """A block searched in two stages. A coarse grid (phase lattice of mean
     mismatch ``coarse_mismatch``, sky step ``coarse_sky_step``, every
     ``decimate``-th lag) is searched exhaustively on ``coarse_model``, the
@@ -439,6 +440,13 @@ def two_stage_block_search(model, coarse_model, region, delay_range=None,
     candidates' parameter rows, e.g. a population's
     :meth:`~pycbc.population.template_prior_weights.TemplatePriorWeights.logpdf`)
     the candidates are ranked by half their 2F plus it.
+
+    A follow-up searches the fine nodes within ``followup_reach`` coarse
+    spacings of the survivor's template and the lags within
+    ``decimate x followup_lags`` lag steps of its own. Chirp mass trades
+    against arrival time, so a survivor on a coarse node far from the
+    source peaks at a shifted time; at high frequency the defaults (1.5
+    spacings, 8 lags) can then miss the source's peak.
 
     Returns the ``top`` candidates and the stages' counts and seconds."""
     start = time.time()
@@ -472,12 +480,12 @@ def two_stage_block_search(model, coarse_model, region, delay_range=None,
         # search; then the loudest refined
         d = fine - coarse[n]
         near = numpy.nonzero(numpy.sqrt(numpy.einsum(
-            'ni,ij,nj->n', d, gs, d)) <= 1.5 * hc[0])[0]
+            'ni,ij,nj->n', d, gs, d)) <= followup_reach * hc[0])[0]
         local = fine_sky[numpy.linalg.norm(fine_sky - sky[p], axis=1)
                          <= 1.5 * coarse_sky_step]
         if not len(near) or not len(local):
             continue
-        window = decimate * 8 * (delays[1] - delays[0])
+        window = decimate * followup_lags * (delays[1] - delays[0])
         out = fft_search_sky_block(
             model, region[fnear[near]], local,
             delay_range=(delays[j] - window, delays[j] + window), top=1,

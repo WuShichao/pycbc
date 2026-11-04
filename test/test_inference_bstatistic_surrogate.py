@@ -704,6 +704,15 @@ def test_the_two_stage_block_search_finds_what_the_fine_grid_finds():
     assert out['survivors'] >= 1 and out['followed'] >= 1
     assert best['twof'] >= 0.99 * fine['twof']
     assert abs(best['time'] - fine['time']) < 3 * m.grid_step
+    # a wider follow-up searches a superset of nodes and lags: never quieter
+    wide = two_stage_block_search(block, block, region, radius=0.02,
+                                  coarse_mismatch=0.1, fine_mismatch=0.02,
+                                  coarse_sky_step=1.0, fine_sky_step=0.5,
+                                  decimate=1, threshold=0.25 * fine['twof'],
+                                  refine_threshold=0.5 * fine['twof'],
+                                  followup_lags=32, followup_reach=3.0)
+    assert wide['followed'] == out['followed']
+    assert wide['candidates'][0]['twof'] >= 0.999 * best['twof']
 
 
 def test_template_factors_enter_the_fft_block_search():
