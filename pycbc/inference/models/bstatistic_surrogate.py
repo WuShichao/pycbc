@@ -680,7 +680,7 @@ class BStatisticSurrogate(BaseModel):
                   derivative_step=0.05, max_time_loss=1e-3, precision='double',
                   expansion_order=2, source_derivatives=None,
                   exact_source_phase=None, sky_block_radius=None,
-                  sky_block_points=600, **kwargs):
+                  sky_block_points=600, notches=None, **kwargs):
         """Build the model from frequency-domain TDI data.
 
         Parameters
@@ -752,6 +752,13 @@ class BStatisticSurrogate(BaseModel):
         precision : {'double', 'single'}
             Precision of the family's correlation and transforms; the
             marginals are always in double precision.
+        notches : sequence of (float, float), optional
+            Bands ``(low, high)``, Hz, given no weight, in the data and the
+            template alike. The whitening is applied on the SSB grid, which
+            is exact only where the PSD is smooth over the Doppler width; at
+            a zero of the TDI-2 PSD it is not, and the whitened template
+            then concentrates there (see
+            :func:`pycbc.tdi.noise.tdi2_zero_notches`). Default none.
         """
         from pycbc.coordinates.space_orbit import LisaEqualArmOrbit
         from pycbc.filter.subsample_arrival_time import (
@@ -777,6 +784,13 @@ class BStatisticSurrogate(BaseModel):
         freqs = numpy.arange(kmin, kmax + 1) * df
         weight = {n: 4 * df / numpy.asarray(psds[n])[kmin:kmax + 1]
                   for n in names}
+        if notches:
+            keep = numpy.ones(len(freqs), bool)
+            for low, high in notches:
+                keep &= ~((freqs >= low) & (freqs <= high))
+            logging.info("notches remove %d of %d bins", (~keep).sum(),
+                         len(freqs))
+            weight = {n: numpy.where(keep, w, 0.0) for n, w in weight.items()}
         bins = numpy.array([numpy.asarray(data[n])[kmin:kmax + 1]
                             * numpy.sqrt(weight[n]) for n in names])
         start = float(first.start_time)
@@ -798,8 +812,12 @@ class BStatisticSurrogate(BaseModel):
                                      weight[names[0]], left=0, right=0))
         coarse = numpy.linspace(grid.frequencies[0],
                                 grid.frequencies[-1], coarse_bins)
+        # unit inside a notch, where both weights vanish
+        first_weight = weight[names[0]]
         ratio = numpy.array([numpy.sqrt(numpy.interp(
-            coarse, freqs, weight[n] / weight[names[0]])) for n in names])
+            coarse, freqs, numpy.divide(
+                weight[n], first_weight, out=numpy.ones(len(freqs)),
+                where=first_weight > 0))) for n in names])
         terms = channel_terms(channels, generation=2, delta_t=5.0)
         lon = reference['eclipticlongitude']
         lat = reference['eclipticlatitude']

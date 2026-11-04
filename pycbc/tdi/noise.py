@@ -144,3 +144,20 @@ def orbit_tdi_psd(orbit, channel_terms, frequencies, times,
     return {name: psd_from_delays(noise_transfer_delays(orbit, terms, times),
                                   f, acc, oms, xp=xp, chunk=chunk)
             for name, terms in channel_terms.items()}
+
+
+def tdi2_zero_notches(low, high, half_width, len_arm=2.5e9):
+    """Bands ``(f - half_width, f + half_width)`` about every zero
+    ``f = k c / (4 L)`` of the equal-arm TDI-2 A/E PSD within ``[low, high]``.
+
+    For ``notches`` of
+    :meth:`pycbc.inference.models.bstatistic_surrogate.BStatisticSurrogate.from_data`.
+    ``half_width`` has to exceed the source's Doppler width,
+    ``f * 1e-4 * cos(latitude)``, by enough that the PSD is smooth over it
+    outside the notch.
+    """
+    c = 299792458.0
+    step = c / (4 * float(len_arm))
+    k = numpy.arange(max(1, int(numpy.ceil((low - half_width) / step))),
+                     int(numpy.floor((high + half_width) / step)) + 1)
+    return [(float(f - half_width), float(f + half_width)) for f in k * step]

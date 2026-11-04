@@ -42,3 +42,13 @@ def test_the_orbit_fills_the_tdi2_zero_and_agrees_elsewhere():
         numpy.testing.assert_allclose(psd[name][:-1], expected, rtol=1e-4)
         assert psd[name][-1] > 0
         assert psd[name][-1] < 1e-12 * numpy.median(expected)
+
+
+def test_zero_notches_cover_each_zero_in_the_band():
+    from pycbc.tdi.noise import tdi2_zero_notches
+    assert tdi2_zero_notches(0.01, 0.025, 1e-5) == []
+    (lo, hi), = tdi2_zero_notches(0.0266, 0.0366, 1e-5)
+    assert numpy.isclose(lo, ZERO - 1e-5) and numpy.isclose(hi, ZERO + 1e-5)
+    assert len(tdi2_zero_notches(0.02, 0.07, 1e-5)) == 2
+    # a zero just outside the band still notches its edge
+    assert len(tdi2_zero_notches(ZERO + 5e-6, 0.04, 1e-5)) == 1
