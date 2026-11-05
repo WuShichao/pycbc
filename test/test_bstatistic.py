@@ -389,6 +389,24 @@ def test_bayes_noise_tail_matches_monte_carlo():
     tail = rank.noise_tail(etas, g00, g11, g01, directions=2048,
                            twof_max=80.0, points=161)
     numpy.testing.assert_allclose(tail, [1e-2, 1e-3], rtol=0.12)
+    # the Hopf quadrature, deterministic, against the same Monte Carlo
+    # (400 samples beyond the 0.999 quantile: 5% statistical error)
+    hopf = rank.noise_tail(etas, g00, g11, g01, twof_max=80.0, points=161)
+    numpy.testing.assert_allclose(hopf, [1e-2, 1e-3], rtol=0.1)
+
+
+def test_bayes_noise_tail_hopf_converges():
+    """The Hopf-sphere quadrature converges: a coarse and a fine grid agree
+    far closer than random directions do."""
+    from pycbc.filter.bstatistic import BayesRanking
+    g00, g11, g01 = _gram()
+    rank = BayesRanking(bs.DistancePowerLaw(1e-2, 1e3, power=2.0))
+    etas = [1.0, 4.0]
+    coarse = rank.noise_tail(etas, g00, g11, g01, hopf=(24, 32),
+                             twof_max=120.0, points=241)
+    fine = rank.noise_tail(etas, g00, g11, g01, hopf=(48, 64),
+                           twof_max=120.0, points=241)
+    numpy.testing.assert_allclose(coarse, fine, rtol=2e-3)
 
 
 def test_orientation_average_of_the_identity_gram():

@@ -875,8 +875,8 @@ class BayesRanking(object):
             numpy.atleast_1d(g01) / s, self.prior, self.nodes,
             table=self.table)
 
-    def noise_tail(self, etas, g00, g11, g01, directions=768, rng=None,
-                   twof_max=200.0, points=401):
+    def noise_tail(self, etas, g00, g11, g01, directions='hopf', rng=None,
+                   twof_max=200.0, points=401, hopf=(64, 80)):
         """``P(ln B > eta)`` per trial under Gaussian noise, at one Gram.
 
         Under noise ``z ~ CN(0, 2G)`` and ``x = z^H G^-1 z`` is chi^2 with
@@ -884,18 +884,41 @@ class BayesRanking(object):
         ``G^-1/2 z``. Along each direction ``ln B`` rises with ``x``, so
         ``P(ln B > eta)`` is the mean over directions of ``S_4(x(eta, u))``,
         ``S_4(x) = exp(-x/2)(1 + x/2)``, with ``x(eta, u)`` where ``ln B``
-        reaches ``eta``; ``directions`` uniform directions, ``x`` on
-        ``points`` values up to ``twof_max`` (beyond it the tail is 0)."""
-        rng = numpy.random.default_rng(0) if rng is None else rng
+        reaches ``eta``; ``x`` on ``points`` values up to ``twof_max``
+        (beyond it the tail is 0).
+
+        ``directions='hopf'`` (default) averages by quadrature: ``ln B`` is
+        unchanged by ``u -> e^{i a} u``, so it depends on ``u`` only through
+        its image on the Hopf sphere, ``u = (cos chi, sin chi e^{i delta})``,
+        a midpoint grid of ``hopf = (n_chi, n_delta)`` points weighted by
+        ``sin chi cos chi``. An integer instead draws that many uniform
+        random directions; their mean converges slowly, because ``S_4``
+        along a ray varies by orders of magnitude over the directions (a
+        few per cent at 4096)."""
         G = numpy.array([[g00, g01], [numpy.conj(g01), g11]], dtype=complex)
         L = numpy.linalg.cholesky(G)
-        u = rng.normal(size=(directions, 2)) + 1j * rng.normal(
-            size=(directions, 2))
-        u /= numpy.linalg.norm(u, axis=1, keepdims=True)
+        if isinstance(directions, str):
+            if directions != 'hopf':
+                raise ValueError("directions: 'hopf' or a number")
+            n_chi, n_delta = (int(v) for v in hopf)
+            chi = (numpy.arange(n_chi) + 0.5) * (numpy.pi / 2) / n_chi
+            delta = (numpy.arange(n_delta) + 0.5) * 2 * numpy.pi / n_delta
+            chi, delta = (v.ravel() for v in numpy.meshgrid(chi, delta,
+                                                            indexing='ij'))
+            u = numpy.stack([numpy.cos(chi), numpy.sin(chi)
+                             * numpy.exp(1j * delta)], axis=1)
+            weight = numpy.sin(chi) * numpy.cos(chi)
+        else:
+            rng = numpy.random.default_rng(0) if rng is None else rng
+            u = rng.normal(size=(int(directions), 2)) + 1j * rng.normal(
+                size=(int(directions), 2))
+            u /= numpy.linalg.norm(u, axis=1, keepdims=True)
+            weight = numpy.ones(len(u))
+        weight = weight / weight.sum()
         zr = u @ L.T
         xs = numpy.linspace(0.0, float(twof_max), int(points))
-        ones = numpy.ones(directions)
-        lb = numpy.empty((directions, len(xs)))
+        ones = numpy.ones(len(u))
+        lb = numpy.empty((len(u), len(xs)))
         for k, x in enumerate(xs):
             lb[:, k] = self(zr.T * numpy.sqrt(x), g00 * ones, g11 * ones,
                             g01 * ones)
@@ -905,8 +928,8 @@ class BayesRanking(object):
         etas = numpy.atleast_1d(numpy.asarray(etas, dtype=float))
         x_at = numpy.array([numpy.interp(etas, lb[j], xs, left=0.0,
                                          right=numpy.inf)
-                            for j in range(directions)])
+                            for j in range(len(u))])
         with numpy.errstate(over='ignore', invalid='ignore'):
             s4 = numpy.where(numpy.isinf(x_at), 0.0,
                              numpy.exp(-x_at / 2) * (1 + x_at / 2))
-        return s4.mean(axis=0)
+        return weight @ s4
