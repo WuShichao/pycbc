@@ -531,3 +531,23 @@ def exact_frequency_count(frequencies, spacing, minimum=5):
     f = numpy.asarray(frequencies, dtype=float)
     n = int(numpy.ceil((f[-1] - f[0]) / float(spacing))) + 1
     return int(min(len(f), max(int(minimum), n)))
+
+
+def exact_frequency_indices(frequencies, spacing, minimum=5, dense=None):
+    """Indices of exact frequencies for :class:`SkyBlockResponse`: spaced by
+    at most ``spacing`` Hz over the band (:func:`exact_frequency_count`),
+    plus every frequency inside the bands ``dense``, a sequence of
+    ``(low, high)`` Hz.
+
+    Next to a notched TDI-2 zero the weighted response changes faster than
+    anywhere else in the band, and the interpolation error of a block
+    concentrates there; dense exact frequencies over a band a little wider
+    than the notch remove it at a fraction of the cost of spacing the whole
+    band that finely.
+    """
+    f = numpy.asarray(frequencies, dtype=float)
+    pick = numpy.linspace(0, len(f) - 1, exact_frequency_count(
+        f, spacing, minimum)).round().astype(int)
+    extra = [numpy.nonzero((f >= lo) & (f <= hi))[0]
+             for lo, hi in (dense or ())]
+    return numpy.unique(numpy.concatenate([pick] + extra))

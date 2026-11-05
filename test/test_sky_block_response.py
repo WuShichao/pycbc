@@ -216,3 +216,16 @@ def test_exact_frequency_indices_and_the_all_frequency_check():
                                  4e-5) == 5
     assert exact_frequency_count(numpy.linspace(0.02, 0.03, 1500),
                                  4e-5) == 251
+
+
+def test_exact_frequency_indices_add_the_dense_bands():
+    from pycbc.tdi.sky_block_response import (exact_frequency_count,
+                                              exact_frequency_indices)
+    f = numpy.linspace(0.02, 0.03, 1501)
+    plain = exact_frequency_indices(f, 4e-5)
+    assert len(plain) == exact_frequency_count(f, 4e-5)
+    dense = exact_frequency_indices(f, 4e-5, dense=[(0.025, 0.0251)])
+    inside = numpy.nonzero((f >= 0.025) & (f <= 0.0251))[0]
+    assert set(inside) <= set(dense)
+    assert set(plain) <= set(dense)
+    assert dense[0] == 0 and dense[-1] == len(f) - 1

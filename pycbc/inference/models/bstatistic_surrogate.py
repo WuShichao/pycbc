@@ -682,7 +682,7 @@ class BStatisticSurrogate(BaseModel):
                   exact_source_phase=None, sky_block_radius=None,
                   sky_block_points=600, notches=None,
                   sky_block_exact_spacing=None, sky_block_check=None,
-                  **kwargs):
+                  sky_block_dense_width=None, **kwargs):
         """Build the model from frequency-domain TDI data.
 
         Parameters
@@ -766,6 +766,11 @@ class BStatisticSurrogate(BaseModel):
             (:func:`pycbc.tdi.sky_block_response.exact_frequency_count`, at
             least 5), here and in :meth:`recentred_stages`; default 160 of
             them whatever the band.
+        sky_block_dense_width : float, optional
+            With ``sky_block_exact_spacing`` and ``notches``: every coarse
+            frequency within this many Hz of a notch's edge is exact too
+            (:func:`pycbc.tdi.sky_block_response.exact_frequency_indices`).
+            The weighted response changes fastest next to a notched zero.
         sky_block_check : {'midpoints', 'all'}, optional
             Where the blocks measure their interpolation error, see
             :class:`pycbc.tdi.sky_block_response.SkyBlockResponse`; default
@@ -923,7 +928,9 @@ class BStatisticSurrogate(BaseModel):
                 ratio=ratio, weight=source_power_weights(fam),
                 points=sky_block_points, test_points=100,
                 **_exact_options(coarse, sky_block_exact_spacing,
-                                 sky_block_check), xp=fam.xp)
+                                 sky_block_check, _dense_bands(
+                                     notches, sky_block_dense_width)),
+                xp=fam.xp)
         daily = DailyGram(fam)
         spectrum, noise = ssb_data_spectrum(grid, bins, orbit, lon, lat,
                                             xp=fam.xp)
@@ -936,6 +943,7 @@ class BStatisticSurrogate(BaseModel):
                     oversampling=oversampling, **kwargs)
         model._recentre_args = dict(
             exact_spacing=sky_block_exact_spacing, check=sky_block_check,
+            dense=_dense_bands(notches, sky_block_dense_width),
             grid=grid, bins=bins, orbit=orbit, terms=terms, coarse=coarse,
             ratio=ratio, harmonics=harmonics, samples=response_samples,
             time_window=time_window, kwargs=kwargs)
@@ -979,7 +987,7 @@ class BStatisticSurrogate(BaseModel):
             weight=source_power_weights(self.surrogate),
             points=sky_block_points, test_points=100,
             **_exact_options(a['coarse'], a.get('exact_spacing'),
-                             a.get('check')),
+                             a.get('check'), a.get('dense')),
             xp=self.surrogate.xp)
         spectrum, noise = ssb_data_spectrum(a['grid'], a['bins'], a['orbit'],
                                             longitude, latitude,
@@ -1511,14 +1519,28 @@ class SharedLikelihood(object):
         return out, choice
 
 
-def _exact_options(coarse, spacing, check):
+def _dense_bands(notches, width):
+    """The bands of dense exact frequencies: each notch widened by
+    ``width`` Hz either side, or none."""
+    if not notches or not width:
+        return None
+    return [(lo - width, hi + width) for lo, hi in notches]
+
+
+def _exact_options(coarse, spacing, check, dense=None):
     """The sky blocks' exact-frequency options: 160 of the coarse
-    frequencies unless spaced by ``spacing`` Hz, and the interpolation check
-    only when asked, so that a block fitted before these options existed
-    keeps its cache key."""
-    from pycbc.tdi.sky_block_response import exact_frequency_count
-    out = dict(exact_frequencies=min(len(coarse), 160) if spacing is None
-               else exact_frequency_count(coarse, spacing))
+    frequencies unless spaced by ``spacing`` Hz (with every frequency in the
+    ``dense`` bands), and the interpolation check only when asked, so that a
+    block fitted before these options existed keeps its cache key."""
+    from pycbc.tdi.sky_block_response import (exact_frequency_count,
+                                              exact_frequency_indices)
+    if spacing is None:
+        n = min(len(coarse), 160)
+    elif dense:
+        n = exact_frequency_indices(coarse, spacing, dense=dense)
+    else:
+        n = exact_frequency_count(coarse, spacing)
+    out = dict(exact_frequencies=n)
     if check is not None:
         out['interpolation_check'] = check
     return out
