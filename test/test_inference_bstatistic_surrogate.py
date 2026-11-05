@@ -758,6 +758,62 @@ def test_the_two_stage_block_search_finds_what_the_fine_grid_finds():
     assert c[0]['twof'] >= 0.99 * fine['twof']
 
 
+
+def test_multilevel_block_search_is_two_stage_with_two_levels():
+    """With two levels the multilevel search is the two-stage search: the
+    same candidates, follow-ups and times. With an extra, coarser level in
+    front it still finds the source the fine grid finds."""
+    from pycbc.filter.sky_block_search import (block_sky_points,
+                                               fft_search_sky_block,
+                                               multilevel_block_search,
+                                               phase_lattice,
+                                               two_stage_block_search)
+    from pycbc.inference import models
+    from pycbc.workflow import WorkflowConfigParser
+    lon, lat = 3.5763564997428436, 0.3429283438977949
+    cp = WorkflowConfigParser()
+    cp.read_string(CONFIG.replace(
+        'grid-periods = 1', 'grid-periods = 1\nharmonics = 8\n'
+        'amplitude-table-file = ' + table_file()))
+    data, psds, snr2, mc = stbbh_data()
+    m = models.read_from_config(cp, data=data, psds=psds)
+    block = m.recentred(lon, lat, 0.02, sky_block_points=200)
+    s = m.static_params
+    unit = m.scales['mchirp']
+    region = numpy.array([[mc + u * unit, s['q'], s['spin1z'], s['spin2z']]
+                          for u in numpy.linspace(-2, 2, 41)])
+    dC, labels, _ = phase_lattice(block, region, 0.02, ndir=1)
+    fine = fft_search_sky_block(block, labels, block_sky_points(block, 0.02,
+                                                                0.5),
+                                top=1, coefficients=dC)['candidates'][0]
+    cut, refine = 0.25 * fine['twof'], 0.5 * fine['twof']
+    two = two_stage_block_search(block, block, region, radius=0.02,
+                                 coarse_mismatch=0.1, fine_mismatch=0.02,
+                                 coarse_sky_step=1.0, fine_sky_step=0.5,
+                                 decimate=1, threshold=cut,
+                                 refine_threshold=refine, top=50)
+    levels = [dict(mismatch=0.1, sky_step=1.0, decimate=1, threshold=cut),
+              dict(mismatch=0.02, sky_step=0.5)]
+    multi = multilevel_block_search(block, block, region, levels,
+                                    radius=0.02, refine_threshold=refine,
+                                    top=50)
+    assert multi['followed'] == two['followed']
+    assert multi['followups'] == two['followups']
+    assert len(multi['candidates']) == len(two['candidates'])
+    for a, b in zip(multi['candidates'], two['candidates']):
+        numpy.testing.assert_allclose(a['twof'], b['twof'], rtol=1e-10)
+        assert a['time'] == b['time']
+    # three levels: a coarser first stage, an intermediate cut
+    three = multilevel_block_search(
+        block, block, region,
+        [dict(mismatch=0.3, sky_step=1.0, decimate=1, threshold=0.2 * fine['twof']),
+         dict(mismatch=0.1, sky_step=1.0, decimate=1, threshold=cut),
+         dict(mismatch=0.02, sky_step=0.5)],
+        radius=0.02, refine_threshold=refine, branch=2)
+    assert len(three['surviving']) == 2
+    assert three['candidates'][0]['twof'] >= 0.99 * fine['twof']
+    assert abs(three['candidates'][0]['time'] - fine['time']) < 3 * m.grid_step
+
 def test_template_factors_enter_the_fft_block_search():
     """A factor of one changes nothing; a phase ramp exp(-2 pi i f tau) on
     the template moves the found arrival time by tau, as any factor on the

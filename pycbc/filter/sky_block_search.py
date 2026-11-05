@@ -569,6 +569,159 @@ def two_stage_block_search(model, coarse_model, region, delay_range=None,
                 seconds=time.time() - start)
 
 
+
+def _merge_sources(surv, sky, delays, sky_step, merge_time, per_source):
+    """Survivor rows (template, sky point, lag, 2F, ...) grouped by source,
+    from the loudest: a row within ``merge_time`` and two sky steps of a
+    louder kept row is its source's, kept (up to ``per_source`` rows of
+    distinct template and sky point) as another of its survivors."""
+    kept = []
+    for n, p, j, v in surv[numpy.argsort(-surv[:, 3])][:, :4]:
+        n, p, j = int(n), int(p), int(j)
+        for k in kept:
+            h = k[0]
+            if (numpy.linalg.norm(sky[p] - sky[h[1]]) <= 2.01 * sky_step
+                    and abs(delays[j] - delays[h[2]]) <= merge_time):
+                if len(k) < per_source and not any(
+                        (n, p) == x[:2] for x in k):
+                    k.append((n, p, j, v))
+                break
+        else:
+            kept.append([(n, p, j, v)])
+    return kept
+
+
+def multilevel_block_search(model, coarse_model, region, levels,
+                            delay_range=None, radius=0.07, top=20,
+                            coarse_options=None, merge_time=86400.0,
+                            refine_threshold=65.0, log_weight=None,
+                            log_bayes=None, followup_lags=8,
+                            followup_reach=1.5, branch=1):
+    """A block searched by adaptive refinement over nested levels of the
+    phase lattice: :func:`two_stage_block_search` with any number of stages.
+
+    ``levels`` is a list of dicts, coarse to fine, each with ``mismatch``
+    (the lattice's mean mismatch), ``sky_step`` (the sky points' step) and
+    optionally ``decimate`` (lag decimation) and ``threshold`` (the cut a
+    survivor of that level must pass; the last level's is not used). Level
+    0 is searched exhaustively on ``coarse_model`` (``coarse_options`` go to
+    its :func:`fft_search_sky_block`); its survivors are merged into
+    sources, up to ``branch`` survivors of distinct template and sky point
+    each. Every later level follows each survivor on ``model``: one FFT
+    search over that level's lattice nodes within ``followup_reach`` of
+    the previous level's spacings of the survivor's node, its sky points
+    within one and a half of the previous level's sky steps, and the lags
+    within ``decimate x followup_lags`` of the previous level's lag steps.
+    An intermediate level keeps, of each follow-up, up to ``branch`` points
+    above its threshold as the next level's survivors; a source with none
+    is dropped. At the last level each source keeps its loudest follow-up,
+    refined (:func:`refine_candidate`) above ``refine_threshold`` or always
+    with ``log_bayes``, and ranked as :func:`two_stage_block_search` ranks.
+
+    With two levels this is :func:`two_stage_block_search` with
+    ``followup_per_source = branch``. Returns the ``top`` candidates, the
+    survivors of level 0, the sources followed, the follow-ups and the
+    surviving points of each level, and the seconds."""
+    start = time.time()
+    s, gs, frame, _ = phase_frame(model, region)
+    lats = [aligned_lattice(s, gs, lv['mismatch']) for lv in levels]
+    skies = [block_sky_points(model, radius, lv['sky_step']) for lv in levels]
+    lv0, (nodes0, near0, h0) = levels[0], lats[0]
+    res = fft_search_sky_block(
+        coarse_model, region[near0], skies[0], delay_range=delay_range,
+        top=1, coefficients=nodes0 @ frame['directions'].T,
+        decimate=int(lv0.get('decimate', 1)), threshold=lv0['threshold'],
+        gram_reuse=len(nodes0), **(coarse_options or {}))
+    surv, delays = res['survivors'], res['delays']
+    coarse_seconds = time.time() - start
+    kept = _merge_sources(surv, skies[0], delays, lv0['sky_step'],
+                          merge_time, branch)
+    # a survivor: (lattice node, sky point, time, 2F), with its level's
+    # spacing, sky step and lag window
+    step0 = delays[1] - delays[0] if len(delays) > 1 else 0.0
+    window0 = int(lv0.get('decimate', 1)) * followup_lags * step0
+    sources = [[(nodes0[n], skies[0][p], float(delays[j]), float(v))
+                for n, p, j, v in k] for k in kept]
+    scale = [h0[0], lv0['sky_step'], window0]
+    followups, surviving = 0, [len(surv)]
+    found = []
+    last = len(levels) - 1
+    for li in range(1, len(levels)):
+        lv, (nodes, near_idx, h) = levels[li], lats[li]
+        decimate = int(lv.get('decimate', 1))
+        nxt = []
+        for source in sources:
+            best, children = None, []
+            for node, sp, t, v in source:
+                d = nodes - node
+                near = numpy.nonzero(numpy.sqrt(numpy.einsum(
+                    'ni,ij,nj->n', d, gs, d)) <= followup_reach * scale[0])[0]
+                local = skies[li][numpy.linalg.norm(skies[li] - sp, axis=1)
+                                  <= 1.5 * scale[1]]
+                if not len(near) or not len(local):
+                    continue
+                final = li == last
+                out = fft_search_sky_block(
+                    model, region[near_idx[near]], local,
+                    delay_range=(t - scale[2], t + scale[2]), top=1,
+                    coefficients=nodes[near] @ frame['directions'].T,
+                    gram_reuse=len(near), share_spectra=False, basis_chunk=8,
+                    decimate=decimate,
+                    threshold=None if final else lv['threshold'])
+                followups += 1
+                c = out['candidates'][0]
+                c['coarse_twof'] = float(v)
+                if best is None or c['twof'] > best['twof']:
+                    best = c
+                if not final:
+                    sv, dl = out['survivors'], out['delays']
+                    for n, p, j, w in sv[numpy.argsort(-sv[:, 3])][:, :4]:
+                        n, p, j = int(n), int(p), int(j)
+                        if len(children) >= branch:
+                            break
+                        if any(n == x[4] and p == x[5] for x in children):
+                            continue
+                        children.append((nodes[near][n], local[p],
+                                         float(dl[j]), float(w), n, p))
+            if li == last:
+                if best is None:
+                    continue
+                if best['twof'] > refine_threshold or log_bayes is not None:
+                    refine_candidate(model, best)
+                best['followups'] = len(source)
+                found.append(best)
+            elif children:
+                nxt.append([x[:4] for x in children])
+        if li < last:
+            sources = nxt
+            surviving.append(sum(len(x) for x in nxt))
+            step = (model.surrogate.grid.delta_t * decimate)
+            scale = [h[0], lv['sky_step'], decimate * followup_lags * step]
+    if len(levels) == 1:
+        found = res['candidates']
+    if log_bayes is not None and found:
+        z = numpy.array([c['z'] for c in found]).T
+        g00, g11, g01 = (numpy.array(v) for v in
+                         zip(*[c['gram'] for c in found]))
+        lb = numpy.atleast_1d(log_bayes(z, g00, g11, g01))
+        for c, v in zip(found, lb):
+            c['log_bayes'] = float(v)
+            c['ranking'] = float(v)
+    if log_weight is not None and found:
+        lw = numpy.atleast_1d(log_weight(numpy.array(
+            [c['theta'] for c in found])))
+        for c, v in zip(found, lw):
+            c['log_weight'] = float(v)
+            c['ranking'] = c.get('log_bayes', 0.5 * c['twof']) + float(v)
+    if found and 'ranking' in found[0]:
+        found.sort(key=lambda c: -c['ranking'])
+    else:
+        found.sort(key=lambda c: -c['twof'])
+    return dict(candidates=found[:top], survivors=len(surv),
+                followed=len(kept), followups=followups,
+                surviving=surviving, coarse_seconds=coarse_seconds,
+                seconds=time.time() - start)
+
 def aligned_lattice(s, metric, mean_mismatch, reach=1.0):
     """A cubic lattice covering the points ``s`` (M, n) of a space with
     constant ``metric``, aligned with their principal axes in the metric,
