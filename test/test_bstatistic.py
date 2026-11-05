@@ -346,3 +346,60 @@ def test_gpu_marginals_extend_the_table_and_read_it():
     assert numpy.exp(t.log_a[1]) > 60
     exact = log_orientation_marginal(z, g00, g11, g01, PRIOR, nodes)
     assert numpy.abs(cupy.asnumpy(gpu) - exact).max() < 1e-3
+
+
+from pycbc.filter import bstatistic as bs  # noqa: E402
+
+
+def _gram():
+    return 1.3, 0.8, 0.2 + 0.15j
+
+
+def test_bayes_ranking_amplitude_unit():
+    from pycbc.filter.bstatistic import BayesRanking
+    g00, g11, g01 = _gram()
+    prior = bs.DistancePowerLaw(1e-2, 1e3, power=2.0)
+    table = bs.AmplitudeTable(prior, y_max=40.0)
+    rng = numpy.random.default_rng(3)
+    z = 4 * (rng.normal(size=(2, 50)) + 1j * rng.normal(size=(2, 50)))
+    s = 7.0
+    one = BayesRanking(prior, table=table)
+    scaled = BayesRanking(prior, table=table, gram_scale=s)
+    ones = numpy.ones(50)
+    numpy.testing.assert_allclose(
+        scaled(z, g00 * ones, g11 * ones, g01 * ones),
+        one(z / numpy.sqrt(s), g00 / s * ones, g11 / s * ones,
+            g01 / s * ones), rtol=1e-10, atol=1e-10)
+
+
+def test_bayes_noise_tail_matches_monte_carlo():
+    from pycbc.filter.bstatistic import BayesRanking
+    g00, g11, g01 = _gram()
+    prior = bs.DistancePowerLaw(1e-2, 1e3, power=2.0)
+    rank = BayesRanking(prior)
+    rng = numpy.random.default_rng(5)
+    n = 400000
+    G = numpy.array([[g00, g01], [numpy.conj(g01), g11]])
+    L = numpy.linalg.cholesky(G)
+    w = rng.normal(size=(n, 2)) + 1j * rng.normal(size=(n, 2))   # CN(0, 2)
+    z = (w @ L.T).T
+    ones = numpy.ones(n)
+    lb = rank(z, g00 * ones, g11 * ones, g01 * ones)
+    etas = numpy.quantile(lb, [0.99, 0.999])
+    tail = rank.noise_tail(etas, g00, g11, g01, directions=2048,
+                           twof_max=80.0, points=161)
+    numpy.testing.assert_allclose(tail, [1e-2, 1e-3], rtol=0.12)
+
+
+def test_orientation_average_of_the_identity_gram():
+    from pycbc.filter.bstatistic import orientation_average
+    nodes = bs.OrientationNodes(16, 8)
+    from pycbc.tmpltbank.fstatistic_metric import orientation_weights
+    rng = numpy.random.default_rng(1)
+    w = orientation_weights(numpy.arccos(rng.uniform(-1, 1, 200000)),
+                            rng.uniform(0, numpy.pi, 200000))
+    g00, g11, g01 = _gram()
+    G = numpy.array([[g00, g01], [numpy.conj(g01), g11]])
+    mc = numpy.mean(numpy.einsum('an,ab,bn->n', numpy.conj(w), G, w).real)
+    numpy.testing.assert_allclose(orientation_average(g00, g11, g01, nodes),
+                                  mc, rtol=5e-3)

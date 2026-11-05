@@ -669,6 +669,11 @@ def test_a_joint_lattice_reaches_its_mismatch_with_fewer_points():
     assert 0.86 < points['centred'] / points['cubic'] < 0.96
 
 
+def rank_nodes():
+    from pycbc.filter.bstatistic import OrientationNodes
+    return OrientationNodes(16, 8)
+
+
 def test_the_two_stage_block_search_finds_what_the_fine_grid_finds():
     """A coarse grid with a threshold, then the follow-up of its merged
     survivors, finds the source the fine grid finds, at least as loud and at
@@ -726,6 +731,31 @@ def test_the_two_stage_block_search_finds_what_the_fine_grid_finds():
     assert out['followed'] < several['followups'] <= 4 * out['followed']
     assert several['candidates'][0]['twof'] >= 0.999 * best['twof']
     assert max(c['followups'] for c in several['candidates']) > 1
+    # ranked by ln B: every candidate refined, with the correlations and Gram
+    # that give its 2F, sorted by ln B, the source still first
+    from pycbc.filter.bstatistic import (BayesRanking, DistancePowerLaw,
+                                         orientation_average)
+    assert 'z' in best and 'gram' in best
+    rank = BayesRanking(DistancePowerLaw(1e-2, 1e3), gram_scale=float(
+        orientation_average(*best['gram'], rank_nodes())))
+    bayes = two_stage_block_search(block, block, region, radius=0.02,
+                                   coarse_mismatch=0.1, fine_mismatch=0.02,
+                                   coarse_sky_step=1.0, fine_sky_step=0.5,
+                                   decimate=1, threshold=0.25 * fine['twof'],
+                                   refine_threshold=0.5 * fine['twof'],
+                                   log_bayes=rank, top=50)
+    c = bayes['candidates']
+    for x in c:
+        (z0, z1), (g00, g11, g01) = x['z'], x['gram']
+        twof = (g11 * abs(z0) ** 2 + g00 * abs(z1) ** 2 - 2 * (
+            numpy.conj(z0) * g01 * z1).real) / (g00 * g11 - abs(g01) ** 2)
+        if x.get('refined'):
+            numpy.testing.assert_allclose(twof, x['twof'], rtol=1e-4)
+        else:   # refinement found nothing louder than the FFT's 2F
+            assert twof <= 1.01 * x['twof']
+    lb = [x['log_bayes'] for x in c]
+    assert lb == sorted(lb, reverse=True)
+    assert c[0]['twof'] >= 0.99 * fine['twof']
 
 
 def test_template_factors_enter_the_fft_block_search():

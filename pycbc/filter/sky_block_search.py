@@ -335,7 +335,13 @@ def refine_candidate(model, candidate, anchors=5, subsamples=8, chunk=1 << 18,
     directly, ``z(Delta) = sum_m a_m
     exp(2 pi i m Delta / T)``; the sky point's correlation and Gram are
     smooth in its offset (Chebyshev coordinates, Chebyshev anchors), so the
-    sky offset is optimised for each arrival time and the largest 2F kept."""
+    sky offset is optimised for each arrival time and the largest 2F kept.
+
+    The candidate also gets the correlations and Gram at its refined point,
+    ``z`` (two complex numbers) and ``gram`` (``g00``, ``g11``, ``g01``),
+    in the units of :func:`pycbc.filter.fstatistic.twof`, for a ranking
+    statistic other than 2F (:func:`two_stage_block_search`'s
+    ``log_bayes``)."""
     from numpy.polynomial import chebyshev
     from scipy.optimize import minimize
     fam, dg = model.surrogate, model.daily_gram
@@ -388,7 +394,7 @@ def refine_candidate(model, candidate, anchors=5, subsamples=8, chunk=1 << 18,
             g[c].append(xp.asarray(v))
     g = [xp.stack(v) / var for v in g]                        # (A^2, delays)
 
-    def twof(offset):
+    def twof(offset, parts=False):
         u = blk._unit(numpy.atleast_2d(offset))
         if numpy.any(numpy.abs(u) > 1):
             return -numpy.inf, 0
@@ -400,11 +406,14 @@ def refine_candidate(model, candidate, anchors=5, subsamples=8, chunk=1 << 18,
              - 2 * xp.real(xp.conj(z[0]) * g01 * z[1])) / (
                  g00 * g11 - xp.abs(g01) ** 2)
         k = int(xp.argmax(f))
+        if parts:
+            return float(f[k]), k, (complex(z[0, k]), complex(z[1, k])), (
+                float(xp.real(g00[k])), float(xp.real(g11[k])), complex(g01[k]))
         return float(f[k]), k
     res = minimize(lambda o: -twof(o)[0], numpy.asarray(candidate['sky']),
                    method='Nelder-Mead',
                    options=dict(xatol=1e-4, fatol=1e-3, maxiter=200))
-    value, k = twof(res.x)
+    value, k, z, gram = twof(res.x, parts=True)
     if value > candidate['twof']:
         candidate.update(
             twof=value, time=float(delays[k]), sky=[float(v) for v in res.x],
@@ -412,7 +421,12 @@ def refine_candidate(model, candidate, anchors=5, subsamples=8, chunk=1 << 18,
                             + res.x[0] * model.scales['eclipticlongitude']),
             latitude=float(model.reference['eclipticlatitude']
                            + res.x[1] * model.scales['eclipticlatitude']),
-            refined=True)
+            refined=True, z=z, gram=gram)
+    else:
+        # not improved: the correlations at its own sky point, the lag
+        # nearest its own time
+        _, _, z, gram = twof(numpy.asarray(candidate['sky']), parts=True)
+        candidate.update(z=z, gram=gram)
     return candidate
 
 
@@ -423,7 +437,8 @@ def two_stage_block_search(model, coarse_model, region, delay_range=None,
                            coarse_options=None, fine_sky_step=0.2,
                            merge_time=86400.0, refine_threshold=65.0,
                            log_weight=None, followup_lags=8,
-                           followup_reach=1.5, followup_per_source=1):
+                           followup_reach=1.5, followup_per_source=1,
+                           log_bayes=None):
     """A block searched in two stages. A coarse grid (phase lattice of mean
     mismatch ``coarse_mismatch``, sky step ``coarse_sky_step``, every
     ``decimate``-th lag) is searched exhaustively on ``coarse_model``, the
@@ -440,6 +455,12 @@ def two_stage_block_search(model, coarse_model, region, delay_range=None,
     candidates' parameter rows, e.g. a population's
     :meth:`~pycbc.population.template_prior_weights.TemplatePriorWeights.logpdf`)
     the candidates are ranked by half their 2F plus it.
+
+    With ``log_bayes`` (a function of ``z`` (2, n) and the Gram elements
+    ``g00``, ``g11``, ``g01`` (n,), e.g. a :class:`~pycbc.filter.bstatistic.BayesRanking`)
+    every follow-up is refined, whatever ``refine_threshold``, and
+    the candidates get its ``log_bayes`` and are ranked by it, plus
+    ``log_weight`` if given, instead of by half their 2F.
 
     A follow-up searches the fine nodes within ``followup_reach`` coarse
     spacings of the survivor's template and the lags within
@@ -518,17 +539,27 @@ def two_stage_block_search(model, coarse_model, region, delay_range=None,
         if best is None:
             continue
         # the loudest refined
-        if best['twof'] > refine_threshold:
+        if best['twof'] > refine_threshold or log_bayes is not None:
             refine_candidate(model, best)
         best['followups'] = len(source)
         found.append(best)
+    if log_bayes is not None and found:
+        z = numpy.array([c['z'] for c in found]).T
+        g00, g11, g01 = (numpy.array(v) for v in
+                         zip(*[c['gram'] for c in found]))
+        lb = numpy.atleast_1d(log_bayes(z, g00, g11, g01))
+        for c, v in zip(found, lb):
+            c['log_bayes'] = float(v)
+            c['ranking'] = float(v)
     if log_weight is not None and found:
         # a population's weight on top of the likelihood ratio, half of 2F
+        # (or ln B)
         lw = numpy.atleast_1d(log_weight(numpy.array(
             [c['theta'] for c in found])))
         for c, v in zip(found, lw):
             c['log_weight'] = float(v)
-            c['ranking'] = 0.5 * c['twof'] + float(v)
+            c['ranking'] = c.get('log_bayes', 0.5 * c['twof']) + float(v)
+    if found and 'ranking' in found[0]:
         found.sort(key=lambda c: -c['ranking'])
     else:
         found.sort(key=lambda c: -c['twof'])

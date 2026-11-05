@@ -826,3 +826,86 @@ extern "C" __global__ void orientation(
         : (best[0] > NEG_INF ? best[0] + log(total[0]) : NEG_INF);
 }
 """
+
+
+def orientation_average(g00, g11, g01, nodes):
+    """``w^H G w`` averaged over the orientation quadrature ``nodes``."""
+    _, g = _project(numpy.zeros((2, numpy.size(g00)), complex),
+                    numpy.atleast_1d(g00), numpy.atleast_1d(g11),
+                    numpy.atleast_1d(g01), nodes.vectors, numpy)
+    return g @ nodes.weights
+
+
+class BayesRanking(object):
+    """``ln B`` of a candidate's correlations, as a ranking statistic:
+    phase, amplitude and an isotropic orientation marginalised
+    (:func:`log_orientation_marginal`), for
+    :func:`pycbc.filter.sky_block_search.two_stage_block_search`'s
+    ``log_bayes``.
+
+    ``gram_scale`` sets the amplitude's unit: the Gram is divided by it and
+    the correlations by its square root (2F is unchanged), so with the
+    sky- and orientation-averaged ``w^H G w`` of the search's templates as
+    ``gram_scale``, ``h = 1`` is a source of sky- and orientation-averaged
+    SNR 1 and the prior's ``hmin`` the SNR at its largest distance.
+
+    Parameters
+    ----------
+    prior : DistancePowerLaw
+        The amplitude prior, in that unit.
+    table : AmplitudeTable, optional
+        Its table; built (``y_max`` 40) if not given.
+    nodes : OrientationNodes, optional
+        Default 16 x 8.
+    gram_scale : float
+    """
+    def __init__(self, prior, table=None, nodes=None, gram_scale=1.0):
+        self.prior = prior
+        self.table = AmplitudeTable(prior, y_max=40.0) if table is None \
+            else table
+        self.nodes = OrientationNodes(16, 8) if nodes is None else nodes
+        self.gram_scale = float(gram_scale)
+
+    def __call__(self, z, g00, g11, g01):
+        s = self.gram_scale
+        z = numpy.asarray(z, dtype=complex).reshape(2, -1) / numpy.sqrt(s)
+        return log_orientation_marginal(
+            z, numpy.atleast_1d(g00) / s, numpy.atleast_1d(g11) / s,
+            numpy.atleast_1d(g01) / s, self.prior, self.nodes,
+            table=self.table)
+
+    def noise_tail(self, etas, g00, g11, g01, directions=768, rng=None,
+                   twof_max=200.0, points=401):
+        """``P(ln B > eta)`` per trial under Gaussian noise, at one Gram.
+
+        Under noise ``z ~ CN(0, 2G)`` and ``x = z^H G^-1 z`` is chi^2 with
+        four degrees of freedom, whatever the direction ``u`` of
+        ``G^-1/2 z``. Along each direction ``ln B`` rises with ``x``, so
+        ``P(ln B > eta)`` is the mean over directions of ``S_4(x(eta, u))``,
+        ``S_4(x) = exp(-x/2)(1 + x/2)``, with ``x(eta, u)`` where ``ln B``
+        reaches ``eta``; ``directions`` uniform directions, ``x`` on
+        ``points`` values up to ``twof_max`` (beyond it the tail is 0)."""
+        rng = numpy.random.default_rng(0) if rng is None else rng
+        G = numpy.array([[g00, g01], [numpy.conj(g01), g11]], dtype=complex)
+        L = numpy.linalg.cholesky(G)
+        u = rng.normal(size=(directions, 2)) + 1j * rng.normal(
+            size=(directions, 2))
+        u /= numpy.linalg.norm(u, axis=1, keepdims=True)
+        zr = u @ L.T
+        xs = numpy.linspace(0.0, float(twof_max), int(points))
+        ones = numpy.ones(directions)
+        lb = numpy.empty((directions, len(xs)))
+        for k, x in enumerate(xs):
+            lb[:, k] = self(zr.T * numpy.sqrt(x), g00 * ones, g11 * ones,
+                            g01 * ones)
+        if numpy.any(numpy.diff(lb, axis=1) < -1e-6):
+            raise RuntimeError('ln B is not monotone along a direction')
+        lb = numpy.maximum.accumulate(lb, axis=1)
+        etas = numpy.atleast_1d(numpy.asarray(etas, dtype=float))
+        x_at = numpy.array([numpy.interp(etas, lb[j], xs, left=0.0,
+                                         right=numpy.inf)
+                            for j in range(directions)])
+        with numpy.errstate(over='ignore', invalid='ignore'):
+            s4 = numpy.where(numpy.isinf(x_at), 0.0,
+                             numpy.exp(-x_at / 2) * (1 + x_at / 2))
+        return s4.mean(axis=0)
