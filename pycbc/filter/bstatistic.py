@@ -833,7 +833,8 @@ def orientation_average(g00, g11, g01, nodes):
     _, g = _project(numpy.zeros((2, numpy.size(g00)), complex),
                     numpy.atleast_1d(g00), numpy.atleast_1d(g11),
                     numpy.atleast_1d(g01), nodes.vectors, numpy)
-    return g @ nodes.weights
+    out = g @ nodes.weights
+    return out[0] if numpy.ndim(g00) == 0 else out
 
 
 class BayesRanking(object):
