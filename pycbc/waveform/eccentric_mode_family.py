@@ -92,6 +92,9 @@ class EccentricModeFamily(object):
         default) or 5 (quartic), which reaches further from the reference
         where the harmonics' amplitudes and phases curve (bands holding
         n != m).
+    support : {'all', 'center'}
+        A mode's frequency support: where every stencil point has it
+        (default) or where the reference has it.
     phase_scaling : {'m', 'n'}
         How a mode's circular phase change scales with the dominant one's:
         ``m / 2`` (default, right for the n = m modes a single harmonic's
@@ -100,7 +103,7 @@ class EccentricModeFamily(object):
     """
     def __init__(self, reference, frequencies, f_ref, step_mass=0.01,
                  step_e=0.002, step_q=0.1, generator=None, f22_window=None,
-                 phase_scaling='m', order=3):
+                 phase_scaling='m', order=3, support='all'):
         self.reference = dict(reference)
         self.f = numpy.asarray(frequencies, dtype=float)
         self.f_ref = float(f_ref)
@@ -141,7 +144,21 @@ class EccentricModeFamily(object):
             amp = {ijl: g[k][0] for ijl, g in grid.items()}
             corr = {ijl: g[k][1] - r * self._circ[ijl[0], ijl[2]][1]
                     for ijl, g in grid.items()}
-            have = numpy.logical_and.reduce([g[k][2] for g in grid.values()])
+            if support == 'center':
+                # a stencil point without the bin has no phase there: take
+                # the reference's correction (amplitude zero, as given)
+                c0 = corr[(0,) * 3]
+                corr = {ijl: numpy.where(grid[ijl][k][2], c, c0)
+                        for ijl, c in corr.items()}
+            if support == 'center':
+                # the reference's own support; a stencil point missing a bin
+                # there contributes zero amplitude (pyEFPEHM keeps a
+                # harmonic only where it passes its tolerance, so the edges
+                # move across the stencil)
+                have = grid[(0,) * 3][k][2]
+            else:
+                have = numpy.logical_and.reduce([g[k][2]
+                                                 for g in grid.values()])
             self._expansions[k] = (r, _tensor_quadratic(amp, self.steps),
                                    _tensor_quadratic(corr, self.steps),
                                    grid[0, 0, 0][k][1], have)
