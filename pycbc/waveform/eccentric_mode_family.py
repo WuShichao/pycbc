@@ -87,9 +87,15 @@ class EccentricModeFamily(object):
         The dominant harmonic's sweep, passed to :func:`efpe_modes`; set it
         to the observed sweep when ``frequencies`` reach further, to hold
         the other harmonics.
+    phase_scaling : {'m', 'n'}
+        How a mode's circular phase change scales with the dominant one's:
+        ``m / 2`` (default, right for the n = m modes a single harmonic's
+        band holds) or ``n / 2`` (an eccentric harmonic's frequency ratio,
+        for bands holding n != m).
     """
     def __init__(self, reference, frequencies, f_ref, step_mass=0.01,
-                 step_e=0.002, step_q=0.1, generator=None, f22_window=None):
+                 step_e=0.002, step_q=0.1, generator=None, f22_window=None,
+                 phase_scaling='m'):
         self.reference = dict(reference)
         self.f = numpy.asarray(frequencies, dtype=float)
         self.f_ref = float(f_ref)
@@ -115,7 +121,12 @@ class EccentricModeFamily(object):
         self._expansions = {}
         for k in self.keys:
             m = k[1]
-            r = m / 2.0 if m else 1.0
+            if phase_scaling == 'n' and len(k) > 2 and k[2]:
+                # an eccentric harmonic (l, m, n) runs at about n / 2 of
+                # the dominant harmonic's frequency, its phase likewise
+                r = k[2] / 2.0
+            else:
+                r = m / 2.0 if m else 1.0
             amp = {ijl: g[k][0] for ijl, g in grid.items()}
             corr = {ijl: g[k][1] - r * self._circ[ijl[0], ijl[2]][1]
                     for ijl, g in grid.items()}
