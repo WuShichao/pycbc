@@ -26,18 +26,25 @@ faster.
 import numpy
 
 
-def efpe_modes(params, frequencies, f_ref, amplitude_tol=1e-12):
+def efpe_modes(params, frequencies, f_ref, amplitude_tol=1e-12,
+               f22_window=None):
     """pyEFPEHM's modes at ``params`` (masses, spins, ``eccentricity``,
     optionally ``inclination``) on ``frequencies``: ``{key: (amplitude,
     psi, present)}``, ``amplitude`` the complex amplitudes of the plus and
-    cross polarisations ``(2, N)``, zero where a mode is absent."""
+    cross polarisations ``(2, N)``, zero where a mode is absent.
+
+    ``f22_window = (start, end)`` bounds the dominant harmonic's sweep (the
+    source's observed time); by default it is the frequencies' own range.
+    A window narrower than the frequencies holds the other harmonics of
+    the same stretch of the orbit (an eccentric source's band)."""
     from pyEFPEHM.waveform.EFPE import pyEFPE
     f = numpy.asarray(frequencies, dtype=float)
+    lo, hi = (f[0], f[-1]) if f22_window is None else f22_window
     p = dict(mass1=params['mass1'], mass2=params['mass2'],
              spin1z=params.get('spin1z', 0.0),
              spin2z=params.get('spin2z', 0.0),
              eccentricity=params.get('eccentricity', 0.0),
-             f22_start=f[0] * 0.999, f22_ref=f_ref, f22_end=f[-1] * 1.001,
+             f22_start=lo * 0.999, f22_ref=f_ref, f22_end=hi * 1.001,
              distance=100.0, inclination=params.get('inclination', 0.0),
              Amplitude_tol=amplitude_tol)
     out = pyEFPE(p).generate_modes(f, return_waveform_pieces=True)['modes']
@@ -76,15 +83,21 @@ class EccentricModeFamily(object):
     generator : callable, optional
         ``generator(params)`` giving the modes as :func:`efpe_modes` does;
         by default pyEFPEHM on ``frequencies``.
+    f22_window : tuple, optional
+        The dominant harmonic's sweep, passed to :func:`efpe_modes`; set it
+        to the observed sweep when ``frequencies`` reach further, to hold
+        the other harmonics.
     """
     def __init__(self, reference, frequencies, f_ref, step_mass=0.01,
-                 step_e=0.002, step_q=0.1, generator=None):
+                 step_e=0.002, step_q=0.1, generator=None, f22_window=None):
         self.reference = dict(reference)
         self.f = numpy.asarray(frequencies, dtype=float)
         self.f_ref = float(f_ref)
         self.steps = (float(step_mass), float(step_e), float(step_q))
+        self.f22_window = f22_window
         self.generator = generator or (
-            lambda p: efpe_modes(p, self.f, self.f_ref))
+            lambda p: efpe_modes(p, self.f, self.f_ref,
+                                 f22_window=f22_window))
         levels = [(-1, 0, 1) if h > 0 else (0,) for h in self.steps]
         # the stencil's amplitudes in single precision (27 points of every
         # mode, both polarisations); the phases, of thousands of radians,
