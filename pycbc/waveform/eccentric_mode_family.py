@@ -104,9 +104,26 @@ class EccentricModeFamily(object):
         default) or 5 (quartic), which reaches further from the reference
         where the harmonics' amplitudes and phases curve (bands holding
         n != m).
-    support : {'all', 'center'}
+    support : {'all', 'center', 'edges'}
         A mode's frequency support: where every stencil point has it
-        (default) or where the reference has it.
+        (default), where the reference has it, or ``'edges'``: amplitudes
+        and phases from a window ``edge_margin`` wider at both ends
+        (``wide_generator``), so that every stencil point has them past
+        the edges, and the edges themselves, the first and last bin of
+        each mode at each stencil point on the nominal window, interpolated
+        like the rest. pyEFPEHM's modes are a function of the window only
+        through a time and phase shift common to all modes, and where they
+        end; the edges move with e and the masses (a harmonic's frequency
+        range over the observation depends on them).
+    edge_margin : float
+        The wider window's relative margin, for ``support='edges'``.
+    wide_generator : callable, optional
+        ``wide_generator(params)``, the modes on the wider window, for
+        ``support='edges'``; by default :func:`efpe_modes` with
+        ``amplitude_tol`` on ``f22_window`` (or the frequencies' range)
+        widened by ``edge_margin``.
+    amplitude_tol : float
+        pyEFPEHM's amplitude tolerance for the default generators.
     phase_scaling : {'m', 'n'}
         How a mode's circular phase change scales with the dominant one's:
         ``m / 2`` (default, right for the n = m modes a single harmonic's
@@ -118,7 +135,9 @@ class EccentricModeFamily(object):
     """
     def __init__(self, reference, frequencies, f_ref, step_mass=0.01,
                  step_e=0.002, step_q=0.1, generator=None, f22_window=None,
-                 phase_scaling='m', order=3, support='all', taper=None):
+                 phase_scaling='m', order=3, support='all', taper=None,
+                 edge_margin=0.01, wide_generator=None,
+                 amplitude_tol=1e-12):
         self.reference = dict(reference)
         self.f = numpy.asarray(frequencies, dtype=float)
         self.f_ref = float(f_ref)
@@ -126,7 +145,20 @@ class EccentricModeFamily(object):
         self.f22_window = f22_window
         self.generator = generator or (
             lambda p: efpe_modes(p, self.f, self.f_ref,
+                                 amplitude_tol=amplitude_tol,
                                  f22_window=f22_window, taper=taper))
+        if support not in ('all', 'center', 'edges'):
+            raise ValueError("support: 'all', 'center' or 'edges'")
+        self.support = support
+        self._circ_generator = self.generator
+        if support == 'edges':
+            lo, hi = (self.f[0], self.f[-1]) if f22_window is None \
+                else f22_window
+            wide = (lo / (1 + edge_margin), hi * (1 + edge_margin))
+            self._circ_generator = wide_generator or (
+                lambda p: efpe_modes(p, self.f, self.f_ref,
+                                     amplitude_tol=amplitude_tol,
+                                     f22_window=wide, taper=taper))
         half = (int(order) - 1) // 2
         if int(order) not in (3, 5):
             raise ValueError("order: 3 (quadratic) or 5 (quartic) points")
@@ -136,16 +168,32 @@ class EccentricModeFamily(object):
         # the stencil's amplitudes in single precision (27 points of every
         # mode, both polarisations); the phases, of thousands of radians,
         # in double
-        grid = {(i, j, l): {k: (a.astype(numpy.complex64), p, h) for k, (
-            a, p, h) in self.generator(self._point(i, j, l)).items()}
-                for i in levels[0] for j in levels[1] for l in levels[2]}
+        points = [(i, j, l) for i in levels[0] for j in levels[1]
+                  for l in levels[2]]
+        edges = {}
+        if support == 'edges':
+            # each mode's first and last bin on the nominal window
+            for ijl in points:
+                edges[ijl] = {}
+                for k, (_, _, h) in self.generator(
+                        self._point(*ijl)).items():
+                    idx = numpy.flatnonzero(h)
+                    edges[ijl][k] = numpy.array([idx[0], idx[-1]], float)
+        gen = self._circ_generator
+        grid = {ijl: {k: (a.astype(numpy.complex64), p, h) for k, (
+            a, p, h) in gen(self._point(*ijl)).items()} for ijl in points}
         self._circ = {(i, l): self._circular(i, l)
                       for i in levels[0] for l in levels[2]}
         self._circ_amp = _tensor_quadratic(
             {(i, 0, l): c[0] for (i, l), c in self._circ.items()},
             (self.steps[0], 0.0, self.steps[2]))
         self.keys = [k for k in grid[0, 0, 0]
-                     if all(k in g for g in grid.values())]
+                     if all(k in g for g in grid.values())
+                     and all(k in e for e in edges.values())]
+        self._edges = {k: _tensor_quadratic(
+            {ijl: e[k] for ijl, e in edges.items()}, self.steps)
+            for k in self.keys} if edges else {}
+        self._bins = numpy.arange(len(self.f))
         self._expansions = {}
         for k in self.keys:
             m = k[1]
@@ -199,7 +247,8 @@ class EccentricModeFamily(object):
     def _circular(self, i, l):
         """The circular binary's dominant mode at stencil point ``(i, l)``:
         pyEFPEHM's key ``(2, 2, 2)``, or the loudest mode."""
-        modes = self.generator(self._point(i, 0, l, eccentricity=0.0))
+        modes = self._circ_generator(self._point(i, 0, l,
+                                                 eccentricity=0.0))
         if (2, 2, 2) in modes:
             return modes[2, 2, 2]
         return max(modes.values(), key=lambda v: numpy.sum(abs(v[0]) ** 2))
@@ -240,7 +289,7 @@ class EccentricModeFamily(object):
         p = dict(r, mass1=mass1_from_mchirp_q(mc, q),
                  mass2=mass2_from_mchirp_q(mc, q), spin1z=s1, spin2z=s2,
                  eccentricity=0.0)
-        modes = self.generator(p)
+        modes = self._circ_generator(p)
         c = modes[2, 2, 2] if (2, 2, 2) in modes else max(
             modes.values(), key=lambda v: numpy.sum(abs(v[0]) ** 2))
         return c[1] - self._circ22(0)
@@ -256,6 +305,9 @@ class EccentricModeFamily(object):
         for k, (r, amp, corr, psi0, have) in self._expansions.items():
             a = amp(d, de, dq)
             c = corr(d, de, dq) - corr(0.0, 0.0, 0.0)
+            if self._edges:
+                lo, hi = numpy.round(self._edges[k](d, de, dq))
+                have = have & (self._bins >= lo) & (self._bins <= hi)
             out[k] = (numpy.where(have, a, 0), psi0 + r * dc + c, have)
         return out
 

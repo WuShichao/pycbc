@@ -90,3 +90,38 @@ def test_the_taper_takes_each_mode_to_zero_at_its_support_edges():
         # a mode's time over the band is years: the middle is untouched
         mid = idx[len(idx) // 2]
         numpy.testing.assert_allclose(b[:, mid], a[:, mid])
+
+
+def _edge_generator(p, wide=False):
+    """A mode whose support starts at a frequency that moves with e; the
+    wide window holds it everywhere."""
+    e = p['eccentricity']
+    psi = 3e3 * (F / F[0]) ** (-5.0 / 3) + 40 * e ** 2 * (F / F[0]) ** (
+        -34.0 / 9)
+    amp = numpy.ones((2, len(F)), complex) * (1 + e) * (F / F[0]) ** -1
+    have = numpy.ones(len(F), bool)
+    if not wide:
+        have = F >= F[0] + (F[-1] - F[0]) * (0.5 + 40 * (e - 0.05))
+        amp = numpy.where(have, amp, 0)
+        psi = numpy.where(have, psi, 0)
+    return {(2, 2, 2): (amp, psi, have)}
+
+
+def test_the_edges_support_follows_a_moving_mode_edge():
+    ref = dict(mass1=36.0, mass2=31.0, eccentricity=0.05)
+    fam = EccentricModeFamily(
+        ref, F, F[0], step_q=0.0, generator=_edge_generator,
+        support='edges',
+        wide_generator=lambda p: _edge_generator(p, wide=True))
+    for de in (-0.003, 0.002, 0.003):
+        p = dict(ref, eccentricity=0.05 + de)
+        a, psi, have = _edge_generator(p)[2, 2, 2]
+        got = fam.modes(0.0, de)[2, 2, 2]
+        # the edge moves 32 bins a step: to two bins (the stencil's edges
+        # are whole bins), the amplitude closely, the phase likewise
+        assert abs(numpy.flatnonzero(got[2])[0]
+                   - numpy.flatnonzero(have)[0]) <= 2
+        both = got[2] & have
+        numpy.testing.assert_allclose(got[0][:, both], a[:, both],
+                                      rtol=1e-4)
+        assert numpy.max(abs(got[1][both] - psi[both])) < 1e-2
