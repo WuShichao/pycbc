@@ -27,7 +27,7 @@ import numpy
 
 
 def efpe_modes(params, frequencies, f_ref, amplitude_tol=1e-12,
-               f22_window=None):
+               f22_window=None, taper=None):
     """pyEFPEHM's modes at ``params`` (masses, spins, ``eccentricity``,
     optionally ``inclination``) on ``frequencies``: ``{key: (amplitude,
     psi, present)}``, ``amplitude`` the complex amplitudes of the plus and
@@ -36,7 +36,14 @@ def efpe_modes(params, frequencies, f_ref, amplitude_tol=1e-12,
     ``f22_window = (start, end)`` bounds the dominant harmonic's sweep (the
     source's observed time); by default it is the frequencies' own range.
     A window narrower than the frequencies holds the other harmonics of
-    the same stretch of the orbit (an eccentric source's band)."""
+    the same stretch of the orbit (an eccentric source's band).
+
+    ``taper`` (seconds) multiplies each mode by ``sin^2`` ramps over that
+    much of its own time ``t(f) = psi'(f) / 2 pi`` from either end of its
+    support, as a time-domain taper of the observation would. A mode's
+    support edges move with the binary's parameters (pyEFPEHM keeps the
+    stretch of the orbit the window sets, at harmonic frequencies that
+    depend on e); tapered, its amplitude goes to zero smoothly there."""
     from pyEFPEHM.waveform.EFPE import pyEFPE
     f = numpy.asarray(frequencies, dtype=float)
     lo, hi = (f[0], f[-1]) if f22_window is None else f22_window
@@ -56,6 +63,11 @@ def efpe_modes(params, frequencies, f_ref, amplitude_tol=1e-12,
         have = numpy.zeros(len(f), bool)
         amp[:, idx] = numpy.asarray(m['A_SUA']).T[:2]
         psi[idx] = numpy.asarray(m['psi_SPA'])
+        if taper and len(idx) > 1:
+            fi = f[idx]
+            t = numpy.gradient(psi[idx], fi) / (2 * numpy.pi)
+            amp[:, idx] *= _ramp(abs(t - t[0]) / taper) * \
+                _ramp(abs(t[-1] - t) / taper)
         have[idx] = True
         modes[tuple(int(v) for v in key)] = (amp, psi, have)
     return modes
@@ -100,10 +112,13 @@ class EccentricModeFamily(object):
         ``m / 2`` (default, right for the n = m modes a single harmonic's
         band holds) or ``n / 2`` (an eccentric harmonic's frequency ratio,
         for bands holding n != m).
+    taper : float, optional
+        Seconds of ``sin^2`` taper at each end of every mode's time, passed
+        to :func:`efpe_modes` (with the default generator).
     """
     def __init__(self, reference, frequencies, f_ref, step_mass=0.01,
                  step_e=0.002, step_q=0.1, generator=None, f22_window=None,
-                 phase_scaling='m', order=3, support='all'):
+                 phase_scaling='m', order=3, support='all', taper=None):
         self.reference = dict(reference)
         self.f = numpy.asarray(frequencies, dtype=float)
         self.f_ref = float(f_ref)
@@ -111,7 +126,7 @@ class EccentricModeFamily(object):
         self.f22_window = f22_window
         self.generator = generator or (
             lambda p: efpe_modes(p, self.f, self.f_ref,
-                                 f22_window=f22_window))
+                                 f22_window=f22_window, taper=taper))
         half = (int(order) - 1) // 2
         if int(order) not in (3, 5):
             raise ValueError("order: 3 (quadratic) or 5 (quartic) points")
@@ -282,6 +297,11 @@ class EccentricModeFamily(object):
     def hplus(self, d, de, dq=0.0, circular=None):
         """The plus polarisation, the modes summed."""
         return self.polarizations(d, de, dq, circular)[0]
+
+
+def _ramp(x):
+    """``sin^2(pi x / 2)`` on ``[0, 1]``, 1 beyond."""
+    return numpy.sin(0.5 * numpy.pi * numpy.clip(x, 0.0, 1.0)) ** 2
 
 
 def _tensor_quadratic(v, steps):

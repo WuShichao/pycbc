@@ -71,3 +71,22 @@ def test_the_quartic_stencil_follows_what_the_quadratic_cannot():
         errs[order] = numpy.max(abs(fam.modes(0.0, 0.015)[2, 2, 2][1]
                                     - _quartic_generator(p)[2, 2, 2][1]))
     assert errs[5] < 1e-8 < errs[3]
+
+
+def test_the_taper_takes_each_mode_to_zero_at_its_support_edges():
+    import pytest
+    pytest.importorskip('pyEFPEHM')
+    from pycbc.waveform.eccentric_mode_family import efpe_modes
+    f = numpy.linspace(0.0136, 0.0157, 2000)
+    p = dict(mass1=36.0, mass2=31.0, eccentricity=0.05)
+    plain = efpe_modes(p, f, f[0])
+    tapered = efpe_modes(p, f, f[0], taper=1e6)
+    assert plain.keys() == tapered.keys()
+    for k, (a, psi, have) in plain.items():
+        b = tapered[k][0]
+        idx = numpy.flatnonzero(have)
+        assert numpy.all(abs(b[:, idx[[0, -1]]]) == 0)
+        assert numpy.all(abs(b) <= abs(a) + 1e-30)
+        # a mode's time over the band is years: the middle is untouched
+        mid = idx[len(idx) // 2]
+        numpy.testing.assert_allclose(b[:, mid], a[:, mid])
