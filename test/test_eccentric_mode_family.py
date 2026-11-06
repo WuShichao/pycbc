@@ -48,3 +48,26 @@ def test_the_polarisations_sum_the_modes():
     numpy.testing.assert_allclose(h, want, rtol=1e-6, atol=1e-6)
     numpy.testing.assert_allclose(fam.hplus(0.0, 0.0), want[0], rtol=1e-6,
                                   atol=1e-6)
+
+
+def _quartic_generator(p):
+    """A mode whose eccentric phase is quartic in e: the quadratic stencil
+    cannot follow it, the quartic one can."""
+    e = p['eccentricity']
+    psi = 3e3 * (F / F[0]) ** (-5.0 / 3) + 4e4 * (e - 0.1) ** 4 \
+        * (F / F[0]) ** (-34.0 / 9)
+    return {(2, 2, 2): (numpy.ones((2, len(F)), complex), psi,
+                        numpy.ones(len(F), bool))}
+
+
+def test_the_quartic_stencil_follows_what_the_quadratic_cannot():
+    ref = dict(mass1=36.0, mass2=31.0, eccentricity=0.1)
+    errs = {}
+    for order in (3, 5):
+        fam = EccentricModeFamily(ref, F, F[0], step_mass=0.0, step_e=0.01,
+                                  step_q=0.0, generator=_quartic_generator,
+                                  order=order)
+        p = dict(ref, eccentricity=0.115)
+        errs[order] = numpy.max(abs(fam.modes(0.0, 0.015)[2, 2, 2][1]
+                                    - _quartic_generator(p)[2, 2, 2][1]))
+    assert errs[5] < 1e-8 < errs[3]

@@ -87,6 +87,11 @@ class EccentricModeFamily(object):
         The dominant harmonic's sweep, passed to :func:`efpe_modes`; set it
         to the observed sweep when ``frequencies`` reach further, to hold
         the other harmonics.
+    order : {3, 5}
+        Stencil points per direction: 3 (the tensor-product quadratic, the
+        default) or 5 (quartic), which reaches further from the reference
+        where the harmonics' amplitudes and phases curve (bands holding
+        n != m).
     phase_scaling : {'m', 'n'}
         How a mode's circular phase change scales with the dominant one's:
         ``m / 2`` (default, right for the n = m modes a single harmonic's
@@ -95,7 +100,7 @@ class EccentricModeFamily(object):
     """
     def __init__(self, reference, frequencies, f_ref, step_mass=0.01,
                  step_e=0.002, step_q=0.1, generator=None, f22_window=None,
-                 phase_scaling='m'):
+                 phase_scaling='m', order=3):
         self.reference = dict(reference)
         self.f = numpy.asarray(frequencies, dtype=float)
         self.f_ref = float(f_ref)
@@ -104,7 +109,12 @@ class EccentricModeFamily(object):
         self.generator = generator or (
             lambda p: efpe_modes(p, self.f, self.f_ref,
                                  f22_window=f22_window))
-        levels = [(-1, 0, 1) if h > 0 else (0,) for h in self.steps]
+        half = (int(order) - 1) // 2
+        if int(order) not in (3, 5):
+            raise ValueError("order: 3 (quadratic) or 5 (quartic) points")
+        self.order = int(order)
+        levels = [tuple(range(-half, half + 1)) if h > 0 else (0,)
+                  for h in self.steps]
         # the stencil's amplitudes in single precision (27 points of every
         # mode, both polarisations); the phases, of thousands of radians,
         # in double
@@ -258,20 +268,29 @@ class EccentricModeFamily(object):
 
 
 def _tensor_quadratic(v, steps):
-    """The tensor-product quadratic through the stencil ``v[i, j, ...]`` at
-    ``(i h0, j h1, ...)``, ``i, j, ... in (-1, 0, 1)`` (only 0 along a
-    direction of step 0): every term up to the square in each direction. A
-    correction ``C(x) e^2`` expanded about ``e0`` has a term ``x y^2`` that
-    does not shrink with ``e0``, and a total-degree quadratic would drop
-    it."""
-    def lagrange(t, h):
+    """The tensor-product Lagrange polynomial through the stencil
+    ``v[i, j, ...]`` at ``(i h0, j h1, ...)``, the indices the stencil's
+    keys hold per direction (``-1, 0, 1`` for the quadratic, ``-2 .. 2`` for
+    the quartic; only 0 along a direction of step 0): every term up to that
+    degree in each direction. A correction ``C(x) e^2`` expanded about
+    ``e0`` has a term ``x y^2`` that does not shrink with ``e0``, and a
+    total-degree polynomial would drop it."""
+    nodes = [sorted({key[d] for key in v}) for d in range(len(steps))]
+
+    def lagrange(t, h, ks):
         if h <= 0:
             return {0: 1.0}
-        return {-1: t * (t - h) / (2 * h * h), 0: 1 - t * t / (h * h),
-                1: t * (t + h) / (2 * h * h)}
+        out = {}
+        for k in ks:
+            w = 1.0
+            for j in ks:
+                if j != k:
+                    w = w * (t - j * h) / ((k - j) * h)
+            out[k] = w
+        return out
 
     def poly(*x):
-        ls = [lagrange(t, h) for t, h in zip(x, steps)]
+        ls = [lagrange(t, h, ks) for t, h, ks in zip(x, steps, nodes)]
         out = 0
         for key, value in v.items():
             w = 1.0
