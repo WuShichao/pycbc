@@ -124,7 +124,8 @@ class EccentricModeFamily(object):
             if phase_scaling == 'n' and len(k) > 2 and k[2]:
                 # an eccentric harmonic (l, m, n) runs at about n / 2 of
                 # the dominant harmonic's frequency, its phase likewise
-                r = k[2] / 2.0
+                # (with the sign of m, as the m / 2 default has)
+                r = (numpy.sign(m) if m else 1.0) * k[2] / 2.0
             else:
                 r = m / 2.0 if m else 1.0
             amp = {ijl: g[k][0] for ijl, g in grid.items()}
