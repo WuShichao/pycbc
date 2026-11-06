@@ -596,7 +596,7 @@ def multilevel_block_search(model, coarse_model, region, levels,
                             coarse_options=None, merge_time=86400.0,
                             refine_threshold=65.0, log_weight=None,
                             log_bayes=None, followup_lags=8,
-                            followup_reach=1.5, branch=1):
+                            followup_reach=1.5, branch=1, basis_chunk=8):
     """A block searched by adaptive refinement over nested levels of the
     phase lattice: :func:`two_stage_block_search` with any number of stages.
 
@@ -619,7 +619,9 @@ def multilevel_block_search(model, coarse_model, region, levels,
     with ``log_bayes``, and ranked as :func:`two_stage_block_search` ranks.
 
     With two levels this is :func:`two_stage_block_search` with
-    ``followup_per_source = branch``. Returns the ``top`` candidates, the
+    ``followup_per_source = branch``. ``basis_chunk`` is the follow-ups'
+    (the transform buffer holds that many basis vectors over every lag; a
+    smaller one fits wide near-merger bands on a small card). Returns the ``top`` candidates, the
     survivors of level 0, the sources followed, the follow-ups and the
     surviving points of each level, and the seconds."""
     start = time.time()
@@ -665,8 +667,8 @@ def multilevel_block_search(model, coarse_model, region, levels,
                     model, region[near_idx[near]], local,
                     delay_range=(t - scale[2], t + scale[2]), top=1,
                     coefficients=nodes[near] @ frame['directions'].T,
-                    gram_reuse=len(near), share_spectra=False, basis_chunk=8,
-                    decimate=decimate,
+                    gram_reuse=len(near), share_spectra=False,
+                    basis_chunk=basis_chunk, decimate=decimate,
                     threshold=None if final else lv['threshold'])
                 followups += 1
                 c = out['candidates'][0]
