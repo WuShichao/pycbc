@@ -2,8 +2,42 @@
 fast in chirp mass, an eccentric correction C(Mc) e^2 and amplitudes smooth
 in both, which the family must reproduce far from its reference."""
 import numpy
+import pytest
 
 from pycbc.waveform.eccentric_mode_family import EccentricModeFamily
+
+
+@pytest.mark.parametrize('eccentricity,inclination', [(0.03, 0.0), (0.1, 1.0)])
+def test_mode_adapter_reconstructs_native_frequency_polarizations(
+        eccentricity, inclination):
+    pytest.importorskip('pyEFPEHM')
+    from pyEFPEHM.waveform.EFPE import pyEFPE
+    from pycbc.waveform.eccentric_mode_family import efpe_modes
+    f = numpy.geomspace(0.0065, 0.034, 2400)
+    window = (0.0136, 0.0157)
+    ref = dict(mass1=60., mass2=12., spin1z=0., spin2z=0.,
+               eccentricity=eccentricity, inclination=inclination)
+    params = dict(ref, f22_start=window[0] * .999, f22_ref=window[0],
+                  f22_end=window[1] * 1.001, distance=100., Amplitude_tol=1e-12)
+    native = pyEFPE(params).generate_modes(f, return_waveform_pieces=True)['modes']
+    got = efpe_modes(ref, f, window[0], f22_window=window)
+    assert got.keys() == native.keys()
+    total = numpy.zeros((2, len(f)), complex)
+    for key, mode in native.items():
+        idx = mode['freq_idxs']
+        amp, phase, have = got[key]
+        want = numpy.asarray(mode['polarizations'])
+        reconstructed = amp[:, idx] * numpy.exp(-1j * phase[idx])
+        # No absolute tolerance that could hide physical strains near zero.
+        assert numpy.linalg.norm(reconstructed - want) <= \
+            1e-12 * numpy.linalg.norm(want)
+        assert numpy.all(amp[:, ~have] == 0)
+        total[:, idx] += want
+    # The interpolator must preserve the same physical normalization too.
+    family = EccentricModeFamily(ref, f, window[0], step_mass=0., step_e=0.,
+                                 step_q=0., f22_window=window)
+    reconstructed = family.polarizations(0., 0.)
+    assert numpy.linalg.norm(reconstructed - total) < 1e-6 * numpy.linalg.norm(total)
 
 F = numpy.linspace(0.0136, 0.0157, 400)
 

@@ -31,7 +31,11 @@ def efpe_modes(params, frequencies, f_ref, amplitude_tol=1e-12,
     """pyEFPEHM's modes at ``params`` (masses, spins, ``eccentricity``,
     optionally ``inclination``) on ``frequencies``: ``{key: (amplitude,
     psi, present)}``, ``amplitude`` the complex amplitudes of the plus and
-    cross polarisations ``(2, N)``, zero where a mode is absent.
+    cross polarisations ``(2, N)``, zero where a mode is absent. At the
+    fixed reference distance of 100 Mpc, ``amplitude * exp(-1j * psi)``
+    reconstructs pyEFPEHM's native frequency-domain polarizations (before
+    the optional taper). The amplitude includes the SPA factor and the
+    Fourier-convention conjugation; raw ``A_SUA`` alone is not this amplitude.
 
     ``f22_window = (start, end)`` bounds the dominant harmonic's sweep (the
     source's observed time); by default it is the frequencies' own range.
@@ -61,8 +65,12 @@ def efpe_modes(params, frequencies, f_ref, amplitude_tol=1e-12,
         amp = numpy.zeros((2, len(f)), complex)
         psi = numpy.zeros(len(f))
         have = numpy.zeros(len(f), bool)
-        amp[:, idx] = numpy.asarray(m['A_SUA']).T[:2]
         psi[idx] = numpy.asarray(m['psi_SPA'])
+        # Native polarizations include sqrt(2 pi) * h0_pref * T_SPA and
+        # conjugate A_SUA to the standard Fourier convention. Recover the
+        # slowly varying FD amplitude by removing only exp(-i psi).
+        amp[:, idx] = numpy.asarray(m['polarizations']) * numpy.exp(
+            1j * psi[idx])
         if taper and len(idx) > 1:
             fi = f[idx]
             t = numpy.gradient(psi[idx], fi) / (2 * numpy.pi)
