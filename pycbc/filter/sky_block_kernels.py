@@ -25,11 +25,13 @@ extern "C" __global__ void spectra(
     const int* index, const float* weight, const complex<float>* basis,
     complex<float>* out, const int n, const int ncoarse, const int kmin,
     const int shift, const double turns_per_second, const int r0,
-    const int nr) {
-  // out[r - r0, a, f] = sum_k sum_c conj(u_rkac(f + k shift) y_k(f + k shift))
-  //                      X_c(f + k shift), y_k = b exp(i k Omega t)
-  int f = blockDim.x * blockIdx.x + threadIdx.x;
-  if (f >= n) return;
+    const int nr, const int f0, const int nout) {
+  // out[r - r0, a, f - f0] = sum_k sum_c conj(u_rkac(f + k shift)
+  //                      y_k(f + k shift)) X_c(f + k shift), y_k = b exp(i k
+  //                      Omega t), for the bins f0 <= f < f0 + nout
+  int fl = blockDim.x * blockIdx.x + threadIdx.x;
+  if (fl >= nout) return;
+  int f = f0 + fl;
   complex<float> e[NK * NCH];
   int ii[NK];
   float ww[NK];
@@ -65,8 +67,8 @@ extern "C" __global__ void spectra(
         acc1 += conj(f1) * e[q * NCH + ch];
       }
     }
-    out[((size_t)(r - r0) * 2 + 0) * n + f] = acc0;
-    out[((size_t)(r - r0) * 2 + 1) * n + f] = acc1;
+    out[((size_t)(r - r0) * 2 + 0) * nout + fl] = acc0;
+    out[((size_t)(r - r0) * 2 + 1) * nout + fl] = acc1;
   }
 }
 """
@@ -170,22 +172,28 @@ def _kernel(source, name, **macros):
     return _CACHE[key]
 
 
-def correlation_spectra(family, data, b, t, basis, r0, nr, out=None):
+def correlation_spectra(family, data, b, t, basis, r0, nr, out=None,
+                        first=0, count=None):
     """The correlation spectra of the template ``(b, t)`` with basis vectors
     ``r0`` to ``r0 + nr`` of ``basis`` (``(R, nk, 2, nch, ncoarse)``), shape
     ``(nr, 2, N)``: each is ``family.correlation_spectrum(data, b, t,
-    basis[r])``, the template's harmonic phases evaluated once for all."""
+    basis[r])``, the template's harmonic phases evaluated once for all.
+    With ``first`` and ``count``, only the bins ``first`` to ``first +
+    count`` of each spectrum, shape ``(nr, 2, count)`` (a band)."""
     import cupy
     nk, nch, ncoarse = basis.shape[1], basis.shape[3], basis.shape[4]
     n = family.size
+    nout = n if count is None else int(count)
+    if not 0 <= first and first + nout <= n:
+        raise ValueError("bins outside the family's grid")
     if out is None:
-        out = cupy.empty((nr, 2, n), dtype=cupy.complex64)
+        out = cupy.empty((nr, 2, nout), dtype=cupy.complex64)
     if not hasattr(family, '_index32'):
         family._index32 = family._index.astype(cupy.int32)
         family._weight32 = family._weight.astype(cupy.float32)
     threads = 128
     _kernel(_SPECTRA, 'spectra', NK=nk, NCH=nch)(
-        ((n + threads - 1) // threads,), (threads,), (
+        ((nout + threads - 1) // threads,), (threads,), (
             cupy.ascontiguousarray(data, dtype=cupy.complex64),
             cupy.ascontiguousarray(b, dtype=cupy.complex64),
             cupy.ascontiguousarray(t, dtype=cupy.float64),
@@ -194,7 +202,8 @@ def correlation_spectra(family, data, b, t, basis, r0, nr, out=None):
             numpy.int32(n), numpy.int32(ncoarse),
             numpy.int32(family.orders[0]), numpy.int32(family.shift),
             numpy.float64(ORBITAL_ANGULAR_FREQUENCY / (2 * numpy.pi)),
-            numpy.int32(r0), numpy.int32(nr)))
+            numpy.int32(r0), numpy.int32(nr), numpy.int32(first),
+            numpy.int32(nout)))
     return out
 
 

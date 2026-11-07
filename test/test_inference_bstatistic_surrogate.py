@@ -853,6 +853,50 @@ def test_template_factors_enter_the_fft_block_search():
                                   plain['candidates'][0]['twof'], rtol=0.05)
 
 
+def test_bands_of_the_fft_block_search_bound_it():
+    """``band`` correlates one band's bins on its own short transform with
+    the whole template's Gram: the whole grid as one band gives the plain
+    search's 2F at lag 0, and over three bands the square roots of the
+    bands' 2F sum to at least the full one's (the sub-band bound), template
+    by template."""
+    from pycbc.filter.sky_block_search import (block_sky_points,
+                                               fft_search_sky_block,
+                                               phase_lattice)
+    from pycbc.inference import models
+    from pycbc.workflow import WorkflowConfigParser
+    lon, lat = 3.5763564997428436, 0.3429283438977949
+    cp = WorkflowConfigParser()
+    cp.read_string(CONFIG.replace(
+        'grid-periods = 1', 'grid-periods = 1\nharmonics = 8\n'
+        'amplitude-table-file = ' + table_file()))
+    data, psds, snr2, mc = stbbh_data()
+    m = models.read_from_config(cp, data=data, psds=psds)
+    block = m.recentred(lon, lat, 0.02, sky_block_points=200)
+    s = m.static_params
+    unit = m.scales['mchirp']
+    region = numpy.array([[mc + u * unit, s['q'], s['spin1z'], s['spin2z']]
+                          for u in numpy.linspace(-1, 1, 9)])
+    dC, labels, _ = phase_lattice(block, region, 0.02, ndir=1)
+    sky = block_sky_points(block, 0.02, 0.5)
+    n = block.surrogate.size
+    kw = dict(top=len(dC), coefficients=dC, delay_range=(0.0, 0.0))
+
+    def by_template(r):
+        return {tuple(c['coefficients']): c['twof'] for c in r['candidates']}
+    plain = by_template(fft_search_sky_block(block, labels, sky, **kw))
+    whole = by_template(fft_search_sky_block(block, labels, sky,
+                                             band=(0, n), **kw))
+    for k, v in plain.items():
+        numpy.testing.assert_allclose(whole[k], v, rtol=1e-6)
+    edges = [0, n // 4, n // 2, n]
+    bands = [by_template(fft_search_sky_block(block, labels, sky,
+                                              band=(a, b), **kw))
+             for a, b in zip(edges[:-1], edges[1:])]
+    for k, v in plain.items():
+        assert numpy.sqrt(v) <= sum(numpy.sqrt(b[k]) for b in bands) * \
+            (1 + 1e-6)
+
+
 def test_a_phase_lattice_bank_finds_the_source_and_refinement_helps():
     """A bank laid out in the family's phase coordinates, searched by the
     FFT route, finds the injection; refining the loudest candidate in

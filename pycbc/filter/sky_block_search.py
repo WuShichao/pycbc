@@ -95,7 +95,8 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
                          subsamples=8, coefficients=None, sky_set=None,
                          lag_shift=None, oversample=1, gram_reuse=1,
                          basis_chunk=16, kernels=None, share_spectra=None,
-                         decimate=1, threshold=None, factors=None):
+                         decimate=1, threshold=None, factors=None,
+                         band=None, band_oversample=2):
     """The loudest ``top`` candidates of one sky block by one FFT per
     intrinsic template and sky-basis vector.
 
@@ -116,7 +117,16 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
     of sky sets, each template searching the set ``sky_set`` gives it (as
     :func:`joint_lattice` lays them out), with its lags shifted by
     ``lag_shift`` lag steps. ``oversample`` pads the transform so the lag
-    step is the grid's over that factor."""
+    step is the grid's over that factor.
+
+    ``band = (k0, k1)``, bins of the family's grid, correlates only the data
+    of that band: the correlation spectrum's bins ``k0`` to ``k1`` alone,
+    on their own transform of a power of two at least ``band_oversample``
+    times their number (the lag step grows accordingly). The bins' common
+    phase ``exp(2 pi i k0 lag / size)`` is the same for every basis vector
+    and component at a lag, so 2F is that of the band's data, with the
+    Gram of the whole template (not the band's): the statistic whose square
+    roots summed over bands bound the full band's (the sub-band bound)."""
     from numpy.polynomial import chebyshev
     fam, dg = model.surrogate, model.daily_gram
     xp, blk = fam.xp, fam.sky_block
@@ -132,7 +142,18 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
     # at step T / size exactly, whatever size divides
     size = fam.size * oversample if decimate == 1 else \
         -(-fam.size // decimate)
+    k0 = k1 = None
+    if band is not None:
+        if decimate != 1 or oversample != 1:
+            raise ValueError("band needs decimate 1 and oversample 1")
+        k0, k1 = int(band[0]), int(band[1])
+        if not 0 <= k0 < k1 <= fam.size:
+            raise ValueError("band bins outside the family's grid")
+        size = 1 << int(numpy.ceil(numpy.log2(band_oversample * (k1 - k0))))
     dt = fam.grid.delta_t * fam.size / size
+
+    def band_cut(a):
+        return a if k0 is None else a[..., k0:k1]
 
     def fold(a):
         if decimate == 1:
@@ -236,10 +257,19 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
                     factor = factor * ramp
             for r0 in range(0, blk.rank, basis_chunk):
                 nr = min(basis_chunk, blk.rank - r0)
-                if shared is not None:
+                if shared is not None and k0 is not None:
+                    a = band_cut(shared[r0:r0 + nr]) * band_cut(factor)
+                elif shared is not None:
                     # the template's spectra are the reference's times its
                     # factor, to second order in the harmonics' shift
                     a = multiply_fold(shared[r0:r0 + nr], factor, size)
+                elif k0 is not None:
+                    # the band's bins only, computed alone
+                    a = correlation_spectra(fam, model.data_spectrum, b, t,
+                                            Ub, r0, nr, first=k0,
+                                            count=k1 - k0)
+                    if ramp is not None:
+                        a *= band_cut(ramp)
                 else:
                     a = correlation_spectra(fam, model.data_spectrum, b, t,
                                             Ub, r0, nr)
@@ -262,9 +292,9 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
             best, where = float(tb[p, tile]), (p, int(ta[p, tile]))
             del Z
         else:
-            Z = xp.stack([xp.fft.ifft(fold(fam.correlation_spectrum(
+            Z = xp.stack([xp.fft.ifft(band_cut(fold(fam.correlation_spectrum(
                 model.data_spectrum, b, t, U[r])
-                * (1 if ramp is None else ramp)), n=size, axis=-1)[
+                * (1 if ramp is None else ramp))), n=size, axis=-1)[
                     :, index] * size for r in range(blk.rank)])     # (R, 2, L)
             best, where = -numpy.inf, None
         for c0 in (range(0, len(lags), lag_chunk) if not fast else []):
