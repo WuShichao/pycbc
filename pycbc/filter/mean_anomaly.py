@@ -32,6 +32,100 @@ exact on that grid (no interpolation in ``l0``).
 import numpy
 
 
+def mean_anomaly_components(z, gram, c, n_l0=None):
+    """Coherently combine modes into two polarisation correlations and Gram.
+
+    ``z`` has shape ``(K, 2, *samples)`` and ``gram`` has shape
+    ``(K, 2, K, 2, *gram_samples)``, with ``gram[k,a,l,b] = <h_ka,h_lb>``.
+    The trailing Gram dimensions must broadcast to ``samples`` (an empty
+    shape means a shared Gram). This permits lag-dependent Grams; cross-mode
+    terms are retained. ``c`` contains the K integer mean-anomaly offsets.
+
+    Returns ``(zl, gl, l0)`` of shapes ``(n_l0, 2, *samples)``,
+    ``(n_l0, 2, 2, *gram_samples)`` and ``(n_l0,)``. These components can
+    feed either the four-real-amplitude F-statistic or orientation/amplitude
+    marginalisation. The modes' amplitudes are tied, not fitted separately.
+
+    The default grid resolves the Fourier polynomials for z and G. It
+    does NOT guarantee convergence of a maximum or integral of the nonlinear
+    statistic over continuous l0; check that by increasing ``n_l0``.
+    """
+    z = numpy.asarray(z, dtype=complex)
+    gram = numpy.asarray(gram, dtype=complex)
+    raw_c = numpy.asarray(c)
+    if z.ndim < 2 or z.shape[0] == 0 or z.shape[1] != 2:
+        raise ValueError("z must have shape (K, 2, *samples), K > 0")
+    k = z.shape[0]
+    if gram.ndim < 4 or gram.shape[:4] != (k, 2, k, 2):
+        raise ValueError("gram must have shape (K, 2, K, 2, *samples)")
+    if (raw_c.shape != (k,) or not numpy.all(numpy.isfinite(raw_c))
+            or not numpy.all(raw_c == numpy.floor(raw_c))):
+        raise ValueError("c must contain K finite integer offsets")
+    if not numpy.all(numpy.isfinite(z)) or not numpy.all(numpy.isfinite(gram)):
+        raise ValueError("correlations and Gram must be finite")
+    if numpy.broadcast_shapes(z.shape[2:], gram.shape[4:]) != z.shape[2:]:
+        raise ValueError("Gram samples must broadcast to correlation samples")
+    c = raw_c.astype(numpy.int64)
+    # A common shift only multiplies z by an irrelevant phase. Retain it
+    # here so the returned complex correlations also agree with direct sums.
+    span = int(c.max() - c.min())
+    need = 2 * span + 1
+    if n_l0 is None:
+        n_l0 = 1 << (max(need, 2) - 1).bit_length()
+    if (isinstance(n_l0, (bool, numpy.bool_)) or not numpy.isscalar(n_l0)
+            or not numpy.isfinite(n_l0) or int(n_l0) != n_l0
+            or n_l0 < need):
+        raise ValueError("n_l0 must be an integer >= 2 (max c - min c) + 1")
+    n_l0 = int(n_l0)
+    Z = numpy.zeros((n_l0,) + z.shape[1:], dtype=complex)
+    numpy.add.at(Z, c % n_l0, z)
+    zl = numpy.fft.fft(Z, axis=0)
+    M = numpy.zeros((n_l0, 2, 2) + gram.shape[4:], dtype=complex)
+    for i in range(k):
+        for j in range(k):
+            M[(c[j] - c[i]) % n_l0] += gram[i, :, j]
+    gl = numpy.fft.ifft(M, axis=0) * n_l0
+    return zl, gl, 2 * numpy.pi * numpy.arange(n_l0) / n_l0
+
+
+def mean_anomaly_twof(z, gram, c, n_l0=None, rcond=1e-12):
+    """Fully coherent ``2F = z^H G^+ z`` on the mean-anomaly grid.
+
+    Inputs follow :func:`mean_anomaly_components`. Noise in each whitened
+    complex data bin must have unit variance in EACH real component. At a
+    fixed template and l0, the noise law is chi-square with twice the complex
+    Gram rank (four for full rank). Maximising over l0 changes that law.
+
+    A Hermitian pseudoinverse handles rank deficiency; eigenvalues no larger
+    than ``rcond * max(abs(eigenvalues))`` are discarded. Non-Hermitian or
+    materially indefinite Grams are refused. Returns ``(twof, l0)`` with
+    ``twof.shape == (n_l0, *samples)``. No time, band or mode powers are
+    summed incoherently.
+    """
+    if not numpy.isfinite(rcond) or not 0 < rcond < 1:
+        raise ValueError("rcond must lie strictly between 0 and 1")
+    zl, gl, l0 = mean_anomaly_components(z, gram, c, n_l0)
+    zz = numpy.moveaxis(zl, 1, -1)
+    gg = numpy.moveaxis(gl, (1, 2), (-2, -1))
+    # Insert missing leading sample axes after the l0 axis, keeping the
+    # latter paired instead of accidentally broadcasting it as a sample.
+    gg = gg.reshape((len(l0),) + (1,) * (zz.ndim - gg.ndim + 1)
+                    + gg.shape[1:])
+    adjoint = gg.swapaxes(-1, -2).conj()
+    scale = numpy.max(abs(gg), axis=(-2, -1), keepdims=True)
+    tolerance = max(rcond, 32 * numpy.finfo(float).eps)
+    if numpy.any(abs(gg - adjoint) > tolerance * scale):
+        raise ValueError("Gram must be Hermitian")
+    values, vectors = numpy.linalg.eigh(0.5 * (gg + adjoint))
+    cutoff = rcond * numpy.max(abs(values), axis=-1, keepdims=True)
+    if numpy.any(values < -cutoff):
+        raise ValueError("Gram must be positive semidefinite")
+    inverse = numpy.divide(1.0, values, out=numpy.zeros_like(values),
+                           where=values > cutoff)
+    projection = numpy.einsum('...ai,...a->...i', vectors.conj(), zz)
+    return numpy.sum(abs(projection) ** 2 * inverse, axis=-1), l0
+
+
 def mode_offsets(keys):
     """``c = n - m`` of pyEFPEHM mode keys ``(l, m, n)``."""
     return numpy.array([int(k[2]) - int(k[1]) for k in keys], dtype=int)
