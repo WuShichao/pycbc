@@ -32,7 +32,7 @@ def test_multilevel_eccentric_backend_recovers_injection_and_matches_exhaustive_
     scales=dict(eclipticlongitude=.01,eclipticlatitude=.01)
     model=EccentricFFTBlockModel(grid,data,source,lambda sky:response,
         grid.frequencies,[0],[0,1],coordinates,np.eye(2),ref,scales,
-        (20,70),(-5*grid.delta_t,5*grid.delta_t),dtype=np.complex128,n_l0=32)
+        (20,70),(-5*grid.delta_t,5*grid.delta_t),dtype=np.complex128,n_l0=32,reuse_grams=True)
     region=coordinates.decode(np.array([[-.6,-.6],[-.6,.6],[.6,-.6],[.6,.6]]))
     levels=[dict(mismatch=.1,sky_step=1.,decimate=1,threshold=20.),
             dict(mismatch=.02,sky_step=.5,decimate=1)]
@@ -45,3 +45,9 @@ def test_multilevel_eccentric_backend_recovers_injection_and_matches_exhaustive_
     np.testing.assert_allclose(output['candidates'][0]['twof'],baseline['candidates'][0]['twof'],rtol=1e-12)
     assert output['candidates'][0]['twof']>200
     assert len(output['candidates'][0]['theta'])==2
+
+    model.set_data(data*2)
+    doubled=fft_search_sky_block(model,region[near],np.zeros((1,2)),coefficients=nodes)
+    np.testing.assert_allclose(doubled['candidates'][0]['twof'],
+                               4*baseline['candidates'][0]['twof'],rtol=1e-12)
+    assert model.work['gram_cache_hits']>0

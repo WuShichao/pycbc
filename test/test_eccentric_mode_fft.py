@@ -72,3 +72,28 @@ def test_gpu_matches_cpu():
     gpu,*_=case(cp)
     np.testing.assert_allclose(gpu.correlations([-3,0,4]).get(),cpu.correlations([-3,0,4]),atol=1e-8,rtol=1e-8)
     np.testing.assert_allclose(gpu.gram([-3,0,4]).get(),cpu.gram([-3,0,4]),atol=1e-8,rtol=1e-8)
+
+
+
+def test_large_single_precision_gpu_gram_reduction_matches_double_cpu():
+    cp=pytest.importorskip('cupy')
+    try:available=cp.cuda.runtime.getDeviceCount()>0
+    except cp.cuda.runtime.CUDARuntimeError:available=False
+    if not available:pytest.skip('CUDA unavailable')
+    rng=np.random.default_rng(71)
+    n=131072
+    grid=SimpleNamespace(size=n,duration=ORBITAL_PERIOD,delta_t=ORBITAL_PERIOD/n,
+        frequencies=.01+np.arange(n)/ORBITAL_PERIOD,harmonic_shift=1)
+    b=rng.normal(size=(2,n))+1j*rng.normal(size=(2,n))
+    b[:,:4]=0;b[:,-4:]=0
+    t=rng.uniform(-ORBITAL_PERIOD,ORBITAL_PERIOD,(2,n))
+    rho=rng.normal(size=(3,2,2,n))+1j*rng.normal(size=(3,2,2,n))
+    data=np.zeros((2,n),complex)
+    for xp,dtype in ((np,np.complex128),(cp,np.complex64)):
+        engine=WindowedModeFFT(grid,b,t,lambda r:rho[r],[-1,0,1],data,
+                               (1000,n-1000),(-5,5),xp=xp,dtype=dtype)
+        value=engine.gram([-3,0,4])
+        if xp is np:reference=value
+        else:
+            relative=np.linalg.norm(value.get()-reference)/np.linalg.norm(reference)
+            assert relative<2e-6

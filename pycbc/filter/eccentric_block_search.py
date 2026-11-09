@@ -64,7 +64,7 @@ class EccentricFFTBlockModel:
                  response_frequencies, orders, offsets, coordinates, metric,
                  reference, scales, observation, delay_range, xp=numpy,
                  n_l0=64, dtype=numpy.complex64, max_cache_bytes=4_000_000_000,
-                 distance_prior=None, bayes_rank=False, contains=None, gram_anchors=3):
+                 distance_prior=None, bayes_rank=False, contains=None, gram_anchors=3, reuse_grams=False):
         self.grid, self.xp = grid, xp
         self.surrogate = SimpleNamespace(grid=grid, xp=xp)
         self.source_builder, self.response_builder = source_builder, response_builder
@@ -77,6 +77,8 @@ class EccentricFFTBlockModel:
         self.distance_prior, self.bayes_rank = distance_prior, bayes_rank
         self.contains = contains
         self.gram_anchors = int(gram_anchors)
+        self.reuse_grams = bool(reuse_grams)
+        self._template_grams = {}
         self._source_cache = None
         f = numpy.asarray(grid.frequencies)
         coarse = numpy.asarray(response_frequencies)
@@ -88,7 +90,7 @@ class EccentricFFTBlockModel:
         self._prepared = None
         self._profiles = {}
         self.work = dict(source_seconds=0., prepare_seconds=0., gram_seconds=0.,
-                         prepared_templates=0, searched_points=0)
+                         prepared_templates=0, searched_points=0, gram_cache_hits=0)
         self.set_data(data)
 
     def set_data(self, data):
@@ -100,6 +102,9 @@ class EccentricFFTBlockModel:
         self._prepared = None
         self._source_cache = None
         self._profiles = {}
+
+    def clear_template_grams(self):
+        self._template_grams = {}
 
     def phase_frame(self, region, **kwargs):
         s = self.coordinates.encode(region)
@@ -140,7 +145,13 @@ class EccentricFFTBlockModel:
         self.work['prepare_seconds'] += perf_counter()-start
         anchor_indices = numpy.unique(numpy.linspace(jlo,jhi,anchors).round().astype(int))
         start = perf_counter()
-        gram = engine.gram(anchor_indices)
+        if self.reuse_grams and key in self._template_grams:
+            gram = xp.asarray(self._template_grams[key])
+            self.work['gram_cache_hits'] += 1
+        else:
+            gram = engine.gram(anchor_indices)
+            if self.reuse_grams:
+                self._template_grams[key] = gram.get() if hasattr(gram, 'get') else gram.copy()
         self._sync()
         self.work['gram_seconds'] += perf_counter()-start
         anchor_times = anchor_indices*self.grid.delta_t

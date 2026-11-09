@@ -136,8 +136,21 @@ class WindowedModeFFT:
                     u = xp.fft.ifft(spectra[j, k], axis=-1)*root
                     h[k] = u[..., take]
                     del u
-                matrix = h.reshape(self.nmode*2, -1).astype(xp.complex128)
-                g = matrix.conj() @ matrix.T
+                matrix = h.reshape(self.nmode*2, -1)
+                block = 16384
+                if xp is not numpy and matrix.shape[1] > 4*block:
+                    # A single 8-by-millions skinny GEMM underutilizes a GPU.
+                    # Sum complete cross-Grams from parallel time chunks;
+                    # no statistic or mode powers are summed incoherently.
+                    pad = (-matrix.shape[1]) % block
+                    padded = xp.pad(matrix, ((0, 0), (0, pad))) if pad else matrix
+                    parts = xp.ascontiguousarray(padded.reshape(
+                        self.nmode*2, -1, block).transpose(1, 0, 2)).astype(xp.complex128)
+                    g = (parts.conj() @ parts.swapaxes(1, 2)).sum(axis=0)
+                    del padded, parts
+                else:
+                    matrix = matrix.astype(xp.complex128)
+                    g = matrix.conj() @ matrix.T
                 out[..., first+j] = g.reshape(self.nmode, 2, self.nmode, 2)
                 del h, matrix, g
             del spectra
