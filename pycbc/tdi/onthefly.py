@@ -1347,13 +1347,20 @@ def interpolated_frequency_response_factors(
     channel_names = tuple(channel_terms)
 
     def evaluate(indices):
+        indices = np.atleast_1d(indices)
+        t, f = times[indices], frequencies[indices]
+        if len(indices) == 1:
+            # the constellation's sampling needs two times: a refinement
+            # round can leave a single probe, so evaluate it beside an
+            # auxiliary time one second later and keep only the probe
+            t, f = np.r_[t, t + 1.0], np.r_[f, f]
         geometry = MultiChannelTermGeometry(
-            orbit, times[indices], channel_terms, links=links,
+            orbit, t, channel_terms, links=links,
             velocity_order=velocity_order)
-        factors = frequency_response_factors(
-            geometry, frequencies[indices], lamb, beta)
-        return np.stack([value for name in channel_names
-                         for value in factors[name]])
+        factors = frequency_response_factors(geometry, f, lamb, beta)
+        out = np.stack([value for name in channel_names
+                        for value in factors[name]])
+        return out[:, :len(indices)]
 
     count = len(frequencies)
     control = np.unique(np.linspace(
