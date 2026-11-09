@@ -18,7 +18,7 @@ def family():
         return out
     ref = dict(mass1=36.,mass2=31.,eccentricity=.05)
     return EccentricModeFamily(ref,f,.015,step_mass=0,step_e=0,step_q=0,
-                               generator=generator)
+                               generator=generator, circular_phase_basis='taylorf2')
 
 
 def test_translation_and_anomaly_preserve_native_contract():
@@ -89,3 +89,10 @@ def test_default_online_source_never_calls_native_generator(d, dq):
 def test_unknown_circular_method_is_refused():
     with pytest.raises(ValueError, match='circular_method'):
         EccentricModeFamilySource(family(), circular_method='typo')
+
+
+def test_mismatched_online_and_construction_bases_are_refused():
+    fam = family()
+    fam.circular_phase_basis = 'pyefpe'
+    with pytest.raises(ValueError, match='match the cell phase basis'):
+        EccentricModeFamilySource(fam, d=.001)

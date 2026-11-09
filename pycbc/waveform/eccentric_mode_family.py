@@ -140,12 +140,19 @@ class EccentricModeFamily(object):
     taper : float, optional
         Seconds of ``sin^2`` taper at each end of every mode's time, passed
         to :func:`efpe_modes` (with the default generator).
+    circular_phase_basis : {'pyefpe', 'taylorf2'}
+        Circular phase subtracted from every stencil waveform. Select
+        'taylorf2' for analytic online phase ratios without native candidate
+        generation. Construction and evaluation must use the same basis.
     """
     def __init__(self, reference, frequencies, f_ref, step_mass=0.01,
                  step_e=0.002, step_q=0.1, generator=None, f22_window=None,
                  phase_scaling='m', order=3, support='all', taper=None,
                  edge_margin=0.01, wide_generator=None,
-                 amplitude_tol=1e-12):
+                 amplitude_tol=1e-12, circular_phase_basis='pyefpe'):
+        if circular_phase_basis not in ('pyefpe', 'taylorf2'):
+            raise ValueError('circular_phase_basis must be pyefpe or taylorf2')
+        self.circular_phase_basis = circular_phase_basis
         self.reference = dict(reference)
         self.f = numpy.asarray(frequencies, dtype=float)
         self.f_ref = float(f_ref)
@@ -279,21 +286,43 @@ class EccentricModeFamily(object):
         pyEFPEHM's key ``(2, 2, 2)``, or the loudest mode."""
         modes = self._circ_generator(self._point(i, 0, l,
                                                  eccentricity=0.0))
-        if (2, 2, 2) in modes:
-            return modes[2, 2, 2]
-        return max(modes.values(), key=lambda v: numpy.sum(abs(v[0]) ** 2))
+        result = modes[2, 2, 2] if (2, 2, 2) in modes else max(
+            modes.values(), key=lambda v: numpy.sum(abs(v[0]) ** 2))
+        if self.circular_phase_basis == 'taylorf2':
+            point = self._point(i, 0, l, eccentricity=0.0)
+            return result[0], self._pn_phase(point), result[2]
+        return result
+
+    def _pn_phase(self, point):
+        # Define the analytic basis on the entire eccentric-mode frequency
+        # grid. Native circular phases are zero outside their own support;
+        # mixing that residual with a global PN change creates phase/clock
+        # discontinuities. Construction and evaluation must use one basis.
+        from pycbc.waveform.taylorf2_jets import (
+            basis_phase_and_time, taylorf2_basis_coefficients)
+        mc = (point['mass1'] * point['mass2']) ** 0.6 / (
+            point['mass1'] + point['mass2']) ** 0.2
+        A, B, _ = taylorf2_basis_coefficients(
+            mc, point['mass1'] / point['mass2'],
+            point.get('spin1z', 0.0), point.get('spin2z', 0.0))
+        phase, _ = basis_phase_and_time(A, B, self.f, self.f_ref)
+        return -phase
 
     def _circ22(self, i):
         return self._circ[i, 0][1]
 
     def circular_phase_change(self, d, q=None, spin1z=None, spin2z=None,
-                              method='pyefpe'):
+                              method=None):
         """The circular dominant mode's phase change from the reference to
         ``ln(Mc / Mc0) = d`` and the mass ratio ``q = m1 / m2`` and spins
         given (the reference's by default): pyEFPEHM at e = 0
         (``'pyefpe'``), or the TaylorF2 phase difference pinned in value and
         slope at ``f_ref`` (``'taylorf2'``), analytic and cheap. The
-        eccentric correction is taken to depend on chirp mass and e alone."""
+        eccentric correction is taken to depend on chirp mass and e alone.
+        The default method is the basis selected when constructing the cell."""
+        method = self.circular_phase_basis if method is None else method
+        if method not in ('pyefpe', 'taylorf2'):
+            raise ValueError('method must be pyefpe or taylorf2')
         r = self.reference
         q0 = r['mass1'] / r['mass2']
         q = q0 if q is None else float(q)

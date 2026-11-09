@@ -191,3 +191,43 @@ def test_sparse_mode_pieces_interpolate_phase_and_separate_clocks():
     for bad in ([.01,.01], [.02,.01], [numpy.nan], [-.01], []):
         with pytest.raises(ValueError):
             list(fam.iter_mode_pieces(0.,0.,frequencies=bad))
+
+
+
+def test_analytic_cell_basis_is_global_and_needs_no_online_native_calls():
+    from pycbc.waveform.taylorf2_jets import (
+        basis_phase_and_time, taylorf2_basis_coefficients)
+    f = numpy.linspace(.005, .03, 301)
+    ref = dict(mass1=36., mass2=31., eccentricity=.05)
+    mc0 = (36.*31.)**.6 / 67.**.2
+    def native(point):
+        mc = (point['mass1']*point['mass2'])**.6 / (
+            point['mass1']+point['mass2'])**.2
+        q = point['mass1']/point['mass2']
+        A, B, _ = taylorf2_basis_coefficients(mc, q, 0., 0.)
+        phase, _ = basis_phase_and_time(A, B, f, .012)
+        e = point['eccentricity']
+        if e == 0.:
+            # A native circular generator has a narrower support than the
+            # eccentric side harmonics and zero phase outside that support.
+            have = (f >= .01) & (f <= .02)
+            return {(2, 2, 2): (numpy.ones((2, len(f))),
+                                numpy.where(have, -phase, 0.), have)}
+        d = numpy.log(mc/mc0)
+        correction = 20*(1+d+d*d)*e*e*(f/.012)**(-2)
+        return {(2, 2, n): (numpy.ones((2, len(f)))*(1+e*n),
+                            -n/2*phase+correction,
+                            numpy.ones(len(f), bool)) for n in (1, 2, 3)}
+    fam = EccentricModeFamily(ref, f, .012, step_mass=.01, step_e=.002,
+        step_q=0., order=5, phase_scaling='n', generator=native,
+        circular_phase_basis='taylorf2')
+    d, de = .0037, -.0013
+    exact = native(dict(ref, mass1=36*numpy.exp(d), mass2=31*numpy.exp(d),
+                        eccentricity=.05+de))
+    def forbidden(*args, **kwargs):
+        raise AssertionError('analytic evaluation must not generate waveforms')
+    fam._circ_generator = forbidden
+    estimate = fam.modes(d, de)
+    for key, (_, phase, have) in exact.items():
+        assert estimate[key][2].all()
+        numpy.testing.assert_allclose(estimate[key][1], phase, atol=2e-7, rtol=0.)

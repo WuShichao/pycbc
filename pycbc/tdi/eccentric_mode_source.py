@@ -25,7 +25,8 @@ class EccentricModeFamilySource:
     (an SPA observation window, not an exact time-domain truncation).
 
     ``circular_method='taylorf2'`` evaluates the analytic PN phase ratio
-    without generating a new native waveform at each candidate. The
+    without generating a new native waveform at each candidate. Mass/ratio
+    offsets require a cell constructed with circular_phase_basis='taylorf2'. The
     explicit ``'pyefpe'`` option regenerates a circular auxiliary waveform
     for off-reference mass coordinates, for offline validation only.
 
@@ -47,6 +48,9 @@ class EccentricModeFamilySource:
             raise ValueError("source coordinates and clock must be finite")
         if circular_method not in ('taylorf2', 'pyefpe'):
             raise ValueError("circular_method must be taylorf2 or pyefpe")
+        if (self.d != 0. or self.dq != 0.) and circular_method != \
+                family.circular_phase_basis:
+            raise ValueError('online circular method must match the cell phase basis')
         self.circular_method = circular_method
         self.circular = family.circular_phase_change(
             self.d, family.q0 * numpy.exp(self.dq), method=circular_method)
