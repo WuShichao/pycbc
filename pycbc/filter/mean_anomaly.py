@@ -183,3 +183,50 @@ def mean_anomaly_statistic(z, gram, c, n_l0=None):
     norm = numpy.fft.ifft(M) * n_l0               # sum_d M_d exp(+2 pi i d j / n)
     stat = numpy.abs(zl) ** 2 / norm.real[:, None]
     return (stat[:, 0] if single else stat), l0
+
+
+
+def mean_anomaly_log_bayes(z, gram, c, prior, nodes, n_l0=None,
+                           noise_variance=1.0, order=64, table=None, xp=numpy):
+    """Physical two-polarization ln B, also marginalized over mean anomaly.
+
+    Inputs z and gram follow mean_anomaly_components and retain all mode
+    cross terms. The modes are tied by one common inclination, polarization,
+    distance and phase; they do not receive independent amplitude fits.
+    prior and nodes are the DistancePowerLaw and OrientationNodes used by
+    BStatisticSurrogate. Amplitudes use the template's reference-distance
+    normalization. Raw z and G are divided by noise_variance, the variance
+    of EACH real component of the whitened complex data.
+
+    Returns (log_b, log_b_by_angle, angles) with shapes (*samples),
+    (n_l0,*samples) and (n_l0,). Mean anomaly has a uniform prior; the first
+    result is a log mean of Bayes factors, never an average of log factors
+    or an incoherent sum of mode powers. Grid convergence must be checked.
+    This direct reference also validates the Hermitian/PSD Gram with 2F;
+    it does not claim an optimized amplitude-marginal search implementation.
+    """
+    from pycbc.filter.bstatistic import log_orientation_marginal
+    if not numpy.isfinite(noise_variance) or noise_variance <= 0:
+        raise ValueError('noise_variance must be positive and finite')
+    mean_anomaly_twof(z, gram, c, n_l0, xp=xp)
+    zl, gl, angles = mean_anomaly_components(z, gram, c, n_l0, xp=xp)
+    shape = zl.shape[2:]
+    missing = len(shape) - len(gl.shape[3:])
+    gl = xp.broadcast_to(gl.reshape(gl.shape[:3] + (1,)*missing + gl.shape[3:]),
+                         (len(angles), 2, 2) + shape)
+    zz = xp.moveaxis(zl, 1, 0).reshape(2, -1) / noise_variance
+    g00 = gl[:, 0, 0].real.ravel() / noise_variance
+    g11 = gl[:, 1, 1].real.ravel() / noise_variance
+    g01 = gl[:, 0, 1].ravel() / noise_variance
+    # With no observed waveform the normalized likelihood integral is one.
+    # Avoid 0/0 in the amplitude integrator's peak/width construction.
+    active = xp.flatnonzero(xp.max(abs(gl), axis=(1, 2)).ravel() > 0)
+    values = xp.zeros(zl.shape[0:1] + shape, dtype=xp.float64)
+    flat = values.reshape(-1)
+    if active.size:
+        flat[active] = log_orientation_marginal(
+            zz[:, active], g00[active], g11[active], g01[active], prior,
+            nodes, order=order, margin=None, table=table, xp=xp)
+    top = xp.max(values, axis=0)
+    result = top + xp.log(xp.mean(xp.exp(values - top), axis=0))
+    return result, values, angles
