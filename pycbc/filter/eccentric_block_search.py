@@ -134,10 +134,12 @@ class EccentricFFTBlockModel:
         def response(r):
             return (rho[r][...,self._index]*(1-self._weight)+
                     rho[r][...,self._index+1]*self._weight)
+        response.coarse, response.index, response.weight = rho, self._index, self._weight
         lo, hi = self.delay_range
         jlo, jhi = int(numpy.ceil(lo/self.grid.delta_t)),int(numpy.floor(hi/self.grid.delta_t))
         start = perf_counter()
-        engine = WindowedModeFFT(self.grid,b,t,response,self.orders,self.data,
+        engine_class = getattr(self, 'fft_engine_class', WindowedModeFFT)
+        engine = engine_class(self.grid,b,t,response,self.orders,self.data,
             self.observation,(jlo,jhi),xp=xp,dtype=self.dtype,
             max_cache_bytes=self.max_cache_bytes)
         del b, t
@@ -203,7 +205,7 @@ class EccentricFFTBlockModel:
                 for first in range(0,len(lags),lag_chunk):
                     last=min(first+lag_chunk,len(lags))
                     g=WindowedModeFFT.interpolated_gram(self,delays[first:last],atimes,ganchors)
-                    stat,angles=mean_anomaly_twof(z[...,first:last],g,self.offsets,nangle,xp=xp)
+                    stat,angles=getattr(self,'statistic',mean_anomaly_twof)(z[...,first:last],g,self.offsets,nangle,xp=xp)
                     angle_at=xp.argmax(stat,axis=0)
                     values=stat[angle_at,xp.arange(last-first)]
                     j=int(xp.argmax(values))
@@ -245,7 +247,7 @@ class EccentricFFTBlockModel:
         delays=delays[keep]
         z=engine.fractional_correlations(delays)
         g=engine.interpolated_gram(delays,atimes,ganchors)
-        stat,angles=mean_anomaly_twof(z,g,self.offsets,self.n_l0,xp=xp)
+        stat,angles=getattr(self,'statistic',mean_anomaly_twof)(z,g,self.offsets,self.n_l0,xp=xp)
         angle,lag=numpy.unravel_index(int(xp.argmax(stat)),stat.shape)
         candidate.update(twof=float(stat[angle,lag]),time=float(delays[lag]),
                          mean_anomaly=float(angles[angle]))
