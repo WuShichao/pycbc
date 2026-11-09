@@ -865,10 +865,12 @@ class BStatisticSurrogate(BaseModel):
         def unit_lengths(fam):
             """The metric in the family's shape units, averaged over
             orientations, and the whitened power at each frequency."""
-            y, dy = fam.tangents()
+            # the derivatives on the host, one on the device at a time
+            y, dy = fam.tangents(host=True)
             window = fam.xp.asarray(grid.in_data)
 
             def windowed(s):
+                s = fam.xp.asarray(s)
                 return _to_numpy(fam.xp.fft.fft(
                     fam.xp.fft.ifft(s, axis=-1) * window, axis=-1))
             # one derivative at a time to the host, which sums the Gram

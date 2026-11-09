@@ -346,10 +346,13 @@ class LinearExponentSurrogate(object):
         shift = xp.asarray(self.grid.frequencies - self.grid.first_frequency)
         return y * xp.exp(-2j * numpy.pi * shift * delta).astype(self.dtype)
 
-    def tangents(self, xi=None, delta=0.0):
+    def tangents(self, xi=None, delta=0.0, host=False):
         """The template and its derivatives in every shape coordinate at
         ``xi`` (default the reference) and arrival time ``delta``: shapes
-        ``(2, nchannels, N)`` and ``(nintrinsic + 2, 2, nchannels, N)``."""
+        ``(2, nchannels, N)`` and ``(nintrinsic + 2, 2, nchannels, N)``.
+        With ``host`` the derivatives are returned as a host array, each
+        copied there as soon as it is computed, so the device holds one
+        derivative at a time (wide near-merger bands)."""
         xp = self.xp
         xi = numpy.zeros(self.nintrinsic + 2) if xi is None else xi
         b, t, rho = self.pieces(xi)
@@ -360,9 +363,12 @@ class LinearExponentSurrogate(object):
             * delta).astype(self.dtype)
         # filled in place: a list stacked at the end would hold every
         # derivative twice
-        out = xp.empty((self.nintrinsic + 2,) + y.shape, dtype=y.dtype)
+        def to_host(a):
+            return a.get() if hasattr(a, 'get') else numpy.asarray(a)
+        out = (numpy if host else xp).empty((self.nintrinsic + 2,) + y.shape,
+                                             dtype=y.dtype)
         for i in range(self.nintrinsic):
-            d = out[i]
+            d = xp.zeros(y.shape, dtype=y.dtype) if host else out[i]
             d[...] = 0
             dlog, dt = self._gradient(xi, i)
             for j, k in enumerate(self.orders):
@@ -370,11 +376,15 @@ class LinearExponentSurrogate(object):
                 d += self.fine(rho[j]) * (self._phase(k, b, t, delta)
                                           * factor.astype(self.dtype))
             d *= shift
+            if host:
+                out[i] = to_host(d)
+                del d
         for axis in range(2):
             drho = xp.fft.fft(self.R0 * sky * self.L[axis], axis=0) \
                 / self.samples
             drho = drho[xp.asarray(self.orders % self.samples)]
-            out[self.nintrinsic + axis] = self.template(b, t, drho, delta)
+            v = self.template(b, t, drho, delta)
+            out[self.nintrinsic + axis] = to_host(v) if host else v
         return y, out
 
 

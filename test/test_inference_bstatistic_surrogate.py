@@ -927,3 +927,49 @@ def test_a_phase_lattice_bank_finds_the_source_and_refinement_helps():
     best, refined = plain['candidates'][0], fine['candidates'][0]
     assert abs(best['theta'][0] - mc) < 0.5 * unit
     assert refined['twof'] >= best['twof'] - 1e-6
+
+
+def test_sky_accumulated_fft_block_search_is_the_same_on_the_gpu():
+    """``accumulate_sky`` keeps the sky points' sums of the basis
+    correlations instead of every basis vector's: the same candidates,
+    times, sky points and survivors, 2F to single-precision rounding."""
+    pytest.importorskip('cupy')
+    from pycbc.scheme import CUPYScheme
+    from pycbc.filter.sky_block_search import (block_sky_points,
+                                               fft_search_sky_block,
+                                               phase_lattice)
+    from pycbc.inference import models
+    from pycbc.workflow import WorkflowConfigParser
+    try:
+        scheme = CUPYScheme()
+    except Exception:
+        pytest.skip('no usable GPU')
+    lon, lat = 3.5763564997428436, 0.3429283438977949
+    data, psds, _, mc = stbbh_data()
+    with scheme:
+        cp = WorkflowConfigParser()
+        cp.read_string(CONFIG.replace(
+            'grid-periods = 1', 'grid-periods = 1\nharmonics = 8\n'
+            'amplitude-table-file = ' + table_file()))
+        m = models.read_from_config(cp, data=data, psds=psds,
+                                    precision='single')
+        block = m.recentred(lon, lat, 0.05, sky_block_points=400)
+        s = m.static_params
+        unit = m.scales['mchirp']
+        region = numpy.array([[mc + u * unit, s['q'], s['spin1z'],
+                               s['spin2z']] for u in numpy.linspace(-1, 1, 9)])
+        dC, labels, _ = phase_lattice(block, region, 0.02, ndir=1)
+        sky = block_sky_points(block, 0.05, 0.02)
+        assert 1 < len(sky) < block.surrogate.sky_block.rank
+        kw = dict(top=len(dC), coefficients=dC, threshold=0.0, basis_chunk=2)
+        a = fft_search_sky_block(block, labels, sky, accumulate_sky=False,
+                                 **kw)
+        b = fft_search_sky_block(block, labels, sky, accumulate_sky=True,
+                                 **kw)
+    ca = {tuple(c['coefficients']): c for c in a['candidates']}
+    cb = {tuple(c['coefficients']): c for c in b['candidates']}
+    assert ca.keys() == cb.keys()
+    for k in ca:
+        assert cb[k]['twof'] == pytest.approx(ca[k]['twof'], rel=1e-5)
+        assert cb[k]['time'] == ca[k]['time'] and cb[k]['sky'] == ca[k]['sky']
+    assert a['survivors'].shape == b['survivors'].shape

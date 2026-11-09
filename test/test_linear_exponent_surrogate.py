@@ -205,6 +205,16 @@ def test_tangents_are_the_derivatives_of_the_template():
         assert numpy.abs(dy[i] - numeric).max() < 1e-6 * numpy.abs(y).max()
 
 
+def test_tangents_on_the_host_are_the_same():
+    family, _, _ = build()
+    xi = numpy.array([0.2, -0.1, 0.3, 0.05, 0.1, -0.2])
+    delta = 7 * family.grid.delta_t
+    y, dy = family.tangents(xi, delta)
+    yh, dyh = family.tangents(xi, delta, host=True)
+    assert isinstance(dyh, numpy.ndarray)
+    assert numpy.array_equal(yh, y) and numpy.array_equal(dyh, dy)
+
+
 def gram_at_delays(days=60):
     family, daily = chirp(days)
     b, t, rho = family.pieces(numpy.zeros(3))

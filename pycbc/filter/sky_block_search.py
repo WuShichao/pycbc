@@ -96,7 +96,7 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
                          lag_shift=None, oversample=1, gram_reuse=1,
                          basis_chunk=16, kernels=None, share_spectra=None,
                          decimate=1, threshold=None, factors=None,
-                         band=None, band_oversample=2):
+                         band=None, band_oversample=2, accumulate_sky=None):
     """The loudest ``top`` candidates of one sky block by one FFT per
     intrinsic template and sky-basis vector.
 
@@ -126,7 +126,15 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
     phase ``exp(2 pi i k0 lag / size)`` is the same for every basis vector
     and component at a lag, so 2F is that of the band's data, with the
     Gram of the whole template (not the band's): the statistic whose square
-    roots summed over bands bound the full band's (the sub-band bound)."""
+    roots summed over bands bound the full band's (the sub-band bound).
+
+    ``accumulate_sky`` (GPU path): instead of every basis vector's
+    correlation at every lag, ``(R, 2, L)``, keep the sky points' sums
+    ``C Z``, ``(P, 2, L)``, accumulated one basis chunk at a time. The same
+    statistic up to the order of summation, and far less memory when the
+    block has fewer sky points than basis vectors and many lags (near
+    merger). By default only when ``P < R`` and the full buffer would take
+    more than 40% of the memory pool's limit."""
     backend = getattr(model, 'fft_block_search', None)
     if backend is not None:
         return backend(thetas, sky, delay_range=delay_range, top=top,
@@ -256,7 +264,18 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
         # times its length
         ramp = ramps[ks]
         if fast:
-            Z = xp.empty((blk.rank, 2, len(lags)), dtype=xp.complex64)
+            P = C.shape[0]
+            accumulate = accumulate_sky
+            if accumulate is None:
+                limit = xp.get_default_memory_pool().get_limit() or \
+                    xp.cuda.Device().mem_info[0]
+                accumulate = P < blk.rank and \
+                    blk.rank * 2 * len(lags) * 8 > 0.4 * limit
+            if accumulate:
+                Z = xp.zeros((P, 2, len(lags)), dtype=xp.complex64)
+                C64 = C.astype(xp.complex64)
+            else:
+                Z = xp.empty((blk.rank, 2, len(lags)), dtype=xp.complex64)
             if shared is not None:
                 factor = fam.coefficient_factor(dC[:8], dC[8:])
                 if extra is not None:
@@ -285,10 +304,16 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
                     if ramp is not None:
                         a *= ramp
                     a = fold(a)
-                Z[r0:r0 + nr] = xp.fft.ifft(a, n=size, axis=-1)[
-                    :, :, index] * size
+                zc = xp.fft.ifft(a, n=size, axis=-1)[:, :, index] * size
                 del a
-            tb, ta = twof_max(Z, C, G[0], G[1], G[2], det, lag_day, 1 / var)
+                if accumulate:
+                    Z += (C64[:, r0:r0 + nr] @ zc.reshape(nr, -1)).reshape(
+                        P, 2, -1)
+                else:
+                    Z[r0:r0 + nr] = zc
+                del zc
+            tb, ta = twof_max(Z, xp.eye(P, dtype=xp.complex64) if accumulate
+                              else C, G[0], G[1], G[2], det, lag_day, 1 / var)
             if threshold is not None:
                 ps, tiles = xp.nonzero(tb > threshold)
                 if len(ps):
