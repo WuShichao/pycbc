@@ -127,6 +127,15 @@ def fft_search_sky_block(model, thetas, sky, delay_range=None, top=20,
     and component at a lag, so 2F is that of the band's data, with the
     Gram of the whole template (not the band's): the statistic whose square
     roots summed over bands bound the full band's (the sub-band bound)."""
+    backend = getattr(model, 'fft_block_search', None)
+    if backend is not None:
+        return backend(thetas, sky, delay_range=delay_range, top=top,
+            anchors=anchors, lag_chunk=lag_chunk, refine=refine,
+            subsamples=subsamples, coefficients=coefficients, sky_set=sky_set,
+            lag_shift=lag_shift, oversample=oversample, gram_reuse=gram_reuse,
+            basis_chunk=basis_chunk, kernels=kernels, share_spectra=share_spectra,
+            decimate=decimate, threshold=threshold, factors=factors,
+            band=band, band_oversample=band_oversample)
     from numpy.polynomial import chebyshev
     fam, dg = model.surrogate, model.daily_gram
     xp, blk = fam.xp, fam.sky_block
@@ -372,6 +381,10 @@ def refine_candidate(model, candidate, anchors=5, subsamples=8, chunk=1 << 18,
     in the units of :func:`pycbc.filter.fstatistic.twof`, for a ranking
     statistic other than 2F (:func:`two_stage_block_search`'s
     ``log_bayes``)."""
+    backend = getattr(model, 'refine_candidate', None)
+    if backend is not None:
+        return backend(candidate, anchors=anchors, subsamples=subsamples,
+                       chunk=chunk, span=span)
     from numpy.polynomial import chebyshev
     from scipy.optimize import minimize
     fam, dg = model.surrogate, model.daily_gram
@@ -654,6 +667,10 @@ def multilevel_block_search(model, coarse_model, region, levels,
     smaller one fits wide near-merger bands on a small card). Returns the ``top`` candidates, the
     survivors of level 0, the sources followed, the follow-ups and the
     surviving points of each level, and the seconds."""
+    for owner in (model, coarse_model):
+        release = getattr(owner, 'release_search_cache', None)
+        if release is not None:
+            release()
     start = time.time()
     s, gs, frame, _ = phase_frame(model, region)
     lats = [aligned_lattice(s, gs, lv['mismatch']) for lv in levels]
@@ -665,6 +682,9 @@ def multilevel_block_search(model, coarse_model, region, levels,
         decimate=int(lv0.get('decimate', 1)), threshold=lv0['threshold'],
         gram_reuse=len(nodes0), **(coarse_options or {}))
     surv, delays = res['survivors'], res['delays']
+    release = getattr(coarse_model, 'release_search_cache', None)
+    if release is not None:
+        release()
     coarse_seconds = time.time() - start
     kept = _merge_sources(surv, skies[0], delays, lv0['sky_step'],
                           merge_time, branch)
@@ -701,6 +721,8 @@ def multilevel_block_search(model, coarse_model, region, levels,
                     basis_chunk=basis_chunk, decimate=decimate,
                     threshold=None if final else lv['threshold'])
                 followups += 1
+                if not out['candidates']:
+                    continue
                 c = out['candidates'][0]
                 c['coarse_twof'] = float(v)
                 if best is None or c['twof'] > best['twof']:
@@ -923,6 +945,9 @@ def phase_frame(model, region, ndir=3, band_margin=5 * 86400.0):
     spin1z, spin2z) over the observed band: the points' phase coordinates,
     the metric in them from the template power with the arrival time
     projected out, the frame and its correlator."""
+    backend = getattr(model, 'phase_frame', None)
+    if backend is not None:
+        return backend(region, ndir=ndir, band_margin=band_margin)
     fam = model.surrogate
     corr = PhaseNUFFTCorrelation(fam, model.data_spectrum, sky=(0.0, 0.0),
                                  band_margin=band_margin)
