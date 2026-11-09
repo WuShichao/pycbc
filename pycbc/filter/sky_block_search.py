@@ -713,6 +713,9 @@ def multilevel_block_search(model, coarse_model, region, levels,
     coarse_seconds = time.time() - start
     kept = _merge_sources(surv, skies[0], delays, lv0['sky_step'],
                           merge_time, branch)
+    logging.info("multilevel level 0: %d survivors above %g, %d sources "
+                 "to follow, %.0f s", len(surv), lv0['threshold'], len(kept),
+                 coarse_seconds)
     # a survivor: (lattice node, sky point, time, 2F), with its level's
     # spacing, sky step and lag window
     step0 = delays[1] - delays[0] if len(delays) > 1 else 0.0
