@@ -1496,17 +1496,21 @@ def project_frequency_tdi(source, orbit, channel_terms, frequencies,
             indices = indices[keep]
             if not len(indices):
                 continue
+            # Retain the borrowed preceding sample while building geometry.
+            # Removing it first leaves a singleton final block, which the
+            # constellation sampler cannot evaluate. Discard it only from
+            # the output contribution.
             geometry = MultiChannelTermGeometry(
-                orbit, np.asarray(item['time'])[keep], channel_terms,
+                orbit, np.asarray(item['time']), channel_terms,
                 links=links, velocity_order=velocity_order)
-            item_frequency = np.asarray(item['frequency'])[keep]
+            item_frequency = np.asarray(item['frequency'])
             factors = frequency_response_factors(
                 geometry, item_frequency, lamb, beta)
             destination = indices + block_start
             for name, (plus, cross) in factors.items():
                 contribution = (
-                    plus * np.asarray(item['plus'])[keep]
-                    + cross * np.asarray(item['cross'])[keep])
+                    plus[keep] * np.asarray(item['plus'])[keep]
+                    + cross[keep] * np.asarray(item['cross'])[keep])
                 np.add.at(output[name], destination, contribution)
     return (output, diagnostics) if return_diagnostics else output
 

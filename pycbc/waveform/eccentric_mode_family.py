@@ -385,6 +385,58 @@ class EccentricModeFamily(object):
             numpy.interp(f[inside], self.f, factor.imag)
         return out
 
+    def iter_mode_pieces(self, d, de, dq=0.0, circular=None,
+                         frequencies=None):
+        """Sparse FD modes and their individual stationary-time clocks.
+
+        Yield ``(key, indices, amplitude, phase, time)`` on ``frequencies``
+        (the family's grid by default), only where each mode is supported.
+        ``amplitude`` has shape ``(2, len(indices))``; the waveform is
+        ``amplitude * exp(-1j * phase)`` and ``time = phase' / (2 pi)``.
+        The clock retains the generator's time origin. A caller applying
+        an epoch shift must translate the phase and time consistently.
+
+        Cubic splines interpolate the unwrapped SPA phase and complex FD
+        amplitudes within each contiguous support interval. They never
+        interpolate a wrapped waveform or bridge gaps. This permits a
+        reference stencil on a smaller grid than the coherent data grid,
+        but its resolution and the clock derivative must be validated for
+        the application. No extrapolation beyond the sampled support is
+        performed. Singleton support bins cannot supply a clock and raise.
+        """
+        from scipy.interpolate import CubicSpline
+        f = self.f if frequencies is None else numpy.asarray(
+            frequencies, dtype=float)
+        if (f.ndim != 1 or not len(f) or not numpy.all(numpy.isfinite(f))
+                or numpy.any(f <= 0) or numpy.any(numpy.diff(f) <= 0)):
+            raise ValueError("frequencies must be positive, finite and increasing")
+        for key, sl, amp, phase, have in self._windows(d, de, dq, circular):
+            active = numpy.flatnonzero(have)
+            if not len(active):
+                continue
+            intervals = numpy.split(active, numpy.flatnonzero(
+                numpy.diff(active) != 1) + 1)
+            chunks = []
+            for bins in intervals:
+                x = self.f[sl][bins]
+                lo, hi = numpy.searchsorted(f, [x[0], x[-1]])
+                hi = numpy.searchsorted(f, x[-1], side='right')
+                if hi <= lo:
+                    continue
+                if len(bins) < 2:
+                    raise ValueError("a mode needs at least two supported bins for its clock")
+                idx = numpy.arange(lo, hi)
+                phase_spline = CubicSpline(x, phase[bins], extrapolate=False)
+                a = CubicSpline(x, amp[:, bins], axis=-1,
+                                extrapolate=False)(f[idx])
+                chunks.append((idx, a, phase_spline(f[idx]),
+                               phase_spline(f[idx], 1) / (2 * numpy.pi)))
+            if chunks:
+                yield (key, numpy.concatenate([p[0] for p in chunks]),
+                       numpy.concatenate([p[1] for p in chunks], axis=-1),
+                       numpy.concatenate([p[2] for p in chunks]),
+                       numpy.concatenate([p[3] for p in chunks]))
+
     def polarizations(self, d, de, dq=0.0, circular=None):
         """The plus and cross polarisations ``(2, N)``, the modes summed."""
         h = numpy.zeros((2, len(self.f)), complex)

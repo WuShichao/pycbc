@@ -32,7 +32,7 @@ exact on that grid (no interpolation in ``l0``).
 import numpy
 
 
-def mean_anomaly_components(z, gram, c, n_l0=None):
+def mean_anomaly_components(z, gram, c, n_l0=None, xp=numpy):
     """Coherently combine modes into two polarisation correlations and Gram.
 
     ``z`` has shape ``(K, 2, *samples)`` and ``gram`` has shape
@@ -46,12 +46,16 @@ def mean_anomaly_components(z, gram, c, n_l0=None):
     feed either the four-real-amplitude F-statistic or orientation/amplitude
     marginalisation. The modes' amplitudes are tied, not fitted separately.
 
+    ``xp`` is NumPy (default) or CuPy. Arrays and transforms stay on that
+    backend; ``c`` is small host-side integer metadata. Validation may
+    synchronize device scalars. Complex arrays are promoted to complex128.
+
     The default grid resolves the Fourier polynomials for z and G. It
     does NOT guarantee convergence of a maximum or integral of the nonlinear
     statistic over continuous l0; check that by increasing ``n_l0``.
     """
-    z = numpy.asarray(z, dtype=complex)
-    gram = numpy.asarray(gram, dtype=complex)
+    z = xp.asarray(z, dtype=complex)
+    gram = xp.asarray(gram, dtype=complex)
     raw_c = numpy.asarray(c)
     if z.ndim < 2 or z.shape[0] == 0 or z.shape[1] != 2:
         raise ValueError("z must have shape (K, 2, *samples), K > 0")
@@ -61,7 +65,7 @@ def mean_anomaly_components(z, gram, c, n_l0=None):
     if (raw_c.shape != (k,) or not numpy.all(numpy.isfinite(raw_c))
             or not numpy.all(raw_c == numpy.floor(raw_c))):
         raise ValueError("c must contain K finite integer offsets")
-    if not numpy.all(numpy.isfinite(z)) or not numpy.all(numpy.isfinite(gram)):
+    if not xp.all(xp.isfinite(z)) or not xp.all(xp.isfinite(gram)):
         raise ValueError("correlations and Gram must be finite")
     if numpy.broadcast_shapes(z.shape[2:], gram.shape[4:]) != z.shape[2:]:
         raise ValueError("Gram samples must broadcast to correlation samples")
@@ -77,19 +81,24 @@ def mean_anomaly_components(z, gram, c, n_l0=None):
             or n_l0 < need):
         raise ValueError("n_l0 must be an integer >= 2 (max c - min c) + 1")
     n_l0 = int(n_l0)
-    Z = numpy.zeros((n_l0,) + z.shape[1:], dtype=complex)
-    numpy.add.at(Z, c % n_l0, z)
-    zl = numpy.fft.fft(Z, axis=0)
-    M = numpy.zeros((n_l0, 2, 2) + gram.shape[4:], dtype=complex)
+    Z = xp.zeros((n_l0,) + z.shape[1:], dtype=complex)
+    for i in range(k):
+        Z[int(c[i] % n_l0)] += z[i]
+    zl = xp.fft.fft(Z, axis=0)
+    M = xp.zeros((n_l0, 2, 2) + gram.shape[4:], dtype=complex)
     for i in range(k):
         for j in range(k):
-            M[(c[j] - c[i]) % n_l0] += gram[i, :, j]
-    gl = numpy.fft.ifft(M, axis=0) * n_l0
-    return zl, gl, 2 * numpy.pi * numpy.arange(n_l0) / n_l0
+            M[int((c[j] - c[i]) % n_l0)] += gram[i, :, j]
+    gl = xp.fft.ifft(M, axis=0) * n_l0
+    return zl, gl, 2 * numpy.pi * xp.arange(n_l0) / n_l0
 
 
-def mean_anomaly_twof(z, gram, c, n_l0=None, rcond=1e-12):
+def mean_anomaly_twof(z, gram, c, n_l0=None, rcond=1e-12,
+                      xp=numpy):
     """Fully coherent ``2F = z^H G^+ z`` on the mean-anomaly grid.
+
+    ``xp`` selects the NumPy or CuPy backend, including the batched
+    Hermitian eigensolver. Returned statistics and angles use that backend.
 
     Inputs follow :func:`mean_anomaly_components`. Noise in each whitened
     complex data bin must have unit variance in EACH real component. At a
@@ -104,26 +113,27 @@ def mean_anomaly_twof(z, gram, c, n_l0=None, rcond=1e-12):
     """
     if not numpy.isfinite(rcond) or not 0 < rcond < 1:
         raise ValueError("rcond must lie strictly between 0 and 1")
-    zl, gl, l0 = mean_anomaly_components(z, gram, c, n_l0)
-    zz = numpy.moveaxis(zl, 1, -1)
-    gg = numpy.moveaxis(gl, (1, 2), (-2, -1))
+    zl, gl, l0 = mean_anomaly_components(z, gram, c, n_l0, xp=xp)
+    zz = xp.moveaxis(zl, 1, -1)
+    gg = xp.moveaxis(gl, (1, 2), (-2, -1))
     # Insert missing leading sample axes after the l0 axis, keeping the
     # latter paired instead of accidentally broadcasting it as a sample.
     gg = gg.reshape((len(l0),) + (1,) * (zz.ndim - gg.ndim + 1)
                     + gg.shape[1:])
     adjoint = gg.swapaxes(-1, -2).conj()
-    scale = numpy.max(abs(gg), axis=(-2, -1), keepdims=True)
+    scale = xp.max(abs(gg), axis=(-2, -1), keepdims=True)
     tolerance = max(rcond, 32 * numpy.finfo(float).eps)
-    if numpy.any(abs(gg - adjoint) > tolerance * scale):
+    if xp.any(abs(gg - adjoint) > tolerance * scale):
         raise ValueError("Gram must be Hermitian")
-    values, vectors = numpy.linalg.eigh(0.5 * (gg + adjoint))
-    cutoff = rcond * numpy.max(abs(values), axis=-1, keepdims=True)
-    if numpy.any(values < -cutoff):
+    values, vectors = xp.linalg.eigh(0.5 * (gg + adjoint))
+    cutoff = rcond * xp.max(abs(values), axis=-1, keepdims=True)
+    if xp.any(values < -cutoff):
         raise ValueError("Gram must be positive semidefinite")
-    inverse = numpy.divide(1.0, values, out=numpy.zeros_like(values),
-                           where=values > cutoff)
-    projection = numpy.einsum('...ai,...a->...i', vectors.conj(), zz)
-    return numpy.sum(abs(projection) ** 2 * inverse, axis=-1), l0
+    retained = values > cutoff
+    safe_values = xp.where(retained, values, 1.0)
+    inverse = xp.where(retained, 1.0 / safe_values, 0.0)
+    projection = xp.einsum('...ai,...a->...i', vectors.conj(), zz)
+    return xp.sum(abs(projection) ** 2 * inverse, axis=-1), l0
 
 
 def mode_offsets(keys):

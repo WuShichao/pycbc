@@ -159,3 +159,35 @@ def test_the_edges_support_follows_a_moving_mode_edge():
         numpy.testing.assert_allclose(got[0][:, both], a[:, both],
                                       rtol=1e-4)
         assert numpy.max(abs(got[1][both] - psi[both])) < 1e-2
+
+
+def test_sparse_mode_pieces_interpolate_phase_and_separate_clocks():
+    f = numpy.linspace(.01, .02, 41)
+    def modes(p):
+        out = {}
+        for n in (2, 3):
+            phase = 2*numpy.pi*(n*1e6*f + 1e9*(f-.015)**3)
+            amp = numpy.array([1 + 2j*f, 2 - 1j*f])
+            have = numpy.ones(len(f), bool)
+            # Internal gaps must remain absent on a finer grid.
+            if n == 3:
+                have[15:21] = False
+            out[2,2,n] = (numpy.where(have, amp, 0), phase, have)
+        return out
+    ref = dict(mass1=36., mass2=31., eccentricity=.05)
+    fam = EccentricModeFamily(ref, f, f[0], generator=modes,
+                              step_mass=0, step_e=0, step_q=0)
+    fine = numpy.linspace(.009, .021, 301)
+    for key, idx, amp, phase, clock in fam.iter_mode_pieces(0.,0.,frequencies=fine):
+        x, n = fine[idx], key[2]
+        assert numpy.all((x >= f[0]) & (x <= f[-1]))
+        if n == 3:
+            assert numpy.all((x <= f[14]) | (x >= f[21]))
+        numpy.testing.assert_allclose(phase, 2*numpy.pi*(n*1e6*x + 1e9*(x-.015)**3), rtol=1e-13)
+        numpy.testing.assert_allclose(clock, n*1e6 + 3e9*(x-.015)**2, rtol=1e-11)
+        numpy.testing.assert_allclose(amp, [1+2j*x,2-1j*x], rtol=1e-6)
+    pieces = list(fam.iter_mode_pieces(0.,0.))
+    assert len(pieces) == 2
+    for bad in ([.01,.01], [.02,.01], [numpy.nan], [-.01], []):
+        with pytest.raises(ValueError):
+            list(fam.iter_mode_pieces(0.,0.,frequencies=bad))
