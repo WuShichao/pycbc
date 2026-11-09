@@ -664,7 +664,8 @@ def multilevel_block_search(model, coarse_model, region, levels,
                             coarse_options=None, merge_time=86400.0,
                             refine_threshold=65.0, log_weight=None,
                             log_bayes=None, followup_lags=8,
-                            followup_reach=1.5, branch=1, basis_chunk=8):
+                            followup_reach=1.5, branch=1, basis_chunk=8,
+                            max_sources=None):
     """A block searched by adaptive refinement over nested levels of the
     phase lattice: :func:`two_stage_block_search` with any number of stages.
 
@@ -689,7 +690,10 @@ def multilevel_block_search(model, coarse_model, region, levels,
     With two levels this is :func:`two_stage_block_search` with
     ``followup_per_source = branch``. ``basis_chunk`` is the follow-ups'
     (the transform buffer holds that many basis vectors over every lag; a
-    smaller one fits wide near-merger bands on a small card). Returns the ``top`` candidates, the
+    smaller one fits wide near-merger bands on a small card). ``max_sources``
+    follows only that many of level 0's sources, the loudest (``None``: all;
+    the number found is returned as ``sources``; level 0's loudest 2F as
+    ``level0_max``). Returns the ``top`` candidates, the
     survivors of level 0, the sources followed, the follow-ups and the
     surviving points of each level, and the seconds."""
     for owner in (model, coarse_model):
@@ -707,15 +711,22 @@ def multilevel_block_search(model, coarse_model, region, levels,
         decimate=int(lv0.get('decimate', 1)), threshold=lv0['threshold'],
         gram_reuse=len(nodes0), **(coarse_options or {}))
     surv, delays = res['survivors'], res['delays']
+    level0_max = float(res['candidates'][0]['twof']) if res['candidates'] \
+        else None
     release = getattr(coarse_model, 'release_search_cache', None)
     if release is not None:
         release()
     coarse_seconds = time.time() - start
     kept = _merge_sources(surv, skies[0], delays, lv0['sky_step'],
                           merge_time, branch)
-    logging.info("multilevel level 0: %d survivors above %g, %d sources "
-                 "to follow, %.0f s", len(surv), lv0['threshold'], len(kept),
-                 coarse_seconds)
+    n_sources = len(kept)
+    # max_sources: follow only the loudest level-0 sources (kept is ordered by
+    # each source's loudest survivor); None follows every one
+    if max_sources is not None:
+        kept = kept[:int(max_sources)]
+    logging.info("multilevel level 0: %d survivors above %g, %d sources, "
+                 "%d to follow, %.0f s", len(surv), lv0['threshold'], n_sources,
+                 len(kept), coarse_seconds)
     # a survivor: (lattice node, sky point, time, 2F), with its level's
     # spacing, sky step and lag window
     step0 = delays[1] - delays[0] if len(delays) > 1 else 0.0
@@ -800,7 +811,8 @@ def multilevel_block_search(model, coarse_model, region, levels,
     else:
         found.sort(key=lambda c: -c['twof'])
     return dict(candidates=found[:top], survivors=len(surv),
-                followed=len(kept), followups=followups,
+                level0_max=level0_max,
+                sources=n_sources, followed=len(kept), followups=followups,
                 surviving=surviving, coarse_seconds=coarse_seconds,
                 seconds=time.time() - start)
 

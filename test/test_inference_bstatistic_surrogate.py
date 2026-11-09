@@ -813,6 +813,15 @@ def test_multilevel_block_search_is_two_stage_with_two_levels():
     assert len(three['surviving']) == 2
     assert three['candidates'][0]['twof'] >= 0.99 * fine['twof']
     assert abs(three['candidates'][0]['time'] - fine['time']) < 3 * m.grid_step
+    # following only the loudest level-0 source keeps the loudest candidate
+    one = multilevel_block_search(block, block, region, levels,
+                                  radius=0.02, refine_threshold=refine,
+                                  top=50, max_sources=1)
+    assert one['sources'] == multi['sources'] >= one['followed'] == 1
+    numpy.testing.assert_allclose(one['candidates'][0]['twof'],
+                                  multi['candidates'][0]['twof'], rtol=1e-10)
+    assert one['candidates'][0]['time'] == multi['candidates'][0]['time']
+    assert one['level0_max'] == multi['level0_max'] >= cut
 
 def test_template_factors_enter_the_fft_block_search():
     """A factor of one changes nothing; a phase ramp exp(-2 pi i f tau) on
