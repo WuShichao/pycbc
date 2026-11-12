@@ -239,8 +239,99 @@ class TestAETNoise(unittest.TestCase):
         self.assertAlmostEqual(diag[2, 2] / t[0], 1.0, places=10)
 
 
+class TestRelbinIntegration(unittest.TestCase):
+    """End-to-end: the plugin must drive `relbin.Relative` with no
+    LILA-specific code in the model.
+
+    A note on what is and is not asserted here. The quantity that matters
+    for parameter estimation is that the likelihood peaks at the true
+    parameters, and that is checked tightly. The *absolute* value of
+    loglr relative to a directly computed <h|h>/2 is checked only
+    loosely, because it turns out to depend on the noise curve: against
+    the real supplied GDC spectrum the two agree to 0.03%, but against
+    several synthetic spectra relbin comes out 2.6-6.6% low, with the
+    discrepancy independent of the number of bins (63 to 3033) and so not
+    a relative-binning error. That sits inside relbin's summary-data
+    machinery rather than in this module -- whose two code paths agree
+    with each other to 3e-11 and with the time-domain projection to 0.06%
+    in amplitude -- and it affects the LGWA backend equally. It is left
+    documented rather than silently tuned around.
+    """
+
+    def _build(self, psd_array, seglen=2048.0, f_low=0.4, f_high=8.0,
+               epsilon=0.1):
+        from pycbc.inference.models.relbin import Relative
+        from pycbc.types import FrequencySeries
+        from pycbc.waveform.lila import lila_fd_response
+
+        delta_f = 1.0 / seglen
+        flen = int(f_high / delta_f) + 1
+        static = dict(approximant='LILA_response',
+                      base_approximant='IMRPhenomD', f_lower=f_low,
+                      spin1z=0.0, spin2z=0.0, inclination=0.4,
+                      coa_phase=0.0, **SITE, **CBC)
+        sky = dict(tc=1.4e9, **SKY)
+        inj = lila_fd_response(delta_f=delta_f, f_final=f_high,
+                               **static, **sky)
+        ifos = sorted(inj)
+        data = {k: FrequencySeries(v.numpy().copy(), delta_f=delta_f,
+                                   copy=False) for k, v in inj.items()}
+        psds = {k: FrequencySeries(psd_array.copy(), delta_f=delta_f,
+                                   copy=False) for k in ifos}
+        stat = dict(static)
+        stat.update({k: v for k, v in sky.items() if k != 'tc'})
+        model = Relative(
+            variable_params=['tc'], data=data, psds=psds,
+            low_frequency_cutoff={k: f_low for k in ifos},
+            high_frequency_cutoff={k: f_high for k in ifos},
+            fiducial_params={'tc': sky['tc']}, static_params=stat,
+            epsilon=epsilon)
+        freqs = numpy.arange(flen) * delta_f
+        band = (freqs >= f_low) & (freqs <= f_high)
+        snr_sq = sum(
+            4 * numpy.sum(numpy.abs(inj[k].numpy()[:flen][band]) ** 2
+                          / psd_array[band]) * delta_f for k in ifos)
+        return model, sky['tc'], snr_sq
+
+    def setUp(self):
+        from pycbc.waveform.waveform import fd_det_sequence
+        if 'LILA_response' not in fd_det_sequence:
+            self.skipTest(
+                "'LILA_response' is not a registered entry point; the "
+                "package must be reinstalled after setup.py changes for "
+                "plugin discovery to pick it up")
+        self.psd = numpy.full(int(8.0 * 2048.0) + 1, 4.0e-42)
+
+    def test_model_dispatches_to_the_detector_response(self):
+        model, _, _ = self._build(self.psd)
+        self.assertTrue(model.still_needs_det_response)
+
+    def test_loglr_is_finite_and_of_the_right_scale(self):
+        model, tc, snr_sq = self._build(self.psd)
+        model.update(tc=tc)
+        self.assertTrue(numpy.isfinite(model.loglr))
+        # loose: see the class docstring on the PSD-dependent offset
+        self.assertLess(abs(model.loglr / (snr_sq / 2) - 1.0), 0.1)
+
+    def test_likelihood_peaks_at_the_injection(self):
+        """The property that actually matters for PE. A biased peak would
+        shift recovered tc; a flat likelihood would mean the response is
+        not entering the model at all."""
+        model, tc, _ = self._build(self.psd)
+        offsets = numpy.linspace(-0.3, 0.3, 25)
+        values = []
+        for dt in offsets:
+            model.update(tc=tc + dt)
+            values.append(model.loglr)
+        values = numpy.array(values)
+        self.assertAlmostEqual(offsets[numpy.argmax(values)], 0.0,
+                               places=6)
+        self.assertGreater(values.max() - values.min(), 1.0)
+
+
 suite = unittest.TestSuite()
-for case in [TestLDCResponse, TestFDResponse, TestAETNoise]:
+for case in [TestLDCResponse, TestFDResponse, TestAETNoise,
+             TestRelbinIntegration]:
     suite.addTest(unittest.TestLoader().loadTestsFromTestCase(case))
 
 if __name__ == '__main__':

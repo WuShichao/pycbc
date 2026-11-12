@@ -254,6 +254,10 @@ def lila_fd_response(ifos=None, sample_points=None, delta_f=None,
 
     cbc_params = {k: v for k, v in params.items()
                   if k not in ("approximant", "base_approximant")}
+    # f_lower/f_ref are named arguments here, so they never reach
+    # **params; the intrinsic waveform still needs them.
+    cbc_params["f_lower"] = f_lower
+    cbc_params.setdefault("f_ref", f_lower)
 
     if sample_points is not None:
         fm = np.asarray(sample_points, dtype=float)
@@ -282,11 +286,19 @@ def lila_fd_response(ifos=None, sample_points=None, delta_f=None,
     out = {}
     for name, arr in chans.items():
         if equal_spaced:
+            # Length int(f_final/delta_f)+1, matching the convention of
+            # pycbc.waveform.lgwa: the series runs from DC to f_final,
+            # not to Nyquist, so a PSD paired with it must be built to
+            # the same length.
             full = np.zeros(kmax, dtype=complex)
             full[kmin:kmax] = arr
             out[name] = FrequencySeries(full, delta_f=delta_f, copy=False)
         else:
-            out[name] = FrequencySeries(arr, delta_f=1.0, copy=False)
+            # Sequence path returns Array, not FrequencySeries: the
+            # sample points are arbitrary, so no single delta_f describes
+            # them, and this is what relbin's
+            # get_fd_det_waveform_sequence expects.
+            out[name] = Array(arr)
     return out
 
 
