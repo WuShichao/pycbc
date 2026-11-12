@@ -1202,6 +1202,18 @@ class _LGWA_detector(AbsSpaceDet):
         return {'LGWA_X': h_x, 'LGWA_Y': h_y}
 
 
+def _selenodetic_to_mcmf(longitude, latitude, height=0.0):
+    """Selenodetic longitude/latitude/height -> Moon-fixed Cartesian
+    position in metres, on `lunarsky`'s spherical Moon."""
+    from pycbc.coordinates.moon import LUNAR_RADIUS
+
+    r = LUNAR_RADIUS + height
+    return numpy.array([
+        r * numpy.cos(latitude) * numpy.cos(longitude),
+        r * numpy.cos(latitude) * numpy.sin(longitude),
+        r * numpy.sin(latitude)])
+
+
 class _LILA_detector(AbsSpaceDet):
     """
     LILA (Laser Interferometer Lunar Antenna) Observatory, modeled as an
@@ -1337,6 +1349,30 @@ class _LILA_detector(AbsSpaceDet):
                 yangle=site['yangle'], xangle=site['xangle'])
             self.responses[chan] = numpy.squeeze(resps[0] - resps[1])
 
+        # Lunar Deformation Channel: the triangle sides read as
+        # long-baseline strainmeters with optics anchored to the surface.
+        # Baseline i runs from vertex i to vertex i+1, and its direction is
+        # the straight-line chord the laser actually traverses, not the
+        # local great-circle tangent -- the two differ by half the subtended
+        # arc, 0.66 degrees at 40 km.
+        self.ldc_channels = ['LDC_1', 'LDC_2', 'LDC_3']
+        self.ldc_responses = {}
+        self.ldc_baselines = {}
+        verts = numpy.array([
+            _selenodetic_to_mcmf(site['longitude'], site['latitude'],
+                                 site['height'])
+            for site in self.sites])
+        for i, chan in enumerate(self.ldc_channels):
+            sep = verts[(i + 1) % 3] - verts[i]
+            ehat = sep / numpy.linalg.norm(sep)
+            self.ldc_baselines[chan] = ehat
+            # A single-arm strainmeter measures dL/L along one baseline:
+            # D = (1/2) e e. Unlike a two-arm Michelson's (xx - yy)/2 this
+            # is NOT traceless (its trace is 1/2); only the
+            # transverse-traceless part contributes against a TT wave, so
+            # that is harmless, but it is not an error.
+            self.ldc_responses[chan] = 0.5 * numpy.outer(ehat, ehat)
+
     @property
     def sky_coords(self):
         return 'eclipticlongitude', 'eclipticlatitude'
@@ -1445,6 +1481,75 @@ class _LILA_detector(AbsSpaceDet):
             if grid is not None:
                 fplus = CubicSpline(grid, fplus)(times)
                 fcross = CubicSpline(grid, fcross)(times)
+            out[chan] = (fplus, fcross)
+        return out
+
+    def ldc_antenna_pattern(self, ra, dec, psi, times, transfer=None):
+        r"""
+        F+ and Fx for each LDC baseline, at the given GPS `times`.
+
+        The Lunar Deformation Channel is a long-baseline strainmeter whose
+        optics are anchored to the lunar surface, so it measures the
+        relative motion of separated endpoints,
+        .. math::
+            s_{\rm LDC} = \Delta L / L
+                 \simeq \hat e_i \hat e_j \partial_j \xi_i ,
+        rather than the local inertial displacement an LGWA-style station
+        records. In the inertial limit, where the surface responds like
+        free masses, this reduces to
+        :math:`\tfrac12 \hat e_i h_{ij} \hat e_j`.
+
+        That is the same geometric form as a single interferometer arm,
+        and it is *not* the LGWA contraction
+        :math:`\hat x_i h_{ij} \hat n_j`, which is bilinear in the
+        sensing axis and the local vertical and has a null for sources
+        directly overhead. The two instruments measure the displacement
+        field and its gradient respectively, so no choice of axes maps one
+        onto the other.
+
+        Parameters
+        ----------
+        ra, dec, psi : float
+            ICRS right ascension, declination and LAL-convention
+            polarization angle of the source, in radians.
+        times : numpy.array
+            GPS times at which to evaluate the patterns.
+        transfer : callable or None, optional
+            The lunar elastic transfer function :math:`\mathcal{T}`, as a
+            function of the times at which the pattern is evaluated. The
+            default of None means unity, which is the correct pairing for
+            the supplied LILA sensitivity curves: those have
+            :math:`\mathcal{T}(f)` already divided out (their normal-mode
+            resonances and antiresonances are plainly visible), so
+            re-applying it here would double-count. Supply a transfer
+            function only when pairing with a raw sensor-noise spectrum.
+
+        Returns
+        -------
+        dict
+            Channel name ('LDC_1', ...) -> (fplus, fcross), each an array
+            of len(times).
+        """
+        from scipy.interpolate import CubicSpline
+
+        times = numpy.asarray(times, dtype=numpy.float64)
+        grid = self._grid(float(times[0]), float(times[-1]))
+        eval_times = times if grid is None else grid
+
+        x_pol, y_pol = self._source_basis_mcmf(ra, dec, psi, eval_times)
+
+        out = {}
+        for chan in self.ldc_channels:
+            resp = self.ldc_responses[chan]
+            dx, dy = resp @ x_pol, resp @ y_pol
+            fplus = numpy.sum(x_pol * dx - y_pol * dy, axis=0)
+            fcross = numpy.sum(x_pol * dy + y_pol * dx, axis=0)
+            if grid is not None:
+                fplus = CubicSpline(grid, fplus)(times)
+                fcross = CubicSpline(grid, fcross)(times)
+            if transfer is not None:
+                scale = numpy.asarray(transfer(times), dtype=numpy.float64)
+                fplus, fcross = fplus * scale, fcross * scale
             out[chan] = (fplus, fcross)
         return out
 

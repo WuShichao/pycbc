@@ -274,9 +274,11 @@ setup(
     entry_points = {
         'pycbc.waveform.fd_det': [
             'LGWA_response = pycbc.waveform.lgwa:lgwa_fd_response',
+            'LILA_response = pycbc.waveform.lila:lila_fd_response',
         ],
         'pycbc.waveform.fd_det_sequence': [
             'LGWA_response = pycbc.waveform.lgwa:lgwa_fd_response',
+            'LILA_response = pycbc.waveform.lila:lila_fd_response',
         ],
     },
     python_requires='>=3.11',
