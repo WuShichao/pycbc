@@ -118,8 +118,15 @@ class EccentricFFTBlockModel:
         self._profiles = {}
 
     def clear_template_grams(self):
-        self._template_grams = {}
-        self._mc_grams = {}
+        # in place: two models of one cell (e.g. a search's coarse and fine levels) may share these dicts
+        self._template_grams.clear()
+        self._mc_grams.clear()
+
+    def share_grams_with(self, other):
+        """Use ``other``'s Gram caches: the Grams do not depend on the data or on the anomaly grid, so the coarse
+        and fine models of one cell (same grid, source, response, observation and delay range) can share them."""
+        self._template_grams = other._template_grams
+        self._mc_grams = other._mc_grams
 
     def _mc_anchor_gram(self, x, theta, sky, anchor_indices, delay_bounds, response):
         key = (float(x),)+tuple(sky)+tuple(int(v) for v in anchor_indices)
