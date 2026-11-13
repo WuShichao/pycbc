@@ -51,3 +51,49 @@ def test_multilevel_eccentric_backend_recovers_injection_and_matches_exhaustive_
     np.testing.assert_allclose(doubled['candidates'][0]['twof'],
                                4*baseline['candidates'][0]['twof'],rtol=1e-12)
     assert model.work['gram_cache_hits']>0
+
+
+def test_mc_interpolated_gram_matches_anchor_and_stays_close_between():
+    n=128
+    grid=SimpleNamespace(size=n,duration=ORBITAL_PERIOD,delta_t=ORBITAL_PERIOD/n,
+        frequencies=.01+np.arange(n)/ORBITAL_PERIOD,harmonic_shift=1)
+    coordinates=MassEccentricCoordinates(30.,.05,[.01,.001])
+    rng=np.random.default_rng(23)
+    carrier=rng.normal(size=(2,n))+1j*rng.normal(size=(2,n))
+    carrier[:,:4]=0;carrier[:,-4:]=0
+    def source(theta):
+        s=coordinates.encode(theta)[0]
+        phase=s[0]*np.linspace(-1,1,n)+s[1]*np.linspace(-1,1,n)**2
+        return carrier*np.exp(1j*phase)*(theta[0]/30.)**(5/6),np.zeros((2,n))
+    response=np.array([[[1.,.3j],[.2+.4j,1.]]],complex)[...,None]*np.ones(n)
+    data=(rng.normal(size=(2,n))+1j*rng.normal(size=(2,n)))
+    ref=dict(eclipticlongitude=1.,eclipticlatitude=.2)
+    scales=dict(eclipticlongitude=.01,eclipticlatitude=.01)
+    def build(**kw):
+        return EccentricFFTBlockModel(grid,data,source,lambda sky:response,
+            grid.frequencies,[0],[0,1],coordinates,np.eye(2),ref,scales,
+            (20,70),(-5*grid.delta_t,5*grid.delta_t),dtype=np.complex128,n_l0=32,**kw)
+    exact,interp=build(),build(gram_mc_anchors=[-.01,0.,.01])
+    sky=np.zeros(2)
+    # at an anchor's chirp mass and the reference eccentricity the Gram is the anchor's, exactly
+    _,_,g_exact=exact._prepare(np.array([30.*np.exp(.01),.05]),sky)
+    _,_,g_interp=interp._prepare(np.array([30.*np.exp(.01),.05]),sky)
+    np.testing.assert_allclose(g_interp,g_exact,rtol=1e-12,atol=1e-12)
+    # between anchors: a convex combination, Hermitian and close to the exact Gram
+    theta=np.array([30.*np.exp(.004),.0505])
+    _,_,g_exact=exact._prepare(theta,sky)
+    _,_,g_interp=interp._prepare(theta,sky)
+    k=g_exact.shape[0]*2
+    for j in range(g_exact.shape[-1]):
+        a=g_exact[...,j].reshape(k,k);b=g_interp[...,j].reshape(k,k)
+        np.testing.assert_allclose(b,b.conj().T,atol=1e-10)
+        assert np.min(np.linalg.eigvalsh(.5*(b+b.conj().T)))>-1e-10
+        assert np.linalg.norm(b-a)/np.linalg.norm(a)<2e-2
+    assert interp.work['gram_cache_hits']>0
+    # outside the anchors: refused, not extrapolated
+    try:
+        interp._prepare(np.array([30.*np.exp(.02),.05]),sky)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('a template outside the Gram anchors must be refused')

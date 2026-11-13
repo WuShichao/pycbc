@@ -64,7 +64,8 @@ class EccentricFFTBlockModel:
                  response_frequencies, orders, offsets, coordinates, metric,
                  reference, scales, observation, delay_range, xp=numpy,
                  n_l0=64, dtype=numpy.complex64, max_cache_bytes=4_000_000_000,
-                 distance_prior=None, bayes_rank=False, contains=None, gram_anchors=3, reuse_grams=False):
+                 distance_prior=None, bayes_rank=False, contains=None, gram_anchors=3, reuse_grams=False,
+                 gram_mc_anchors=None):
         self.grid, self.xp = grid, xp
         self.surrogate = SimpleNamespace(grid=grid, xp=xp)
         self.source_builder, self.response_builder = source_builder, response_builder
@@ -78,6 +79,19 @@ class EccentricFFTBlockModel:
         self.contains = contains
         self.gram_anchors = int(gram_anchors)
         self.reuse_grams = bool(reuse_grams)
+        # gram_mc_anchors: increasing offsets x = ln(Mc/Mc_ref) of the cell's Gram anchors. Each template's
+        # complete Gram is then the convex linear interpolation in ln Mc between the two anchors around it,
+        # each anchor at the cell's reference eccentricity and the template's sky point (data-independent,
+        # cached until clear_template_grams). Measured: largest relative 2F error 4.4e-4 to 1.1e-3 at e0 0.03 to
+        # 0.1 with anchors -0.01, 0, 0.01 over a cell of half-width 0.01 (lisa_tests_with_cc card
+        # 2026-11-13-eccentric-gram-reuse).
+        self.gram_mc_anchors = None
+        if gram_mc_anchors is not None:
+            a = numpy.asarray(gram_mc_anchors, dtype=float)
+            if a.ndim != 1 or len(a) < 2 or numpy.any(numpy.diff(a) <= 0):
+                raise ValueError('gram_mc_anchors must be at least two increasing ln Mc offsets')
+            self.gram_mc_anchors = a
+        self._mc_grams = {}
         self._template_grams = {}
         self._source_cache = None
         f = numpy.asarray(grid.frequencies)
@@ -105,6 +119,40 @@ class EccentricFFTBlockModel:
 
     def clear_template_grams(self):
         self._template_grams = {}
+        self._mc_grams = {}
+
+    def _mc_anchor_gram(self, x, theta, sky, anchor_indices, delay_bounds, response):
+        key = (float(x),)+tuple(sky)+tuple(int(v) for v in anchor_indices)
+        if key in self._mc_grams:
+            self.work['gram_cache_hits'] += 1
+            return self.xp.asarray(self._mc_grams[key])
+        anchor = numpy.array(theta, dtype=float)
+        anchor[0] = self.coordinates.mchirp*numpy.exp(x)
+        if self.coordinates.ndim == 2:
+            anchor[1] = self.coordinates.eccentricity
+        b, t = self.source_builder(anchor)
+        engine_class = getattr(self, 'fft_engine_class', WindowedModeFFT)
+        engine = engine_class(self.grid, b, t, response, self.orders, self.data,
+            self.observation, delay_bounds, xp=self.xp, dtype=self.dtype,
+            max_cache_bytes=self.max_cache_bytes)
+        del b, t
+        gram = engine.gram(anchor_indices)
+        self._mc_grams[key] = gram.get() if hasattr(gram, 'get') else gram.copy()
+        del engine
+        return gram
+
+    def _mc_interpolated_gram(self, theta, sky, anchor_indices, delay_bounds, response):
+        a = self.gram_mc_anchors
+        x = float(numpy.log(theta[0]/self.coordinates.mchirp))
+        if x < a[0]-1e-12 or x > a[-1]+1e-12:
+            raise ValueError('template chirp mass lies outside the Gram anchors')
+        i = int(numpy.clip(numpy.searchsorted(a, x, side='right')-1, 0, len(a)-2))
+        w = min(max((x-a[i])/(a[i+1]-a[i]), 0.), 1.)
+        g0 = self._mc_anchor_gram(a[i], theta, sky, anchor_indices, delay_bounds, response)
+        if w == 0.:
+            return g0
+        g1 = self._mc_anchor_gram(a[i+1], theta, sky, anchor_indices, delay_bounds, response)
+        return g0*(1-w)+g1*w
 
     def phase_frame(self, region, **kwargs):
         s = self.coordinates.encode(region)
@@ -147,7 +195,9 @@ class EccentricFFTBlockModel:
         self.work['prepare_seconds'] += perf_counter()-start
         anchor_indices = numpy.unique(numpy.linspace(jlo,jhi,anchors).round().astype(int))
         start = perf_counter()
-        if self.reuse_grams and key in self._template_grams:
+        if self.gram_mc_anchors is not None:
+            gram = self._mc_interpolated_gram(theta, sky, anchor_indices, (jlo, jhi), response)
+        elif self.reuse_grams and key in self._template_grams:
             gram = xp.asarray(self._template_grams[key])
             self.work['gram_cache_hits'] += 1
         else:
