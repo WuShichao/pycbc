@@ -156,3 +156,15 @@ def test_merge_sources_whole_block_radius_and_branch_separation():
     # separation of 1.5 steps (3 units): the second kept row must be far from the first
     sep=_merge_sources(surv,sky,delays,2.,86400.,3,merge_sky=np.inf,separation=1.5)
     assert [[x[1] for x in k] for k in sep]==[[0,2,3],[0]]
+
+
+def test_coordinates_clip_below_zero_eccentricity_only_when_asked():
+    import pytest
+    from pycbc.filter.eccentric_block_search import MassEccentricCoordinates
+    c=MassEccentricCoordinates(30.,.005,[1e-6,1e-8])
+    s=np.array([[0.,-5000.]])
+    with pytest.raises(ValueError):
+        c.decode(s)
+    clipped=MassEccentricCoordinates(30.,.005,[1e-6,1e-8],clip_at_zero=True).decode(s)
+    assert clipped[0,1]==0.
+    np.testing.assert_allclose(clipped[0,0],30.)
