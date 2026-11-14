@@ -34,6 +34,7 @@ def toy():
     model=EccentricCellPE(['mchirp','q','eccentricity','chi_eff','eclipticlongitude','eclipticlatitude'],block,
         (1.,.2,.01,.01),(-6*grid.delta_t,6*grid.delta_t),DistancePowerLaw(.1,1e3,scale=10.),n_l0=16,
         orientation_nodes=(8,4),oversampling=16,screen_margin=80.,bayes_margin=60.)
+    model.keep_engine=True
     return model,block,grid
 
 

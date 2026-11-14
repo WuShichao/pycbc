@@ -257,6 +257,8 @@ class EccentricCellPE(BaseModel):
         key = tuple(float(params[k]) for k in self.intrinsic + ('eclipticlongitude', 'eclipticlatitude'))
         if self._last is not None and self._last[0] == key:
             return self._last[1]
+        # release the previous point's arrays before preparing this one (GPU memory)
+        self._last = None
         xp = self.xp
         host = lambda a: a.get() if hasattr(a, 'get') else numpy.asarray(a)
         theta, sky = self._theta_sky(params)
@@ -287,8 +289,14 @@ class EccentricCellPE(BaseModel):
         top = terms.max()
         logl = float(top + numpy.log(numpy.sum(numpy.exp(terms - top))) - numpy.log(hi - lo))
         out = dict(loglikelihood=logl, delays=fdelays[active], widths=numpy.full(len(active), width), log_bayes=lnb,
-                   z=zf[..., active], gram=gf[..., active], engine=engine, anchor_times=atimes, anchor_grams=ganchors,
+                   z=zf[..., active], gram=gf[..., active], anchor_times=atimes, anchor_grams=ganchors,
                    theta=theta, sky=sky, lags_screened=int(len(keep)), samples_active=int(len(active)))
+        # the engine (all mode spectra on the full grid) is not kept: neither here (unless keep_engine) nor in the
+        # block model's last-prepared slot
+        if getattr(self, 'keep_engine', False):
+            out['engine'] = engine
+        self.block._prepared = None
+        del engine, z, g, zf, gf
         self._last = (key, out)
         return out
 
