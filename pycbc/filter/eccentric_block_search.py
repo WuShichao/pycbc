@@ -24,11 +24,15 @@ class MassEccentricCoordinates:
     """Local coordinates ln(Mc/Mc0) and e^2-e0^2, each in explicit units.
 
     ``clip_at_zero``: a point below e^2 = 0 (a lattice or region box reaching past the circular edge, as the cell
-    next to e = 0 does) decodes to e = 0 instead of being refused. e^2 is the coordinate the leading eccentric phase
-    is linear in, so e = 0 is the edge of the space and such points are copies of the circular edge."""
-    def __init__(self, mchirp, eccentricity, scales, clip_at_zero=False):
+    next to e = 0 does) decodes onto e = 0 instead of being refused. With ``metric`` (the 2 x 2 metric in these
+    coordinates) it goes to its metric projection onto the edge, moving ln Mc along the ln Mc - e^2 degeneracy;
+    the projection onto a half-space is non-expansive in the metric, so a lattice keeps its covering radius. Without
+    a metric only e is set to 0, which loses the match wherever the two are correlated (near e = 0 at Mc 30 the
+    correlation is 0.998, and folding at fixed Mc lost the injections)."""
+    def __init__(self, mchirp, eccentricity, scales, clip_at_zero=False, metric=None):
         self.mchirp, self.eccentricity = float(mchirp), float(eccentricity)
         self.clip_at_zero = bool(clip_at_zero)
+        self.metric = None if metric is None else numpy.asarray(metric, dtype=float)
         self.scales = numpy.asarray(scales, dtype=float)
         self.ndim = len(self.scales)
         if self.ndim not in (1, 2) or numpy.any(self.scales <= 0):
@@ -43,13 +47,21 @@ class MassEccentricCoordinates:
 
     def decode(self, coordinates):
         s = numpy.atleast_2d(numpy.asarray(coordinates, dtype=float))
-        columns = [self.mchirp*numpy.exp(s[:, 0]*self.scales[0])]
         if self.ndim == 2:
             e2 = self.eccentricity**2+s[:, 1]*self.scales[1]
-            if numpy.any(e2 < 0):
+            below = e2 < 0
+            if numpy.any(below):
                 if not self.clip_at_zero:
                     raise ValueError('eccentric lattice extends below e^2=0')
-                e2 = numpy.maximum(e2, 0.)
+                s = s.copy()
+                edge = -self.eccentricity**2/self.scales[1]
+                if self.metric is not None:
+                    g = self.metric
+                    s[below, 0] += g[0, 1]/g[0, 0]*(s[below, 1]-edge)
+                s[below, 1] = edge
+                e2 = numpy.maximum(self.eccentricity**2+s[:, 1]*self.scales[1], 0.)
+        columns = [self.mchirp*numpy.exp(s[:, 0]*self.scales[0])]
+        if self.ndim == 2:
             columns.append(numpy.sqrt(e2))
         return numpy.column_stack(columns)
 

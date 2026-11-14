@@ -168,3 +168,20 @@ def test_coordinates_clip_below_zero_eccentricity_only_when_asked():
     clipped=MassEccentricCoordinates(30.,.005,[1e-6,1e-8],clip_at_zero=True).decode(s)
     assert clipped[0,1]==0.
     np.testing.assert_allclose(clipped[0,0],30.)
+
+
+def test_clip_projects_onto_the_circular_edge_in_the_metric():
+    from pycbc.filter.eccentric_block_search import MassEccentricCoordinates
+    g=np.array([[4.,1.9],[1.9,1.]])
+    c=MassEccentricCoordinates(30.,.005,[1e-6,1e-8],clip_at_zero=True,metric=g)
+    edge=-.005**2/1e-8
+    s=np.array([[3.,edge-50.]])
+    x=c.encode(c.decode(s))[0]
+    np.testing.assert_allclose(x[1],edge,atol=1e-6)
+    # the metric-nearest point of the edge: the gradient along the edge vanishes
+    d=x-s[0]
+    assert abs((g@d)[0])<1e-6*np.abs(g@d).max()
+    # non-expansive: closer in the metric to a physical point than the unprojected node
+    p=np.array([2.,edge+30.])
+    dist=lambda a,b:(a-b)@g@(a-b)
+    assert dist(x,p)<=dist(s[0],p)
