@@ -88,6 +88,31 @@ class WindowedModeFFT:
                          xp.asarray(indices*self.dt))
         return output*carrier[None, None]
 
+    def oversampled_correlations(self, sample_offsets, oversampling):
+        """z (K,2,P,L) at delays (j + p / P) dt for every lag j of sample_offsets and p < P, and those delays
+        (P,L): one inverse FFT per mode and fraction (exact, as correlations is at p = 0), instead of a direct sum
+        over every frequency per delay."""
+        xp = self.xp
+        indices = numpy.asarray(sample_offsets, dtype=int)
+        if indices.ndim != 1 or not len(indices):
+            raise ValueError('sample_offsets must be a nonempty vector')
+        P = int(oversampling)
+        if P < 1:
+            raise ValueError('oversampling must be at least 1')
+        m = xp.arange(self.size, dtype=xp.float64)
+        selected = xp.asarray(indices % self.size)
+        output = xp.empty((self.nmode, 2, P, len(indices)), dtype=xp.complex128)
+        for p in range(P):
+            ramp = xp.exp(2j*numpy.pi*m*p/(P*self.size)).astype(self.dtype)
+            for k in range(self.nmode):
+                transformed = xp.fft.ifft(self.spectra[k]*ramp[None], axis=-1)*self.size
+                output[k, :, p] = transformed[:, selected]
+                del transformed
+            del ramp
+        delays = (indices[None, :] + numpy.arange(P)[:, None]/P)*self.dt
+        carrier = xp.exp(2j*numpy.pi*float(self.grid.frequencies[0])*xp.asarray(delays))
+        return output*carrier[None, None], delays
+
     def fractional_correlations(self, delays, chunk=2):
         """Evaluate the same correlation Fourier polynomial off its grid.
 

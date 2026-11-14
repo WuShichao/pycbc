@@ -33,7 +33,7 @@ def toy():
         np.eye(3),ref,scales,(20,200),(-8*grid.delta_t,8*grid.delta_t),dtype=np.complex128,n_l0=16)
     model=EccentricCellPE(['mchirp','q','eccentricity','chi_eff','eclipticlongitude','eclipticlatitude'],block,
         (1.,.2,.01,.01),(-6*grid.delta_t,6*grid.delta_t),DistancePowerLaw(.1,1e3,scale=10.),n_l0=16,
-        orientation_nodes=(8,4),fine_subsamples=16,fine_drop=60.)
+        orientation_nodes=(8,4),oversampling=16,screen_margin=80.,bayes_margin=60.)
     return model,block,grid
 
 
@@ -58,3 +58,12 @@ def test_time_quadrature_matches_a_dense_integral_and_reconstruct_draws():
     for k in ('delta_tc','mean_anomaly','inclination','polarization','distance','coa_phase','loglr'):
         assert np.isfinite(rec[k]), k
     assert lo<=rec['delta_tc']<=hi and 0<=rec['mean_anomaly']<2*np.pi and rec['distance']>0
+
+
+def test_oversampled_correlations_equal_the_direct_sum():
+    model,block,grid=toy()
+    model.update(mchirp=30.,q=1.5,eccentricity=.05,chi_eff=0.,eclipticlongitude=1.,eclipticlatitude=.2)
+    engine=model.evaluate()['engine']
+    z,d=engine.oversampled_correlations(np.array([-3,0,2]),5)
+    direct=engine.fractional_correlations(d.ravel())
+    np.testing.assert_allclose(z.reshape(z.shape[0],2,-1),direct,rtol=1e-6,atol=1e-6*np.abs(direct).max())

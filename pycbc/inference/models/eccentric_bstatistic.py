@@ -194,20 +194,17 @@ class EccentricCellPE(BaseModel):
     offset is ``((lon - lon0) / scale_lon, (lat - lat0) / scale_lat)``.
 
     Arrival time has a uniform prior over ``delay_window`` (seconds, the
-    model's lag convention). ln B is evaluated at every whole lag of the
-    window; every lag interval ``[j dt, (j + 1) dt)`` whose ln B lies within
-    ``fine_drop`` of the largest is integrated at ``fine_subsamples``
-    fractional delays (midpoint rule), the others by their left value. The
-    time integral is therefore converged where it matters; check with
-    ``fine_subsamples``. Mean anomaly is uniform on ``n_l0`` nodes, the
+    model's lag convention), integrated on samples ``dt / oversampling``
+    apart where it matters (see :meth:`evaluate`); check convergence in
+    ``oversampling``. Mean anomaly is uniform on ``n_l0`` nodes, the
     orientation on ``OrientationNodes(*orientation_nodes)``.
     """
     name = 'eccentric_cell_pe'
     intrinsic = ('mchirp', 'eccentricity', 'chi_eff', 'q')
 
     def __init__(self, variable_params, block_model, sky_reference, delay_window, distance_prior,
-                 n_l0=64, orientation_nodes=(16, 8), amplitude_order=64, fine_subsamples=16,
-                 fine_drop=20.0, noise_variance=1.0, **kwargs):
+                 n_l0=64, orientation_nodes=(16, 8), amplitude_order=64, oversampling=4,
+                 screen_margin=40.0, bayes_margin=30.0, noise_variance=1.0, **kwargs):
         super().__init__(variable_params, **kwargs)
         self.block = block_model
         self.xp = block_model.xp
@@ -219,7 +216,8 @@ class EccentricCellPE(BaseModel):
         self.distance_prior = distance_prior
         self.n_l0, self.amplitude_order = int(n_l0), int(amplitude_order)
         self.nodes = OrientationNodes(*orientation_nodes)
-        self.fine_subsamples, self.fine_drop = int(fine_subsamples), float(fine_drop)
+        self.oversampling = int(oversampling)
+        self.screen_margin, self.bayes_margin = float(screen_margin), float(bayes_margin)
         self.noise_variance = float(noise_variance)
         self._last = None
 
@@ -237,42 +235,52 @@ class EccentricCellPE(BaseModel):
     def evaluate(self, params=None):
         """ln B and the time quadrature at ``params`` (the current point by
         default): a dict with ``loglikelihood``, the quadrature's delays,
-        widths and ln B, and the prepared engine."""
+        widths, ln B and the correlations and Grams of its active samples.
+
+        The integrand is evaluated in three steps, each exact to its margin:
+        2F (maximised over amplitude, phase and anomaly) at every whole lag;
+        lags with F = 2F/2 within ``screen_margin`` of the largest are
+        oversampled ``oversampling`` times by exact FFT shifts; ln B, which
+        never exceeds F there, is computed only at fine samples with F above
+        the best ln B less ``bayes_margin`` (each dropped sample contributes
+        less than exp(-bayes_margin) of the peak)."""
         from pycbc.filter.eccentric_mode_fft import WindowedModeFFT
+        from pycbc.filter.eccentric_fast_search import mean_anomaly_twof_analytic
         params = self.current_params if params is None else params
         key = tuple(float(params[k]) for k in self.intrinsic + ('eclipticlongitude', 'eclipticlatitude'))
         if self._last is not None and self._last[0] == key:
             return self._last[1]
         xp = self.xp
+        host = lambda a: a.get() if hasattr(a, 'get') else numpy.asarray(a)
         theta, sky = self._theta_sky(params)
         engine, atimes, ganchors = self.block._prepare(theta, sky)
         dt = self.block.grid.delta_t
         lo, hi = self.delay_window
-        lags = numpy.arange(int(numpy.ceil(lo / dt)), int(numpy.floor(hi / dt)) + 1)
-        delays = lags * dt
+        lags = numpy.arange(int(numpy.ceil(lo / dt)), int(numpy.floor(hi / dt)))
+        var = self.noise_variance
         z = engine.correlations(lags)
-        g = WindowedModeFFT.interpolated_gram(engine, delays, atimes, ganchors)
-        coarse = self._log_bayes(z, g)[0]
-        coarse_h = coarse.get() if hasattr(coarse, 'get') else numpy.asarray(coarse)
-        fine_lags = numpy.flatnonzero(coarse_h >= coarse_h.max() - self.fine_drop)
-        # the last whole lag starts no interval
-        fine_lags = fine_lags[fine_lags < len(lags) - 1]
-        n = self.fine_subsamples
-        sub = (numpy.arange(n) + 0.5) / n
-        fdelays = (delays[fine_lags][:, None] + sub[None, :] * dt).ravel()
-        zf = engine.fractional_correlations(fdelays)
-        gf = engine.interpolated_gram(fdelays, atimes, ganchors)
-        fine = self._log_bayes(zf, gf)[0]
-        fine_h = fine.get() if hasattr(fine, 'get') else numpy.asarray(fine)
-        coarse_intervals = numpy.setdiff1d(numpy.arange(len(lags) - 1), fine_lags)
-        q_delays = numpy.concatenate([delays[coarse_intervals], fdelays])
-        q_widths = numpy.concatenate([numpy.full(len(coarse_intervals), dt), numpy.full(len(fdelays), dt / n)])
-        q_lnb = numpy.concatenate([coarse_h[coarse_intervals], fine_h])
-        terms = q_lnb + numpy.log(q_widths)
+        g = WindowedModeFFT.interpolated_gram(engine, lags * dt, atimes, ganchors)
+        twof = host(mean_anomaly_twof_analytic(z / var, g / var, self.block.offsets, self.n_l0, xp=xp)[0].max(axis=0))
+        keep = numpy.flatnonzero(twof / 2 >= twof.max() / 2 - self.screen_margin)
+        # the neighbours too: F between whole lags can exceed both ends
+        keep = numpy.unique(numpy.clip(numpy.concatenate([keep - 1, keep, keep + 1]), 0, len(lags) - 1))
+        P = self.oversampling
+        zf, fdelays = engine.oversampled_correlations(lags[keep], P)
+        zf = zf.reshape(zf.shape[0], 2, -1)
+        fdelays = fdelays.ravel()
+        gf = WindowedModeFFT.interpolated_gram(engine, fdelays, atimes, ganchors)
+        ftwof = host(mean_anomaly_twof_analytic(zf / var, gf / var, self.block.offsets, self.n_l0, xp=xp)[0].max(axis=0))
+        order = numpy.argsort(-ftwof)
+        best = float(host(self._log_bayes(zf[..., order[:1]], gf[..., order[:1]])[0])[0])
+        active = numpy.flatnonzero(ftwof / 2 >= best - self.bayes_margin)
+        lnb = host(self._log_bayes(zf[..., active], gf[..., active])[0])
+        width = dt / P
+        terms = lnb + numpy.log(width)
         top = terms.max()
-        logl = float(top + numpy.log(numpy.sum(numpy.exp(terms - top))) - numpy.log(delays[-1] - delays[0]))
-        out = dict(loglikelihood=logl, delays=q_delays, widths=q_widths, log_bayes=q_lnb,
-                   engine=engine, anchor_times=atimes, anchor_grams=ganchors, theta=theta, sky=sky)
+        logl = float(top + numpy.log(numpy.sum(numpy.exp(terms - top))) - numpy.log(hi - lo))
+        out = dict(loglikelihood=logl, delays=fdelays[active], widths=numpy.full(len(active), width), log_bayes=lnb,
+                   z=zf[..., active], gram=gf[..., active], engine=engine, anchor_times=atimes, anchor_grams=ganchors,
+                   theta=theta, sky=sky, lags_screened=int(len(keep)), samples_active=int(len(active)))
         self._last = (key, out)
         return out
 
@@ -294,13 +302,10 @@ class EccentricCellPE(BaseModel):
         terms = ev['log_bayes'] + numpy.log(ev['widths'])
         weight = numpy.exp(terms - terms.max())
         k = rng.choice(len(weight), p=weight / weight.sum())
-        delay = ev['delays'][k] + (rng.random() - 0.5) * ev['widths'][k] \
-            if ev['widths'][k] < self.block.grid.delta_t else ev['delays'][k] + rng.random() * ev['widths'][k]
-        lo, hi = self.delay_window
-        delay = min(max(delay, lo), hi)
-        engine = ev['engine']
-        z = engine.fractional_correlations(numpy.array([delay]))
-        g = engine.interpolated_gram(numpy.array([delay]), ev['anchor_times'], ev['anchor_grams'])
+        # the drawn sample's own correlations; the delay is jittered within its width
+        delay = float(ev['delays'][k] + rng.random() * ev['widths'][k])
+        z = ev['z'][..., k:k + 1]
+        g = ev['gram'][..., k:k + 1]
         _, by_angle, angles = self._log_bayes(z, g)
         by_angle = by_angle.get() if hasattr(by_angle, 'get') else numpy.asarray(by_angle)
         by_angle = by_angle.reshape(len(angles))
