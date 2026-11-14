@@ -638,20 +638,25 @@ def two_stage_block_search(model, coarse_model, region, delay_range=None,
 
 
 
-def _merge_sources(surv, sky, delays, sky_step, merge_time, per_source):
+def _merge_sources(surv, sky, delays, sky_step, merge_time, per_source,
+                   merge_sky=2.01, separation=0.0):
     """Survivor rows (template, sky point, lag, 2F, ...) grouped by source,
-    from the loudest: a row within ``merge_time`` and two sky steps of a
-    louder kept row is its source's, kept (up to ``per_source`` rows of
-    distinct template and sky point) as another of its survivors."""
+    from the loudest: a row within ``merge_time`` and ``merge_sky`` sky
+    steps of a louder kept row is its source's, kept (up to ``per_source``
+    rows of distinct template and sky point, each more than ``separation``
+    sky steps from the source's rows already kept) as another of its
+    survivors."""
     kept = []
     for n, p, j, v in surv[numpy.argsort(-surv[:, 3])][:, :4]:
         n, p, j = int(n), int(p), int(j)
         for k in kept:
             h = k[0]
-            if (numpy.linalg.norm(sky[p] - sky[h[1]]) <= 2.01 * sky_step
+            if (numpy.linalg.norm(sky[p] - sky[h[1]]) <= merge_sky * sky_step
                     and abs(delays[j] - delays[h[2]]) <= merge_time):
                 if len(k) < per_source and not any(
-                        (n, p) == x[:2] for x in k):
+                        (n, p) == x[:2] for x in k) and all(
+                        numpy.linalg.norm(sky[p] - sky[x[1]])
+                        > separation * sky_step for x in k):
                     k.append((n, p, j, v))
                 break
         else:
@@ -665,7 +670,8 @@ def multilevel_block_search(model, coarse_model, region, levels,
                             refine_threshold=65.0, log_weight=None,
                             log_bayes=None, followup_lags=8,
                             followup_reach=1.5, branch=1, basis_chunk=8,
-                            max_sources=None):
+                            max_sources=None, merge_sky=2.01,
+                            branch_separation=0.0):
     """A block searched by adaptive refinement over nested levels of the
     phase lattice: :func:`two_stage_block_search` with any number of stages.
 
@@ -693,7 +699,12 @@ def multilevel_block_search(model, coarse_model, region, levels,
     smaller one fits wide near-merger bands on a small card). ``max_sources``
     follows only that many of level 0's sources, the loudest (``None``: all;
     the number found is returned as ``sources``; level 0's loudest 2F as
-    ``level0_max``). Returns the ``top`` candidates, the
+    ``level0_max``). ``merge_sky`` is level 0's merging radius in its sky
+    steps (``numpy.inf``: one source per ``merge_time`` over the whole
+    block, for a statistic whose sky sidelobes cover the block), and a
+    source's level-0 survivors after its first must lie more than
+    ``branch_separation`` sky steps from those already kept (so their
+    follow-ups cover different sky). Returns the ``top`` candidates, the
     survivors of level 0, the sources followed, the follow-ups and the
     surviving points of each level, and the seconds."""
     for owner in (model, coarse_model):
@@ -718,7 +729,8 @@ def multilevel_block_search(model, coarse_model, region, levels,
         release()
     coarse_seconds = time.time() - start
     kept = _merge_sources(surv, skies[0], delays, lv0['sky_step'],
-                          merge_time, branch)
+                          merge_time, branch, merge_sky=merge_sky,
+                          separation=branch_separation)
     n_sources = len(kept)
     # max_sources: follow only the loudest level-0 sources (kept is ordered by
     # each source's loudest survivor); None follows every one

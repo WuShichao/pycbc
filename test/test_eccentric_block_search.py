@@ -139,3 +139,20 @@ def test_sky_interpolated_gram_is_the_anchor_gram_at_anchors_and_psd_between():
         pass
     else:
         raise AssertionError('a sky point outside the Gram sky anchors must be refused')
+
+
+def test_merge_sources_whole_block_radius_and_branch_separation():
+    from pycbc.filter.sky_block_search import _merge_sources
+    sky=np.array([[0.,0.],[2.,0.],[6.,0.],[-6.,2.],[0.,2.]])
+    delays=np.array([0.,100.,200000.])
+    # rows: template, sky point, lag, 2F, spare
+    surv=np.array([[0,0,0,100.,0],[1,1,1,90.,0],[0,2,0,70.,0],[0,3,1,60.,0],[0,4,0,50.,0],[0,0,2,40.,0]])
+    # default: two sky steps of 2 -> the sidelobes at 6 and -6 are separate sources
+    default=_merge_sources(surv,sky,delays,2.,86400.,2)
+    assert [len(k) for k in default]==[2,1,1,1]
+    # whole block: one source per day, the far-in-time row stays its own
+    whole=_merge_sources(surv,sky,delays,2.,86400.,2,merge_sky=np.inf)
+    assert [[x[1] for x in k] for k in whole]==[[0,1],[0]]
+    # separation of 1.5 steps (3 units): the second kept row must be far from the first
+    sep=_merge_sources(surv,sky,delays,2.,86400.,3,merge_sky=np.inf,separation=1.5)
+    assert [[x[1] for x in k] for k in sep]==[[0,2,3],[0]]
