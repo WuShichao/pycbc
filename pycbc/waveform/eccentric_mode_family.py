@@ -370,15 +370,26 @@ class EccentricModeFamily(object):
             out[k] = (amp, ph, h)
         return out
 
-    def _windows(self, d, de, dq=0.0, circular=None):
+    def _windows(self, d, de, dq=0.0, circular=None, spin_phase=None):
         """Each mode at ``(d, de, dq)`` on its own window of bins: ``(key,
         slice, amplitude, psi, present)``, the amplitude zero where the mode
-        is absent."""
+        is absent.
+
+        ``spin_phase`` (on the family's grid, as a function of the dominant
+        harmonic's frequency) is a circular phase change the stencil does
+        not interpolate, such as an aligned-spin change: a harmonic of phase
+        scale ``r`` at frequency ``f`` lies at the orbital frequency of the
+        dominant harmonic's ``f / |r|``, so it gets ``r * spin_phase(f /
+        |r|)``. (Mass and ratio changes are applied at ``f`` itself; the
+        difference is part of the interpolated eccentric correction.)"""
         dc = self.circular_phase_change(d, self.q0 * numpy.exp(dq)) \
             if circular is None else circular
         for k, (r, amp, corr, psi0, have, sl) in self._expansions.items():
             a = amp(d, de, dq)
             c = corr(d, de, dq) - corr(0.0, 0.0, 0.0)
+            if spin_phase is not None and r != 0:
+                c = c + r * numpy.interp(self.f[sl] / abs(r), self.f,
+                                         spin_phase)
             if self._edges:
                 lo, hi = numpy.round(self._edges[k](d, de, dq))
                 b = self._bins[sl]
@@ -415,7 +426,7 @@ class EccentricModeFamily(object):
         return out
 
     def iter_mode_pieces(self, d, de, dq=0.0, circular=None,
-                         frequencies=None):
+                         frequencies=None, spin_phase=None):
         """Sparse FD modes and their individual stationary-time clocks.
 
         Yield ``(key, indices, amplitude, phase, time)`` on ``frequencies``
@@ -439,7 +450,8 @@ class EccentricModeFamily(object):
         if (f.ndim != 1 or not len(f) or not numpy.all(numpy.isfinite(f))
                 or numpy.any(f <= 0) or numpy.any(numpy.diff(f) <= 0)):
             raise ValueError("frequencies must be positive, finite and increasing")
-        for key, sl, amp, phase, have in self._windows(d, de, dq, circular):
+        for key, sl, amp, phase, have in self._windows(d, de, dq, circular,
+                                                       spin_phase):
             active = numpy.flatnonzero(have)
             if not len(active):
                 continue

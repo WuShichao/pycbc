@@ -96,3 +96,35 @@ def test_mismatched_online_and_construction_bases_are_refused():
     fam.circular_phase_basis = 'pyefpe'
     with pytest.raises(ValueError, match='match the cell phase basis'):
         EccentricModeFamilySource(fam, d=.001)
+
+
+def test_aligned_spins_enter_the_circular_phase_only():
+    fam = family()
+    f = np.linspace(.011,.019,47)
+    base = EccentricModeFamilySource(fam,clock_time=0.)
+    same = EccentricModeFamilySource(fam,clock_time=0.,spin1z=0.,spin2z=0.)
+    spun = EccentricModeFamilySource(fam,clock_time=0.,spin1z=.6,spin2z=-.3)
+    a,b,c = (s.frequency_harmonics(f) for s in (base,same,spun))
+    dc = fam.circular_phase_change(0.,spin1z=.6,spin2z=-.3)
+    assert np.any(abs(dc) > 1e-3)
+    for key in a:
+        np.testing.assert_allclose(b[key]['plus'],a[key]['plus'])
+        # the amplitude is the cell's; the phase moves by (m/2) times the circular change, up to the clock re-anchor
+        np.testing.assert_allclose(abs(c[key]['plus']),abs(a[key]['plus']),rtol=1e-12)
+    with pytest.raises(ValueError):
+        EccentricModeFamilySource(fam,spin1z=.6,circular_method='pyefpe')
+
+
+def test_spin_phase_maps_each_harmonic_to_its_orbital_frequency():
+    base = family()
+    fam = EccentricModeFamily(base.reference,base.f,base.f_ref,step_mass=0,step_e=0,step_q=0,
+                              generator=base.generator,circular_phase_basis='taylorf2',phase_scaling='n')
+    assert sorted(fam._expansions[k][0] for k in fam._expansions) == [.5,1.,1.5]
+    f = np.linspace(.011,.019,47)
+    spun = EccentricModeFamilySource(fam,clock_time=0.,spin1z=.6,spin2z=-.3)
+    S = fam.circular_phase_change(0.,spin1z=.6,spin2z=-.3)
+    windows = {k:(sl,psi) for k,sl,_,psi,_ in fam._windows(0.,0.,0.,spin_phase=spun.spin_phase)}
+    plain = {k:(sl,psi) for k,sl,_,psi,_ in fam._windows(0.,0.,0.)}
+    for k,(sl,psi) in windows.items():
+        r = fam._expansions[k][0]
+        np.testing.assert_allclose(psi-plain[k][1], r*np.interp(fam.f[sl]/abs(r),fam.f,S), atol=1e-9)
