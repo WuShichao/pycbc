@@ -204,7 +204,8 @@ class EccentricCellPE(BaseModel):
 
     def __init__(self, variable_params, block_model, sky_reference, delay_window, distance_prior,
                  n_l0=64, orientation_nodes=(16, 8), amplitude_order=64, oversampling=4,
-                 screen_margin=40.0, bayes_margin=30.0, noise_variance=1.0, **kwargs):
+                 screen_margin=40.0, bayes_margin=30.0, noise_variance=1.0, amplitude_table=None,
+                 screen_anomalies=None, **kwargs):
         super().__init__(variable_params, **kwargs)
         self.block = block_model
         self.xp = block_model.xp
@@ -216,6 +217,11 @@ class EccentricCellPE(BaseModel):
         self.distance_prior = distance_prior
         self.n_l0, self.amplitude_order = int(n_l0), int(amplitude_order)
         self.nodes = OrientationNodes(*orientation_nodes)
+        # amplitude_table: a pycbc.filter.bstatistic.AmplitudeTable of distance_prior (its interpolated amplitude
+        # integrals replace the quadrature); screen_anomalies: anomaly nodes of the whole-lag 2F screen (default
+        # n_l0; fewer only lowers F there, and screen_margin absorbs it)
+        self.table = amplitude_table
+        self.screen_anomalies = int(screen_anomalies or n_l0)
         self.oversampling = int(oversampling)
         self.screen_margin, self.bayes_margin = float(screen_margin), float(bayes_margin)
         self.noise_variance = float(noise_variance)
@@ -230,7 +236,8 @@ class EccentricCellPE(BaseModel):
 
     def _log_bayes(self, z, g):
         return mean_anomaly_log_bayes(z, g, self.block.offsets, self.distance_prior, self.nodes, n_l0=self.n_l0,
-                                      noise_variance=self.noise_variance, order=self.amplitude_order, xp=self.xp)
+                                      noise_variance=self.noise_variance, order=self.amplitude_order,
+                                      table=self.table, xp=self.xp)
 
     def evaluate(self, params=None):
         """ln B and the time quadrature at ``params`` (the current point by
@@ -260,7 +267,8 @@ class EccentricCellPE(BaseModel):
         var = self.noise_variance
         z = engine.correlations(lags)
         g = WindowedModeFFT.interpolated_gram(engine, lags * dt, atimes, ganchors)
-        twof = host(mean_anomaly_twof_analytic(z / var, g / var, self.block.offsets, self.n_l0, xp=xp)[0].max(axis=0))
+        twof = host(mean_anomaly_twof_analytic(z / var, g / var, self.block.offsets, self.screen_anomalies,
+                                               xp=xp)[0].max(axis=0))
         keep = numpy.flatnonzero(twof / 2 >= twof.max() / 2 - self.screen_margin)
         # the neighbours too: F between whole lags can exceed both ends
         keep = numpy.unique(numpy.clip(numpy.concatenate([keep - 1, keep, keep + 1]), 0, len(lags) - 1))

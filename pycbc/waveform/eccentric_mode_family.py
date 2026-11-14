@@ -382,6 +382,20 @@ class EccentricModeFamily(object):
 
     def _windows(self, d, de, dq=0.0, circular=None, spin_phase=None,
                  dchi=0.0):
+        """The modes on their windows (see :meth:`_windows_uncached`); the
+        last result is kept, since a source and its device evaluation ask
+        for the same point twice."""
+        def digest(a):
+            return None if a is None else hash(numpy.ascontiguousarray(a).tobytes())
+        key = (float(d), float(de), float(dq), float(dchi), digest(circular), digest(spin_phase))
+        cached = getattr(self, '_windows_last', None)
+        if cached is None or cached[0] != key:
+            cached = (key, list(self._windows_uncached(d, de, dq, circular, spin_phase, dchi)))
+            self._windows_last = cached
+        return iter(cached[1])
+
+    def _windows_uncached(self, d, de, dq=0.0, circular=None, spin_phase=None,
+                          dchi=0.0):
         """Each mode at ``(d, de, dq)`` on its own window of bins: ``(key,
         slice, amplitude, psi, present)``, the amplitude zero where the mode
         is absent.
@@ -537,13 +551,17 @@ def _tensor_quadratic(v, steps):
             out[k] = w
         return out
 
+    # the stencil values stacked once, so an evaluation is one weighted sum
+    # (a matrix-vector product) instead of a Python loop over the points
+    keys = list(v)
+    stacked = numpy.stack([numpy.asarray(v[k]) for k in keys])
+    real = numpy.zeros((), stacked.dtype).real.dtype
+    index = numpy.array(keys, dtype=int).reshape(len(keys), -1)
+
     def poly(*x):
-        ls = [lagrange(t, h, ks) for t, h, ks in zip(x, steps, nodes)]
-        out = 0
-        for key, value in v.items():
-            w = 1.0
-            for li, k in zip(ls, key):
-                w = w * li[k]
-            out = out + value * w
-        return out
+        w = numpy.ones(len(keys))
+        for d, (t, h, ks) in enumerate(zip(x, steps, nodes)):
+            ld = lagrange(t, h, ks)
+            w = w * numpy.array([ld[k] for k in index[:, d]])
+        return numpy.tensordot(w.astype(real), stacked, axes=(0, 0))
     return poly
