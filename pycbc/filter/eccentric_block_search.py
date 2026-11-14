@@ -21,33 +21,38 @@ from pycbc.filter.bstatistic import OrientationNodes
 
 
 class MassEccentricCoordinates:
-    """Local coordinates ln(Mc/Mc0) and e^2-e0^2, each in explicit units.
+    """Local coordinates ln(Mc/Mc0), e^2-e0^2 and (with three scales) chi-chi0, each in explicit units.
+
+    chi is the common aligned spin (spin1z = spin2z) of a cell with a spin stencil; theta is then (Mc, e, chi).
 
     ``clip_at_zero``: a point below e^2 = 0 (a lattice or region box reaching past the circular edge, as the cell
-    next to e = 0 does) decodes onto e = 0 instead of being refused. With ``metric`` (the 2 x 2 metric in these
-    coordinates) it goes to its metric projection onto the edge, moving ln Mc along the ln Mc - e^2 degeneracy;
-    the projection onto a half-space is non-expansive in the metric, so a lattice keeps its covering radius. Without
-    a metric only e is set to 0, which loses the match wherever the two are correlated (near e = 0 at Mc 30 the
-    correlation is 0.998, and folding at fixed Mc lost the injections)."""
-    def __init__(self, mchirp, eccentricity, scales, clip_at_zero=False, metric=None):
+    next to e = 0 does) decodes onto e = 0 instead of being refused. With ``metric`` (the metric in these
+    coordinates) it goes to its metric projection onto the edge, moving the other coordinates along their
+    degeneracy with e^2; the projection onto a half-space is non-expansive in the metric, so a lattice keeps its
+    covering radius. Without a metric only e is set to 0, which loses the match wherever the coordinates are
+    correlated (near e = 0 at Mc 30 ln Mc and e^2 correlate at 0.997, and folding at fixed Mc lost the injections)."""
+    def __init__(self, mchirp, eccentricity, scales, clip_at_zero=False, metric=None, spin=0.0):
         self.mchirp, self.eccentricity = float(mchirp), float(eccentricity)
+        self.spin = float(spin)
         self.clip_at_zero = bool(clip_at_zero)
         self.metric = None if metric is None else numpy.asarray(metric, dtype=float)
         self.scales = numpy.asarray(scales, dtype=float)
         self.ndim = len(self.scales)
-        if self.ndim not in (1, 2) or numpy.any(self.scales <= 0):
-            raise ValueError('one or two positive coordinate scales are required')
+        if self.ndim not in (1, 2, 3) or numpy.any(self.scales <= 0):
+            raise ValueError('one to three positive coordinate scales are required')
 
     def encode(self, theta):
         theta = numpy.atleast_2d(numpy.asarray(theta, dtype=float))
         columns = [numpy.log(theta[:, 0]/self.mchirp)/self.scales[0]]
-        if self.ndim == 2:
+        if self.ndim >= 2:
             columns.append((theta[:, 1]**2-self.eccentricity**2)/self.scales[1])
+        if self.ndim == 3:
+            columns.append((theta[:, 2]-self.spin)/self.scales[2])
         return numpy.column_stack(columns)
 
     def decode(self, coordinates):
         s = numpy.atleast_2d(numpy.asarray(coordinates, dtype=float))
-        if self.ndim == 2:
+        if self.ndim >= 2:
             e2 = self.eccentricity**2+s[:, 1]*self.scales[1]
             below = e2 < 0
             if numpy.any(below):
@@ -56,13 +61,18 @@ class MassEccentricCoordinates:
                 s = s.copy()
                 edge = -self.eccentricity**2/self.scales[1]
                 if self.metric is not None:
+                    # minimise the metric distance over the other coordinates with e^2 on the edge
                     g = self.metric
-                    s[below, 0] += g[0, 1]/g[0, 0]*(s[below, 1]-edge)
+                    other = [k for k in range(self.ndim) if k != 1]
+                    shift = numpy.linalg.solve(g[numpy.ix_(other, other)], g[other, 1])
+                    s[numpy.ix_(below, other)] += numpy.outer(s[below, 1]-edge, shift)
                 s[below, 1] = edge
                 e2 = numpy.maximum(self.eccentricity**2+s[:, 1]*self.scales[1], 0.)
         columns = [self.mchirp*numpy.exp(s[:, 0]*self.scales[0])]
-        if self.ndim == 2:
+        if self.ndim >= 2:
             columns.append(numpy.sqrt(e2))
+        if self.ndim == 3:
+            columns.append(self.spin+s[:, 2]*self.scales[2])
         return numpy.column_stack(columns)
 
 
@@ -210,7 +220,9 @@ class EccentricFFTBlockModel:
         return gram
 
     def _mc_anchor_gram(self, x, theta, sky, anchor_indices, delay_bounds, response):
-        key = (float(x),)+tuple(sky)+tuple(int(v) for v in anchor_indices)
+        # the anchor keeps the template's other coordinates beyond Mc and e (the spin chi of a spin cell), so they
+        # are part of the key
+        key = (float(x),)+tuple(float(v) for v in theta[2:])+tuple(sky)+tuple(int(v) for v in anchor_indices)
         if key in self._mc_grams:
             self.work['gram_cache_hits'] += 1
             return self.xp.asarray(self._mc_grams[key])

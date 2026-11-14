@@ -128,3 +128,29 @@ def test_spin_phase_maps_each_harmonic_to_its_orbital_frequency():
     for k,(sl,psi) in windows.items():
         r = fam._expansions[k][0]
         np.testing.assert_allclose(psi-plain[k][1], r*np.interp(fam.f[sl]/abs(r),fam.f,S), atol=1e-9)
+
+
+def test_spin_stencil_reproduces_the_generator_at_its_points():
+    f = np.linspace(.01,.02,61)
+    def generator(p):
+        s = p.get('spin1z',0.)+p.get('spin2z',0.)
+        out = {}
+        for n in (1,2,3):
+            phase = 2*np.pi*(n*1e5*f + 2e7*f**2) + n*s*3e4*f**2
+            amp = np.array([1+.5j*f, .3-.7j+0*f]) * n * (1+.2*s)
+            out[2,2,n] = amp,phase,np.ones(len(f),bool)
+        return out
+    ref = dict(mass1=36.,mass2=31.,eccentricity=.05)
+    fam = EccentricModeFamily(ref,f,.015,step_mass=0,step_e=0,step_q=0,step_chi=.1,
+                              generator=generator,circular_phase_basis='taylorf2')
+    for k in (-1,1):
+        got = fam.modes(0.,0.,dchi=k*.1)
+        want = generator(dict(ref,spin1z=k*.1,spin2z=k*.1))
+        for key,(a,psi,h) in got.items():
+            np.testing.assert_allclose(a[:,h],want[key][0][:,h],rtol=1e-6)
+            np.testing.assert_allclose(psi[h],want[key][1][h],rtol=0,atol=1e-6)
+    # the source moves its circular phase with the cell spin
+    src = EccentricModeFamilySource(fam,dchi=.1)
+    assert src.spins == (.1,.1) and src.spin_phase is None
+    with pytest.raises(ValueError):
+        EccentricModeFamilySource(family(),dchi=.1)

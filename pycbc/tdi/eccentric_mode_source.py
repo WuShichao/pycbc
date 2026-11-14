@@ -42,31 +42,41 @@ class EccentricModeFamilySource:
     def __init__(self, family, d=0., de=0., dq=0., mean_anomaly=0.,
                  clock_frequency=None, clock_time=0., time_shift=0.,
                  time_window=None, circular_method='taylorf2',
-                 spin1z=None, spin2z=None):
+                 spin1z=None, spin2z=None, dchi=0.):
         self.family = family
         self.d, self.de, self.dq = map(float, (d, de, dq))
+        # dchi: both aligned spins moved by dchi inside the cell's spin
+        # stencil (the eccentric correction interpolated there); spin1z and
+        # spin2z, if given, are the source's spins beyond that, in the
+        # circular phase only
+        self.dchi = float(dchi)
+        if self.dchi != 0. and family.steps[3] <= 0.:
+            raise ValueError('dchi needs a cell with a spin stencil (step_chi)')
         self.mean_anomaly = float(mean_anomaly)
         self.clock_frequency = float(family.f_ref if clock_frequency is None
                                      else clock_frequency)
-        parameters = [self.d, self.de, self.dq, self.mean_anomaly,
+        parameters = [self.d, self.de, self.dq, self.dchi, self.mean_anomaly,
                       self.clock_frequency, clock_time, time_shift]
         if not numpy.all(numpy.isfinite(parameters)):
             raise ValueError("source coordinates and clock must be finite")
         if circular_method not in ('taylorf2', 'pyefpe'):
             raise ValueError("circular_method must be taylorf2 or pyefpe")
         r = family.reference
-        self.spins = (float(r.get('spin1z', 0.) if spin1z is None else spin1z),
-                      float(r.get('spin2z', 0.) if spin2z is None else spin2z))
+        cell = (float(r.get('spin1z', 0.)) + self.dchi,
+                float(r.get('spin2z', 0.)) + self.dchi)
+        self.spins = (cell[0] if spin1z is None else float(spin1z),
+                      cell[1] if spin2z is None else float(spin2z))
         if not numpy.all(numpy.isfinite(self.spins)):
             raise ValueError("spins must be finite")
-        moved = self.spins != (float(r.get('spin1z', 0.)),
-                               float(r.get('spin2z', 0.)))
-        if (self.d != 0. or self.dq != 0. or moved) and circular_method != \
+        moved = self.spins != cell
+        if (self.d != 0. or self.dq != 0. or self.dchi != 0. or moved) and \
+                circular_method != \
                 family.circular_phase_basis:
             raise ValueError('online circular method must match the cell phase basis')
         self.circular_method = circular_method
         self.circular = family.circular_phase_change(
-            self.d, family.q0 * numpy.exp(self.dq), method=circular_method)
+            self.d, family.q0 * numpy.exp(self.dq), spin1z=cell[0],
+            spin2z=cell[1], method=circular_method)
         self.spin_phase = None
         if moved:
             self.spin_phase = family.circular_phase_change(
@@ -75,7 +85,7 @@ class EccentricModeFamilySource:
         anchor = [t[0] for k, _, _, _, t in family.iter_mode_pieces(
             self.d, self.de, self.dq, circular=self.circular,
             frequencies=[self.clock_frequency],
-            spin_phase=self.spin_phase) if k == (2, 2, 2)]
+            spin_phase=self.spin_phase, dchi=self.dchi) if k == (2, 2, 2)]
         if len(anchor) != 1:
             raise ValueError("clock anchor must lie inside the dominant mode")
         self.shift = float(clock_time + time_shift - anchor[0])
@@ -93,7 +103,7 @@ class EccentricModeFamilySource:
         records = {}
         for key, indices, amp, phase, time in self.family.iter_mode_pieces(
                 self.d, self.de, self.dq, circular=self.circular,
-                frequencies=f, spin_phase=self.spin_phase):
+                frequencies=f, spin_phase=self.spin_phase, dchi=self.dchi):
             time = time + self.shift
             keep = numpy.ones(len(indices), bool)
             if self.time_window is not None:

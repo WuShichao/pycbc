@@ -185,3 +185,17 @@ def test_clip_projects_onto_the_circular_edge_in_the_metric():
     p=np.array([2.,edge+30.])
     dist=lambda a,b:(a-b)@g@(a-b)
     assert dist(x,p)<=dist(s[0],p)
+
+
+def test_three_dimensional_coordinates_roundtrip_and_project_in_the_metric():
+    from pycbc.filter.eccentric_block_search import MassEccentricCoordinates
+    g=np.array([[4.,1.9,.5],[1.9,1.,.3],[.5,.3,2.]])
+    c=MassEccentricCoordinates(30.,.005,[1e-6,1e-8,1e-2],clip_at_zero=True,metric=g,spin=.1)
+    theta=np.array([[30.01,.006,.13]])
+    np.testing.assert_allclose(c.decode(c.encode(theta)),theta)
+    edge=-.005**2/1e-8
+    s=np.array([3.,edge-50.,-2.])
+    x=c.encode(c.decode(s[None]))[0]
+    np.testing.assert_allclose(x[1],edge,atol=1e-6)
+    grad=g@(x-s)
+    assert abs(grad[0])<1e-6*abs(grad).max() and abs(grad[2])<1e-6*abs(grad).max()

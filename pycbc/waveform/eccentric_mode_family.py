@@ -149,14 +149,19 @@ class EccentricModeFamily(object):
                  step_e=0.002, step_q=0.1, generator=None, f22_window=None,
                  phase_scaling='m', order=3, support='all', taper=None,
                  edge_margin=0.01, wide_generator=None,
-                 amplitude_tol=1e-12, circular_phase_basis='pyefpe'):
+                 amplitude_tol=1e-12, circular_phase_basis='pyefpe',
+                 step_chi=0.0):
         if circular_phase_basis not in ('pyefpe', 'taylorf2'):
             raise ValueError('circular_phase_basis must be pyefpe or taylorf2')
         self.circular_phase_basis = circular_phase_basis
         self.reference = dict(reference)
         self.f = numpy.asarray(frequencies, dtype=float)
         self.f_ref = float(f_ref)
-        self.steps = (float(step_mass), float(step_e), float(step_q))
+        # the fourth direction: both aligned spins moved together by
+        # ``k * step_chi`` (the eccentric correction depends on spin through
+        # the periastron advance; the circular phase change stays exact)
+        self.steps = (float(step_mass), float(step_e), float(step_q),
+                      float(step_chi))
         self.f22_window = f22_window
         self.generator = generator or (
             lambda p: efpe_modes(p, self.f, self.f_ref,
@@ -184,8 +189,8 @@ class EccentricModeFamily(object):
         # mode, both polarisations); the phases, of thousands of radians,
         # in double; each mode only on its own window of bins (the union of
         # its supports over the stencil), a fraction of a wide band
-        points = [(i, j, l) for i in levels[0] for j in levels[1]
-                  for l in levels[2]]
+        points = [(i, j, l, k) for i in levels[0] for j in levels[1]
+                  for l in levels[2] for k in levels[3]]
         edges = {}
         if support == 'edges':
             # each mode's first and last bin on the nominal window
@@ -205,12 +210,13 @@ class EccentricModeFamily(object):
                     w = slice(idx[0], idx[-1] + 1)
                     grid[ijl][k] = (int(idx[0]), a[:, w].astype(
                         numpy.complex64), p[w].copy(), h[w].copy())
-        self._circ = {(i, l): self._circular(i, l)
-                      for i in levels[0] for l in levels[2]}
+        self._circ = {(i, l, k): self._circular(i, l, k)
+                      for i in levels[0] for l in levels[2]
+                      for k in levels[3]}
         self._circ_amp = _tensor_quadratic(
-            {(i, 0, l): c[0] for (i, l), c in self._circ.items()},
-            (self.steps[0], 0.0, self.steps[2]))
-        self.keys = [k for k in grid[0, 0, 0]
+            {(i, 0, l, k): c[0] for (i, l, k), c in self._circ.items()},
+            (self.steps[0], 0.0, self.steps[2], self.steps[3]))
+        self.keys = [k for k in grid[0, 0, 0, 0]
                      if all(k in g for g in grid.values())
                      and all(k in e for e in edges.values())]
         self._edges = {k: _tensor_quadratic(
@@ -240,14 +246,14 @@ class EccentricModeFamily(object):
                 psi[ijl][w] = ph
                 hv[ijl] = numpy.zeros(hi - lo, bool)
                 hv[ijl][w] = h
-            corr = {ijl: ph - r * self._circ[ijl[0], ijl[2]][1][sl]
+            corr = {ijl: ph - r * self._circ[ijl[0], ijl[2], ijl[3]][1][sl]
                     for ijl, ph in psi.items()}
-            psi0 = psi[(0,) * 3]
+            psi0 = psi[(0,) * 4]
             del psi
             if support == 'center':
                 # a stencil point without the bin has no phase there: take
                 # the reference's correction (amplitude zero, as given)
-                c0 = corr[(0,) * 3]
+                c0 = corr[(0,) * 4]
                 corr = {ijl: numpy.where(hv[ijl], c, c0)
                         for ijl, c in corr.items()}
             if support == 'center':
@@ -255,7 +261,7 @@ class EccentricModeFamily(object):
                 # there contributes zero amplitude (pyEFPEHM keeps a
                 # harmonic only where it passes its tolerance, so the edges
                 # move across the stencil)
-                have = hv[(0,) * 3]
+                have = hv[(0,) * 4]
             else:
                 have = numpy.logical_and.reduce(list(hv.values()))
             self._expansions[k] = (r, _tensor_quadratic(amp, self.steps),
@@ -267,9 +273,9 @@ class EccentricModeFamily(object):
     def q0(self):
         return self.reference['mass1'] / self.reference['mass2']
 
-    def _point(self, i, j, l, eccentricity=None):
-        """The reference moved ``i`` steps in ln Mc, ``j`` in e and ``l`` in
-        ln q (chirp mass held when q moves)."""
+    def _point(self, i, j, l, k=0, eccentricity=None):
+        """The reference moved ``i`` steps in ln Mc, ``j`` in e, ``l`` in
+        ln q (chirp mass held when q moves) and ``k`` in both aligned spins."""
         from pycbc.conversions import mass1_from_mchirp_q, mass2_from_mchirp_q
         r = self.reference
         mc = (r['mass1'] * r['mass2']) ** 0.6 / (r['mass1']
@@ -278,18 +284,21 @@ class EccentricModeFamily(object):
         q = self.q0 * numpy.exp(l * self.steps[2])
         e = r.get('eccentricity', 0.0) + j * self.steps[1] \
             if eccentricity is None else eccentricity
+        chi = k * self.steps[3]
         return dict(r, mass1=mass1_from_mchirp_q(mc, q),
-                    mass2=mass2_from_mchirp_q(mc, q), eccentricity=e)
+                    mass2=mass2_from_mchirp_q(mc, q), eccentricity=e,
+                    spin1z=r.get('spin1z', 0.0) + chi,
+                    spin2z=r.get('spin2z', 0.0) + chi)
 
-    def _circular(self, i, l):
+    def _circular(self, i, l, k=0):
         """The circular binary's dominant mode at stencil point ``(i, l)``:
         pyEFPEHM's key ``(2, 2, 2)``, or the loudest mode."""
-        modes = self._circ_generator(self._point(i, 0, l,
+        modes = self._circ_generator(self._point(i, 0, l, k,
                                                  eccentricity=0.0))
         result = modes[2, 2, 2] if (2, 2, 2) in modes else max(
             modes.values(), key=lambda v: numpy.sum(abs(v[0]) ** 2))
         if self.circular_phase_basis == 'taylorf2':
-            point = self._point(i, 0, l, eccentricity=0.0)
+            point = self._point(i, 0, l, k, eccentricity=0.0)
             return result[0], self._pn_phase(point), result[2]
         return result
 
@@ -309,7 +318,7 @@ class EccentricModeFamily(object):
         return -phase
 
     def _circ22(self, i):
-        return self._circ[i, 0][1]
+        return self._circ[i, 0, 0][1]
 
     def circular_phase_change(self, d, q=None, spin1z=None, spin2z=None,
                               method=None):
@@ -353,14 +362,15 @@ class EccentricModeFamily(object):
             modes.values(), key=lambda v: numpy.sum(abs(v[0]) ** 2))
         return c[1] - self._circ22(0)
 
-    def modes(self, d, de, dq=0.0, circular=None):
+    def modes(self, d, de, dq=0.0, circular=None, dchi=0.0):
         """The modes at ``(d, de, dq)``, ``dq = ln(q / q0)``: ``{key:
         (amplitude, psi, present)}``. ``circular`` is the circular dominant
         mode's phase change there (spins included, see
         :meth:`circular_phase_change`); pyEFPEHM's when not given."""
         n = len(self.f)
         out = {}
-        for k, sl, a, psi, have in self._windows(d, de, dq, circular):
+        for k, sl, a, psi, have in self._windows(d, de, dq, circular,
+                                                 dchi=dchi):
             amp = numpy.zeros((2, n), complex)
             amp[:, sl] = a
             ph = numpy.zeros(n)
@@ -370,7 +380,8 @@ class EccentricModeFamily(object):
             out[k] = (amp, ph, h)
         return out
 
-    def _windows(self, d, de, dq=0.0, circular=None, spin_phase=None):
+    def _windows(self, d, de, dq=0.0, circular=None, spin_phase=None,
+                 dchi=0.0):
         """Each mode at ``(d, de, dq)`` on its own window of bins: ``(key,
         slice, amplitude, psi, present)``, the amplitude zero where the mode
         is absent.
@@ -382,21 +393,28 @@ class EccentricModeFamily(object):
         dominant harmonic's ``f / |r|``, so it gets ``r * spin_phase(f /
         |r|)``. (Mass and ratio changes are applied at ``f`` itself; the
         difference is part of the interpolated eccentric correction.)"""
-        dc = self.circular_phase_change(d, self.q0 * numpy.exp(dq)) \
-            if circular is None else circular
+        if circular is None:
+            ref = self.reference
+            dc = self.circular_phase_change(
+                d, self.q0 * numpy.exp(dq),
+                spin1z=ref.get('spin1z', 0.0) + dchi,
+                spin2z=ref.get('spin2z', 0.0) + dchi)
+        else:
+            dc = circular
         for k, (r, amp, corr, psi0, have, sl) in self._expansions.items():
-            a = amp(d, de, dq)
-            c = corr(d, de, dq) - corr(0.0, 0.0, 0.0)
+            a = amp(d, de, dq, dchi)
+            c = corr(d, de, dq, dchi) - corr(0.0, 0.0, 0.0, 0.0)
             if spin_phase is not None and r != 0:
                 c = c + r * numpy.interp(self.f[sl] / abs(r), self.f,
                                          spin_phase)
             if self._edges:
-                lo, hi = numpy.round(self._edges[k](d, de, dq))
+                lo, hi = numpy.round(self._edges[k](d, de, dq, dchi))
                 b = self._bins[sl]
                 have = have & (b >= lo) & (b <= hi)
             yield k, sl, numpy.where(have, a, 0), psi0 + r * dc[sl] + c, have
 
-    def dominant_correction(self, d, de, dq=0.0, frequencies=None):
+    def dominant_correction(self, d, de, dq=0.0, frequencies=None,
+                            dchi=0.0):
         """The dominant mode's eccentric factor at ``(d, de, dq)``: its
         complex amplitude over the circular binary's and ``exp(-i (psi -
         psi_circ))``, on ``frequencies`` (by default the family's),
@@ -409,13 +427,13 @@ class EccentricModeFamily(object):
         r, amp, corr, psi0, have, sl = self._expansions[key]
         # constant and linear parts of the correction (pyEFPEHM's pinning)
         # are a phase and an arrival time, which the search maximises over
-        a = amp(d, de, dq)[0]
-        a0 = self._circ_amp(d, 0.0, dq)[0][sl]
+        a = amp(d, de, dq, dchi)[0]
+        a0 = self._circ_amp(d, 0.0, dq, dchi)[0][sl]
         ratio = numpy.where(have & (abs(a0) > 0), a / numpy.where(
             abs(a0) > 0, a0, 1), 1)
         factor = numpy.ones(len(self.f), dtype=complex)
         factor[sl] = ratio * numpy.exp(-1j * numpy.where(
-            have, corr(d, de, dq), 0))
+            have, corr(d, de, dq, dchi), 0))
         if frequencies is None:
             return factor
         f = numpy.asarray(frequencies, dtype=float)
@@ -426,7 +444,7 @@ class EccentricModeFamily(object):
         return out
 
     def iter_mode_pieces(self, d, de, dq=0.0, circular=None,
-                         frequencies=None, spin_phase=None):
+                         frequencies=None, spin_phase=None, dchi=0.0):
         """Sparse FD modes and their individual stationary-time clocks.
 
         Yield ``(key, indices, amplitude, phase, time)`` on ``frequencies``
@@ -451,7 +469,7 @@ class EccentricModeFamily(object):
                 or numpy.any(f <= 0) or numpy.any(numpy.diff(f) <= 0)):
             raise ValueError("frequencies must be positive, finite and increasing")
         for key, sl, amp, phase, have in self._windows(d, de, dq, circular,
-                                                       spin_phase):
+                                                       spin_phase, dchi):
             active = numpy.flatnonzero(have)
             if not len(active):
                 continue
@@ -478,17 +496,18 @@ class EccentricModeFamily(object):
                        numpy.concatenate([p[2] for p in chunks]),
                        numpy.concatenate([p[3] for p in chunks]))
 
-    def polarizations(self, d, de, dq=0.0, circular=None):
+    def polarizations(self, d, de, dq=0.0, circular=None, dchi=0.0):
         """The plus and cross polarisations ``(2, N)``, the modes summed."""
         h = numpy.zeros((2, len(self.f)), complex)
-        for _, sl, amp, psi, have in self._windows(d, de, dq, circular):
+        for _, sl, amp, psi, have in self._windows(d, de, dq, circular,
+                                                   dchi=dchi):
             hs = h[:, sl]
             hs[:, have] += amp[:, have] * numpy.exp(-1j * psi[have])
         return h
 
-    def hplus(self, d, de, dq=0.0, circular=None):
+    def hplus(self, d, de, dq=0.0, circular=None, dchi=0.0):
         """The plus polarisation, the modes summed."""
-        return self.polarizations(d, de, dq, circular)[0]
+        return self.polarizations(d, de, dq, circular, dchi)[0]
 
 
 def _ramp(x):
