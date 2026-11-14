@@ -65,7 +65,7 @@ class EccentricFFTBlockModel:
                  reference, scales, observation, delay_range, xp=numpy,
                  n_l0=64, dtype=numpy.complex64, max_cache_bytes=4_000_000_000,
                  distance_prior=None, bayes_rank=False, contains=None, gram_anchors=3, reuse_grams=False,
-                 gram_mc_anchors=None):
+                 gram_mc_anchors=None, gram_sky_anchors=None):
         self.grid, self.xp = grid, xp
         self.surrogate = SimpleNamespace(grid=grid, xp=xp)
         self.source_builder, self.response_builder = source_builder, response_builder
@@ -91,7 +91,19 @@ class EccentricFFTBlockModel:
             if a.ndim != 1 or len(a) < 2 or numpy.any(numpy.diff(a) <= 0):
                 raise ValueError('gram_mc_anchors must be at least two increasing ln Mc offsets')
             self.gram_mc_anchors = a
+        # gram_sky_anchors=(n, half): an n x n uniform grid of sky anchors over offsets [-half, half] (shape units)
+        # in both sky coordinates. Each sky point's complete Gram is the piecewise-bilinear (convex, PSD)
+        # interpolation of the four surrounding anchors' Grams (each itself ln-Mc-interpolated when
+        # gram_mc_anchors is set). Measured: largest relative 2F error 9.5e-4 at 3 x 3 and 4.0e-4 at 5 x 5 over a
+        # 0.07 rad block (card 2026-11-14-eccentric-sky-step-gram).
+        self.gram_sky_anchors = None
+        if gram_sky_anchors is not None:
+            n, half = int(gram_sky_anchors[0]), float(gram_sky_anchors[1])
+            if n < 2 or half <= 0:
+                raise ValueError('gram_sky_anchors needs n >= 2 and half > 0')
+            self.gram_sky_anchors = numpy.linspace(-half, half, n)
         self._mc_grams = {}
+        self._sky_grams = {}
         self._template_grams = {}
         self._source_cache = None
         f = numpy.asarray(grid.frequencies)
@@ -121,12 +133,62 @@ class EccentricFFTBlockModel:
         # in place: two models of one cell (e.g. a search's coarse and fine levels) may share these dicts
         self._template_grams.clear()
         self._mc_grams.clear()
+        self._sky_grams.clear()
 
     def share_grams_with(self, other):
         """Use ``other``'s Gram caches: the Grams do not depend on the data or on the anomaly grid, so the coarse
         and fine models of one cell (same grid, source, response, observation and delay range) can share them."""
         self._template_grams = other._template_grams
         self._mc_grams = other._mc_grams
+        self._sky_grams = other._sky_grams
+
+    def _response(self, sky):
+        rho = self.xp.asarray(self.response_builder(numpy.asarray(sky)), dtype=self.dtype)
+        def response(r):
+            return (rho[r][...,self._index]*(1-self._weight)+
+                    rho[r][...,self._index+1]*self._weight)
+        response.coarse, response.index, response.weight = rho, self._index, self._weight
+        return response
+
+    def _sky_anchor_gram(self, theta, sky, anchor_indices, delay_bounds):
+        """The complete Gram of ``theta`` at an anchor sky point: ln-Mc-interpolated when gram_mc_anchors is set,
+        otherwise the template's own (cached per template and anchor)."""
+        response = self._response(sky)
+        if self.gram_mc_anchors is not None:
+            return self._mc_interpolated_gram(theta, sky, anchor_indices, delay_bounds, response)
+        key = tuple(float(v) for v in theta)+tuple(float(v) for v in sky)+tuple(int(v) for v in anchor_indices)
+        if key in self._sky_grams:
+            self.work['gram_cache_hits'] += 1
+            return self.xp.asarray(self._sky_grams[key])
+        engine_class = getattr(self, 'fft_engine_class', WindowedModeFFT)
+        if self._source_cache is not None and self._source_cache[0] == tuple(theta):
+            _, b, t = self._source_cache
+        else:
+            b, t = self.source_builder(numpy.asarray(theta))
+        engine = engine_class(self.grid, b, t, response, self.orders, self.data, self.observation,
+            delay_bounds, xp=self.xp, dtype=self.dtype, max_cache_bytes=self.max_cache_bytes)
+        gram = engine.gram(anchor_indices)
+        self._sky_grams[key] = gram.get() if hasattr(gram, 'get') else gram.copy()
+        return gram
+
+    def _sky_interpolated_gram(self, theta, sky, anchor_indices, delay_bounds):
+        ax = self.gram_sky_anchors
+        idx, w = [], []
+        for k in range(2):
+            v = float(sky[k])
+            if v < ax[0]-1e-9 or v > ax[-1]+1e-9:
+                raise ValueError('sky point lies outside the Gram sky anchors')
+            i = int(numpy.clip(numpy.searchsorted(ax, v, side='right')-1, 0, len(ax)-2))
+            idx.append(i)
+            w.append(min(max((v-ax[i])/(ax[i+1]-ax[i]), 0.), 1.))
+        gram = 0
+        for di, wx in ((0, 1-w[0]), (1, w[0])):
+            for dj, wy in ((0, 1-w[1]), (1, w[1])):
+                if wx*wy == 0:
+                    continue
+                corner = (float(ax[idx[0]+di]), float(ax[idx[1]+dj]))
+                gram = gram+self._sky_anchor_gram(theta, corner, anchor_indices, delay_bounds)*(wx*wy)
+        return gram
 
     def _mc_anchor_gram(self, x, theta, sky, anchor_indices, delay_bounds, response):
         key = (float(x),)+tuple(sky)+tuple(int(v) for v in anchor_indices)
@@ -202,7 +264,9 @@ class EccentricFFTBlockModel:
         self.work['prepare_seconds'] += perf_counter()-start
         anchor_indices = numpy.unique(numpy.linspace(jlo,jhi,anchors).round().astype(int))
         start = perf_counter()
-        if self.gram_mc_anchors is not None:
+        if self.gram_sky_anchors is not None:
+            gram = self._sky_interpolated_gram(theta, sky, anchor_indices, (jlo, jhi))
+        elif self.gram_mc_anchors is not None:
             gram = self._mc_interpolated_gram(theta, sky, anchor_indices, (jlo, jhi), response)
         elif self.reuse_grams and key in self._template_grams:
             gram = xp.asarray(self._template_grams[key])

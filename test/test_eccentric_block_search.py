@@ -97,3 +97,45 @@ def test_mc_interpolated_gram_matches_anchor_and_stays_close_between():
         pass
     else:
         raise AssertionError('a template outside the Gram anchors must be refused')
+
+
+def test_sky_interpolated_gram_is_the_anchor_gram_at_anchors_and_psd_between():
+    n=128
+    grid=SimpleNamespace(size=n,duration=ORBITAL_PERIOD,delta_t=ORBITAL_PERIOD/n,
+        frequencies=.01+np.arange(n)/ORBITAL_PERIOD,harmonic_shift=1)
+    coordinates=MassEccentricCoordinates(30.,.05,[.01,.001])
+    rng=np.random.default_rng(29)
+    carrier=rng.normal(size=(2,n))+1j*rng.normal(size=(2,n))
+    carrier[:,:4]=0;carrier[:,-4:]=0
+    def source(theta):
+        s=coordinates.encode(theta)[0]
+        return carrier*np.exp(1j*s[0]*np.linspace(-1,1,n)),np.zeros((2,n))
+    def response(sky):
+        a=np.array([[[1.,.3j],[.2+.4j,1.]]],complex)[...,None]*np.ones(n)
+        return a*np.exp(1j*(.3*sky[0]-.2*sky[1]))*(1+.05*sky[0])
+    data=(rng.normal(size=(2,n))+1j*rng.normal(size=(2,n)))
+    ref=dict(eclipticlongitude=1.,eclipticlatitude=.2)
+    scales=dict(eclipticlongitude=.01,eclipticlatitude=.01)
+    def build(**kw):
+        return EccentricFFTBlockModel(grid,data,source,response,grid.frequencies,[0],[0,1],coordinates,np.eye(2),
+            ref,scales,(20,70),(-5*grid.delta_t,5*grid.delta_t),dtype=np.complex128,n_l0=32,**kw)
+    exact=build()
+    both=build(gram_sky_anchors=(3,2.),gram_mc_anchors=[-.01,0.,.01])
+    sky_only=build(gram_sky_anchors=(3,2.))
+    theta=np.array([30.,.05])
+    for model in (both,sky_only):
+        _,_,g=model._prepare(theta,np.array([2.,-2.]))
+        _,_,ge=exact._prepare(theta,np.array([2.,-2.]))
+        np.testing.assert_allclose(g,ge,rtol=1e-12,atol=1e-12)
+        _,_,g=model._prepare(theta,np.array([.7,-1.3]))
+        k=g.shape[0]*2
+        for j in range(g.shape[-1]):
+            m=g[...,j].reshape(k,k)
+            np.testing.assert_allclose(m,m.conj().T,atol=1e-10)
+            assert np.min(np.linalg.eigvalsh(.5*(m+m.conj().T)))>-1e-10
+    try:
+        sky_only._prepare(theta,np.array([2.5,0.]))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('a sky point outside the Gram sky anchors must be refused')
