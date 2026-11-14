@@ -199,3 +199,49 @@ def test_three_dimensional_coordinates_roundtrip_and_project_in_the_metric():
     np.testing.assert_allclose(x[1],edge,atol=1e-6)
     grad=g@(x-s)
     assert abs(grad[0])<1e-6*abs(grad).max() and abs(grad[2])<1e-6*abs(grad).max()
+
+
+def test_chi_interpolated_gram_is_the_anchor_gram_at_anchors_and_keeps_e_at_the_reference():
+    n=128
+    grid=SimpleNamespace(size=n,duration=ORBITAL_PERIOD,delta_t=ORBITAL_PERIOD/n,
+        frequencies=.01+np.arange(n)/ORBITAL_PERIOD,harmonic_shift=1)
+    coordinates=MassEccentricCoordinates(30.,.05,[.01,.001,.01])
+    rng=np.random.default_rng(29)
+    carrier=rng.normal(size=(2,n))+1j*rng.normal(size=(2,n))
+    carrier[:,:4]=0;carrier[:,-4:]=0
+    def source(theta):
+        s=coordinates.encode(theta)[0]
+        x=np.linspace(-1,1,n)
+        phase=s[0]*x+s[1]*x**2+s[2]*x**3
+        return carrier*np.exp(1j*phase)*(1+.1*theta[2]),np.zeros((2,n))
+    response=np.array([[[1.,.3j],[.2+.4j,1.]]],complex)[...,None]*np.ones(n)
+    data=(rng.normal(size=(2,n))+1j*rng.normal(size=(2,n)))
+    ref=dict(eclipticlongitude=1.,eclipticlatitude=.2)
+    scales=dict(eclipticlongitude=.01,eclipticlatitude=.01)
+    def build(**kw):
+        return EccentricFFTBlockModel(grid,data,source,lambda sky:response,
+            grid.frequencies,[0],[0,1],coordinates,np.eye(3),ref,scales,
+            (20,70),(-5*grid.delta_t,5*grid.delta_t),dtype=np.complex128,n_l0=32,**kw)
+    mc=build(gram_mc_anchors=[-.01,0.,.01])
+    chi=build(gram_mc_anchors=[-.01,0.,.01],gram_chi_anchors=[-.1,0.,.1])
+    sky=np.zeros(2)
+    # at a spin anchor the Gram is the ln-Mc-interpolated one at that spin, with e at the cell's reference
+    theta=np.array([30.*np.exp(.004),.052,.1])
+    _,_,a=mc._prepare(theta,sky)
+    _,_,b=chi._prepare(theta,sky)
+    np.testing.assert_allclose(b,a,rtol=1e-12,atol=1e-12)
+    # a fresh model, so no cache is shared: the anchors sit at the cell's e whatever the template's
+    ref_e=build(gram_mc_anchors=[-.01,0.,.01])._prepare(np.array([30.*np.exp(.004),.05,.1]),sky)[2]
+    np.testing.assert_allclose(a,ref_e,rtol=1e-12,atol=1e-12)
+    # between spin anchors: convex in chi
+    t=np.array([30.*np.exp(.004),.05,.03])
+    g=chi._prepare(t,sky)[2]
+    g0=mc._prepare(np.array([30.*np.exp(.004),.05,0.]),sky)[2]
+    g1=mc._prepare(np.array([30.*np.exp(.004),.05,.1]),sky)[2]
+    np.testing.assert_allclose(g,.7*g0+.3*g1,rtol=1e-10,atol=1e-12)
+    try:
+        chi._prepare(np.array([30.,.05,.2]),sky)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('a template outside the spin anchors must be refused')

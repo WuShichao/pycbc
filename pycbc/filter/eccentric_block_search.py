@@ -94,7 +94,7 @@ class EccentricFFTBlockModel:
                  reference, scales, observation, delay_range, xp=numpy,
                  n_l0=64, dtype=numpy.complex64, max_cache_bytes=4_000_000_000,
                  distance_prior=None, bayes_rank=False, contains=None, gram_anchors=3, reuse_grams=False,
-                 gram_mc_anchors=None, gram_sky_anchors=None):
+                 gram_mc_anchors=None, gram_sky_anchors=None, gram_chi_anchors=None):
         self.grid, self.xp = grid, xp
         self.surrogate = SimpleNamespace(grid=grid, xp=xp)
         self.source_builder, self.response_builder = source_builder, response_builder
@@ -114,6 +114,17 @@ class EccentricFFTBlockModel:
         # cached until clear_template_grams). Measured: largest relative 2F error 4.4e-4 to 1.1e-3 at e0 0.03 to
         # 0.1 with anchors -0.01, 0, 0.01 over a cell of half-width 0.01 (lisa_tests_with_cc card
         # 2026-11-13-eccentric-gram-reuse).
+        # gram_chi_anchors (with gram_mc_anchors, for a cell with a spin coordinate): increasing offsets of the
+        # common aligned spin from the cell's (coordinates.spin); each template's Gram is then linear in chi between
+        # the two anchors around it, each of those ln-Mc-interpolated at that anchor's chi
+        self.gram_chi_anchors = None
+        if gram_chi_anchors is not None:
+            c = numpy.asarray(gram_chi_anchors, dtype=float)
+            if c.ndim != 1 or len(c) < 2 or numpy.any(numpy.diff(c) <= 0):
+                raise ValueError('gram_chi_anchors must be at least two increasing spin offsets')
+            if gram_mc_anchors is None:
+                raise ValueError('gram_chi_anchors needs gram_mc_anchors')
+            self.gram_chi_anchors = c
         self.gram_mc_anchors = None
         if gram_mc_anchors is not None:
             a = numpy.asarray(gram_mc_anchors, dtype=float)
@@ -219,17 +230,19 @@ class EccentricFFTBlockModel:
                 gram = gram+self._sky_anchor_gram(theta, corner, anchor_indices, delay_bounds)*(wx*wy)
         return gram
 
-    def _mc_anchor_gram(self, x, theta, sky, anchor_indices, delay_bounds, response):
-        # the anchor keeps the template's other coordinates beyond Mc and e (the spin chi of a spin cell), so they
-        # are part of the key
-        key = (float(x),)+tuple(float(v) for v in theta[2:])+tuple(sky)+tuple(int(v) for v in anchor_indices)
+    def _mc_anchor_gram(self, x, theta, sky, anchor_indices, delay_bounds, response, chi=None):
+        # the anchor: ln Mc offset x, the cell's reference e, and the spin anchor chi if given, else the template's
+        # own coordinates beyond Mc and e, which are then part of the key
+        anchor = numpy.array(theta, dtype=float)
+        anchor[0] = self.coordinates.mchirp*numpy.exp(x)
+        if self.coordinates.ndim >= 2:
+            anchor[1] = self.coordinates.eccentricity
+        if chi is not None:
+            anchor[2] = self.coordinates.spin+chi
+        key = (float(x),)+tuple(float(v) for v in anchor[2:])+tuple(sky)+tuple(int(v) for v in anchor_indices)
         if key in self._mc_grams:
             self.work['gram_cache_hits'] += 1
             return self.xp.asarray(self._mc_grams[key])
-        anchor = numpy.array(theta, dtype=float)
-        anchor[0] = self.coordinates.mchirp*numpy.exp(x)
-        if self.coordinates.ndim == 2:
-            anchor[1] = self.coordinates.eccentricity
         b, t = self.source_builder(anchor)
         engine_class = getattr(self, 'fft_engine_class', WindowedModeFFT)
         engine = engine_class(self.grid, b, t, response, self.orders, self.data,
@@ -242,16 +255,31 @@ class EccentricFFTBlockModel:
         return gram
 
     def _mc_interpolated_gram(self, theta, sky, anchor_indices, delay_bounds, response):
+        c = self.gram_chi_anchors
+        if c is None:
+            return self._mc_interpolated_gram_at(theta, sky, anchor_indices, delay_bounds, response, None)
+        y = float(theta[2])-self.coordinates.spin
+        if y < c[0]-1e-12 or y > c[-1]+1e-12:
+            raise ValueError('template spin lies outside the Gram spin anchors')
+        j = int(numpy.clip(numpy.searchsorted(c, y, side='right')-1, 0, len(c)-2))
+        w = min(max((y-c[j])/(c[j+1]-c[j]), 0.), 1.)
+        g0 = self._mc_interpolated_gram_at(theta, sky, anchor_indices, delay_bounds, response, c[j])
+        if w == 0.:
+            return g0
+        g1 = self._mc_interpolated_gram_at(theta, sky, anchor_indices, delay_bounds, response, c[j+1])
+        return g0*(1-w)+g1*w
+
+    def _mc_interpolated_gram_at(self, theta, sky, anchor_indices, delay_bounds, response, chi):
         a = self.gram_mc_anchors
         x = float(numpy.log(theta[0]/self.coordinates.mchirp))
         if x < a[0]-1e-12 or x > a[-1]+1e-12:
             raise ValueError('template chirp mass lies outside the Gram anchors')
         i = int(numpy.clip(numpy.searchsorted(a, x, side='right')-1, 0, len(a)-2))
         w = min(max((x-a[i])/(a[i+1]-a[i]), 0.), 1.)
-        g0 = self._mc_anchor_gram(a[i], theta, sky, anchor_indices, delay_bounds, response)
+        g0 = self._mc_anchor_gram(a[i], theta, sky, anchor_indices, delay_bounds, response, chi)
         if w == 0.:
             return g0
-        g1 = self._mc_anchor_gram(a[i+1], theta, sky, anchor_indices, delay_bounds, response)
+        g1 = self._mc_anchor_gram(a[i+1], theta, sky, anchor_indices, delay_bounds, response, chi)
         return g0*(1-w)+g1*w
 
     def phase_frame(self, region, **kwargs):
