@@ -307,3 +307,49 @@ def ssb_data_spectrum(grid, bins, orbit, longitude, latitude, xp=numpy):
     n_in = int(grid.in_data.sum())
     spectrum = xp.fft.fft(xp.asarray(series), axis=-1) / n_in
     return spectrum, grid.size * grid.data_nbins / n_in ** 2
+
+
+class GridSkyResponse(object):
+    """Any function of the sky offset (e.g. a yearly-harmonic response)
+    precomputed on a uniform grid and interpolated by 4-point Lagrange
+    polynomials per axis (error of order h^4 for a smooth function).
+
+    ``function(sky)`` returns an array (any shape) for a sky offset ``(x, y)``;
+    ``axes`` are the two increasing, uniformly spaced grid axes. Points
+    outside the grid are refused. ``values`` may be given instead of
+    ``function`` (shape ``(len(ax0), len(ax1)) + shape``), e.g. from a cache.
+    """
+    def __init__(self, axes, function=None, values=None):
+        self.axes = [numpy.asarray(a, dtype=float) for a in axes]
+        for a in self.axes:
+            if len(a) < 4:
+                raise ValueError('each grid axis needs at least 4 points')
+            step = numpy.diff(a)
+            if numpy.any(step <= 0) or numpy.ptp(step) > 1e-9 * abs(step[0]):
+                raise ValueError('grid axes must be uniform and increasing')
+        if values is None:
+            if function is None:
+                raise ValueError('give function or values')
+            values = numpy.array([[numpy.asarray(function(numpy.array([x, y])))
+                                   for y in self.axes[1]] for x in self.axes[0]])
+        self.values = numpy.asarray(values)
+
+    @staticmethod
+    def _weights(axis, v):
+        h = axis[1] - axis[0]
+        if v < axis[0] - 1e-9 * h or v > axis[-1] + 1e-9 * h:
+            raise ValueError('sky offset lies outside the response grid')
+        i = int(numpy.clip(numpy.floor((v - axis[0]) / h) - 1, 0, len(axis) - 4))
+        t = (v - axis[i]) / h
+        nodes = numpy.arange(4)
+        w = numpy.array([numpy.prod([(t - nodes[m]) / (nodes[k] - nodes[m])
+                                     for m in range(4) if m != k])
+                         for k in range(4)])
+        return i, w
+
+    def __call__(self, sky):
+        i, wx = self._weights(self.axes[0], float(sky[0]))
+        j, wy = self._weights(self.axes[1], float(sky[1]))
+        block = self.values[i:i + 4, j:j + 4]
+        return numpy.tensordot(wx, numpy.tensordot(wy, block, axes=(0, 1)),
+                               axes=(0, 0))

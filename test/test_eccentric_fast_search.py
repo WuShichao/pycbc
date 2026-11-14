@@ -119,3 +119,31 @@ def test_fused_existing_gpu_kernel_matches_complete_reference_fft():
                 (actual.fractional_correlations(np.array([-.4,1.7])*grid.delta_t).get(),
                  expected.fractional_correlations(np.array([-.4,1.7])*grid.delta_t))):
         assert np.linalg.norm(a-e)/np.linalg.norm(e)<3e-6
+
+
+def test_device_source_takes_spin_and_mass_ratio():
+    f=np.linspace(.01,.02,61)
+    def generator(p):
+        q=p['mass1']/p['mass2'];s=p.get('spin1z',0.)+p.get('spin2z',0.)
+        out={}
+        for n in (1,2,3):
+            phase=2*np.pi*(n*1e5*f+2e7*f*f)+p['eccentricity']*f+n*s*3e3*f*f+q*40*f
+            amp=np.ones((2,len(f)),complex)*(1+n*p['eccentricity'])*(1+.1*s)*(1+.05*q)
+            out[2,2,n]=amp,phase,np.ones(len(f),bool)
+        return out
+    ref=dict(mass1=36.,mass2=24.,eccentricity=.05)
+    family=EccentricModeFamily(ref,f,.015,step_mass=.01,step_e=.002,step_q=.1,step_chi=.1,
+        generator=generator,circular_phase_basis='taylorf2')
+    fine=np.linspace(.0105,.0195,211)
+    weight=np.ones(len(fine))
+    keys=sorted(family.keys)
+    mc0=(36.*24.)**.6/60.**.2
+    builder=DeviceEccentricModeSource(family,fine,keys,weight,mc0,clock_time=14.)
+    theta=[mc0*np.exp(.004),.051,.07,1.5*np.exp(.05)]
+    b,t=builder(theta)
+    source=EccentricModeFamilySource(family,d=.004,de=.001,dq=.05,dchi=.07,clock_time=14.)
+    records=source.frequency_harmonics(fine)
+    for k,key in enumerate(keys):
+        expected=np.zeros(len(fine),complex);rec=records[key]
+        expected[rec['indices']]=rec['plus']
+        np.testing.assert_allclose(b[k],expected,atol=5e-6,rtol=5e-6)

@@ -17,9 +17,10 @@ class DeviceEccentricModeSource:
     """Whitened face-on (2,2,n) mode arrays for a dense FFT grid.
 
     family must have a global TaylorF2 phase basis and static 'all' support.
-    Physical coordinates are chirp mass, eccentricity and, for a cell with a
-    spin stencil (step_chi), the common aligned spin chi (both spin1z and
-    spin2z); q is fixed.
+    Physical coordinates are chirp mass, eccentricity, and optionally the
+    common aligned spin chi (both spin1z and spin2z, a cell with step_chi)
+    and the mass ratio q = m1/m2 (a cell with step_q): theta = (Mc, e[, chi[,
+    q]]).
     source_weight includes whitening and any frequency notches/band masks.
     """
     def __init__(self,family,frequencies,keys,source_weight,
@@ -39,10 +40,11 @@ class DeviceEccentricModeSource:
         d=numpy.log(float(theta[0])/self.mc0)
         de=e-self.family.reference['eccentricity']
         dchi=float(theta[2])-self.family.reference.get('spin1z',0.) if len(theta)>2 else 0.
-        source=EccentricModeFamilySource(self.family,d=d,de=de,dchi=dchi,clock_time=self.clock_time)
+        dq=numpy.log(float(theta[3])/self.family.q0) if len(theta)>3 else 0.
+        source=EccentricModeFamilySource(self.family,d=d,de=de,dq=dq,dchi=dchi,clock_time=self.clock_time)
         b=xp.zeros((len(self.keys),len(self.f)),dtype=xp.complex64)
         t=xp.zeros(b.shape,dtype=xp.float64)
-        for key,sl,amp,phase,have in self.family._windows(d,de,circular=source.circular,dchi=dchi):
+        for key,sl,amp,phase,have in self.family._windows(d,de,dq,circular=source.circular,dchi=dchi):
             if key not in self.keys:continue
             k=self.keys.index(key)
             active=numpy.flatnonzero(have)

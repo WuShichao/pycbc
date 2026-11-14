@@ -245,3 +245,44 @@ def test_chi_interpolated_gram_is_the_anchor_gram_at_anchors_and_keeps_e_at_the_
         pass
     else:
         raise AssertionError('a template outside the spin anchors must be refused')
+
+
+def test_q_interpolated_gram_is_the_anchor_gram_at_q_anchors_and_convex_between():
+    n=128
+    grid=SimpleNamespace(size=n,duration=ORBITAL_PERIOD,delta_t=ORBITAL_PERIOD/n,
+        frequencies=.01+np.arange(n)/ORBITAL_PERIOD,harmonic_shift=1)
+    coordinates=MassEccentricCoordinates(30.,.05,[.01,.001,.01])
+    rng=np.random.default_rng(31)
+    carrier=rng.normal(size=(2,n))+1j*rng.normal(size=(2,n))
+    carrier[:,:4]=0;carrier[:,-4:]=0
+    def source(theta):
+        s=coordinates.encode(theta[:3])[0]
+        x=np.linspace(-1,1,n)
+        phase=s[0]*x+s[1]*x**2+s[2]*x**3+20*np.log(theta[3]/1.5)*x**4
+        return carrier*np.exp(1j*phase)*(1+.1*theta[2])*theta[3]**.2,np.zeros((2,n))
+    response=np.array([[[1.,.3j],[.2+.4j,1.]]],complex)[...,None]*np.ones(n)
+    data=(rng.normal(size=(2,n))+1j*rng.normal(size=(2,n)))
+    ref=dict(eclipticlongitude=1.,eclipticlatitude=.2)
+    scales=dict(eclipticlongitude=.01,eclipticlatitude=.01)
+    def build(**kw):
+        return EccentricFFTBlockModel(grid,data,source,lambda sky:response,
+            grid.frequencies,[0],[0,1],coordinates,np.eye(3),ref,scales,
+            (20,70),(-5*grid.delta_t,5*grid.delta_t),dtype=np.complex128,n_l0=32,**kw)
+    anchors=dict(gram_mc_anchors=[-.01,0.,.01],gram_chi_anchors=[-.1,0.,.1])
+    sky=np.zeros(2)
+    qm=build(gram_q_anchors=[-.2,0.,.2],q_reference=1.5,**anchors)
+    # at a q anchor: the chi/ln-Mc-interpolated Gram of a model without q anchors at that q
+    t=np.array([30.*np.exp(.004),.05,.03,1.5*np.exp(.2)])
+    np.testing.assert_allclose(qm._prepare(t,sky)[2],build(**anchors)._prepare(t,sky)[2],rtol=1e-12,atol=1e-12)
+    # between: convex in ln q
+    tm=np.array([30.*np.exp(.004),.05,.03,1.5*np.exp(.05)])
+    g=qm._prepare(tm,sky)[2]
+    g0=build(**anchors)._prepare(np.array([30.*np.exp(.004),.05,.03,1.5]),sky)[2]
+    g1=build(**anchors)._prepare(np.array([30.*np.exp(.004),.05,.03,1.5*np.exp(.2)]),sky)[2]
+    np.testing.assert_allclose(g,.75*g0+.25*g1,rtol=1e-10,atol=1e-12)
+    try:
+        qm._prepare(np.array([30.,.05,0.,1.5*np.exp(.3)]),sky)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('a template outside the q anchors must be refused')
