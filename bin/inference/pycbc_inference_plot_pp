@@ -49,8 +49,11 @@ parser.add_argument("--do-ks-test", action="store_true", default=False,
                          "plot for each parameter and the (expected) uniform "
                          "distribution. Results are printed in the legend.")
 option_utils.add_injsamples_map_opt(parser)
-pycbc.results.plot.add_style_opt_to_parser(parser,
-                                           default='seaborn-colorblind')
+# matplotlib 3.6 renamed the seaborn styles
+pycbc.results.plot.add_style_opt_to_parser(
+    parser, default='seaborn-v0_8-colorblind'
+    if 'seaborn-v0_8-colorblind' in matplotlib.style.available
+    else 'seaborn-colorblind')
 opts = parser.parse_args()
 
 # set style
@@ -100,7 +103,9 @@ ax = fig.add_subplot(111)
 # calculate the expected percentile for each injection and plot
 for param in parameters:
     label = labels[param]
-    meas = numpy.array(measured_percentiles[param])
+    # an injection value read as a length-1 array gives a length-1 percentile: flatten, or meas is (n, 1),
+    # expected (n, n) and every file plots as its own line
+    meas = numpy.ravel(numpy.array(measured_percentiles[param]))
     meas.sort()
     expected = numpy.array([stats.percentileofscore(meas, x, kind='weak')
                             for x in meas])
