@@ -68,3 +68,20 @@ def test_oversampled_correlations_equal_the_direct_sum():
     z,d=engine.oversampled_correlations(np.array([-3,0,2]),5)
     direct=engine.fractional_correlations(d.ravel())
     np.testing.assert_allclose(z.reshape(z.shape[0],2,-1),direct,rtol=1e-6,atol=1e-6*np.abs(direct).max())
+
+
+def test_shared_region_gram_interpolation_matches_the_engine_rule():
+    from types import SimpleNamespace as NS
+    from pycbc.filter.eccentric_mode_fft import WindowedModeFFT
+    from pycbc.filter.eccentric_shared import EccentricSharedRegion
+    rng=np.random.default_rng(5)
+    region=EccentricSharedRegion.__new__(EccentricSharedRegion)
+    region.xp=np
+    region._anchor_times=np.array([-10.,0.,25.])
+    stack=rng.normal(size=(3,4,4,3))+1j*rng.normal(size=(3,4,4,3))
+    rows=np.array([0,2,1,1,0])
+    delays=np.array([-10.,-3.,0.,24.,25.])
+    got=region._gram_at(stack,rows,delays)
+    for s,(r,d) in enumerate(zip(rows,delays)):
+        want=WindowedModeFFT.interpolated_gram(NS(xp=np),[d],region._anchor_times,stack[r])[...,0]
+        np.testing.assert_allclose(got[...,s],want,rtol=1e-12)

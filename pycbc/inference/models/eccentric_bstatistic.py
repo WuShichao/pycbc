@@ -205,7 +205,7 @@ class EccentricCellPE(BaseModel):
     def __init__(self, variable_params, block_model, sky_reference, delay_window, distance_prior,
                  n_l0=64, orientation_nodes=(16, 8), amplitude_order=64, oversampling=4,
                  screen_margin=40.0, bayes_margin=30.0, noise_variance=1.0, amplitude_table=None,
-                 screen_anomalies=None, **kwargs):
+                 screen_anomalies=None, shared_options=None, **kwargs):
         super().__init__(variable_params, **kwargs)
         self.block = block_model
         self.xp = block_model.xp
@@ -225,7 +225,119 @@ class EccentricCellPE(BaseModel):
         self.oversampling = int(oversampling)
         self.screen_margin, self.bayes_margin = float(screen_margin), float(bayes_margin)
         self.noise_variance = float(noise_variance)
+        # shared_options: keyword arguments of pycbc.filter.eccentric_shared.EccentricSharedRegion (data_window is
+        # required) for share(); without it the model evaluates every point directly
+        self.shared_options = shared_options
         self._last = None
+
+    #: the shared regions kept at once, the oldest dropped first
+    max_shared_regions = 2
+    #: points outside every shared region that one batch must have before a new region is built for them
+    min_new_region = 3000
+
+    @property
+    def batches_points(self):
+        """Whether :meth:`loglikelihoods` should get whole batches: once shared regions are possible."""
+        return self.shared_options is not None
+
+    @property
+    def shared_statistics(self):
+        """Counts of the shared computation (as BStatisticSurrogate's)."""
+        if getattr(self, '_shared_statistics', None) is None:
+            self._shared_statistics = dict(shared_points=0, single_points=0, shared_seconds=0.0, single_seconds=0.0,
+                                           regions=0, region_seconds=0.0, regions_refused=0,
+                                           largest_refused_gb=0.0)
+        return self._shared_statistics
+
+    def share(self, region, **kwargs):
+        """Set up an :class:`pycbc.filter.eccentric_shared.EccentricSharedRegion` over ``region`` (parameter
+        dicts); :meth:`loglikelihoods` then uses it for the points it covers. Raises ``MemoryError`` when a mode's
+        grid does not fit."""
+        import time
+        from pycbc.filter.eccentric_shared import EccentricSharedRegion
+        if self.shared_options is None:
+            raise ValueError('share needs shared_options')
+        regions = getattr(self, '_shared_regions', [])
+        while len(regions) >= self.max_shared_regions:
+            regions.pop(0)
+        self._shared_regions = regions
+        stats = self.shared_statistics
+        tick = time.time()
+        options = dict(self.shared_options)
+        options.update(kwargs)
+        try:
+            shared = EccentricSharedRegion(self, region, **options)
+        except MemoryError as err:
+            stats['regions_refused'] += 1
+            stats['largest_refused_gb'] = max(stats['largest_refused_gb'], getattr(err, 'need', 0) / 1e9)
+            err.__traceback__ = None
+            import gc
+            gc.collect()
+            if self.xp is not numpy:
+                self.xp.get_default_memory_pool().free_all_blocks()
+            raise
+        stats['regions'] += 1
+        stats['region_seconds'] += time.time() - tick
+        regions.append(shared)
+        self._shared_regions = regions[-self.max_shared_regions:]
+        return shared
+
+    def _share_split(self, points, depth=0):
+        try:
+            self.share(points)
+            return True
+        except MemoryError:
+            if depth >= 3 or len(points) < 2 * self.min_new_region // 4:
+                return False
+            key = numpy.array([p['mchirp'] for p in points])
+            half = numpy.median(key)
+            done = self._share_split([p for p, k in zip(points, key) if k <= half], depth + 1)
+            return self._share_split([p for p, k in zip(points, key) if k > half], depth + 1) or done
+
+    def loglikelihoods(self, points):
+        """The log likelihood of each of ``points`` (dicts of the variable parameters): from the shared regions
+        where they cover the point, directly otherwise; a batch with many points outside every region gets a new
+        one for them."""
+        import logging
+        import time
+        full = []
+        for p in points:
+            q = dict(self.static_params)
+            q.update(p)
+            full.append(q)
+        out = numpy.full(len(full), numpy.nan)
+        todo = numpy.ones(len(full), dtype=bool)
+        tick = time.time()
+        regions = getattr(self, '_shared_regions', [])
+        if regions and len(full) >= self.min_new_region:
+            covered = numpy.zeros(len(full), dtype=bool)
+            for shared in regions:
+                covered |= shared.inside(full)
+            outside = numpy.nonzero(~covered)[0]
+            if len(outside) >= self.min_new_region:
+                self._share_split([full[i] for i in outside])
+                regions = self._shared_regions
+        for shared in regions:
+            idx = numpy.nonzero(todo)[0]
+            if len(idx) == 0:
+                break
+            hit = shared.inside([full[i] for i in idx])
+            if hit.any():
+                sel = idx[hit]
+                out[sel] = shared([full[i] for i in sel])
+                todo[sel] = ~numpy.isfinite(out[sel])
+        middle = time.time()
+        nshared = int((~todo).sum())
+        for i in numpy.nonzero(todo)[0]:
+            out[i] = self.evaluate(full[i])['loglikelihood']
+        stats = self.shared_statistics
+        stats['shared_points'] += nshared
+        stats['single_points'] += int(todo.sum())
+        stats['shared_seconds'] += middle - tick
+        stats['single_seconds'] += time.time() - middle
+        logging.info("batch of %d: %d shared in %.2f s, %d directly in %.2f s", len(full), nshared, middle - tick,
+                     int(todo.sum()), time.time() - middle)
+        return out
 
     def _theta_sky(self, params):
         theta = numpy.array([params['mchirp'], params['eccentricity'], params['chi_eff'], params['q']], float)

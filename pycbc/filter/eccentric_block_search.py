@@ -160,6 +160,7 @@ class EccentricFFTBlockModel:
         self._source_cache = None
         f = numpy.asarray(grid.frequencies)
         coarse = numpy.asarray(response_frequencies)
+        self.response_frequencies = coarse
         if coarse[0] > f[0] or coarse[-1] < f[-1]:
             raise ValueError('response grid must cover the FFT frequencies')
         index = numpy.clip(numpy.searchsorted(coarse, f)-1, 0, len(coarse)-2)
@@ -311,6 +312,33 @@ class EccentricFFTBlockModel:
         g1 = self._mc_anchor_gram(a[i+1], theta, sky, anchor_indices, delay_bounds, response, chi, q)
         return g0*(1-w)+g1*w
 
+    def _anchored_gram(self, theta, sky, anchor_indices, delay_bounds, response):
+        if self.gram_sky_anchors is not None:
+            return self._sky_interpolated_gram(theta, sky, anchor_indices, delay_bounds)
+        return self._mc_interpolated_gram(theta, sky, anchor_indices, delay_bounds, response)
+
+    def template_gram(self, theta, sky, anchors=None):
+        """The template's complete Grams at its anchor delays, ``(anchor_times, gram)``, as :meth:`_prepare` gives
+        them, without the template's own correlation engine: only for a model whose Grams are anchored (in sky, or
+        in ln Mc and the cell's other coordinates), which a template does not need its mode spectra for."""
+        if self.gram_sky_anchors is None and self.gram_mc_anchors is None:
+            raise ValueError('template_gram needs anchored Grams')
+        anchors = self.gram_anchors if anchors is None else int(anchors)
+        lo, hi = self.delay_range
+        jlo, jhi = int(numpy.ceil(lo/self.grid.delta_t)), int(numpy.floor(hi/self.grid.delta_t))
+        anchor_indices = numpy.unique(numpy.linspace(jlo, jhi, anchors).round().astype(int))
+        response = None
+        if self.gram_sky_anchors is None:
+            xp = self.xp
+            rho = xp.asarray(self.response_builder(numpy.asarray(sky)), dtype=self.dtype)
+
+            def response(r):
+                return rho[r][..., self._index]*(1-self._weight)+rho[r][..., self._index+1]*self._weight
+            response.coarse, response.index, response.weight = rho, self._index, self._weight
+        gram = self._anchored_gram(numpy.asarray(theta, dtype=float), numpy.asarray(sky, dtype=float),
+                                   anchor_indices, (jlo, jhi), response)
+        return anchor_indices*self.grid.delta_t, gram
+
     def phase_frame(self, region, **kwargs):
         s = self.coordinates.encode(region)
         return s, self.metric, {'directions':numpy.eye(s.shape[1])}, None
@@ -352,10 +380,8 @@ class EccentricFFTBlockModel:
         self.work['prepare_seconds'] += perf_counter()-start
         anchor_indices = numpy.unique(numpy.linspace(jlo,jhi,anchors).round().astype(int))
         start = perf_counter()
-        if self.gram_sky_anchors is not None:
-            gram = self._sky_interpolated_gram(theta, sky, anchor_indices, (jlo, jhi))
-        elif self.gram_mc_anchors is not None:
-            gram = self._mc_interpolated_gram(theta, sky, anchor_indices, (jlo, jhi), response)
+        if self.gram_sky_anchors is not None or self.gram_mc_anchors is not None:
+            gram = self._anchored_gram(theta, sky, anchor_indices, (jlo, jhi), response)
         elif self.reuse_grams and key in self._template_grams:
             gram = xp.asarray(self._template_grams[key])
             self.work['gram_cache_hits'] += 1
