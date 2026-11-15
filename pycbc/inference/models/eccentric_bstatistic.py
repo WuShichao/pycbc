@@ -309,7 +309,11 @@ class EccentricCellPE(BaseModel):
         todo = numpy.ones(len(full), dtype=bool)
         tick = time.time()
         regions = getattr(self, '_shared_regions', [])
-        if regions and len(full) >= self.min_new_region:
+        if not regions and self.shared_options is not None and len(full) >= self.min_new_region:
+            # the first large batch (as a sampler's whitened frame) is its own region
+            self._share_split(full)
+            regions = getattr(self, '_shared_regions', [])
+        elif regions and len(full) >= self.min_new_region:
             covered = numpy.zeros(len(full), dtype=bool)
             for shared in regions:
                 covered |= shared.inside(full)
@@ -328,6 +332,9 @@ class EccentricCellPE(BaseModel):
                 todo[sel] = ~numpy.isfinite(out[sel])
         middle = time.time()
         nshared = int((~todo).sum())
+        if todo.any() and self.xp is not numpy:
+            # the direct engine's workspace: the shared evaluation's freed blocks back to the device
+            self.xp.get_default_memory_pool().free_all_blocks()
         for i in numpy.nonzero(todo)[0]:
             out[i] = self.evaluate(full[i])['loglikelihood']
         stats = self.shared_statistics
@@ -346,10 +353,10 @@ class EccentricCellPE(BaseModel):
         sky = numpy.array([dlon / slon, (params['eclipticlatitude'] - lat0) / slat])
         return theta, sky
 
-    def _log_bayes(self, z, g):
+    def _log_bayes(self, z, g, validate=True):
         return mean_anomaly_log_bayes(z, g, self.block.offsets, self.distance_prior, self.nodes, n_l0=self.n_l0,
                                       noise_variance=self.noise_variance, order=self.amplitude_order,
-                                      table=self.table, xp=self.xp)
+                                      table=self.table, xp=self.xp, validate=validate)
 
     def evaluate(self, params=None):
         """ln B and the time quadrature at ``params`` (the current point by
@@ -395,7 +402,10 @@ class EccentricCellPE(BaseModel):
         order = numpy.argsort(-ftwof)
         best = float(host(self._log_bayes(zf[..., order[:1]], gf[..., order[:1]])[0])[0])
         active = numpy.flatnonzero(ftwof / 2 >= best - self.bayes_margin)
-        lnb = host(self._log_bayes(zf[..., active], gf[..., active])[0])
+        # in chunks: the orientation quadrature holds n_l0 x nodes values per sample, and a quiet point keeps
+        # most of its samples
+        lnb = numpy.concatenate([host(self._log_bayes(zf[..., active[c:c + 256]], gf[..., active[c:c + 256]])[0])
+                                 for c in range(0, len(active), 256)])
         width = dt / P
         terms = lnb + numpy.log(width)
         top = terms.max()
@@ -415,6 +425,16 @@ class EccentricCellPE(BaseModel):
     def _loglikelihood(self):
         return self.evaluate()['loglikelihood']
 
+    def _shared_evaluate(self, params=None):
+        """The current point's quadrature from a shared region that covers it, or ``None``."""
+        params = self.current_params if params is None else params
+        for shared in getattr(self, '_shared_regions', []):
+            if shared.inside([params])[0]:
+                ev = shared.evaluate(params)
+                if ev is not None:
+                    return ev
+        return None
+
     def reconstruct(self, rec=None, seed=None):
         """Draw the marginalised parameters at the current point: ``delta_tc``
         (the arrival-time delay, the model's lag convention), ``mean_anomaly``,
@@ -426,7 +446,9 @@ class EccentricCellPE(BaseModel):
         from pycbc.tmpltbank.fstatistic_metric import orientation_weights
         rng = numpy.random.default_rng(seed)
         rec = {} if rec is None else rec
-        ev = self.evaluate()
+        ev = self._shared_evaluate()
+        if ev is None:
+            ev = self.evaluate()
         terms = ev['log_bayes'] + numpy.log(ev['widths'])
         weight = numpy.exp(terms - terms.max())
         k = rng.choice(len(weight), p=weight / weight.sum())

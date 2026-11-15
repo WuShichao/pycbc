@@ -221,6 +221,16 @@ class EccentricModePhaseCorrelation(PhaseNUFFTCorrelation):
     def time_offsets(self, thetas):
         raise NotImplementedError
 
+    def release(self):
+        """Drop the per-frequency arrays only a grid's build needs (data, strengths, derivatives, the view's
+        reference waveform); projections, sky weights and errors keep working."""
+        for name in ('_data', '_D', '_Dp', '_logf', '_strengths', '_template_power', '_rho', '_rho_at', '_power'):
+            if hasattr(self, name):
+                setattr(self, name, None)
+        view = self.family
+        view.b0 = view.t0 = None
+        self.f = None
+
     def direct(self, thetas, delays):
         """The correlations term by term on the full grid, without a transform or a projection (for tests)."""
         from pycbc.tdi.ssb_yearly_harmonics import ORBITAL_ANGULAR_FREQUENCY
@@ -278,6 +288,9 @@ class EccentricSharedRegion(object):
     """
     def __init__(self, model, region, data_window, family=None, keys=None, band_margin=60 * 86400.0,
                  sky_tolerance=1e-4, edge_margin=30.0, probes=8, grid_options=None, seed=0):
+        import logging
+        import time
+        tick = time.time()
         self.model = model
         block = model.block
         self.xp = block.xp
@@ -293,10 +306,23 @@ class EccentricSharedRegion(object):
         self.dt = dt
         lo, hi = model.delay_window
         self.lags = numpy.arange(int(numpy.ceil(lo / dt)), int(numpy.floor(hi / dt)))
+        # one response per sky point per region, shared by every mode's view (sky weights and errors ask for it
+        # per mode and per call)
+        self._responses = {}
+        builder = block.response_builder
+
+        def response(sky):
+            key = (round(float(sky[0]), 12), round(float(sky[1]), 12))
+            if key not in self._responses:
+                if len(self._responses) > 200000:
+                    self._responses.clear()
+                self._responses[key] = numpy.asarray(builder(numpy.asarray(sky, dtype=float)))
+            return self._responses[key]
+        self._response_function = response
         self.views, self.correlators, self.grids = [], [], []
         frames, shifts = [], []
         for k, key in enumerate(self.keys):
-            view = EccentricModeView(block, theta0, k, block.response_builder, family.f_ref,
+            view = EccentricModeView(block, theta0, k, response, family.f_ref,
                                      block.response_frequencies)
             corr = EccentricModePhaseCorrelation(family, key, view, theta0, block.data, skies,
                                                  sky_tolerance=self.sky_tolerance, window=self.data_window,
@@ -306,16 +332,22 @@ class EccentricSharedRegion(object):
             self.correlators.append(corr)
             frames.append(frame)
             shifts.append(corr.project(thetas, frame)[1])
+        logging.info("EccentricSharedRegion: %d points, correlators and frames in %.1f s", len(region),
+                     time.time() - tick)
         # the grid times the region needs (per mode, T = delay + shift): where the probes' ln B lies within
         # edge_margin of each one's largest, for the probes within it of the best, widened by itself and eight lags
         rng = numpy.random.default_rng(seed)
         pick = rng.choice(len(region), min(int(probes), len(region)), replace=False)
-        curves = []
+        curves, values = [], []
         for j in pick:
             ev = model.evaluate(region[j])
             curves.append((ev['delays'], ev['log_bayes']))
+            values.append(float(ev['loglikelihood']))
         tops = numpy.array([v[1].max() for v in curves])
+        # the region's largest log likelihood seen: a point far below it needs no exact arrival-time edges
+        self.best_loglikelihood = max(values)
         good = numpy.nonzero(tops >= tops.max() - self.edge_margin)[0]
+        logging.info("EccentricSharedRegion: %d probes in %.1f s", len(pick), time.time() - tick)
         options = dict(grid_options or {})
         for k in range(len(self.keys)):
             tlo, thi = numpy.inf, -numpy.inf
@@ -327,7 +359,12 @@ class EccentricSharedRegion(object):
             reach = (self.lags[0] * dt + shifts[k].min() - dt, self.lags[-1] * dt + shifts[k].max() + 2 * dt)
             window = (max(tlo - pad, reach[0]), min(thi + pad, reach[1]))
             self.grids.append(PhaseGrid(self.correlators[k], thetas, (lo, hi), time_range=window, **options))
+            self.correlators[k].release()
+            if self.xp is not numpy:
+                self.xp.get_default_memory_pool().free_all_blocks()
         model.block._prepared = None
+        logging.info("EccentricSharedRegion: grids %s in %.1f s", [list(g.size) for g in self.grids],
+                     time.time() - tick)
 
     def _coordinates(self, points):
         pairs = [self.model._theta_sky(p) for p in points]
@@ -335,12 +372,33 @@ class EccentricSharedRegion(object):
 
     def inside(self, points):
         """Whether each point lies in the region every mode's grid covers, with its response on the sky basis."""
+        import logging
         thetas, skies = self._coordinates(points)
         ok = numpy.ones(len(points), dtype=bool)
-        for grid in self.grids:
-            ok &= grid.inside(thetas)
+        reasons = {}
+        for k, grid in enumerate(self.grids):
+            s, _, _ = grid.correlator.project(thetas, grid.frame)
+            hw = grid.half_width
+            on = numpy.ones(len(points), dtype=bool)
+            for d in range(grid.ndir):
+                lo = grid.start[d] + hw[d] * grid.step[d]
+                hi = grid.start[d] + (grid.size[d] - hw[d] - 1) * grid.step[d]
+                on &= (s[:, d] >= lo) & (s[:, d] <= hi)
+            taylor = numpy.ones(len(points), dtype=bool)
+            if grid.terms > 1:
+                taylor = numpy.abs(s[:, grid.ndir] - grid.middle) <= grid.s3_half
+            phase = grid.correlator.phase_residual(thetas, grid.frame) <= grid.phase_tolerance
+            reasons['off_grid_%d' % k] = int((~on).sum())
+            reasons['taylor_%d' % k] = int((~taylor).sum())
+            reasons['phase_%d' % k] = int((~phase).sum())
+            ok &= on & taylor & phase
         if ok.any():
-            ok[ok] = self.correlators[0].sky_error(skies[ok]) <= self.sky_tolerance
+            sky = self.correlators[0].sky_error(skies[ok]) <= self.sky_tolerance
+            reasons['sky'] = int((~sky).sum())
+            ok[ok] = sky
+        if len(points) >= 100:
+            logging.info("EccentricSharedRegion.inside: %d of %d; outside by %s", ok.sum(), len(points),
+                         {k: v for k, v in reasons.items() if v})
         return ok
 
     def _z(self, thetas, skies, delays):
@@ -354,6 +412,67 @@ class EccentricSharedRegion(object):
             out.append(xp.moveaxis(xp.asarray(z, dtype=xp.complex128) * carrier[None], 0, 1))
         return xp.stack(out, axis=1)
 
+    def _template_grams(self, thetas, skies):
+        """``(M, ..., A)``: each point's complete Grams at the block model's anchor delays, as its
+        ``template_gram`` gives them. For Grams anchored in sky, q, chi and ln Mc, one weight matrix over the
+        anchors (kept on the device) for all points; otherwise point by point."""
+        xp, block = self.xp, self.model.block
+        if (block.gram_sky_anchors is None or block.gram_mc_anchors is None or block.gram_chi_anchors is None
+                or block.gram_q_anchors is None):
+            grams = []
+            for th, sk in zip(thetas, skies):
+                atimes, g = block.template_gram(th, sk)
+                grams.append(g)
+            self._anchor_times = numpy.asarray(atimes, dtype=float)
+            return xp.stack(grams)
+        lo, hi = block.delay_range
+        jlo, jhi = int(numpy.ceil(lo / block.grid.delta_t)), int(numpy.floor(hi / block.grid.delta_t))
+        anchor_indices = numpy.unique(numpy.linspace(jlo, jhi, block.gram_anchors).round().astype(int))
+        self._anchor_times = anchor_indices * block.grid.delta_t
+        if not hasattr(self, '_anchor_grams'):
+            self._anchor_grams, self._anchor_order = {}, []
+
+        def axis(anchors, v, what):
+            if anchors is None:
+                return [(None, 1.0)]
+            if v < anchors[0] - 1e-9 or v > anchors[-1] + 1e-9:
+                raise ValueError('template %s lies outside the Gram anchors' % what)
+            i = int(numpy.clip(numpy.searchsorted(anchors, v, side='right') - 1, 0, len(anchors) - 2))
+            w = min(max((v - anchors[i]) / (anchors[i + 1] - anchors[i]), 0.), 1.)
+            return [(a, b) for a, b in ((anchors[i], 1 - w), (anchors[i + 1], w)) if b != 0]
+        weights = []
+        for th, sk in zip(thetas, skies):
+            row = {}
+            q = axis(block.gram_q_anchors, numpy.log(th[3] / block.q_reference) if block.gram_q_anchors is not None
+                     else 0., 'mass ratio')
+            c = axis(block.gram_chi_anchors, th[2] - block.coordinates.spin if block.gram_chi_anchors is not None
+                     else 0., 'spin')
+            x = axis(block.gram_mc_anchors, numpy.log(th[0] / block.coordinates.mchirp), 'chirp mass')
+            for sx, wx in axis(block.gram_sky_anchors, float(sk[0]), 'sky'):
+                for sy, wy in axis(block.gram_sky_anchors, float(sk[1]), 'sky'):
+                    for qa, wq in q:
+                        for ca, wc in c:
+                            for xa, wm in x:
+                                key = (float(sx), float(sy), qa, ca, float(xa))
+                                row[key] = row.get(key, 0.) + wx * wy * wq * wc * wm
+            weights.append(row)
+        for row, th in zip(weights, thetas):
+            for key in row:
+                if key not in self._anchor_grams:
+                    sx, sy, qa, ca, xa = key
+                    g = block._mc_anchor_gram(xa, th, (sx, sy), anchor_indices, (jlo, jhi),
+                                              block._response((sx, sy)), ca, qa)
+                    self._anchor_grams[key] = xp.asarray(g)
+                    self._anchor_order.append(key)
+        index = {k: i for i, k in enumerate(self._anchor_order)}
+        W = numpy.zeros((len(thetas), len(index)))
+        for j, row in enumerate(weights):
+            for key, w in row.items():
+                W[j, index[key]] = w
+        used = numpy.flatnonzero(W.any(axis=0))
+        G = xp.stack([self._anchor_grams[self._anchor_order[i]] for i in used])
+        return xp.tensordot(xp.asarray(W[:, used]), G, axes=(1, 0))
+
     #: samples per ln B call (its orientation quadrature holds n_l0 x nodes values per sample)
     bayes_chunk = 256
 
@@ -363,7 +482,8 @@ class EccentricSharedRegion(object):
         out = []
         for c in range(0, len(which), self.bayes_chunk):
             sel = xp.asarray(which[c:c + self.bayes_chunk])
-            v = self.model._log_bayes(z[..., sel], g[..., sel])[0]
+            # the screen's 2F (mean_anomaly_twof_analytic) has checked these Grams already
+            v = self.model._log_bayes(z[..., sel], g[..., sel], validate=False)[0]
             out.append(v.get() if hasattr(v, 'get') else numpy.asarray(v))
         return numpy.concatenate(out) if out else numpy.zeros(0)
 
@@ -385,7 +505,22 @@ class EccentricSharedRegion(object):
 
     def __call__(self, points):
         """The log likelihood of each point; ``nan`` where its F has not fallen by ``edge_margin`` at the ends of
-        the lags its grid times cover. All points' correlations, Grams and statistics are batched."""
+        the lags its grid times cover. The correlations, Grams and statistics of ``point_chunk`` points at a time
+        are batched."""
+        out = [self._evaluate(points[c:c + self.point_chunk]) for c in range(0, len(points), self.point_chunk)]
+        return numpy.concatenate(out) if out else numpy.zeros(0)
+
+    #: points evaluated together (device memory grows with points x lags)
+    point_chunk = 512
+
+    def evaluate(self, point):
+        """For one point, what :meth:`EccentricCellPE.evaluate` returns (``loglikelihood``, the quadrature's
+        ``delays``, ``widths``, ``log_bayes``, and the ``z`` and ``gram`` of its active samples), from the region;
+        ``None`` where its log likelihood would be ``nan``."""
+        out = self._evaluate([point], keep=True)
+        return out[0] if out else None
+
+    def _evaluate(self, points, keep=False):
         from pycbc.filter.eccentric_fast_search import mean_anomaly_twof_analytic
         m, xp = self.model, self.xp
         host = lambda a: a.get() if hasattr(a, 'get') else numpy.asarray(a)
@@ -406,7 +541,7 @@ class EccentricSharedRegion(object):
         out = numpy.full(M, numpy.nan)
         idx = numpy.nonzero(last - first >= 2)[0]
         if not len(idx):
-            return out
+            return [] if keep else out
         th, sk, fi, la = thetas[idx], skies[idx], first[idx], last[idx]
         Mi = len(idx)
         count = la - fi + 1
@@ -416,13 +551,7 @@ class EccentricSharedRegion(object):
         K = numpy.minimum(fi[:, None] + col[None], la[:, None])
         delays = lags[K] * dt                                                  # (Mi, W)
         # the points' anchor Grams (cached anchors: no mode spectra)
-        grams = []
-        for j in range(Mi):
-            atimes, g = m.block.template_gram(th[j], sk[j])
-            grams.append(g)
-        self._anchor_times = numpy.asarray(atimes, dtype=float)
-        stack = xp.stack(grams)
-        del grams
+        stack = self._template_grams(th, sk)
         rows = numpy.repeat(numpy.arange(Mi), W)
         z = self._z(th, sk, delays)                                            # (Mi, K, 2, W)
         nk = z.shape[1]
@@ -436,12 +565,12 @@ class EccentricSharedRegion(object):
         r = numpy.arange(Mi)
         edge = ((F[:, 0] <= top - self.edge_margin) | (fi == 0)) & \
             ((F[r, count - 1] <= top - self.edge_margin) | (la == L - 1))
-        keep = F >= top[:, None] - m.screen_margin
-        keep = (keep | numpy.roll(keep, 1, axis=1) | numpy.roll(keep, -1, axis=1)) & valid
+        screened = F >= top[:, None] - m.screen_margin
+        screened = (screened | numpy.roll(screened, 1, axis=1) | numpy.roll(screened, -1, axis=1)) & valid
         # the oversampled samples of the kept lags
         P = m.oversampling
         frac = numpy.arange(P) / P
-        fine = [((K[j][keep[j]][None, :] + lags[0] + frac[:, None]) * dt).ravel() for j in range(Mi)]
+        fine = [((K[j][screened[j]][None, :] + lags[0] + frac[:, None]) * dt).ravel() for j in range(Mi)]
         nf = numpy.array([len(f) for f in fine])
         Wf = int(nf.max())
         fdel = numpy.array([numpy.concatenate([f, numpy.full(Wf - len(f), f[-1])]) for f in fine])
@@ -467,5 +596,26 @@ class EccentricSharedRegion(object):
         sums = numpy.zeros(Mi)
         numpy.add.at(sums, owner, numpy.exp(terms - tops[owner]))
         value = tops + numpy.log(sums) - numpy.log(hi - lo)
+        # a point whose ln B has not fallen off at the ends of its lags, but which, even with every lag of the
+        # model's window as large as its largest, lies edge_margin below the region's best, keeps its value: its
+        # posterior weight is below exp(-edge_margin) of the best either way
+        bound = top + numpy.log(dt * L) - numpy.log(hi - lo)
+        edge = edge | (bound < self.best_loglikelihood - self.edge_margin)
         out[idx] = numpy.where(edge, value, numpy.nan)
-        return out
+        if M >= 100:
+            import logging
+            logging.info("EccentricSharedRegion: %d points, %d without lags on the grid, %d failing the edge check",
+                         M, M - Mi, int((~edge).sum()))
+        if not keep:
+            return out
+        fd = fdel.ravel()[flat]
+        records = []
+        for j in range(Mi):
+            if not edge[j]:
+                continue
+            mine = active[owner == j]
+            sel = xp.asarray(mine)
+            records.append(dict(loglikelihood=float(value[j]), delays=fd[mine], widths=numpy.full(len(mine), dt / P),
+                                log_bayes=lnb[owner == j], z=zf[..., sel], gram=gf[..., sel],
+                                theta=th[j], sky=sk[j], shared=True))
+        return records

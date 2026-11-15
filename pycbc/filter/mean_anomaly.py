@@ -187,7 +187,8 @@ def mean_anomaly_statistic(z, gram, c, n_l0=None):
 
 
 def mean_anomaly_log_bayes(z, gram, c, prior, nodes, n_l0=None,
-                           noise_variance=1.0, order=64, table=None, xp=numpy):
+                           noise_variance=1.0, order=64, table=None, xp=numpy,
+                           validate=True):
     """Physical two-polarization ln B, also marginalized over mean anomaly.
 
     Inputs z and gram follow mean_anomaly_components and retain all mode
@@ -204,11 +205,14 @@ def mean_anomaly_log_bayes(z, gram, c, prior, nodes, n_l0=None,
     or an incoherent sum of mode powers. Grid convergence must be checked.
     This direct reference also validates the Hermitian/PSD Gram with 2F;
     it does not claim an optimized amplitude-marginal search implementation.
+    ``validate=False`` skips that check (a full 2F evaluation), for callers
+    whose Grams are already validated.
     """
     from pycbc.filter.bstatistic import log_orientation_marginal
     if not numpy.isfinite(noise_variance) or noise_variance <= 0:
         raise ValueError('noise_variance must be positive and finite')
-    mean_anomaly_twof(z, gram, c, n_l0, xp=xp)
+    if validate:
+        mean_anomaly_twof(z, gram, c, n_l0, xp=xp)
     zl, gl, angles = mean_anomaly_components(z, gram, c, n_l0, xp=xp)
     shape = zl.shape[2:]
     missing = len(shape) - len(gl.shape[3:])

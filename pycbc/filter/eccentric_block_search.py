@@ -258,6 +258,21 @@ class EccentricFFTBlockModel:
         if key in self._mc_grams:
             self.work['gram_cache_hits'] += 1
             return self.xp.asarray(self._mc_grams[key])
+        # gram_disk_cache (a directory) with gram_disk_tag (a string naming everything the Gram depends on besides
+        # the key: the cell, grid, response, orders, observation): anchor Grams are data-independent, so a set of
+        # injections on one cell shares them
+        path = None
+        disk = getattr(self, 'gram_disk_cache', None)
+        if disk is not None:
+            import hashlib
+            import os
+            name = hashlib.sha1(repr((getattr(self, 'gram_disk_tag', ''), key, tuple(int(v) for v in delay_bounds))
+                                     ).encode()).hexdigest()
+            path = os.path.join(disk, name + '.npy')
+            if os.path.exists(path):
+                self._mc_grams[key] = numpy.load(path)
+                self.work['gram_cache_hits'] += 1
+                return self.xp.asarray(self._mc_grams[key])
         b, t = self.source_builder(anchor)
         engine_class = getattr(self, 'fft_engine_class', WindowedModeFFT)
         engine = engine_class(self.grid, b, t, response, self.orders, self.data,
@@ -266,6 +281,12 @@ class EccentricFFTBlockModel:
         del b, t
         gram = engine.gram(anchor_indices)
         self._mc_grams[key] = gram.get() if hasattr(gram, 'get') else gram.copy()
+        if path is not None:
+            import os
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + '.tmp%d.npy' % os.getpid()
+            numpy.save(tmp, self._mc_grams[key])
+            os.replace(tmp, path)
         del engine
         return gram
 
