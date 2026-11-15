@@ -604,7 +604,7 @@ class EccentricSharedRegion(object):
                          numpy.percentile(last[lost], [0, 50, 100]).tolist(), L)
         idx = numpy.nonzero(last - first >= 2)[0]
         if not len(idx):
-            return [] if keep else out
+            return [None] * M if keep else out
         th, sk, fi, la = thetas[idx], skies[idx], first[idx], last[idx]
         Mi = len(idx)
         count = la - fi + 1
@@ -663,7 +663,11 @@ class EccentricSharedRegion(object):
         # model's window as large as its largest, lies edge_margin below the region's best, keeps its value: its
         # posterior weight is below exp(-edge_margin) of the best either way
         bound = top + numpy.log(dt * L) - numpy.log(hi - lo)
-        edge = edge | (bound < self.best_loglikelihood - self.edge_margin)
+        # only where the grid covers the point's whole window: elsewhere top is the largest F over the lags the grid
+        # holds, and a peak outside them (a template whose arrival time lies past the grid's times) is no bound at
+        # all (two posterior samples got ln B 11 and 20 from a region where the direct engine gives 110 and 106)
+        whole = (fi == 0) & (la == L - 1)
+        edge = edge | (whole & (bound < self.best_loglikelihood - self.edge_margin))
         out[idx] = numpy.where(edge, value, numpy.nan)
         if M >= 100 and (M > Mi or not edge.all()):
             import logging
@@ -672,15 +676,16 @@ class EccentricSharedRegion(object):
         if not keep:
             return out
         fd = fdel.ravel()[flat]
-        records = []
+        # one record per point, in order; None where the region gives no value (no lags, or the edge check)
+        records = [None] * M
         for j in range(Mi):
             if not edge[j]:
                 continue
             mine = active[owner == j]
             sel = xp.asarray(mine)
-            records.append(dict(loglikelihood=float(value[j]), delays=fd[mine], widths=numpy.full(len(mine), dt / P),
-                                log_bayes=lnb[owner == j], z=zf[..., sel], gram=gf[..., sel],
-                                theta=th[j], sky=sk[j], shared=True))
+            records[idx[j]] = dict(loglikelihood=float(value[j]), delays=fd[mine], widths=numpy.full(len(mine), dt / P),
+                                   log_bayes=lnb[owner == j], z=zf[..., sel], gram=gf[..., sel],
+                                   theta=th[j], sky=sk[j], shared=True)
         return records
 
 
@@ -798,8 +803,12 @@ class EccentricPhaseCoordinates(object):
             raw[:, m['block']] += (m['weights'](X) - m['W0'][None]) @ m['V']
         return raw - (raw @ self._Q) @ self._Q.T
 
-    def fit(self, theta):
-        """Set the directions from rows of (mchirp, q, eccentricity, chi_eff) (at most ``max_fit`` of them)."""
+    def fit(self, theta, refit=False):
+        """Set the directions from rows of (mchirp, q, eccentricity, chi_eff) (at most ``max_fit`` of them); a
+        second call keeps the first fit unless ``refit`` (a sampler fits to the prior's draws again, which a caller
+        that already fitted to the same prior need not pay for)."""
+        if self._vs is not None and not refit:
+            return self
         theta = numpy.atleast_2d(numpy.asarray(theta, dtype=float))
         theta = theta[numpy.all(numpy.isfinite(theta), axis=1)]
         if len(theta) > self.max_fit:

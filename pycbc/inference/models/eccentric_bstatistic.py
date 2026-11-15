@@ -261,7 +261,13 @@ class EccentricCellPE(BaseModel):
             raise ValueError('share needs shared_options')
         regions = getattr(self, '_shared_regions', [])
         while len(regions) >= self.max_shared_regions:
-            regions.pop(0)
+            # the region that has evaluated the fewest points goes: the oldest is often the one the sampler is
+            # working in (a frame's region, made before the refinement's small ones), and a count that decays by
+            # batch forgot it after a dozen small batches. The newest region is kept until it has been tried.
+            uses = [getattr(r, 'points_used', 0) for r in regions]
+            if len(regions) > 1:
+                uses[-1] = numpy.inf
+            regions.pop(int(numpy.argmin(uses)))
         self._shared_regions = regions
         stats = self.shared_statistics
         tick = time.time()
@@ -285,8 +291,9 @@ class EccentricCellPE(BaseModel):
             raise
         stats['regions'] += 1
         stats['region_seconds'] += time.time() - tick
+        shared.points_used = 0
         regions.append(shared)
-        self._shared_regions = regions[-self.max_shared_regions:]
+        self._shared_regions = regions
         return shared
 
     def _share_split(self, points, depth=0):
@@ -326,14 +333,23 @@ class EccentricCellPE(BaseModel):
             # the first large batch (as a sampler's whitened frame) is its own region
             self._share_split(full)
             regions = getattr(self, '_shared_regions', [])
-        elif regions and len(full) >= self.min_new_region:
+        elif regions:
             covered = numpy.zeros(len(full), dtype=bool)
             for shared in regions:
                 covered |= shared.inside(full)
             outside = numpy.nonzero(~covered)[0]
-            if len(outside) >= self.min_new_region:
-                self._share_split([full[i] for i in outside])
+            # the points outside every region, pooled over batches: a refinement's batches each hold a few dozen of
+            # them, too few for a region of their own, which then went directly batch after batch
+            pool = getattr(self, '_outside_pool', [])
+            if len(full) >= 50:
+                # only a refinement's batches (a frame's climb asks a dozen points at a time, along its path)
+                pool.extend(full[i] for i in outside)
+            if len(pool) >= self.min_new_region:
+                self._share_split(pool)
                 regions = self._shared_regions
+                pool = []
+            self._outside_pool = pool
+        used = {}
         for shared in regions:
             idx = numpy.nonzero(todo)[0]
             if len(idx) == 0:
@@ -342,7 +358,10 @@ class EccentricCellPE(BaseModel):
             if hit.any():
                 sel = idx[hit]
                 out[sel] = shared([full[i] for i in sel])
+                used[id(shared)] = len(sel)
                 todo[sel] = ~numpy.isfinite(out[sel])
+        for r in regions:
+            r.points_used = getattr(r, 'points_used', 0) + used.get(id(r), 0)
         middle = time.time()
         nshared = int((~todo).sum())
         if todo.any() and self.xp is not numpy:
@@ -448,18 +467,141 @@ class EccentricCellPE(BaseModel):
                     return ev
         return None
 
-    def reconstruct(self, rec=None, seed=None):
+    @property
+    def lognl(self):
+        """The noise model's log likelihood of the data, ``-<d, d> / 2``: ``-sum |d|^2 / (2 noise_variance)``
+        over the whitened data spectrum (``noise_variance`` per real component), without the normalisation
+        constant, as PyCBC's Gaussian-noise models define it."""
+        if getattr(self, '_lognl', None) is None:
+            d = self.block.data
+            total = (abs(d) ** 2).sum()
+            total = float(total.get() if hasattr(total, 'get') else total)
+            self._lognl = -0.5 * total / self.noise_variance
+        return self._lognl
+
+    def reconstruct_many(self, points, seeds, chunk=256):
+        """:meth:`reconstruct` at each of ``points`` (dicts of the variable parameters) with its seed, ``chunk``
+        points at a time: the time quadratures of the points a shared region covers computed together, the rest
+        directly; then the draws per point (the quadratures' device arrays are released chunk by chunk)."""
+        # the posterior's points outside every region (as many as a third: the regions were built for the
+        # sampler's boxes) get a region of their own first, as a large batch does in loglikelihoods
+        if getattr(self, 'shared_options', None) is not None and len(points) >= self.min_new_region:
+            full = []
+            for p in points:
+                q = dict(self.static_params)
+                q.update(p)
+                full.append(q)
+            covered = numpy.zeros(len(full), dtype=bool)
+            for shared in getattr(self, '_shared_regions', []):
+                covered |= shared.inside(full)
+            outside = numpy.nonzero(~covered)[0]
+            if len(outside) >= self.min_new_region:
+                import logging
+                logging.info("reconstruct_many: %d of %d points outside every region: sharing them", len(outside),
+                             len(full))
+                self._share_split([full[i] for i in outside])
+        out = []
+        for c in range(0, len(points), chunk):
+            part = points[c:c + chunk]
+            full = []
+            for p in part:
+                q = dict(self.static_params)
+                q.update(p)
+                full.append(q)
+            evs = [None] * len(full)
+            todo = numpy.arange(len(full))
+            for shared in getattr(self, '_shared_regions', []):
+                if not len(todo):
+                    break
+                sel = todo[shared.inside([full[i] for i in todo])]
+                if len(sel):
+                    for i, ev in zip(sel, shared._evaluate([full[i] for i in sel], keep=True)):
+                        evs[i] = ev
+                todo = numpy.array([i for i in todo if evs[i] is None], dtype=int)
+            for i, p in enumerate(part):
+                if evs[i] is None:
+                    self.update(**p)
+                    evs[i] = self._shared_evaluate()
+                    if evs[i] is None:
+                        evs[i] = self.evaluate()
+            out.extend(self._draw_many(evs, seeds[c:c + len(part)]))
+            del evs
+        return out
+
+    def _draw_many(self, evs, seeds):
+        """The draws of :meth:`reconstruct` for many points' quadratures ``evs`` at once: each point's own
+        generator, used in the same order as :meth:`reconstruct` uses it (so the draws are the same), with the
+        anomaly-resolved ln B and the mean-anomaly components of all the drawn time samples computed together."""
+        from pycbc.filter.bstatistic import draw_orientation, draw_amplitude, draw_phase, _project
+        from pycbc.filter.mean_anomaly import mean_anomaly_components
+        from pycbc.tmpltbank.fstatistic_metric import orientation_weights
+        xp = self.xp
+
+        def host(a):
+            return a.get() if hasattr(a, 'get') else numpy.asarray(a)
+        rngs, delays, zs, gs = [], [], [], []
+        for ev, seed in zip(evs, seeds):
+            rng = numpy.random.default_rng(seed)
+            terms = ev['log_bayes'] + numpy.log(ev['widths'])
+            weight = numpy.exp(terms - terms.max())
+            k = rng.choice(len(weight), p=weight / weight.sum())
+            delays.append(float(ev['delays'][k] + rng.random() * ev['widths'][k]))
+            rngs.append(rng)
+            zs.append(xp.asarray(ev['z'][..., k:k + 1]))
+            g = ev['gram']
+            # a Gram shared by the samples has no sample axis
+            gs.append(xp.asarray(g[..., None] if g.ndim == 4 else g[..., k:k + 1]))
+        z = xp.concatenate(zs, axis=-1)
+        g = xp.concatenate(gs, axis=-1)
+        _, by_angle, angles = self._log_bayes(z, g)
+        by_angle = host(by_angle).reshape(len(angles), len(evs))
+        zl, gl, _ = mean_anomaly_components(z, g, self.block.offsets, self.n_l0, xp=xp)
+        zl, gl = host(zl), host(gl)
+        step = 2 * numpy.pi / len(angles)
+        out = []
+        for i, (ev, rng) in enumerate(zip(evs, rngs)):
+            w = numpy.exp(by_angle[:, i] - by_angle[:, i].max())
+            a = rng.choice(len(w), p=w / w.sum())
+            anomaly = float(numpy.mod(angles[a] + (rng.random() - 0.5) * step, 2 * numpy.pi))
+            zz = zl[a, :, i] / self.noise_variance
+            gg = gl[a][..., i]
+            gram = (float(gg[0, 0].real) / self.noise_variance, float(gg[1, 1].real) / self.noise_variance,
+                    complex(gg[0, 1]) / self.noise_variance)
+            cos_iota, psi = draw_orientation(zz, gram, self.distance_prior, self.nodes, rng)
+            wv = orientation_weights(numpy.arccos(cos_iota), psi)
+            x, gx = _project(zz.reshape(2, 1), *(numpy.array([v]) for v in gram), wv.reshape(1, 2), numpy)
+            h = draw_amplitude(float(x[0, 0]), float(gx[0, 0]), self.distance_prior, rng)
+            X = complex(numpy.conj(wv) @ zz)
+            phase = draw_phase(h, X, rng)
+            loglr = h * numpy.real(numpy.exp(-1j * phase) * X) - 0.5 * h * h * float(gx[0, 0])
+            quarter = rng.integers(4)
+            out.append(dict(delta_tc=delays[i], mean_anomaly=anomaly, loglr=float(loglr),
+                            snr=float(numpy.sqrt(max(2 * loglr, 0.0))), inclination=float(numpy.arccos(cos_iota)),
+                            polarization=float(psi + quarter * numpy.pi / 2),
+                            distance=float(self.distance_prior.scale / h),
+                            coa_phase=float(numpy.mod(0.5 * (phase + quarter * numpy.pi), numpy.pi)),
+                            loglikelihood=float(self.lognl + loglr), marginal_loglr=float(ev['loglikelihood'])))
+        return out
+
+    def reconstruct(self, rec=None, seed=None, ev=None):
         """Draw the marginalised parameters at the current point: ``delta_tc``
         (the arrival-time delay, the model's lag convention), ``mean_anomaly``,
         ``inclination``, ``polarization``, ``distance``, ``coa_phase`` (half
-        the dominant (2,2,2) mode's phase, modulo pi, as BStatisticSurrogate),
-        ``loglr``, ``snr`` and ``loglikelihood``."""
+        the dominant (2,2,2) mode's phase, modulo pi, as BStatisticSurrogate).
+        As PyCBC's marginalised models reconstruct
+        (:meth:`pycbc.inference.models.tools.DistMarg.reconstruct`): ``loglr``
+        is the log likelihood ratio at the drawn point, not marginalised,
+        ``loglikelihood = lognl + loglr``, and ``snr = sqrt(2 loglr)``;
+        ``marginal_loglr`` is the model's own ln B, marginalised over all of
+        them, the quantity the sampler sampled."""
         from pycbc.filter.bstatistic import draw_orientation, draw_amplitude, draw_phase, _project
         from pycbc.filter.mean_anomaly import mean_anomaly_components
         from pycbc.tmpltbank.fstatistic_metric import orientation_weights
         rng = numpy.random.default_rng(seed)
         rec = {} if rec is None else rec
-        ev = self._shared_evaluate()
+        if ev is None:
+            # ev: the current point's quadrature when the caller has it (reconstruct_many)
+            ev = self._shared_evaluate()
         if ev is None:
             ev = self.evaluate()
         terms = ev['log_bayes'] + numpy.log(ev['widths'])
@@ -495,5 +637,5 @@ class EccentricCellPE(BaseModel):
                    snr=float(numpy.sqrt(max(2 * loglr, 0.0))), inclination=float(numpy.arccos(cos_iota)),
                    polarization=float(psi + quarter * numpy.pi / 2), distance=float(self.distance_prior.scale / h),
                    coa_phase=float(numpy.mod(0.5 * (phase + quarter * numpy.pi), numpy.pi)),
-                   loglikelihood=float(ev['loglikelihood']))
+                   loglikelihood=float(self.lognl + loglr), marginal_loglr=float(ev['loglikelihood']))
         return rec

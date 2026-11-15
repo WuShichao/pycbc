@@ -126,6 +126,14 @@ class AMRSampler(BaseSampler):
         (see
         :class:`pycbc.inference.models.bstatistic_surrogate.SharedLikelihood`).
         Default 0, off.
+    frame_starts : int, optional
+        The number of Newton climbs the Laplace or curvilinear frame takes
+        its maximum from (the pilot's best separate points and the start
+        cube). Default 5.
+    share_frame : bool, optional
+        With ``shared_region`` and a curvilinear frame, hand the model the
+        frame's whitened ball before its first boxes are evaluated (see
+        :meth:`_share_ball`). Default False.
     share_after_pilot : bool, optional
         With ``shared_region``, hand the model the pilot's region already,
         before the frame is set, so that the frame's own evaluations (the
@@ -202,7 +210,7 @@ class AMRSampler(BaseSampler):
                  laplace_frame=False, curvilinear_frame=False,
                  shared_region=0, explore_basin=0.0, explore_miss=0.01,
                  check_points=0, check_tolerance=0.1, start_cube=None,
-                 share_after_pilot=False):
+                 share_after_pilot=False, frame_starts=5, share_frame=False):
         super().__init__(model)
         self.initial_divisions = int(initial_divisions)
         self.partition_file = partition_file
@@ -213,6 +221,8 @@ class AMRSampler(BaseSampler):
         self.curvilinear_frame = bool(curvilinear_frame)
         self.shared_region = int(shared_region)
         self.share_after_pilot = bool(share_after_pilot)
+        self.frame_starts = int(frame_starts)
+        self.share_frame = bool(share_frame)
         self.explore_basin = float(explore_basin)
         self.explore_miss = float(explore_miss)
         if not 0 <= self.explore_basin < 1 or not 0 < self.explore_miss < 1:
@@ -556,9 +566,9 @@ class AMRSampler(BaseSampler):
                     self._share()
                     self._next_share = 0
                 if self.curvilinear_frame:
-                    self._curvilinear()
+                    self._curvilinear(starts=self.frame_starts)
                 elif self.laplace_frame:
-                    self._whiten(*self._laplace())
+                    self._whiten(*self._laplace(starts=self.frame_starts))
                 else:
                     self._whiten()
                 if self.shared_region and not self._batched:
@@ -838,7 +848,41 @@ class AMRSampler(BaseSampler):
         self._scale = span
         logging.info("AMR: curvilinear frame after %d evaluations",
                      self.nevaluations)
+        if self.share_frame and self.shared_region:
+            # the boxes reach past the radius by up to half a box (those whose nearest point lies within it)
+            self._share_ball(low, span, 1.3 * radius)
         self._start_frame(low, span, radius)
+
+    def _share_ball(self, low, span, radius):
+        """Hand the model, before the frame's first boxes are evaluated, the
+        region they cover: ``shared_region`` points drawn uniformly in the
+        frame's whitened ball of ``radius`` (the boxes :meth:`_start_frame`
+        lays out), inside the prior. Without it the first batch, which holds
+        boxes far from the maximum, is evaluated before any region covers
+        it."""
+        rng = numpy.random.default_rng(self.seed + 2)
+        z = rng.normal(size=(self.shared_region, self.ndim))
+        z *= (radius * rng.random(len(z)) ** (1.0 / self.ndim)
+              / numpy.linalg.norm(z, axis=1))[:, None]
+        cube, logjac = self._curve((z - low) / span)
+        ok = (numpy.all((cube >= 0) & (cube <= 1), axis=1)
+              & numpy.isfinite(logjac))
+        names = list(self.model.variable_params)
+        full = []
+        for c in cube[ok]:
+            q = dict(self.model.static_params)
+            q.update(dict(zip(names, self._prior_transform(c))))
+            full.append(q)
+        tick = time.time()
+        try:
+            self.model.share(full)
+        except MemoryError as err:
+            logging.info("AMR: the frame's ball does not fit a shared "
+                         "region (%s)", err)
+            return
+        self._batched = True
+        logging.info("AMR: shared the frame's ball, %d points, in %.0f s",
+                     len(full), time.time() - tick)
 
     def _laplace(self, iterations=8, starts=5):
         """Mean and covariance, in the cube, of the Laplace approximation

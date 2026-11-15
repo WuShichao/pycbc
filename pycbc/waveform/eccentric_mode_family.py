@@ -269,6 +269,40 @@ class EccentricModeFamily(object):
                                    psi0, have, sl)
         del grid
 
+    def __getstate__(self):
+        """The family without its closures, for pickling (a cell built once, cached on disk): every stencil
+        polynomial (:func:`_tensor_quadratic`) as its stencil values, the generators dropped (needed only to build
+        the stencil, or for ``circular_phase_change(method='pyefpe')``)."""
+        def encode(v):
+            if callable(v) and hasattr(v, 'stacked') and hasattr(v, 'index'):
+                return ('__tensor_quadratic__', [tuple(int(i) for i in row) for row in v.index], v.stacked,
+                        tuple(v.steps))
+            if isinstance(v, dict):
+                return {k: encode(x) for k, x in v.items()}
+            if isinstance(v, tuple):
+                return tuple(encode(x) for x in v)
+            if isinstance(v, list):
+                return [encode(x) for x in v]
+            if callable(v):
+                return None
+            return v
+        state = {k: encode(v) for k, v in self.__dict__.items() if k != '_windows_last'}
+        return state
+
+    def __setstate__(self, state):
+        def decode(v):
+            if isinstance(v, tuple) and len(v) == 4 and v[0] == '__tensor_quadratic__':
+                _, keys, stacked, steps = v
+                return _tensor_quadratic(dict(zip(keys, stacked)), steps)
+            if isinstance(v, dict):
+                return {k: decode(x) for k, x in v.items()}
+            if isinstance(v, tuple):
+                return tuple(decode(x) for x in v)
+            if isinstance(v, list):
+                return [decode(x) for x in v]
+            return v
+        self.__dict__.update({k: decode(v) for k, v in state.items()})
+
     @property
     def q0(self):
         return self.reference['mass1'] / self.reference['mass2']

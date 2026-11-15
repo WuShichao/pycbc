@@ -85,3 +85,16 @@ def test_shared_region_gram_interpolation_matches_the_engine_rule():
     for s,(r,d) in enumerate(zip(rows,delays)):
         want=WindowedModeFFT.interpolated_gram(NS(xp=np),[d],region._anchor_times,stack[r])[...,0]
         np.testing.assert_allclose(got[...,s],want,rtol=1e-12)
+
+
+def test_reconstruct_many_draws_what_reconstruct_draws():
+    model,block,grid=toy()
+    points=[dict(mchirp=30.*np.exp(d),q=1.5,eccentricity=.05+de,chi_eff=0.,eclipticlongitude=1.,eclipticlatitude=.2)
+            for d,de in ((0.,0.),(1e-4,0.),(-1e-4,1e-4),(0.,-1e-4))]
+    seeds=[3,4,5,6]
+    many=model.reconstruct_many(points,seeds,chunk=3)
+    for p,seed,got in zip(points,seeds,many):
+        model.update(**p)
+        want=model.reconstruct(seed=seed)
+        for k,v in want.items():
+            np.testing.assert_allclose(got[k],v,rtol=1e-9,atol=1e-12,err_msg=k)

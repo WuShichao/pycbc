@@ -61,3 +61,15 @@ def test_phase_model_is_the_cells_own_and_the_coordinates_invert():
     assert np.all(np.isfinite(back))
     np.testing.assert_allclose(back, draws[:50], rtol=0, atol=1e-8 * np.max(hi))
     assert np.all(np.isfinite(c.log_jacobian(draws[:10])))
+
+
+def test_the_family_pickles_and_evaluates_the_same():
+    import pickle
+    fam = _family()
+    back = pickle.loads(pickle.dumps(fam))
+    for args in ((0.004, 0.001, 0.05, 0.03), (-0.006, -0.002, -0.08, 0.0)):
+        want = fam.modes(*args[:3], dchi=args[3])
+        got = back.modes(*args[:3], dchi=args[3])
+        for k in want:
+            for a, b in zip(want[k], got[k]):
+                np.testing.assert_array_equal(a, b)
