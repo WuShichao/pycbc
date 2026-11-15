@@ -546,8 +546,26 @@ class EccentricSharedRegion(object):
         """The log likelihood of each point; ``nan`` where its F has not fallen by ``edge_margin`` at the ends of
         the lags its grid times cover. The correlations, Grams and statistics of ``point_chunk`` points at a time
         are batched."""
-        out = [self._evaluate(points[c:c + self.point_chunk]) for c in range(0, len(points), self.point_chunk)]
+        out = [self._evaluate_halving(points[c:c + self.point_chunk])
+               for c in range(0, len(points), self.point_chunk)]
         return numpy.concatenate(out) if out else numpy.zeros(0)
+
+    def _evaluate_halving(self, points):
+        """:meth:`_evaluate`, the points halved while the device runs out of memory: the fine samples grow with the
+        points' screened lags, which a chunk of points far from the peak can hold many of."""
+        try:
+            return self._evaluate(points)
+        except Exception as err:
+            if type(err).__name__ != 'OutOfMemoryError' or len(points) < 2:
+                raise
+        import gc
+        import logging
+        gc.collect()
+        if self.xp is not numpy:
+            self.xp.get_default_memory_pool().free_all_blocks()
+        logging.info("EccentricSharedRegion: %d points out of device memory, halved", len(points))
+        half = len(points) // 2
+        return numpy.concatenate([self._evaluate_halving(points[:half]), self._evaluate_halving(points[half:])])
 
     #: points evaluated together (device memory grows with points x lags)
     point_chunk = 512
