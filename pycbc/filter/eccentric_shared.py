@@ -335,7 +335,8 @@ class EccentricSharedRegion(object):
         def response(sky):
             key = (round(float(sky[0]), 12), round(float(sky[1]), 12))
             if key not in self._responses:
-                if len(self._responses) > 200000:
+                # about 0.14 MB a point (17 harmonics x 2 x 2 x 256): a chunk's worth, not a region's
+                if len(self._responses) >= 2048:
                     self._responses.clear()
                 self._responses[key] = numpy.asarray(builder(numpy.asarray(sky, dtype=float)))
             return self._responses[key]
@@ -394,7 +395,17 @@ class EccentricSharedRegion(object):
         return numpy.array([t for t, _ in pairs]), numpy.array([s for _, s in pairs])
 
     def inside(self, points):
-        """Whether each point lies in the region every mode's grid covers, with its response on the sky basis."""
+        """Whether each point lies in the region every mode's grid covers, with its response on the sky basis
+        (``point_chunk`` points at a time: the sky error forms every point's response)."""
+        import logging
+        if len(points) > self.point_chunk:
+            ok = numpy.concatenate([self._inside(points[c:c + self.point_chunk])
+                                    for c in range(0, len(points), self.point_chunk)])
+            logging.info("EccentricSharedRegion.inside: %d of %d", ok.sum(), len(points))
+            return ok
+        return self._inside(points)
+
+    def _inside(self, points):
         import logging
         thetas, skies = self._coordinates(points)
         ok = numpy.ones(len(points), dtype=bool)
@@ -419,7 +430,7 @@ class EccentricSharedRegion(object):
             sky = self.correlators[0].sky_error(skies[ok]) <= self.sky_tolerance
             reasons['sky'] = int((~sky).sum())
             ok[ok] = sky
-        if len(points) >= 100:
+        if len(points) >= 100 and not ok.all():
             logging.info("EccentricSharedRegion.inside: %d of %d; outside by %s", ok.sum(), len(points),
                          {k: v for k, v in reasons.items() if v})
         return ok
@@ -631,7 +642,7 @@ class EccentricSharedRegion(object):
         bound = top + numpy.log(dt * L) - numpy.log(hi - lo)
         edge = edge | (bound < self.best_loglikelihood - self.edge_margin)
         out[idx] = numpy.where(edge, value, numpy.nan)
-        if M >= 100:
+        if M >= 100 and (M > Mi or not edge.all()):
             import logging
             logging.info("EccentricSharedRegion: %d points, %d without lags on the grid, %d failing the edge check",
                          M, M - Mi, int((~edge).sum()))
