@@ -289,7 +289,13 @@ class EccentricCellPE(BaseModel):
         except MemoryError:
             if depth >= 3 or len(points) < 2 * self.min_new_region // 4:
                 return False
-            key = numpy.array([p['mchirp'] for p in points])
+            # halve along the points' widest direction: the leading principal axis of their standardised
+            # coordinates (the posterior is widest along q, which ln Mc alone does not separate)
+            X = numpy.array([[numpy.log(p['mchirp']), p['eccentricity'], p['chi_eff'], numpy.log(p['q']),
+                              p['eclipticlongitude'], p['eclipticlatitude']] for p in points])
+            X = (X - X.mean(axis=0)) / numpy.maximum(X.std(axis=0), 1e-300)
+            axis = numpy.linalg.svd(X, full_matrices=False)[2][0]
+            key = X @ axis
             half = numpy.median(key)
             done = self._share_split([p for p, k in zip(points, key) if k <= half], depth + 1)
             return self._share_split([p for p, k in zip(points, key) if k > half], depth + 1) or done

@@ -11,12 +11,13 @@ EccentricModeFamily mode ``k`` (phase scale ``r_k``) at ``theta = (Mc, e, chi, q
     b_k(theta) ~ b_k(theta_0) a(theta) exp(-i [r_k dpsi_PN(f; dC) + sum_j dtheta_j D_kj(f)]),
 
 where ``dpsi_PN`` is the TaylorF2 basis phase difference (exact: the cell takes the circular phase change from
-the same basis), linear in the coefficient changes ``dC = (A - A0, B - B0)``, and ``D_kj = d corr_k / d theta_j``
-linearises the cell's interpolated eccentric correction in ``dtheta = (ln Mc / Mc0, e - e0, chi - chi0,
-ln q / q0)``. The phase is therefore linear in ``c = (r_k dC, dtheta)`` over 20 basis functions, and the mode's
-clock ``t_k = t_k0 + dpsi' / 2 pi`` too, so each mode is a :class:`PhaseNUFFTCorrelation` of its own basis and
-``PhaseGrid`` applies unchanged. The amplitude change is the cell's own, linearised as one complex log-slope per
-direction (a scalar per template and mode: an eccentric harmonic's amplitude goes as e^|n-2|); what
+the same basis), linear in the coefficient changes ``dC = (A - A0, B - B0)``. The cell's eccentric correction is a
+tensor-product polynomial, linear in its stencil values, ``corr_k(x) = W(x) . V_k``; its change over the region,
+``(W(x) - W(x0)) . V_k``, is spanned to ``basis_tolerance`` by a few leading vectors ``U_k`` of the region's
+training templates, with coefficients ``(W(x) - W(x0)) . P_k``. The phase is therefore linear in ``c = (r_k dC,
+e_k)`` over 16 + rank basis functions, and the mode's clock ``t_k = t_k0 + dpsi' / 2 pi`` too, so each mode is a
+:class:`PhaseNUFFTCorrelation` of its own basis and The amplitude change is the cell's own band-averaged ratio, also linear in ``W(x)`` (a scalar per template and
+mode: an eccentric harmonic's amplitude goes as e^|n-2|); what
 the linearisation and the fixed amplitude miss is measured against the direct engine, not assumed.
 """
 import numpy
@@ -73,8 +74,8 @@ class EccentricModePhaseCorrelation(PhaseNUFFTCorrelation):
     ``data`` the whitened SSB data spectrum ``(nchannels, N)``, ``sky_points``
     the region's sky offsets for the sky basis.
     """
-    def __init__(self, family, key, view, theta0, data, sky_points, sky_tolerance=1e-4, eps=1e-6,
-                 step=(1e-5, 1e-5, 1e-4, 1e-4), window=None, band_margin=5 * 86400.0):
+    def __init__(self, family, key, view, theta0, data, sky_points, training, sky_tolerance=1e-4, eps=1e-6,
+                 window=None, band_margin=5 * 86400.0, basis_tolerance=1e-3, max_training=400):
         from scipy.interpolate import CubicSpline
         self.family = view
         xp = self.xp = view.xp
@@ -103,22 +104,20 @@ class EccentricModePhaseCorrelation(PhaseNUFFTCorrelation):
         self._logf = xp.asarray(numpy.log(f))
         self.theta0 = numpy.asarray(theta0, dtype=float)
         self.r = float(family._expansions[key][0])
-        # the reference's family offsets
-        ref = family.reference
-        mc_ref = (ref['mass1'] * ref['mass2']) ** .6 / (ref['mass1'] + ref['mass2']) ** .2
-        x0 = numpy.array([numpy.log(self.theta0[0] / mc_ref), self.theta0[1] - ref['eccentricity'],
-                          numpy.log(self.theta0[3] / family.q0), self.theta0[2] - ref.get('spin1z', 0.)])
+        # the eccentric correction and amplitude are the cell's tensor-product polynomials, linear in the stencil
+        # values: corr(x) = W(x) . V. The region's changes (W(x) - W(x0)) . V span a low-rank space: its leading
+        # vectors U (weighted by template power over the observed band) are the basis, and a template's coefficients
+        # are (W(x) - W(x0)) . P, exact but for the rank truncation (basis_tolerance, rms rad over the training
+        # templates); the amplitude ratio and the (2,2,2) clock's slope at f_ref are linear in W(x) too
+        from scipy.interpolate import CubicSpline
+        self.family_cell = family
+        self.key = key
+        r_, amp, corr, psi0, have, sl = family._expansions[key]
+        fx = family.f[sl][have]
+        self._x0 = self._offsets(family, self.theta0)
+        self._W0 = corr.weights(*self._x0)
         step_c = max(1, len(f_all) // 4000)
         coarse = slice(0, len(f_all), step_c)
-        D_all, _ = self._derivatives(family, key, x0, f_all[coarse], step)
-        D, Dp = self._derivatives(family, key, x0, f, step)
-        self._D, self._Dp = xp.asarray(D), xp.asarray(Dp)
-        # the cell's pins: its circular change is pinned (value and slope) at f_ref = f_lower, its eccentric
-        # correction is not, and every mode's clock is anchored to the (2,2,2) mode's time at f_ref, so the
-        # eccentric rows enter the time pin only through that common slope
-        _, Dp222 = self._derivatives(family, (2, 2, 2), x0, numpy.array([self.f_lower]), step)
-        self._anchor_slope = Dp222[:, 0]
-        # the frame's coarse grid and weights: the parent's construction
         power = self.template_power()[coarse]
         if self._sel is not None:
             observed = numpy.zeros(len(f_all), dtype=bool)
@@ -126,13 +125,73 @@ class EccentricModePhaseCorrelation(PhaseNUFFTCorrelation):
             power = power * observed[coarse]
         self._fc = f_all[coarse]
         self._wc = power / power.sum()
+        wx = numpy.interp(fx, self._fc, self._wc, left=0., right=0.)
+        wx = wx / max(wx.sum(), 1e-300)
+        V = numpy.asarray(corr.stacked, dtype=float)[:, have]                 # (S, nh)
+        training = numpy.atleast_2d(numpy.asarray(training, dtype=float))
+        if len(training) > max_training:
+            training = training[numpy.random.default_rng(1).choice(len(training), max_training, replace=False)]
+        X = corr.weights_many(self._offsets_many(family, training)) - self._W0[None]
+        delta = (X @ V) * numpy.sqrt(wx)[None]
+        u, sv, vt = numpy.linalg.svd(delta, full_matrices=False)
+        # rank: the largest training residual rms below basis_tolerance
+        left = numpy.sqrt(numpy.maximum(numpy.sum(delta ** 2, axis=1)[:, None]
+                                        - numpy.cumsum((u * sv[None]) ** 2, axis=1), 0))
+        good = numpy.nonzero(left.max(axis=0) <= basis_tolerance)[0]
+        rank = int(good[0]) + 1 if len(good) else len(sv)
+        self.basis_rank = rank
+        self.basis_residual = float(left[:, rank - 1].max()) if rank else 0.
+        # the vectors as combinations of the training changes themselves (orthonormal in wx; bounded where the
+        # weight is small, which vt / sqrt(wx) is not, and the grid's extents read the basis everywhere)
+        U = (u[:, :rank] / sv[None, :rank]).T @ (X @ V)                        # (rank, nh)
+        # P: coefficients = (W(x) - W0) . P, the weighted projection of each stencil row onto U
+        self._P = V @ (U * wx[None]).T                                          # (S, rank)
+        D, Dp = numpy.zeros((rank, len(f))), numpy.zeros((rank, len(f)))
+        D_all = numpy.zeros((rank, len(self._fc)))
+        inside = (f >= fx[0]) & (f <= fx[-1])
+        inside_c = (self._fc >= fx[0]) & (self._fc <= fx[-1])
+        if rank:
+            spline = CubicSpline(fx, U, axis=1, extrapolate=False)
+            D[:, inside] = spline(f[inside])
+            Dp[:, inside] = spline(f[inside], 1)
+            D_all[:, inside_c] = spline(self._fc[inside_c])
+        self._D, self._Dp = xp.asarray(D), xp.asarray(Dp)
+        # the clock: every mode is anchored to the (2,2,2) mode's time at f_ref, which moves with that mode's
+        # correction slope there, (W(x) - W0) . S
+        c222 = family._expansions[(2, 2, 2)]
+        f222 = family.f[c222[5]][c222[4]]
+        self._S = CubicSpline(f222, numpy.asarray(c222[2].stacked, dtype=float)[:, c222[4]], axis=1)(
+            self.f_lower, 1)
+        self._W0_222 = c222[2].weights(*self._x0)
+        # the amplitude ratio: the template-power weighted mean of a(x) / a(x0) over the band, W(x) . Ra
+        A = numpy.asarray(amp.stacked)[:, 0][:, have]
+        a0 = amp.weights(*self._x0) @ A
+        ok = numpy.abs(a0) > 0
+        self._Ra = (A[:, ok] / a0[ok][None]) @ wx[ok] / max(wx[ok].sum(), 1e-300)
+        self._amp_weights = amp.weights_many
+        self._corr_weights = corr.weights_many
+        self._222_weights = c222[2].weights_many
         psi_c, _ = _basis(self._fc)
-        self._psic = numpy.vstack([psi_c, D_all])
+        # rows: 16 PN, rank eccentric, one zero row carrying the anchor slope's change into the time pin
+        self._psic = numpy.vstack([psi_c, D_all, numpy.zeros((1, len(self._fc)))])
         self._A0, self._B0, self._la0 = taylorf2_basis_coefficients(*self._pn_params(self.theta0))
-        # the amplitude change: the cell's own (an eccentric harmonic's amplitude goes as e^|n-2|, which the TaylorF2
-        # ratio does not see), as one complex log-slope per direction, the template-power weighted mean of
-        # (d a_k / d theta_j) / a_k over the observed band
-        self._amp_slopes = self._amplitude_slopes(family, key, x0, self._fc, self._wc, step)
+
+    @staticmethod
+    def _offsets_many(family, thetas):
+        """The cell's offsets ``(d, de, dq, dchi)`` of rows ``(Mc, e, chi, q)``: (M, 4)."""
+        t = numpy.atleast_2d(numpy.asarray(thetas, dtype=float))
+        ref = family.reference
+        mc_ref = (ref['mass1'] * ref['mass2']) ** .6 / (ref['mass1'] + ref['mass2']) ** .2
+        return numpy.column_stack([numpy.log(t[:, 0] / mc_ref), t[:, 1] - ref['eccentricity'],
+                                   numpy.log(t[:, 3] / family.q0), t[:, 2] - ref.get('spin1z', 0.)])
+
+    @staticmethod
+    def _offsets(family, theta):
+        """The cell's offsets ``(d, de, dq, dchi)`` of ``theta = (Mc, e, chi, q)``."""
+        ref = family.reference
+        mc_ref = (ref['mass1'] * ref['mass2']) ** .6 / (ref['mass1'] + ref['mass2']) ** .2
+        return numpy.array([numpy.log(theta[0] / mc_ref), theta[1] - ref['eccentricity'],
+                            numpy.log(theta[3] / family.q0), theta[2] - ref.get('spin1z', 0.)])
 
     @staticmethod
     def _pn_params(theta):
@@ -140,70 +199,32 @@ class EccentricModePhaseCorrelation(PhaseNUFFTCorrelation):
         return mc, q, chi, chi
 
     def _coefficients(self, thetas):
-        """``c`` (M, 20) and the amplitude ratios."""
-        c, amp = [], []
-        for theta in numpy.atleast_2d(numpy.asarray(thetas, dtype=float)):
+        """``c`` (M, 16 + rank + 1): ``r dC``, the eccentric coefficients, the anchor slope's change; and the
+        amplitude ratios."""
+        fam = self.family_cell
+        thetas = numpy.atleast_2d(numpy.asarray(thetas, dtype=float))
+        dC = []
+        for theta in thetas:
             A, B, la = taylorf2_basis_coefficients(*self._pn_params(theta))
-            dC = numpy.concatenate([A - self._A0, B - self._B0])
-            dtheta = numpy.array([numpy.log(theta[0] / self.theta0[0]), theta[1] - self.theta0[1],
-                                  theta[2] - self.theta0[2], numpy.log(theta[3] / self.theta0[3])])
-            c.append(numpy.concatenate([self.r * dC, dtheta]))
-            amp.append(numpy.exp(self._amp_slopes @ dtheta))
-        return numpy.array(c), numpy.array(amp)
+            dC.append(numpy.concatenate([A - self._A0, B - self._B0]))
+        X = self._offsets_many(fam, thetas)
+        ecc = (self._corr_weights(X) - self._W0[None]) @ self._P
+        slope = (self._222_weights(X) - self._W0_222[None]) @ self._S
+        amp = self._amp_weights(X) @ self._Ra
+        return numpy.column_stack([self.r * numpy.array(dC), ecc, slope]), amp
 
     def _pins(self, c):
         psi_l, dpsi_l = _basis([self.f_lower])
-        p0 = numpy.concatenate([psi_l[:, 0], numpy.zeros(4)])
-        p1 = numpy.concatenate([dpsi_l[:, 0], self._anchor_slope])
+        n = c.shape[1] - 17
+        p0 = numpy.concatenate([psi_l[:, 0], numpy.zeros(n + 1)])
+        p1 = numpy.concatenate([dpsi_l[:, 0], numpy.zeros(n), [1.]])
         return c @ p0, c @ p1
 
-    @staticmethod
-    def _derivatives(family, key, x0, f, step):
-        """``d corr_key / d theta_j`` and its frequency derivative on ``f`` (zero outside the mode's support),
-        ``theta = (ln Mc, e, chi, ln q)``, by central differences of the cell's interpolated correction."""
-        from scipy.interpolate import CubicSpline
-        r, amp, corr, psi0, have, sl = family._expansions[key]
-        fx = family.f[sl][have]
-        f = numpy.asarray(f, dtype=float)
-        D, Dp = numpy.zeros((4, len(f))), numpy.zeros((4, len(f)))
-        inside = (f >= fx[0]) & (f <= fx[-1])
-        # corr is called (d, de, dq, dchi); theta is ordered (ln Mc, e, chi, ln q)
-        for row, (j, h) in enumerate(zip((0, 1, 3, 2), step)):
-            if family.steps[j] <= 0:
-                continue
-            up, dn = x0.copy(), x0.copy()
-            up[j] += h
-            dn[j] -= h
-            spline = CubicSpline(fx, ((corr(*up) - corr(*dn)) / (2 * h))[have], extrapolate=False)
-            D[row, inside] = spline(f[inside])
-            Dp[row, inside] = spline(f[inside], 1)
-        return D, Dp
-
-    @staticmethod
-    def _amplitude_slopes(family, key, x0, fc, wc, step):
-        """The weighted mean over ``fc`` (weights ``wc``) of ``(d a / d theta_j) / a`` for the mode's face-on
-        amplitude, ``theta = (ln Mc, e, chi, ln q)``, by central differences of the cell's interpolated amplitude."""
-        r, amp, corr, psi0, have, sl = family._expansions[key]
-        fx = family.f[sl][have]
-        a0 = amp(*x0)[0][have]
-        ok = abs(a0) > 0
-        g = numpy.zeros(4, dtype=complex)
-        inside = (fc >= fx[0]) & (fc <= fx[-1])
-        for row, (j, h) in enumerate(zip((0, 1, 3, 2), step)):
-            if family.steps[j] <= 0:
-                continue
-            up, dn = x0.copy(), x0.copy()
-            up[j] += h
-            dn[j] -= h
-            ratio = numpy.where(ok, (amp(*up)[0][have] - amp(*dn)[0][have]) / (2 * h) / numpy.where(ok, a0, 1), 0)
-            on = numpy.interp(fc[inside], fx, ratio.real) + 1j * numpy.interp(fc[inside], fx, ratio.imag)
-            g[row] = numpy.sum(wc[inside] * on) / max(numpy.sum(wc[inside]), 1e-300)
-        return g
-
     def _projected_basis(self, D):
-        """``D^T Psi(f)`` and ``D^T Psi'(f)`` on the grid for coefficient directions ``D`` (20, ndir)."""
+        """``D^T Psi(f)`` and ``D^T Psi'(f)`` on the grid for coefficient directions ``D`` (16 + rank + 1, ndir);
+        the last row (the anchor slope) has no phase."""
         x, dx = PhaseNUFFTCorrelation._projected_basis(self, D[:16])
-        w = self.xp.asarray(D[16:])
+        w = self.xp.asarray(D[16:-1])
         return x + w.T @ self._D, dx + w.T @ self._Dp
 
     def project(self, thetas, frame):
@@ -324,7 +345,7 @@ class EccentricSharedRegion(object):
         for k, key in enumerate(self.keys):
             view = EccentricModeView(block, theta0, k, response, family.f_ref,
                                      block.response_frequencies)
-            corr = EccentricModePhaseCorrelation(family, key, view, theta0, block.data, skies,
+            corr = EccentricModePhaseCorrelation(family, key, view, theta0, block.data, skies, thetas,
                                                  sky_tolerance=self.sky_tolerance, window=self.data_window,
                                                  band_margin=band_margin)
             frame = corr.frame(thetas, 3)
@@ -332,8 +353,10 @@ class EccentricSharedRegion(object):
             self.correlators.append(corr)
             frames.append(frame)
             shifts.append(corr.project(thetas, frame)[1])
-        logging.info("EccentricSharedRegion: %d points, correlators and frames in %.1f s", len(region),
-                     time.time() - tick)
+        logging.info("EccentricSharedRegion: %d points, correlators and frames in %.1f s; eccentric ranks %s "
+                     "(training residual rms %s rad)", len(region), time.time() - tick,
+                     [c.basis_rank for c in self.correlators],
+                     ['%.1e' % c.basis_residual for c in self.correlators])
         # the grid times the region needs (per mode, T = delay + shift): where the probes' ln B lies within
         # edge_margin of each one's largest, for the probes within it of the best, widened by itself and eight lags
         rng = numpy.random.default_rng(seed)
@@ -539,6 +562,12 @@ class EccentricSharedRegion(object):
             first = numpy.maximum(first, numpy.ceil((t_lo - shift) / dt - lags[0]).astype(int))
             last = numpy.minimum(last, numpy.floor((t_hi - dt - shift) / dt - lags[0]).astype(int))
         out = numpy.full(M, numpy.nan)
+        if M >= 100 and numpy.any(last - first < 2):
+            import logging
+            lost = last - first < 2
+            logging.info("EccentricSharedRegion: lags first/last of points without lags: first %s, last %s (of %d)",
+                         numpy.percentile(first[lost], [0, 50, 100]).tolist(),
+                         numpy.percentile(last[lost], [0, 50, 100]).tolist(), L)
         idx = numpy.nonzero(last - first >= 2)[0]
         if not len(idx):
             return [] if keep else out

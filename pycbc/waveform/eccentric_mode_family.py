@@ -558,10 +558,33 @@ def _tensor_quadratic(v, steps):
     real = numpy.zeros((), stacked.dtype).real.dtype
     index = numpy.array(keys, dtype=int).reshape(len(keys), -1)
 
-    def poly(*x):
+    def weights(*x):
         w = numpy.ones(len(keys))
         for d, (t, h, ks) in enumerate(zip(x, steps, nodes)):
             ld = lagrange(t, h, ks)
             w = w * numpy.array([ld[k] for k in index[:, d]])
-        return numpy.tensordot(w.astype(real), stacked, axes=(0, 0))
+        return w
+
+    def weights_many(X):
+        """``weights`` at each row of ``X`` (M, ndim): (M, S)."""
+        X = numpy.atleast_2d(numpy.asarray(X, dtype=float))
+        w = numpy.ones((len(X), len(keys)))
+        for d, (h, ks) in enumerate(zip(steps, nodes)):
+            if h <= 0:
+                continue
+            t = X[:, d]
+            L = numpy.ones((len(X), len(ks)))
+            for a, k in enumerate(ks):
+                for j in ks:
+                    if j != k:
+                        L[:, a] *= (t - j * h) / ((k - j) * h)
+            pos = numpy.searchsorted(numpy.asarray(ks), index[:, d])
+            w *= L[:, pos]
+        return w
+
+    def poly(*x):
+        return numpy.tensordot(weights(*x).astype(real), stacked, axes=(0, 0))
+    # the polynomial is linear in the stencil values: poly(x) = weights(x) . stacked (for callers that project the
+    # stacked values once and then need only the weights)
+    poly.weights, poly.weights_many, poly.stacked = weights, weights_many, stacked
     return poly
