@@ -587,4 +587,7 @@ def _tensor_quadratic(v, steps):
     # the polynomial is linear in the stencil values: poly(x) = weights(x) . stacked (for callers that project the
     # stacked values once and then need only the weights)
     poly.weights, poly.weights_many, poly.stacked = weights, weights_many, stacked
+    # the stencil's layout: each stacked row's node indices per direction, the nodes and the steps (for callers that
+    # contract a projection of the stacked values as a tensor, one direction at a time)
+    poly.index, poly.nodes, poly.steps = index, nodes, tuple(steps)
     return poly

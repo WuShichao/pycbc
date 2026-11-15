@@ -659,3 +659,207 @@ class EccentricSharedRegion(object):
                                 log_bayes=lnb[owner == j], z=zf[..., sel], gram=gf[..., sel],
                                 theta=th[j], sky=sk[j], shared=True))
         return records
+
+
+class EccentricPhaseCoordinates(object):
+    """Curvilinear coordinates ``(s_1 .. s_ndir, q)`` for the eccentric cell's PE, the eccentric counterpart of
+    :class:`pycbc.waveform.taylorf2_jets.MeasuredPhaseCoordinates`: ``s`` are the projections of the cell's whole
+    phase change on the ``ndir`` directions along which it changes most over a sample of points (:meth:`fit`).
+
+    The phase change of mode ``k`` (phase scale ``r_k``) from the cell's reference is exactly (the cell's own
+    evaluation, :meth:`EccentricModeFamily._windows`)
+
+        dpsi_k(f; theta) = r_k dC(theta) . psi(f) + (W_k(x) - W_k(0)) . V_k(f)  (+ the pins: a constant and f),
+
+    linear in the TaylorF2 coefficient changes ``dC`` and the cell polynomial's weights ``W_k`` at the offsets
+    ``x = (ln Mc / Mc0, e - e0, ln q / q0, chi - chi0)``, the circular part pinned at ``f_ref`` before ``r_k``
+    scales it. Stacked over the modes, weighted by each mode's power over the noise at the frequencies it sweeps
+    while the data last (``sqrt w``), less what the marginalised phases (a constant and one proportional to
+    ``r_k``) and a common arrival time absorb, it is a vector ``Phi(theta)`` whose norm is the rms phase change in radians;
+    ``s = v . (Phi - mean)`` with ``v`` its leading right singular vectors over the sample. Points of equal ``s``
+    have nearly equal phase and differ along ``q``, the fourth coordinate, which the phase barely fixes; the
+    likelihood's degenerate valley is then nearly straight in ``y``. At ``e -> 0`` the eccentric part vanishes and
+    ``s`` are the circular coordinates' projections of ``dC``.
+
+    Parameters
+    ----------
+    family : EccentricModeFamily
+        The cell (with ``step_q`` and ``step_chi``).
+    noise_weight : callable
+        ``noise_weight(f)``: the inverse noise power at ``f`` (any constant factor).
+    data_window : tuple
+        The data's start and end, s, on the clock that puts the ``(2,2,2)`` mode at ``f_ref`` at time 0.
+    band_margin : float
+        Seconds about the window still counted as observed.
+    keys : list, optional
+        The modes; all the cell's by default.
+    ndir : int
+        The number of phase directions; the coordinates are ``ndir + 1`` and the parameters four, so 3.
+    coarse : int
+        Frequencies kept per mode.
+    guess : array_like, optional
+        ``(mchirp, q, eccentricity, chi_eff)`` the inverse starts from (at each point's own ``q``); the
+        cell's reference by default.
+    """
+    names = ('mchirp', 'q', 'eccentricity', 'chi_eff')
+
+    def __init__(self, family, noise_weight, data_window, band_margin=60 * 86400., keys=None, ndir=3,
+                 coarse=2000, guess=None, max_fit=4000):
+        ref = family.reference
+        self.family = family
+        self.mc0 = (ref['mass1'] * ref['mass2']) ** .6 / (ref['mass1'] + ref['mass2']) ** .2
+        self.q0 = float(family.q0)
+        self.e0 = float(ref.get('eccentricity', 0.))
+        self.chi0 = float(ref.get('spin1z', 0.))
+        self.guess = numpy.array([self.mc0, self.q0, self.e0, self.chi0] if guess is None else guess, dtype=float)
+        if ndir != 3:
+            raise ValueError("four parameters: three phase directions and q")
+        self.ndir = int(ndir)
+        self.max_fit = int(max_fit)
+        self.keys = sorted(family._expansions) if keys is None else list(keys)
+        pieces = {k: (idx, t) for k, idx, _, _, t in family.iter_mode_pieces(0., 0., 0., dchi=0.)}
+        i222, t222 = pieces[(2, 2, 2)]
+        t_anchor = numpy.interp(family.f_ref, family.f[i222], t222)
+        lo_t, hi_t = data_window
+        self._C0 = numpy.concatenate(taylorf2_basis_coefficients(self.mc0, self.q0, self.chi0, self.chi0)[:2])
+        f_all, sw_all, blocks, self._modes = [], [], [], []
+        start = 0
+        for key in self.keys:
+            r, amp, corr, psi0, have, sl = family._expansions[key]
+            fk = family.f[sl]
+            hidx = numpy.flatnonzero(have)
+            idx, tk = pieces[key]
+            t_at = numpy.interp(fk[hidx], family.f[idx], tk - t_anchor)
+            step = max(1, len(hidx) // coarse)
+            sel = hidx[::step]
+            t_at = t_at[::step]
+            a0 = numpy.abs(numpy.asarray(amp(0., 0., 0., 0.))[0][sel]) ** 2
+            w = a0 * noise_weight(fk[sel]) * step * ((t_at >= lo_t - band_margin) & (t_at <= hi_t + band_margin))
+            V = numpy.asarray(corr.stacked, dtype=float)[:, sel]                 # (S, n_k)
+            f_all.append(fk[sel])
+            sw_all.append(w)
+            self._modes.append(dict(key=key, r=float(r), block=slice(start, start + len(sel)), V=V, sel=sel,
+                                    weights=corr.weights_many, W0=corr.weights(0., 0., 0., 0.)))
+            start += len(sel)
+        f = numpy.concatenate(f_all)
+        w = numpy.concatenate(sw_all)
+        w = w / w.sum()
+        self.frequencies, self.weights = f, w
+        sw = self._sw = numpy.sqrt(w)
+        # the circular change is pinned in value and slope at f_ref (EccentricModeFamily.circular_phase_change)
+        # before the mode's r_k scales it: the pins differ between modes, and set the modes' relative times
+        psi, _ = _basis(f)
+        psi_r, dpsi_r = _basis(numpy.array([family.f_ref]))
+        psi = psi - psi_r - dpsi_r * (f - family.f_ref)[None]
+        r_all = numpy.concatenate([numpy.full(m['block'].stop - m['block'].start, m['r']) for m in self._modes])
+        self._G = (psi * (r_all * sw)[None]).T                                    # (nf, 16)
+        for m in self._modes:
+            m['V'] = m['V'] * sw[m['block']][None]
+        # what the marginalised phases absorb, 2 phi + (n - 2) l0 (a constant and one linear in the harmonic's
+        # r_k = n / 2), and a common arrival time
+        cols = [sw, sw * r_all, sw * f / f[w > 0].mean()]
+        self._Q = numpy.linalg.qr(numpy.array(cols).T)[0]
+        self._vs = None
+
+    def _offsets(self, mc, q, e, chi):
+        return numpy.column_stack([numpy.log(mc / self.mc0), e - self.e0, numpy.log(q / self.q0), chi - self.chi0])
+
+    def phases(self, theta):
+        """``Phi`` (M, nf) at rows ``(mchirp, q, eccentricity, chi_eff)``: the weighted phase change, rad."""
+        from pycbc.waveform.taylorf2_jets import basis_coefficients
+        mc, q, e, chi = numpy.atleast_2d(numpy.asarray(theta, dtype=float)).T
+        dC = basis_coefficients(mc, q, chi, chi).T - self._C0[None]
+        raw = dC @ self._G.T
+        X = self._offsets(mc, q, e, chi)
+        for m in self._modes:
+            raw[:, m['block']] += (m['weights'](X) - m['W0'][None]) @ m['V']
+        return raw - (raw @ self._Q) @ self._Q.T
+
+    def fit(self, theta):
+        """Set the directions from rows of (mchirp, q, eccentricity, chi_eff) (at most ``max_fit`` of them)."""
+        theta = numpy.atleast_2d(numpy.asarray(theta, dtype=float))
+        theta = theta[numpy.all(numpy.isfinite(theta), axis=1)]
+        if len(theta) > self.max_fit:
+            theta = theta[numpy.random.default_rng(0).choice(len(theta), self.max_fit, replace=False)]
+        P = self.phases(theta)
+        mean = P.mean(axis=0)
+        _, sv, vt = numpy.linalg.svd(P - mean, full_matrices=False)
+        vs = vt[:self.ndir]
+        # the rms phase change over the sample along each direction, and what the directions leave, rad
+        self.singular_values = sv / numpy.sqrt(len(P))
+        self.residual_rms = float(numpy.sqrt(numpy.sum(sv[self.ndir:] ** 2) / len(P)))
+        # s = vs . (Phi - mean), with Phi = P_perp G z and vs in the range of P_perp: vs . G z
+        self._M_pn = vs @ self._G
+        for m in self._modes:
+            m['M'] = vs[:, m['block']] @ m['V'].T
+        self._s0 = vs @ mean + sum(m['M'] @ m['W0'] for m in self._modes)
+        # the modes' polynomial parts summed into one tensor over the stencil's nodes, contracted with the 1-d
+        # Lagrange weights one direction at a time (W(x) is their tensor product)
+        poly = self.family._expansions[self._modes[0]['key']][2]
+        self._nodes, self._steps = poly.nodes, poly.steps
+        T = numpy.zeros((self.ndir,) + tuple(len(n) for n in self._nodes))
+        for m in self._modes:
+            p = self.family._expansions[m['key']][2]
+            pos = tuple(numpy.searchsorted(numpy.asarray(n), p.index[:, d]) for d, n in enumerate(self._nodes))
+            numpy.add.at(T, (slice(None),) + pos, m['M'])
+        self._T = T
+        self._vs = vs
+        return self
+
+    def _lagrange(self, X):
+        out = []
+        for d, (h, ks) in enumerate(zip(self._steps, self._nodes)):
+            L = numpy.ones((len(X), len(ks)))
+            if h > 0:
+                t = X[:, d]
+                for a, k in enumerate(ks):
+                    for j in ks:
+                        if j != k:
+                            L[:, a] *= (t - j * h) / ((k - j) * h)
+            out.append(L)
+        return out
+
+    def _forward(self, mchirp, q, eccentricity, chi_eff):
+        if self._vs is None:
+            raise RuntimeError("fit the coordinates to a sample first")
+        from pycbc.waveform.taylorf2_jets import basis_coefficients
+        mc, q_, e, chi = (numpy.asarray(v, dtype=float) for v in (mchirp, q, eccentricity, chi_eff))
+        shape = numpy.broadcast(mc, q_, e, chi).shape
+        mc, q_, e, chi = (numpy.broadcast_to(v, shape).ravel() for v in (mc, q_, e, chi))
+        s = numpy.empty((self.ndir, len(mc)))
+        # in chunks: the polynomial weights are (points, stencil) per mode, and the inverse asks for five columns a
+        # point
+        for c in range(0, len(mc), 4096):
+            sl = slice(c, c + 4096)
+            dC = basis_coefficients(mc[sl], q_[sl], chi[sl], chi[sl]) - self._C0[:, None]
+            v = self._M_pn @ dC
+            L = self._lagrange(self._offsets(mc[sl], q_[sl], e[sl], chi[sl]))
+            R = numpy.einsum('aijkl,ml->maijk', self._T, L[3])
+            R = numpy.einsum('maijk,mk->maij', R, L[2])
+            R = numpy.einsum('maij,mj->mai', R, L[1])
+            v += numpy.einsum('mai,mi->am', R, L[0])
+            s[:, sl] = v - self._s0[:, None]
+        return numpy.concatenate([s, q_[None]]).reshape((4,) + shape)
+
+    def forward(self, theta):
+        return self._forward(*numpy.asarray(theta, dtype=float).T).T
+
+    def inverse(self, y):
+        from pycbc.waveform.taylorf2_jets import from_phase_coordinates
+        y = numpy.atleast_2d(numpy.asarray(y, dtype=float))
+        out = numpy.full(y.shape, numpy.nan)
+        # q is the last coordinate itself: rows below q = 1 have no parameters
+        ok = numpy.all(numpy.isfinite(y), axis=1) & (y[:, 3] >= 1)
+        if ok.any():
+            guess = numpy.repeat(self.guess[:, None], ok.sum(), axis=1)
+            guess[1] = y[ok, 3]
+            # residuals in units of 100 rad: steps stop at 1e-8 rad, above the forward map's rounding (about
+            # 2e-10 rad for a one-ulp change of the parameters), which a tolerance of 1e-10 rad never reached
+            out[ok] = from_phase_coordinates(y[ok].T, guess, iterations=60, forward=self._forward,
+                                             scale=numpy.full(4, 100.),
+                                             max_step=[0.05 * self.mc0, numpy.inf, 0.005, 0.2]).T
+        return out
+
+    def log_jacobian(self, theta):
+        from pycbc.waveform.taylorf2_jets import log_jacobian_from_phase_coordinates
+        return log_jacobian_from_phase_coordinates(numpy.asarray(theta, dtype=float).T, forward=self._forward)

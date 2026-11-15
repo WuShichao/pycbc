@@ -232,6 +232,8 @@ class EccentricCellPE(BaseModel):
 
     #: the shared regions kept at once, the oldest dropped first
     max_shared_regions = 2
+    #: points a region is built from at most (a uniform subsample of a larger batch)
+    max_region_points = 4000
     #: points outside every shared region that one batch must have before a new region is built for them
     min_new_region = 3000
 
@@ -265,6 +267,11 @@ class EccentricCellPE(BaseModel):
         tick = time.time()
         options = dict(self.shared_options)
         options.update(kwargs)
+        if len(region) > self.max_region_points:
+            # the region's extent from a uniform subsample: its sky basis and frames grow with the points (a
+            # curvilinear frame's first batch of 13385 boxes overran 10 GB of host memory)
+            pick = numpy.random.default_rng(len(region)).choice(len(region), self.max_region_points, replace=False)
+            region = [region[i] for i in numpy.sort(pick)]
         try:
             shared = EccentricSharedRegion(self, region, **options)
         except MemoryError as err:

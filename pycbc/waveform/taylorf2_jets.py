@@ -396,7 +396,8 @@ def from_phase_coordinates(y, guess, iterations=30, tolerance=1e-10,
         values = forward(*moved.reshape(4, -1)).reshape(4, 5, k)
         f0 = values[:, 0]
         res = (f0 - y2[:, active]) / scale2[:, active]
-        done = numpy.all(numpy.abs(res) < tolerance, axis=0)
+        # columns whose forward map is not finite (beyond the parameters' domain) stop; they come back NaN
+        done = numpy.all(numpy.abs(res) < tolerance, axis=0) | ~numpy.all(numpy.isfinite(res), axis=0)
         if done.all():
             break
         jac = (values[:, 1:] - f0[:, None]) / steps[None, :, active]
