@@ -134,6 +134,17 @@ class AMRSampler(BaseSampler):
         With ``shared_region`` and a curvilinear frame, hand the model the
         frame's whitened ball before its first boxes are evaluated (see
         :meth:`_share_ball`). Default False.
+    frame_moments : bool, optional
+        With a curvilinear frame and ``whitening_rounds`` above one, every
+        frame after the first is set by the moments of the previous one's
+        boxes in ``y`` (their posterior mean and covariance, each box's own
+        spread included) instead of a Laplace approximation. Default False.
+    edge_points : int, optional
+        A box straddling the prior's edge is valued by the mean likelihood
+        at up to this many of its inner points (default 1: the inner point
+        nearest its centre).
+    share_frame_radius : float, optional
+        The shared ball's radius over the frame's (default 1.3).
     share_after_pilot : bool, optional
         With ``shared_region``, hand the model the pilot's region already,
         before the frame is set, so that the frame's own evaluations (the
@@ -210,7 +221,8 @@ class AMRSampler(BaseSampler):
                  laplace_frame=False, curvilinear_frame=False,
                  shared_region=0, explore_basin=0.0, explore_miss=0.01,
                  check_points=0, check_tolerance=0.1, start_cube=None,
-                 share_after_pilot=False, frame_starts=5, share_frame=False):
+                 share_after_pilot=False, frame_starts=5, share_frame=False,
+                 share_frame_radius=1.3, edge_points=1, frame_moments=False):
         super().__init__(model)
         self.initial_divisions = int(initial_divisions)
         self.partition_file = partition_file
@@ -223,6 +235,9 @@ class AMRSampler(BaseSampler):
         self.share_after_pilot = bool(share_after_pilot)
         self.frame_starts = int(frame_starts)
         self.share_frame = bool(share_frame)
+        self.share_frame_radius = float(share_frame_radius)
+        self.edge_points = int(edge_points)
+        self.frame_moments = bool(frame_moments)
         self.explore_basin = float(explore_basin)
         self.explore_miss = float(explore_miss)
         if not 0 <= self.explore_basin < 1 or not 0 < self.explore_miss < 1:
@@ -417,12 +432,33 @@ class AMRSampler(BaseSampler):
         cube, logjac = self._map(centre)
         out = ~(numpy.all((cube >= 0) & (cube <= 1), axis=1)
                 & numpy.isfinite(logjac))
-        mean, inner = self._volume(index)
+        mean, inner, inside, s = self._volume(index)
         # a box straddling the prior's edge: a point inside it, where any
         has = out & numpy.isfinite(mean)
         if has.any():
             cube[has], logjac[has] = self._map(inner[has])
-        self._logl[index] = self._cube_loglikelihoods(cube, logjac)
+        logl = self._cube_loglikelihoods(cube, logjac)
+        k = inside.shape[1]
+        straddle = numpy.nonzero((inside.sum(axis=1) < k) & inside.any(axis=1))[0]
+        if self.edge_points > 1 and len(straddle):
+            # a box straddling the prior's edge, valued at one inner point, can hold a likelihood that falls by tens
+            # across its inner part (boxes on a prior bound the posterior presses on): its value the mean of the
+            # likelihood at up to edge_points inner points, the one valued above and the next Sobol points inside
+            extra, owner = [], []
+            for b in straddle:
+                pts = numpy.nonzero(inside[b])[0][:self.edge_points - 1]
+                extra.extend(s[b, j] for j in pts)
+                owner.extend([b] * len(pts))
+            if extra:
+                c2, j2 = self._map(numpy.array(extra))
+                v2 = self._cube_loglikelihoods(c2, j2)
+                owner = numpy.array(owner)
+                for b in straddle:
+                    vals = numpy.concatenate([[logl[b]], v2[owner == b]])
+                    vals = vals[numpy.isfinite(vals)]
+                    if len(vals):
+                        logl[b] = logsumexp(vals) - numpy.log(len(vals))
+        self._logl[index] = logl
         self._logjac[index] = mean
 
     def _volume(self, index):
@@ -448,7 +484,7 @@ class AMRSampler(BaseSampler):
         far = numpy.where(inside, numpy.sum((off - 0.5) ** 2, axis=1)[None],
                           numpy.inf)
         inner = s[numpy.arange(n), numpy.argmin(far, axis=1)]
-        return mean, inner
+        return mean, inner, inside, s
 
     def _cube_loglikelihoods(self, cube, logjac=None):
         """The log likelihood at cube points, ``-inf`` outside the cube or
@@ -554,7 +590,7 @@ class AMRSampler(BaseSampler):
                                                      logl]))
         self._grid()
         if self.pilot_evaluations > 0:
-            for _ in range(self.whitening_rounds):
+            for whitening_round in range(self.whitening_rounds):
                 budget = self.nevaluations + self.pilot_evaluations
                 if budget >= self.max_evaluations:
                     break
@@ -566,7 +602,8 @@ class AMRSampler(BaseSampler):
                     self._share()
                     self._next_share = 0
                 if self.curvilinear_frame:
-                    self._curvilinear(starts=self.frame_starts)
+                    self._curvilinear(starts=self.frame_starts, moments=(
+                        self.frame_moments and whitening_round > 0))
                 elif self.laplace_frame:
                     self._whiten(*self._laplace(starts=self.frame_starts))
                 else:
@@ -725,7 +762,7 @@ class AMRSampler(BaseSampler):
                      len(full), time.time() - tick)
 
     def _curvilinear(self, radius=4.0, prior_draws=20000, iterations=8,
-                     starts=5):
+                     starts=5, moments=False):
         """Partition in the model's curvilinear coordinates ``y``, whitened
         by the Laplace approximation about the likelihood's maximum there:
         the highest of Newton climbs from the pilot's ``starts`` best boxes,
@@ -739,6 +776,24 @@ class AMRSampler(BaseSampler):
         coords = self.model.curvilinear_coordinates
         names = list(self.model.variable_params)
         idx = [names.index(n) for n in coords.names]
+        moment_frame = None
+        if moments and 'low' in (getattr(self, 'frame', None) or {}):
+            # a frame from the current boxes' posterior, in y, the boxes' own spread included: the Laplace
+            # approximation at the maximum can miss a direction the posterior is far wider in (108 times the
+            # variance along one phase coordinate of the eccentric cell's, so the frame's ball covered a tenth of it)
+            fr = self.frame
+            leaves = self._leaves()
+            lm = self._log_mass(leaves)
+            ok = numpy.isfinite(lm)
+            w = numpy.exp(lm[ok] - logsumexp(lm[ok]))
+            centre = self._lower[leaves][ok] + 0.5 * self._width[leaves][ok]
+            yb = fr['mean'] + (fr['low'] + fr['span'] * centre) @ fr['chol'].T
+            mu = w @ yb
+            d = yb - mu
+            cov = d.T @ (d * w[:, None])
+            spread = w @ ((fr['span'] * self._width[leaves][ok]) ** 2 / 12)
+            cov = cov + fr['chol'] @ numpy.diag(spread) @ fr['chol'].T
+            moment_frame = (mu, cov)
         bottom = numpy.array(self._prior_transform(numpy.zeros(self.ndim)))
         top = numpy.array(self._prior_transform(numpy.ones(self.ndim)))
         prior_range = top - bottom
@@ -804,29 +859,39 @@ class AMRSampler(BaseSampler):
                 if size < 0.05:
                     break
             return y0 + unit * x, precision, value
-        # from the pilot's and the exploration's best, separate points, the
-        # highest maximum
-        best = None
-        for point in self._climb_starts(starts):
-            start = numpy.array(self._prior_transform(point))
-            y0 = to_y(start[None])[0]
-            if not numpy.all(numpy.isfinite(y0)):
-                continue
-            found = climb(y0)
-            if best is None or found[2] > best[2]:
-                best = found
-        mean, precision, peak = best
-        logging.info("AMR: frame about ln L %.3f", peak)
-        self._diagnostics.update(frame_peak=float(peak),
-                                 frame_starts=int(starts),
-                                 frame_evaluations=self.nevaluations)
-        chol = numpy.linalg.cholesky(numpy.linalg.inv(precision)) \
-            * unit[:, None]
+        if moment_frame is not None:
+            mean, cov = moment_frame
+            chol = numpy.linalg.cholesky(cov)
+            logging.info("AMR: frame from the boxes' moments after %d "
+                         "evaluations", self.nevaluations)
+            self._diagnostics.update(frame_moments_evaluations=self.nevaluations)
+        else:
+            # from the pilot's and the exploration's best, separate points, the
+            # highest maximum
+            best = None
+            for point in self._climb_starts(starts):
+                start = numpy.array(self._prior_transform(point))
+                y0 = to_y(start[None])[0]
+                if not numpy.all(numpy.isfinite(y0)):
+                    continue
+                found = climb(y0)
+                if best is None or found[2] > best[2]:
+                    best = found
+            mean, precision, peak = best
+            logging.info("AMR: frame about ln L %.3f", peak)
+            self._diagnostics.update(frame_peak=float(peak),
+                                     frame_starts=int(starts),
+                                     frame_evaluations=self.nevaluations)
+            chol = numpy.linalg.cholesky(numpy.linalg.inv(precision)) \
+                * unit[:, None]
         inverse = numpy.linalg.inv(chol)
+        # the frame, for diagnosis: y = mean + chol w
+        self.frame = dict(mean=numpy.array(mean), chol=numpy.array(chol), names=list(names), coords=list(coords.names))
         whitened = (image - mean) @ inverse.T
         low = whitened.min(axis=0)
         span = whitened.max(axis=0) - low
         low, span = low - 0.01 * span, 1.02 * span
+        self.frame.update(low=numpy.array(low), span=numpy.array(span))
         logdet = float(numpy.linalg.slogdet(chol)[1] + numpy.sum(
             numpy.log(span)) - numpy.sum(numpy.log(prior_range)))
 
@@ -849,8 +914,9 @@ class AMRSampler(BaseSampler):
         logging.info("AMR: curvilinear frame after %d evaluations",
                      self.nevaluations)
         if self.share_frame and self.shared_region:
-            # the boxes reach past the radius by up to half a box (those whose nearest point lies within it)
-            self._share_ball(low, span, 1.3 * radius)
+            # the boxes reach past the radius by up to half a box (those whose nearest point lies within it), and the
+            # refinement past them
+            self._share_ball(low, span, self.share_frame_radius * radius)
         self._start_frame(low, span, radius)
 
     def _share_ball(self, low, span, radius):

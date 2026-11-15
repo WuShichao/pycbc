@@ -415,8 +415,17 @@ class EccentricSharedRegion(object):
         thetas, skies = self._coordinates(points)
         ok = numpy.ones(len(points), dtype=bool)
         reasons = {}
+        # the point's whole lags whose grid times every mode's grid holds, as _evaluate finds them: a point with none
+        # passed every other check and then went directly (posterior points whose arrival-time shift lies past the
+        # region's)
+        L = len(self.lags)
+        first = numpy.zeros(len(points), dtype=int)
+        last = numpy.full(len(points), L - 1)
         for k, grid in enumerate(self.grids):
-            s, _, _ = grid.correlator.project(thetas, grid.frame)
+            s, shift, _ = grid.correlator.project(thetas, grid.frame)
+            t_lo, t_hi = grid.time_limits()
+            first = numpy.maximum(first, numpy.ceil((t_lo - shift) / self.dt - self.lags[0]).astype(int))
+            last = numpy.minimum(last, numpy.floor((t_hi - self.dt - shift) / self.dt - self.lags[0]).astype(int))
             hw = grid.half_width
             on = numpy.ones(len(points), dtype=bool)
             for d in range(grid.ndir):
@@ -431,6 +440,9 @@ class EccentricSharedRegion(object):
             reasons['taylor_%d' % k] = int((~taylor).sum())
             reasons['phase_%d' % k] = int((~phase).sum())
             ok &= on & taylor & phase
+        has_lags = last - first >= 2
+        reasons['no_lags'] = int((~has_lags).sum())
+        ok &= has_lags
         if ok.any():
             sky = self.correlators[0].sky_error(skies[ok]) <= self.sky_tolerance
             reasons['sky'] = int((~sky).sum())
