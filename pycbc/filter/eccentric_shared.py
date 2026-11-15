@@ -75,7 +75,7 @@ class EccentricModePhaseCorrelation(PhaseNUFFTCorrelation):
     the region's sky offsets for the sky basis.
     """
     def __init__(self, family, key, view, theta0, data, sky_points, training, sky_tolerance=1e-4, eps=1e-6,
-                 window=None, band_margin=5 * 86400.0, basis_tolerance=1e-3, max_training=400):
+                 window=None, band_margin=5 * 86400.0, basis_tolerance=1e-3, max_training=400, max_rank=12):
         from scipy.interpolate import CubicSpline
         self.family = view
         xp = self.xp = view.xp
@@ -134,11 +134,16 @@ class EccentricModePhaseCorrelation(PhaseNUFFTCorrelation):
         X = corr.weights_many(self._offsets_many(family, training)) - self._W0[None]
         delta = (X @ V) * numpy.sqrt(wx)[None]
         u, sv, vt = numpy.linalg.svd(delta, full_matrices=False)
-        # rank: the largest training residual rms below basis_tolerance
-        left = numpy.sqrt(numpy.maximum(numpy.sum(delta ** 2, axis=1)[:, None]
-                                        - numpy.cumsum((u * sv[None]) ** 2, axis=1), 0))
+        # rank: the largest training residual rms below basis_tolerance. The residual after k vectors is the sum of
+        # the rest's squares, accumulated from the tail: the total less the leading part cancels to about
+        # sqrt(eps) |delta|, which over a full-q region (changes of 1e4 rad) exceeded the tolerance and kept every
+        # training vector (rank 400 for (2,2,4), a grid of 1e19 points)
+        c = (u * sv[None]) ** 2
+        tail = numpy.cumsum(c[:, ::-1], axis=1)[:, ::-1]
+        left = numpy.sqrt(numpy.concatenate([tail[:, 1:], numpy.zeros((len(c), 1))], axis=1))
         good = numpy.nonzero(left.max(axis=0) <= basis_tolerance)[0]
         rank = int(good[0]) + 1 if len(good) else len(sv)
+        rank = min(rank, int(max_rank))
         self.basis_rank = rank
         self.basis_residual = float(left[:, rank - 1].max()) if rank else 0.
         # the vectors as combinations of the training changes themselves (orthonormal in wx; bounded where the
