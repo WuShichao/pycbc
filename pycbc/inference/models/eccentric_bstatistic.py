@@ -706,6 +706,7 @@ class EccentricCellPE(BaseModel):
         rng = rngs[0] if len(rngs) else numpy.random.default_rng()
         # the anomaly node of each point by its (2,2) ln B per node (ln B divides by the noise variance itself)
         _, by_angle, angles = self._log_bayes(xp.asarray(z22), xp.asarray(g22))
+        angles = numpy.asarray(host(angles), dtype=float)
         by_angle = host(by_angle).reshape(len(angles), M)
         a = flat_choice(by_angle.T, rng.random((M, 1)))[:, 0]
         step = 2 * numpy.pi / len(angles)
