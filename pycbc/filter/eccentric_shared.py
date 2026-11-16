@@ -346,6 +346,24 @@ class EccentricSharedRegion(object):
                 self._responses[key] = numpy.asarray(builder(numpy.asarray(sky, dtype=float)))
             return self._responses[key]
         self._response_function = response
+        # the probes first (the direct engine, all modes on the full grid), their device memory released before
+        # the modes' correlators take theirs: with seven modes both together overran 6 GB
+        rng = numpy.random.default_rng(seed)
+        pick = rng.choice(len(region), min(int(probes), len(region)), replace=False)
+        curves, values = [], []
+        for j in pick:
+            ev = model.evaluate(region[j])
+            curves.append((ev['delays'], ev['log_bayes']))
+            values.append(float(ev['loglikelihood']))
+        model._last = None
+        model.block._prepared = None
+        if self.xp is not numpy:
+            self.xp.get_default_memory_pool().free_all_blocks()
+        tops = numpy.array([v[1].max() for v in curves])
+        # the region's largest log likelihood seen: a point far below it needs no exact arrival-time edges
+        self.best_loglikelihood = max(values)
+        good = numpy.nonzero(tops >= tops.max() - self.edge_margin)[0]
+        logging.info("EccentricSharedRegion: %d probes in %.1f s", len(pick), time.time() - tick)
         self.views, self.correlators, self.grids = [], [], []
         frames, shifts = [], []
         for k, key in enumerate(self.keys):
@@ -372,18 +390,6 @@ class EccentricSharedRegion(object):
         # over the region's points, widened by the grid margin of it. From the probes alone (8 points) those
         # windows missed most of a posterior that reached past a frame ball's spread: no lags on the weak modes'
         # grids for 90% of the posterior points (timecheck0, fig10k)
-        rng = numpy.random.default_rng(seed)
-        pick = rng.choice(len(region), min(int(probes), len(region)), replace=False)
-        curves, values = [], []
-        for j in pick:
-            ev = model.evaluate(region[j])
-            curves.append((ev['delays'], ev['log_bayes']))
-            values.append(float(ev['loglikelihood']))
-        tops = numpy.array([v[1].max() for v in curves])
-        # the region's largest log likelihood seen: a point far below it needs no exact arrival-time edges
-        self.best_loglikelihood = max(values)
-        good = numpy.nonzero(tops >= tops.max() - self.edge_margin)[0]
-        logging.info("EccentricSharedRegion: %d probes in %.1f s", len(pick), time.time() - tick)
         options = dict(grid_options or {})
         keys = [tuple(int(v) for v in key) for key in self.keys]
         ref = keys.index((2, 2, 2)) if (2, 2, 2) in keys else 0
