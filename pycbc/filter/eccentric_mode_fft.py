@@ -137,7 +137,11 @@ class WindowedModeFFT:
         out = xp.empty((self.nmode, 2, self.nmode, 2, len(indices)), dtype=xp.complex128)
         one = self.nmode*2*self.nchannel*self.size*self.dtype.itemsize
         if one > self.max_workspace_bytes:
-            raise MemoryError('one Gram anchor exceeds the workspace limit')
+            # every mode's templates at once do not fit (seven modes: 2.2 GB a lag): the Gram block by block of
+            # modes, each block's templates recomputed for each pair of blocks it is in
+            for j, lag in enumerate(indices):
+                out[..., j] = self._blocked_gram(int(lag))
+            return out
         chunk = max(1, min(len(indices), self.max_workspace_bytes//one))
         observation = xp.arange(self.first, self.last)
         root = self.dtype.type(numpy.sqrt(self.size))
@@ -180,6 +184,65 @@ class WindowedModeFFT:
                 del h, matrix, g
             del spectra
         return out
+
+    def _templates(self, modes, lag):
+        """The windowed time-domain templates of ``modes`` at one lag: (len(modes), 2, C, last - first)."""
+        xp = self.xp
+        root = self.dtype.type(numpy.sqrt(self.size))
+        spectra = xp.zeros((len(modes), 2, self.nchannel, self.size), dtype=self.dtype)
+        for r, order in enumerate(self.orders):
+            rho = xp.asarray(self.response(r), dtype=self.dtype)
+            coefficient = self.dtype.type(numpy.exp(1j*int(order)*ORBITAL_ANGULAR_FREQUENCY*lag*self.dt))
+            for i, k in enumerate(modes):
+                phase = (self.b[k]*xp.exp(1j*int(order)*ORBITAL_ANGULAR_FREQUENCY*self.t[k])).astype(self.dtype)
+                spectra[i] += rho*phase[None, None]*coefficient
+                del phase
+            del rho
+        take = (xp.arange(self.first, self.last)-int(lag)) % self.size
+        h = xp.empty((len(modes), 2, self.nchannel, self.last-self.first), dtype=self.dtype)
+        for i in range(len(modes)):
+            u = xp.fft.ifft(spectra[i], axis=-1)*root
+            h[i] = u[..., take]
+            del u
+        del spectra
+        return h
+
+    def _cross(self, a, b):
+        """``a^H b`` of two (rows, n) complex64 matrices in complex128, in parallel time chunks on a GPU."""
+        xp = self.xp
+        block = 16384
+        if xp is not numpy and a.shape[1] > 4*block:
+            pad = (-a.shape[1]) % block
+            pa = xp.pad(a, ((0, 0), (0, pad))) if pad else a
+            pb = xp.pad(b, ((0, 0), (0, pad))) if pad else b
+            pa = xp.ascontiguousarray(pa.reshape(a.shape[0], -1, block).transpose(1, 0, 2)).astype(xp.complex128)
+            pb = xp.ascontiguousarray(pb.reshape(b.shape[0], -1, block).transpose(1, 0, 2)).astype(xp.complex128)
+            g = (pa.conj() @ pb.swapaxes(1, 2)).sum(axis=0)
+            del pa, pb
+            return g
+        return a.astype(xp.complex128).conj() @ b.astype(xp.complex128).T
+
+    def _blocked_gram(self, lag):
+        """The complete (K, 2, K, 2) Gram at one lag, modes in blocks that fit the workspace two at a time."""
+        xp = self.xp
+        per_mode = 2*2*self.nchannel*self.size*self.dtype.itemsize    # spectra and templates
+        size = max(1, int(self.max_workspace_bytes // (2*per_mode)))
+        blocks = [list(range(i, min(self.nmode, i+size))) for i in range(0, self.nmode, size)]
+        g = xp.zeros((self.nmode*2, self.nmode*2), dtype=xp.complex128)
+        for bi, I in enumerate(blocks):
+            hI = self._templates(I, lag).reshape(len(I)*2, -1)
+            rows = slice(2*I[0], 2*I[-1]+2)
+            for J in blocks[bi:]:
+                hJ = hI if J is I else self._templates(J, lag).reshape(len(J)*2, -1)
+                cols = slice(2*J[0], 2*J[-1]+2)
+                c = self._cross(hI, hJ)
+                g[rows, cols] = c
+                if J is not I:
+                    g[cols, rows] = c.conj().T
+                    del hJ
+                del c
+            del hI
+        return g.reshape(self.nmode, 2, self.nmode, 2)
 
     def interpolated_gram(self, delays, anchors, matrices):
         """Convex linear interpolation of complete anchor Grams.

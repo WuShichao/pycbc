@@ -309,7 +309,7 @@ def _peaks_marginal(x, gam, m, xp, amplitude, logw, n_gh, n_uniform,
 
 def hm_log_bayes(z, gram, keys, prior, nodes, n_l0=32, n_phi=256,
                  order=64, xp=numpy, table=None, phi_rule='uniform',
-                 sample_chunk=64, n_gh=12, n_uniform=64):
+                 sample_chunk=16, n_gh=12, n_uniform=64):
     """``ln B`` per sample, marginalised over distance, inclination and
     polarisation (``nodes``, an :class:`pycbc.filter.bstatistic.
     OrientationNodes`), coalescence phase and mean anomaly (uniform ``n_l0``
@@ -460,7 +460,7 @@ def _exact_xg(z, gram, patterns, l0, iota, psi, phi):
 
 
 def hm_draw_batch(z, gram, keys, prior, nodes, rngs, n_l0=32, table=None,
-                  xp=numpy, chunk=64, n_phi_draw=4096, proposals=64,
+                  xp=numpy, chunk=16, n_phi_draw=4096, proposals=64,
                   n_gh=12, n_uniform=64):
     """For each of ``M`` samples (``z (K, 2, M)``, ``gram (K, 2, K, 2, M)``,
     one ``numpy.random.Generator`` each in ``rngs``): ``ln B`` marginalised

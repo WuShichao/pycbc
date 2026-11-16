@@ -97,3 +97,13 @@ def test_large_single_precision_gpu_gram_reduction_matches_double_cpu():
         else:
             relative=np.linalg.norm(value.get()-reference)/np.linalg.norm(reference)
             assert relative<2e-6
+
+
+def test_blocked_gram_equals_complete():
+    """Modes whose templates do not fit the workspace at once (higher-mode cells): the Gram block by block of
+    modes equals the complete one."""
+    engine,grid,b,t,rho,orders,data=case()
+    lags=np.array([-5,0,3,5])
+    full=engine.gram(lags)
+    engine.max_workspace_bytes=3*2*2*grid.size*16-1      # one mode short of all three: blocks of one
+    np.testing.assert_allclose(engine.gram(lags),full,atol=1e-10,rtol=1e-10)
