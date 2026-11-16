@@ -633,7 +633,11 @@ class EccentricCellPE(BaseModel):
                          xp.get_default_memory_pool().used_bytes() / 1e9)
         if getattr(fm, '_hm_table', None) is None:
             fm._hm_table = AmplitudeTable(self.distance_prior, kernel='cosh', xp=xp)
+        import time
+        t0 = time.time()
         z, g = self._full_at(params, numpy.array(sample_delays))
+        logging.info("full model: correlations of %d points in %.1f s", len(params), time.time() - t0)
+        t0 = time.time()
         var = self.noise_variance
         out = []
         for c in range(0, len(points), chunk):
@@ -648,6 +652,7 @@ class EccentricCellPE(BaseModel):
                                 polarization=d['polarization'], distance=float(self.distance_prior.scale / h),
                                 coa_phase=d['coa_phase'], loglikelihood=float(self.lognl + d['loglr']),
                                 marginal_loglr=marg[i] + delta, hm_delta=delta))
+        logging.info("full model: ln B and draws of %d points in %.1f s", len(params), time.time() - t0)
         return out
 
     def _quadratures(self, part):
