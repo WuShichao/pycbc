@@ -25,6 +25,7 @@ import numpy
 from pycbc.filter.nufft_correlation import (PhaseGrid, PhaseNUFFTCorrelation, SkyBasis, source_power_weights,
                                             _basis, _host)
 from pycbc.waveform.taylorf2_jets import taylorf2_basis_coefficients
+from pycbc.tdi.ssb_yearly_harmonics import GridSkyResponse
 
 
 class EccentricModeView(object):
@@ -392,6 +393,9 @@ class EccentricSharedRegion(object):
             key = self.keys[k]
             view = EccentricModeView(block, theta0, k, response, family.f_ref,
                                      block.response_frequencies)
+            # a gridded response: sky errors and coordinates as combinations of the grid nodes' (SkyBasis)
+            if isinstance(builder, GridSkyResponse):
+                view.grid_response = builder
             corr = EccentricModePhaseCorrelation(family, key, view, theta0, block.data, skies, thetas,
                                                  sky_tolerance=self.sky_tolerance, window=self.data_window,
                                                  band_margin=band_margin)

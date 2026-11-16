@@ -236,8 +236,11 @@ class AMRSampler(BaseSampler):
                  share_after_pilot=False, frame_starts=5, share_frame=False,
                  share_frame_radius=1.3, edge_points=1, frame_moments=False,
                  layout_fraction=0.1, pilot_layout_fraction=None,
-                 final_share_frame_radius=None):
+                 final_share_frame_radius=None, linear_posterior=False,
+                 linear_cap=10.0):
         super().__init__(model)
+        self.linear_posterior = bool(linear_posterior)
+        self.linear_cap = float(linear_cap)
         self.initial_divisions = int(initial_divisions)
         self.partition_file = partition_file
         self.max_level = int(max_level)
@@ -654,6 +657,8 @@ class AMRSampler(BaseSampler):
         if len(refine) and not self.check_points:
             logging.warning("AMR stopped by max-evaluations with %d boxes "
                             "still to refine", len(refine))
+        # the boxes the budget left unrefined, marked on the samples drawn from them
+        self._pending = numpy.asarray(refine, dtype=int)
         self._draw_posterior(leaves, logmass)
         seconds = time.time() - start
         diag = self._diagnostics
@@ -1299,6 +1304,72 @@ class AMRSampler(BaseSampler):
                             self.check_tolerance)
         return leaves, logmass, logz, refine
 
+    def _box_slopes(self, index):
+        """Each box's slope of ln L along each axis of the box coordinates,
+        ``(len(index), ndim)``: the central difference of its two face
+        neighbours' centre values (probed across the middle of each face),
+        the one-sided difference where one neighbour is missing or outside
+        the likelihood's support, zero where both are."""
+        n = len(index)
+        centre = self._lower[index] + 0.5 * self._width[index]
+        value = self._logl[index]
+        slope = numpy.zeros((n, self.ndim))
+        for axis in range(self.ndim):
+            vals, dist = [], []
+            for sign in (-1, 1):
+                probe = centre.copy()
+                probe[:, axis] += sign * 0.5 * self._width[index, axis] * (
+                    1 + 1e-9)
+                inside = (probe[:, axis] > 0) & (probe[:, axis] < 1)
+                found = numpy.full(n, -1)
+                found[inside] = self._locate(probe[inside])
+                v = numpy.full(n, numpy.nan)
+                d = numpy.full(n, numpy.nan)
+                has = found >= 0
+                v[has] = self._logl[found[has]]
+                d[has] = (self._lower[found[has], axis]
+                          + 0.5 * self._width[found[has], axis]
+                          - centre[has, axis])
+                v[~numpy.isfinite(v)] = numpy.nan
+                vals.append(v)
+                dist.append(d)
+            (vm, vp), (dm, dp) = vals, dist
+            with numpy.errstate(invalid='ignore', divide='ignore'):
+                both = numpy.isfinite(vm) & numpy.isfinite(vp)
+                plus = ~both & numpy.isfinite(vp)
+                minus = ~both & numpy.isfinite(vm)
+                g = numpy.zeros(n)
+                g[both] = (vp[both] - vm[both]) / (dp[both] - dm[both])
+                g[plus] = (vp[plus] - value[plus]) / dp[plus]
+                g[minus] = (vm[minus] - value[minus]) / dm[minus]
+            g[~numpy.isfinite(g) | ~numpy.isfinite(value)] = 0.0
+            slope[:, axis] = g
+        # at most linear_cap across a box per axis: a step to a neighbour
+        # far below (the support's edge) is not a slope
+        cap = self.linear_cap / self._width[index]
+        return numpy.clip(slope, -cap, cap)
+
+    @staticmethod
+    def _linear_log_factor(a):
+        """ln of the mean of exp(a (t - 1/2)) over t in [0, 1], summed over
+        the last axis: a box's mass under the linear density over its
+        midpoint mass."""
+        a = numpy.asarray(a, dtype=float)
+        small = numpy.abs(a) < 1e-8
+        safe = numpy.where(small, 1.0, a)
+        out = numpy.where(small, 0.0,
+                          numpy.log(numpy.expm1(safe) / safe) - 0.5 * safe)
+        return out.sum(axis=-1)
+
+    @staticmethod
+    def _linear_unit_draw(a, u):
+        """t in [0, 1] with density proportional to exp(a t), from uniform
+        ``u``."""
+        small = numpy.abs(a) < 1e-8
+        safe = numpy.where(small, 1.0, a)
+        t = numpy.log1p(u * numpy.expm1(safe)) / safe
+        return numpy.clip(numpy.where(small, u, t), 0.0, 1.0)
+
     def _draw_posterior(self, leaves, logmass):
         if self._curve is not None and self.posterior_samples > 0:
             return self._draw_curved_posterior(leaves, logmass)
@@ -1321,6 +1392,13 @@ class AMRSampler(BaseSampler):
         samples = {p: points[:, i]
                    for i, p in enumerate(self.model.variable_params)}
         samples['loglikelihood'] = self._logl[boxes]
+        # the box each point came from: its depth and its mass error over Z
+        # (for judging importance weights against the boxes afterwards)
+        samples['box_level'] = self._level[boxes].astype(float)
+        samples['box_logerr'] = self._logerr[boxes] - self._logz
+        samples['box_index'] = boxes.astype(float)
+        samples['box_pending'] = numpy.isin(
+            boxes, getattr(self, '_pending', ())).astype(float)
         samples['logwt'] = numpy.full(len(boxes),
                                       self._logz - numpy.log(len(boxes)))
         self._samples = samples
@@ -1339,6 +1417,17 @@ class AMRSampler(BaseSampler):
         weight concentration diagnostic proves that the map covers the prior.
         """
         rng = numpy.random.default_rng(self.seed)
+        slopes = None
+        if self.linear_posterior:
+            # a box's density linear in ln L across it, the slopes from its
+            # neighbours: exp(l + g (x - c)) in place of exp(l), its mass the
+            # midpoint mass times the mean of that factor over the box (the
+            # importance weights against the samples' own ln L then lose the
+            # first-order variation across a box)
+            slopes = numpy.zeros((len(self._lower), self.ndim))
+            slopes[leaves] = self._box_slopes(leaves)
+            logmass = logmass + self._linear_log_factor(
+                slopes[leaves] * self._width[leaves])
         tree_logz = float(logsumexp(logmass))
         weights = numpy.exp(logmass - tree_logz)
         weights /= weights.sum()
@@ -1353,11 +1442,18 @@ class AMRSampler(BaseSampler):
         logjac = numpy.empty(len(trial_boxes))
         todo = numpy.arange(len(trial_boxes))
         failed_inverse = 0
+        offsets = numpy.zeros((len(trial_boxes), self.ndim))
         while len(todo):
             chosen = trial_boxes[todo]
-            mapped, jacobian = self._map(
-                self._lower[chosen]
-                + rng.random((len(chosen), self.ndim)) * self._width[chosen])
+            unit = rng.random((len(chosen), self.ndim))
+            if slopes is not None:
+                unit = self._linear_unit_draw(
+                    slopes[chosen] * self._width[chosen], unit)
+            point = self._lower[chosen] + unit * self._width[chosen]
+            if slopes is not None:
+                offsets[todo] = point - (self._lower[chosen]
+                                         + 0.5 * self._width[chosen])
+            mapped, jacobian = self._map(point)
             if (mapped.shape != (len(todo), self.ndim)
                     or jacobian.shape != (len(todo),)):
                 raise ValueError(
@@ -1383,6 +1479,16 @@ class AMRSampler(BaseSampler):
         samples = {p: points[:, i]
                    for i, p in enumerate(self.model.variable_params)}
         samples['loglikelihood'] = self._logl[boxes]
+        if slopes is not None:
+            samples['loglikelihood'] = self._logl[boxes] + numpy.sum(
+                slopes[boxes] * offsets[:number], axis=1)
+        # the box each point came from: its depth and its mass error over Z
+        # (for judging importance weights against the boxes afterwards)
+        samples['box_level'] = self._level[boxes].astype(float)
+        samples['box_logerr'] = self._logerr[boxes] - self._logz
+        samples['box_index'] = boxes.astype(float)
+        samples['box_pending'] = numpy.isin(
+            boxes, getattr(self, '_pending', ())).astype(float)
         samples['log_geometry_weight'] = correction
         # The file convention scales posterior weights by the reported
         # evidence. Keep the independent geometry estimate in diagnostics.

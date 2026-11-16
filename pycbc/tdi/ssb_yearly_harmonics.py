@@ -347,6 +347,23 @@ class GridSkyResponse(object):
                          for k in range(4)])
         return i, w
 
+    @staticmethod
+    def weights_many(axis, v):
+        """:meth:`_weights` for an array of offsets: the first node ``(M,)`` and the four weights ``(M, 4)``;
+        ``inside`` (M,) false where the offset lies outside the grid."""
+        v = numpy.asarray(v, dtype=float)
+        h = axis[1] - axis[0]
+        inside = (v >= axis[0] - 1e-9 * h) & (v <= axis[-1] + 1e-9 * h)
+        i = numpy.clip(numpy.floor((v - axis[0]) / h) - 1, 0, len(axis) - 4).astype(int)
+        t = (v - axis[i]) / h
+        nodes = numpy.arange(4)
+        w = numpy.ones((len(v), 4))
+        for k in range(4):
+            for m in range(4):
+                if m != k:
+                    w[:, k] *= (t - nodes[m]) / (nodes[k] - nodes[m])
+        return i, w, inside
+
     def __call__(self, sky):
         i, wx = self._weights(self.axes[0], float(sky[0]))
         j, wy = self._weights(self.axes[1], float(sky[1]))

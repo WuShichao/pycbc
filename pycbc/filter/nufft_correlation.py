@@ -188,6 +188,11 @@ class SkyBasis(object):
             res = xp.sum(xp.conj(c) * (c @ Hres), axis=1).real
             norm = xp.sum(xp.conj(c) * (c @ Hall), axis=1).real
             return _host(C), _host(xp.sqrt(xp.maximum(res, 0) / norm))
+        grid = getattr(self.family, 'grid_response', None)
+        if grid is not None:
+            fast = self._project_grid(points, grid)
+            if fast is not None:
+                return fast
         coords, errors = [], []
         for i in range(0, len(points), chunk):
             A = self._rows(points[i:i + chunk])
@@ -199,6 +204,50 @@ class SkyBasis(object):
             errors.append(_host(xp.sqrt(xp.sum(xp.abs(res) ** 2, axis=1)
                                         / xp.sum(xp.abs(A) ** 2, axis=1))))
         return numpy.concatenate(coords), numpy.concatenate(errors)
+
+
+    #: largest number of response-grid nodes whose Gram is formed for the fast projection
+    max_grid_nodes = 900
+
+    def _project_grid(self, points, grid):
+        """:meth:`project` for a family whose responses are a :class:`pycbc.tdi.ssb_yearly_harmonics.
+        GridSkyResponse` (``family.grid_response``): a point's response is a fixed combination of 16 grid nodes'
+        (the grid's Lagrange weights), so its coordinates and its error follow from the nodes' coordinates on the
+        basis and their Gram, formed once over the nodes the points need. The same numbers as projecting the
+        point's response, without forming it (that took 110 s of an eccentric PE's 470 s of sampling). ``None``
+        when the points need more than ``max_grid_nodes`` nodes (the caller projects them one by one)."""
+        xp = self.xp
+        points = numpy.atleast_2d(numpy.asarray(points, dtype=float))
+        i, wx, ok_x = grid.weights_many(grid.axes[0], points[:, 0])
+        j, wy, ok_y = grid.weights_many(grid.axes[1], points[:, 1])
+        if not (ok_x.all() and ok_y.all()):
+            return None
+        i0, i1, j0, j1 = int(i.min()), int(i.max()) + 3, int(j.min()), int(j.max()) + 3
+        cache = getattr(self, '_grid_cache', None)
+        if cache is None or not (cache[0] <= i0 and i1 <= cache[1] and cache[2] <= j0 and j1 <= cache[3]):
+            if cache is not None:
+                i0, i1 = min(i0, cache[0]), max(i1, cache[1])
+                j0, j1 = min(j0, cache[2]), max(j1, cache[3])
+            ni, nj = i1 - i0 + 1, j1 - j0 + 1
+            if ni * nj > self.max_grid_nodes:
+                return None
+            V = xp.asarray(grid.values[i0:i1 + 1, j0:j1 + 1], dtype=xp.complex128)
+            V = (V.reshape((ni * nj,) + V.shape[2:]) * self._root).reshape(ni * nj, -1)
+            Cn = V @ xp.conj(self._U.T)                                  # (nodes, rank)
+            G = V @ xp.conj(V.T)                                         # (nodes, nodes): <v_p, v_q> conj order
+            self._grid_cache = cache = (i0, i1, j0, j1, nj, Cn, G)
+            del V
+        ci0, _, cj0, _, nj, Cn, G = cache
+        a = numpy.arange(4)
+        idx = ((i - ci0)[:, None, None] + a[None, :, None]) * nj + ((j - cj0)[:, None, None] + a[None, None, :])
+        idx = xp.asarray(idx.reshape(len(points), 16))
+        w = xp.asarray((wx[:, :, None] * wy[:, None, :]).reshape(len(points), 16))
+        C = xp.einsum('mk,mkr->mr', w, Cn[idx])
+        # |A|^2 = sum_kl w_k w_l <v_l, v_k>: G[p, q] = v_p . conj(v_q)
+        Gs = G[idx[:, :, None], idx[:, None, :]]                         # (M, 16, 16)
+        norm2 = xp.real(xp.einsum('mk,mkl,ml->m', w, Gs, w))
+        res = xp.maximum(norm2 - xp.sum(xp.abs(C) ** 2, axis=1), 0)
+        return _host(C), _host(xp.sqrt(res / norm2))
 
 
 class PhaseNUFFTCorrelation(object):
