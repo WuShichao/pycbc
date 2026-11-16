@@ -585,6 +585,24 @@ class EccentricSharedRegion(object):
         out = moved[r, a] * (1 - wv) + moved[r, a + 1] * wv                  # (S, ...)
         return xp.moveaxis(out, 0, -1)
 
+    def at_delays(self, points, delays):
+        """Every mode's correlations ``(K, 2, M)`` and complete Grams ``(K, 2, K, 2, M)`` of each of ``points``
+        (inside the region) at one delay each (s), ``point_chunk`` points at a time."""
+        xp = self.xp
+        zs, gs = [], []
+        delays = numpy.asarray(delays, dtype=float)
+        for c in range(0, len(points), self.point_chunk):
+            part = points[c:c + self.point_chunk]
+            thetas, skies = self._coordinates(part)
+            d = delays[c:c + len(part)]
+            z = self._z(thetas, skies, d[:, None])[..., 0]                   # (M, K, 2)
+            stack = self._template_grams(thetas, skies)
+            g = self._gram_at(stack, numpy.arange(len(part)), d)              # (K, 2, K, 2, M)
+            zs.append(xp.moveaxis(z, 0, -1))
+            gs.append(g)
+            del stack
+        return xp.concatenate(zs, axis=-1), xp.concatenate(gs, axis=-1)
+
     def __call__(self, points):
         """The log likelihood of each point; ``nan`` where its F has not fallen by ``edge_margin`` at the ends of
         the lags its grid times cover. The correlations, Grams and statistics of ``point_chunk`` points at a time

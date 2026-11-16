@@ -535,6 +535,135 @@ class EccentricCellPE(BaseModel):
             self._lognl = -0.5 * total / self.noise_variance
         return self._lognl
 
+    def _params_of(self, theta, sky):
+        """The parameter dict of ``theta = (Mc, e, chi, q)`` and a sky offset (the inverse of _theta_sky)."""
+        lon0, lat0, slon, slat = self.sky_reference
+        q = dict(self.static_params)
+        q.update(mchirp=float(theta[0]), eccentricity=float(theta[1]), chi_eff=float(theta[2]), q=float(theta[3]),
+                 eclipticlongitude=float(numpy.mod(lon0 + sky[0] * slon, 2 * numpy.pi)),
+                 eclipticlatitude=float(lat0 + sky[1] * slat))
+        return q
+
+    def _full_at(self, params, delays):
+        """The full model's (``self.full_model``) correlations and Grams of every mode at one delay per point:
+        through its shared regions, built over the points first (the sampler's (2,2) regions released before), and
+        directly (the nearest of the point's own samples) where none covers a point."""
+        import logging
+        fm, xp = self.full_model, self.xp
+        M = len(params)
+        covered = numpy.zeros(M, dtype=bool)
+        for shared in getattr(fm, '_shared_regions', []):
+            covered |= shared.inside(params)
+        outside = numpy.nonzero(~covered)[0]
+        if fm.shared_options is not None and len(outside) >= min(fm.min_new_region, M):
+            logging.info("full model: sharing %d of %d points", len(outside), M)
+            fm._share_split([params[i] for i in outside])
+        K = len(fm.patterns.keys)
+        z = xp.zeros((K, 2, M), dtype=xp.complex128)
+        g = xp.zeros((K, 2, K, 2, M), dtype=xp.complex128)
+        todo = numpy.arange(M)
+        for shared in getattr(fm, '_shared_regions', []):
+            if not len(todo):
+                break
+            sel = todo[shared.inside([params[i] for i in todo])]
+            if len(sel):
+                zz, gg = shared.at_delays([params[i] for i in sel], delays[sel])
+                z[..., xp.asarray(sel)] = zz
+                g[..., xp.asarray(sel)] = gg
+                todo = numpy.setdiff1d(todo, sel)
+        if len(todo):
+            logging.info("full model: %d of %d points directly", len(todo), M)
+        for i in todo:
+            fm.update(**{k: params[i][k] for k in fm.variable_params})
+            ev = fm.evaluate()
+            k = int(numpy.argmin(numpy.abs(ev['delays'] - delays[i])))
+            z[..., i] = xp.asarray(ev['z'][..., k])
+            gi = ev['gram']
+            g[..., i] = xp.asarray(gi if gi.ndim == 4 else gi[..., k])
+        return z, g
+
+    def _reconstruct_many_full(self, points, seeds, chunk):
+        """:meth:`reconstruct_many` with a full model (every mode; ``self.full_model``) beside this (2,2) one: the
+        time samples drawn from this model's quadratures through its regions, which are then released; the full
+        model's correlations at those samples, and its ln B and angles (:func:`pycbc.filter.hm_marginal.
+        hm_draw_batch`); ``marginal_loglr`` this model's marginal plus the full model's difference at the sample."""
+        from pycbc.filter.bstatistic import AmplitudeTable
+        from pycbc.filter.hm_marginal import hm_draw_batch
+        xp = self.xp
+        host = lambda a: a.get() if hasattr(a, 'get') else numpy.asarray(a)
+        rngs, delays, sample_delays, lnb22, marg, params = [], [], [], [], [], []
+        for c in range(0, len(points), chunk):
+            part = points[c:c + chunk]
+            evs = self._quadratures(part)
+            zs, gs = [], []
+            for ev, seed in zip(evs, seeds[c:c + len(part)]):
+                rng = numpy.random.default_rng(seed)
+                terms = ev['log_bayes'] + numpy.log(ev['widths'])
+                weight = numpy.exp(terms - terms.max())
+                k = rng.choice(len(weight), p=weight / weight.sum())
+                delays.append(float(ev['delays'][k] + rng.random() * ev['widths'][k]))
+                sample_delays.append(float(ev['delays'][k]))
+                rngs.append(rng)
+                marg.append(float(ev['loglikelihood']))
+                params.append(self._params_of(ev['theta'], ev['sky']))
+                zs.append(xp.asarray(ev['z'][..., k:k + 1]))
+                gm = ev['gram']
+                gs.append(xp.asarray(gm[..., None] if gm.ndim == 4 else gm[..., k:k + 1]))
+            v = self._log_bayes(xp.concatenate(zs, axis=-1), xp.concatenate(gs, axis=-1))[0]
+            lnb22.extend(numpy.ravel(host(v)).tolist())
+            del evs, zs, gs
+        # the sampler's regions released: the full model's grids (every mode) need the room
+        self._shared_regions = []
+        self._last = None
+        self.block._prepared = None
+        if xp is not numpy:
+            xp.get_default_memory_pool().free_all_blocks()
+        fm = self.full_model
+        if getattr(fm, '_hm_table', None) is None:
+            fm._hm_table = AmplitudeTable(self.distance_prior, kernel='cosh', xp=xp)
+        z, g = self._full_at(params, numpy.array(sample_delays))
+        var = self.noise_variance
+        out = []
+        for c in range(0, len(points), chunk):
+            sl = slice(c, min(len(points), c + chunk))
+            lnb, draws = hm_draw_batch(z[..., sl] / var, g[..., sl] / var, fm.patterns.keys, self.distance_prior,
+                                       self.nodes, rngs[sl], n_l0=self.n_l0, table=fm._hm_table, xp=xp)
+            for i, d in zip(range(sl.start, sl.stop), draws):
+                delta = float(lnb[i - sl.start] - lnb22[i])
+                h = d['amplitude']
+                out.append(dict(delta_tc=delays[i], mean_anomaly=d['mean_anomaly'], loglr=d['loglr'],
+                                snr=float(numpy.sqrt(max(2 * d['loglr'], 0.0))), inclination=d['inclination'],
+                                polarization=d['polarization'], distance=float(self.distance_prior.scale / h),
+                                coa_phase=d['coa_phase'], loglikelihood=float(self.lognl + d['loglr']),
+                                marginal_loglr=marg[i] + delta, hm_delta=delta))
+        return out
+
+    def _quadratures(self, part):
+        """The time quadratures of ``part`` (dicts of the variable parameters): through the shared regions that
+        cover them, the rest directly."""
+        full = []
+        for p in part:
+            q = dict(self.static_params)
+            q.update(p)
+            full.append(q)
+        evs = [None] * len(full)
+        todo = numpy.arange(len(full))
+        for shared in getattr(self, '_shared_regions', []):
+            if not len(todo):
+                break
+            sel = todo[shared.inside([full[i] for i in todo])]
+            if len(sel):
+                for i, ev in zip(sel, shared._evaluate([full[i] for i in sel], keep=True)):
+                    evs[i] = ev
+            todo = numpy.array([i for i in todo if evs[i] is None], dtype=int)
+        for i, p in enumerate(part):
+            if evs[i] is None:
+                self.update(**p)
+                evs[i] = self._shared_evaluate()
+                if evs[i] is None:
+                    evs[i] = self.evaluate()
+        return evs
+
     def reconstruct_many(self, points, seeds, chunk=256):
         """:meth:`reconstruct` at each of ``points`` (dicts of the variable parameters) with its seed, ``chunk``
         points at a time: the time quadratures of the points a shared region covers computed together, the rest
@@ -556,6 +685,8 @@ class EccentricCellPE(BaseModel):
                 logging.info("reconstruct_many: %d of %d points outside every region: sharing them", len(outside),
                              len(full))
                 self._share_split([full[i] for i in outside])
+        if getattr(self, 'full_model', None) is not None:
+            return self._reconstruct_many_full(points, seeds, chunk)
         out = []
         for c in range(0, len(points), chunk):
             part = points[c:c + chunk]
