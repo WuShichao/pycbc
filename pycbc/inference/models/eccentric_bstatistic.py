@@ -666,7 +666,7 @@ class EccentricCellPE(BaseModel):
         var = self.noise_variance
         if getattr(self, 'hm_draws', 'importance') == 'importance':
             out = self._importance_draws(numpy.concatenate(z22s, axis=-1), numpy.concatenate(g22s, axis=-1),
-                                         host(z), host(g), rngs, delays, marg)
+                                         host(z), host(g), rngs, delays, marg, sample_delays=sample_delays)
             logging.info("full model: draws and weights of %d points in %.1f s", len(params), time.time() - t0)
             return out
         out = []
@@ -686,7 +686,7 @@ class EccentricCellPE(BaseModel):
         logging.info("full model: ln B and draws of %d points in %.1f s", len(params), time.time() - t0)
         return out
 
-    def _importance_draws(self, z22, g22, z, g, rngs, delays, marg):
+    def _importance_draws(self, z22, g22, z, g, rngs, delays, marg, sample_delays=None):
         """The extrinsic draws of the (2,2) model at each point's time sample (``z22 (K22, 2, M)``, ``g22``, the
         sampler's own), spread over the full model's ranges (``phi`` over ``[0, 2 pi)``, ``psi`` over ``[0, pi)``:
         the (2,2) model's equivalent branches taken at random), and the full model's log likelihood there (``z``,
@@ -742,6 +742,15 @@ class EccentricCellPE(BaseModel):
         lnl = log_likelihood_batch(z / var, g / var, self.full_model.patterns.keys, h, anomaly, iota, pol, phi)
         lnl22 = log_likelihood_batch(z22 / var, g22 / var, self.patterns.keys, h, anomaly, iota, pol, phi)
         delta = lnl - lnl22
+        # the delay is drawn within its sample's width (delays) while the angles belong to the sample's own time:
+        # moved by dt, the orbital phase and the mean anomaly advance by pi f dt at the frequency the data fix
+        # best (phase_reference_frequency; every harmonic's phase at its own frequency is then kept, 2 dphi + (n - 2)
+        # dl0 = n pi f dt). Without it the phase at a fixed epoch was biased by 2 pi f <dt>, 0.5 rad
+        f_ph = getattr(self, 'phase_reference_frequency', None)
+        if f_ph is not None and sample_delays is not None:
+            jit = numpy.asarray(delays, dtype=float) - numpy.asarray(sample_delays, dtype=float)
+            phi = numpy.mod(phi + numpy.pi * f_ph * jit, 2 * numpy.pi)
+            anomaly = numpy.mod(anomaly + numpy.pi * f_ph * jit, 2 * numpy.pi)
         logging.info("importance draws: hm_delta median %.3f, 5-95%% %s", numpy.median(delta),
                      numpy.percentile(delta, [5, 95]).round(3).tolist())
         return [dict(delta_tc=delays[i], mean_anomaly=float(anomaly[i]), loglr=float(lnl[i]),
