@@ -69,6 +69,17 @@ def efpe_modes(params, frequencies, f_ref, amplitude_tol=1e-12,
              Amplitude_tol=amplitude_tol)
     if mode_array is not None:
         p['mode_array'] = [list(v) for v in mode_array]
+    try:
+        return _efpe_modes(p, f, hlm, taper)
+    finally:
+        # pyEFPEHM's model holds reference cycles, which the collector, counting objects and not bytes, frees
+        # late: a cell's 625 calls with hlm grew the memory by 14 GB; collected after each call, by 0.7 GB at 81
+        import gc
+        gc.collect()
+
+
+def _efpe_modes(p, f, hlm, taper):
+    from pyEFPEHM.waveform.EFPE import pyEFPE
     if hlm:
         p.update(inclination=numpy.pi / 3, Compute_hlm_Modes=True)
         out = pyEFPE(p).generate_hlm_modes(
