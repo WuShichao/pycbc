@@ -221,7 +221,11 @@ class EccentricModePhaseCorrelation(PhaseNUFFTCorrelation):
     def _pins(self, c):
         psi_l, dpsi_l = _basis([self.f_lower])
         n = c.shape[1] - 17
-        p0 = numpy.concatenate([psi_l[:, 0], numpy.zeros(n + 1)])
+        # the anchor slope's change moves the clock: a time shift pinned at f_ref, phase slope (f - f_ref), so its
+        # value pin is f_ref times it (without it the region's correlations had a phase 2 pi f_ref dt common to
+        # every mode, dt the clock's shift from the region's reference: up to 2 rad at one posterior width in q
+        # or chi; ln B did not see it, the drawn coa_phase did)
+        p0 = numpy.concatenate([psi_l[:, 0], numpy.zeros(n), [self.f_lower]])
         p1 = numpy.concatenate([dpsi_l[:, 0], numpy.zeros(n), [1.]])
         return c @ p0, c @ p1
 

@@ -577,6 +577,27 @@ class EccentricCellPE(BaseModel):
                 todo = numpy.setdiff1d(todo, sel)
         if len(todo):
             logging.info("full model: %d of %d points directly", len(todo), M)
+        # diagnostics: three points' correlations, region against direct, in both models (phase of each mode)
+        host = lambda a: a.get() if hasattr(a, 'get') else numpy.asarray(a)
+        for i in range(min(3, M)):
+            if i in todo:
+                continue
+            fm.update(**{k: params[i][k] for k in fm.variable_params})
+            ev = fm.evaluate()
+            k = int(numpy.argmin(numpy.abs(ev['delays'] - delays[i])))
+            zd = host(ev['z'][..., k])
+            zr = host(z[..., i])
+            self.update(**{k_: params[i][k_] for k_ in self.variable_params})
+            e2 = self.evaluate()
+            k2 = int(numpy.argmin(numpy.abs(e2['delays'] - delays[i])))
+            z2 = host(e2['z'][..., k2])
+            k222 = fm.patterns.keys.index((2, 2, 2))
+            logging.info("full model check %d: delay %.1f / direct %.1f / sampler direct %.1f; arg region/direct per "
+                         "mode %s; |region/direct| %s; arg full direct/sampler direct (2,2,2) %.3f", i, delays[i],
+                         ev['delays'][k], e2['delays'][k2],
+                         numpy.round(numpy.angle(zr[:, 0] / zd[:, 0]), 3).tolist(),
+                         numpy.round(numpy.abs(zr[:, 0] / zd[:, 0]), 3).tolist(),
+                         float(numpy.angle(zd[k222, 0] / z2[self.patterns.keys.index((2, 2, 2)), 0])))
         for i in todo:
             fm.update(**{k: params[i][k] for k in fm.variable_params})
             ev = fm.evaluate()
@@ -689,7 +710,7 @@ class EccentricCellPE(BaseModel):
         step = 2 * numpy.pi / len(angles)
         P22 = PatternSet(self.patterns.keys)
         Pf = PatternSet(self.full_model.patterns.keys)
-        out = []
+        out, diag = [], []
         for i in range(M):
             rng = rngs[i]
             w = numpy.exp(by_angle[:, i] - by_angle[:, i].max())
@@ -715,10 +736,24 @@ class EccentricCellPE(BaseModel):
             lnl = float(h * Xf[0] - 0.5 * h * h * gf[0])
             lnl22 = float(h * X2[0] - 0.5 * h * h * g2[0])
             delta = lnl - lnl22
+            # diagnostics: the (2,2) modes' likelihood from the full model's correlations, and that model's own
+            # (2,2) likelihood with its ln L - ln L_22 (all from the same correlations)
+            k22 = [Pf.keys.index(k) for k in P22.keys]
+            X3, g3 = _exact_xg(z[k22][..., i], g[k22][:, :, k22][..., i], P22, *args)
+            diag.append((float(h * X3[0] - 0.5 * h * h * g3[0]) - lnl22, delta, abs(complex(z[k22][0, 0, i])),
+                         abs(complex(z22[0, 0, i])), float(numpy.angle(complex(z[k22][1, 0, i]) / complex(z22[1, 0, i])))))
             out.append(dict(delta_tc=delays[i], mean_anomaly=anomaly, loglr=lnl,
                             snr=float(numpy.sqrt(max(2 * lnl, 0.0))), inclination=iota, polarization=pol,
                             distance=float(self.distance_prior.scale / h), coa_phase=phi,
                             loglikelihood=float(self.lognl + lnl), marginal_loglr=marg[i] + delta, hm_delta=delta))
+        import logging
+        d = numpy.array(diag)
+        logging.info("importance draws: ln L_22(full model's z) - ln L_22(sampler's z) median %.3f, 5-95%% %s; "
+                     "hm_delta median %.3f, 5-95%% %s; |z(2,2,1)+| full/sampler median %.3f; arg z(2,2,2)+ "
+                     "full/sampler median %.3f, 5-95%% %s", numpy.median(d[:, 0]),
+                     numpy.percentile(d[:, 0], [5, 95]).round(3).tolist(), numpy.median(d[:, 1]),
+                     numpy.percentile(d[:, 1], [5, 95]).round(3).tolist(), numpy.median(d[:, 2] / d[:, 3]),
+                     numpy.median(d[:, 4]), numpy.percentile(d[:, 4], [5, 95]).round(3).tolist())
         return out
 
     def _quadratures(self, part):
