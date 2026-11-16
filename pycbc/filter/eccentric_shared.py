@@ -364,23 +364,17 @@ class EccentricSharedRegion(object):
         self.best_loglikelihood = max(values)
         good = numpy.nonzero(tops >= tops.max() - self.edge_margin)[0]
         logging.info("EccentricSharedRegion: %d probes in %.1f s", len(pick), time.time() - tick)
-        self.views, self.correlators, self.grids = [], [], []
-        frames, shifts = [], []
-        for k, key in enumerate(self.keys):
-            view = EccentricModeView(block, theta0, k, response, family.f_ref,
-                                     block.response_frequencies)
-            corr = EccentricModePhaseCorrelation(family, key, view, theta0, block.data, skies, thetas,
-                                                 sky_tolerance=self.sky_tolerance, window=self.data_window,
-                                                 band_margin=band_margin)
-            frame = corr.frame(thetas, 3)
-            self.views.append(view)
-            self.correlators.append(corr)
-            frames.append(frame)
-            shifts.append(corr.project(thetas, frame)[1])
-        logging.info("EccentricSharedRegion: %d points, correlators and frames in %.1f s; eccentric ranks %s "
-                     "(training residual rms %s rad)", len(region), time.time() - tick,
-                     [c.basis_rank for c in self.correlators],
-                     ['%.1e' % c.basis_residual for c in self.correlators])
+        # the modes one at a time, the reference (2,2,2) first: its correlator, frame, shift and grid, the
+        # correlator's device arrays released before the next mode's (all seven modes' correlators at once took
+        # 5 GB, leaving 0.36 GB for a grid that needs 0.46)
+        options = dict(grid_options or {})
+        keys = [tuple(int(v) for v in key) for key in self.keys]
+        ref = keys.index((2, 2, 2)) if (2, 2, 2) in keys else 0
+        K = len(self.keys)
+        self.views, self.correlators, self.grids = [None] * K, [None] * K, [None] * K
+        margin = float(options.get('margin', 0.05))
+        shifts = [None] * K
+        tlo = thi = base_pad = None
         # the grid times the region needs (per mode, T = delay + shift). The posterior's arrival time is set by the
         # dominant (2,2,2) mode, whose T at the peak hardly moves over a region (170 s over a posterior where its
         # shift moves 6000 s): its window is where the probes' ln B lies within edge_margin of each one's largest,
@@ -390,30 +384,40 @@ class EccentricSharedRegion(object):
         # over the region's points, widened by the grid margin of it. From the probes alone (8 points) those
         # windows missed most of a posterior that reached past a frame ball's spread: no lags on the weak modes'
         # grids for 90% of the posterior points (timecheck0, fig10k)
-        options = dict(grid_options or {})
-        keys = [tuple(int(v) for v in key) for key in self.keys]
-        ref = keys.index((2, 2, 2)) if (2, 2, 2) in keys else 0
-        tlo, thi = numpy.inf, -numpy.inf
-        for i in good:
-            d, v = curves[i]
-            T = d[v >= tops[i] - self.edge_margin] + shifts[ref][pick[i]]
-            tlo, thi = min(tlo, T.min()), max(thi, T.max())
-        base_pad = (thi - tlo) + 8 * dt
-        margin = float(options.get('margin', 0.05))
-        for k in range(len(self.keys)):
+        for k in [ref] + [j for j in range(K) if j != ref]:
+            key = self.keys[k]
+            view = EccentricModeView(block, theta0, k, response, family.f_ref,
+                                     block.response_frequencies)
+            corr = EccentricModePhaseCorrelation(family, key, view, theta0, block.data, skies, thetas,
+                                                 sky_tolerance=self.sky_tolerance, window=self.data_window,
+                                                 band_margin=band_margin)
+            frame = corr.frame(thetas, 3)
+            self.views[k], self.correlators[k] = view, corr
+            shifts[k] = corr.project(thetas, frame)[1]
+            if k == ref:
+                tlo, thi = numpy.inf, -numpy.inf
+                for i in good:
+                    d, v = curves[i]
+                    T = d[v >= tops[i] - self.edge_margin] + shifts[ref][pick[i]]
+                    tlo, thi = min(tlo, T.min()), max(thi, T.max())
+                base_pad = (thi - tlo) + 8 * dt
             diff = shifts[k] - shifts[ref]
             dmin, dmax = float(diff.min()), float(diff.max())
             pad = base_pad + margin * (dmax - dmin)
             reach = (self.lags[0] * dt + shifts[k].min() - dt, self.lags[-1] * dt + shifts[k].max() + 2 * dt)
             window = (max(tlo + dmin - pad, reach[0]), min(thi + dmax + pad, reach[1]))
-            self.grids.append(PhaseGrid(self.correlators[k], thetas, (lo, hi), time_range=window, **options))
-            g = self.grids[-1]
+            self.grids[k] = PhaseGrid(corr, thetas, (lo, hi), time_range=window, **options)
+            g = self.grids[k]
             logging.info("EccentricSharedRegion: mode %d grid times %.0f to %.0f s (step %.1f s, %d cells); "
                          "the region's whole lag reach %.0f to %.0f s", k, window[0], window[1], g.step[-1],
                          g.size[-1], reach[0], reach[1])
-            self.correlators[k].release()
+            corr.release()
             if self.xp is not numpy:
                 self.xp.get_default_memory_pool().free_all_blocks()
+        logging.info("EccentricSharedRegion: %d points, correlators, frames and grids in %.1f s; eccentric ranks %s "
+                     "(training residual rms %s rad)", len(region), time.time() - tick,
+                     [c.basis_rank for c in self.correlators],
+                     ['%.1e' % c.basis_residual for c in self.correlators])
         model.block._prepared = None
         logging.info("EccentricSharedRegion: grids %s in %.1f s", [list(g.size) for g in self.grids],
                      time.time() - tick)
