@@ -633,7 +633,7 @@ class EccentricCellPE(BaseModel):
                 rngs.append(rng)
                 marg.append(r['loglikelihood'])
                 params.append(self._params_of(r['theta'], r['sky']))
-            v = self._log_bayes(xp.asarray(zc), xp.asarray(gc_))[0]
+            v = self._log_bayes(xp.asarray(zc), xp.asarray(gc_), validate=False)[0]
             lnb22.extend(numpy.ravel(host(v)).tolist())
             if getattr(self, 'hm_draws', 'importance') == 'importance':
                 z22s.append(zc)
@@ -705,9 +705,15 @@ class EccentricCellPE(BaseModel):
         var = self.noise_variance
         rng = rngs[0] if len(rngs) else numpy.random.default_rng()
         # the anomaly node of each point by its (2,2) ln B per node (ln B divides by the noise variance itself)
-        _, by_angle, angles = self._log_bayes(xp.asarray(z22), xp.asarray(g22))
+        # in chunks: all 30000 points of a 10000-sample run at once asked 16 GB of the device (the Grams' eigen
+        # decomposition); the Grams were checked when these samples were first evaluated
+        parts = []
+        for c in range(0, M, 2048):
+            _, ba, angles = self._log_bayes(xp.asarray(z22[..., c:c + 2048]), xp.asarray(g22[..., c:c + 2048]),
+                                            validate=False)
+            parts.append(host(ba).reshape(len(angles), -1))
         angles = numpy.asarray(host(angles), dtype=float)
-        by_angle = host(by_angle).reshape(len(angles), M)
+        by_angle = numpy.concatenate(parts, axis=1)
         a = flat_choice(by_angle.T, rng.random((M, 1)))[:, 0]
         step = 2 * numpy.pi / len(angles)
         anomaly = numpy.mod(angles[a] + (rng.random(M) - 0.5) * step, 2 * numpy.pi)
