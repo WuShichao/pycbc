@@ -27,7 +27,7 @@ import numpy
 
 
 def efpe_modes(params, frequencies, f_ref, amplitude_tol=1e-12,
-               f22_window=None, taper=None):
+               f22_window=None, taper=None, hlm=False, mode_array=None):
     """pyEFPEHM's modes at ``params`` (masses, spins, ``eccentricity``,
     optionally ``inclination``) on ``frequencies``: ``{key: (amplitude,
     psi, present)}``, ``amplitude`` the complex amplitudes of the plus and
@@ -47,7 +47,16 @@ def efpe_modes(params, frequencies, f_ref, amplitude_tol=1e-12,
     support, as a time-domain taper of the observation would. A mode's
     support edges move with the binary's parameters (pyEFPEHM keeps the
     stretch of the orbit the window sets, at harmonic frequencies that
-    depend on e); tapered, its amplitude goes to zero smoothly there."""
+    depend on e); tapered, its amplitude goes to zero smoothly there.
+
+    ``hlm=True``: each aligned mode ``(l, m, n)``'s multipole moment (its
+    inertial ``m' = m`` column of pyEFPEHM's ``generate_hlm_modes``, phase 0,
+    mean anomaly 0, no angular factor) in the first row of ``amplitude``,
+    zero in the second: the templates of :mod:`pycbc.filter.hm_marginal`,
+    which applies the angular factors of every pattern. The modes are
+    selected at inclination pi / 3 (where every pattern is non-zero; the
+    moments themselves do not depend on it). ``mode_array``: pyEFPEHM's
+    ``(l, |m|)`` list (default its own, l <= 4)."""
     from pyEFPEHM.waveform.EFPE import pyEFPE
     f = numpy.asarray(frequencies, dtype=float)
     lo, hi = (f[0], f[-1]) if f22_window is None else f22_window
@@ -58,6 +67,30 @@ def efpe_modes(params, frequencies, f_ref, amplitude_tol=1e-12,
              f22_start=lo * 0.999, f22_ref=f_ref, f22_end=hi * 1.001,
              distance=100.0, inclination=params.get('inclination', 0.0),
              Amplitude_tol=amplitude_tol)
+    if mode_array is not None:
+        p['mode_array'] = [list(v) for v in mode_array]
+    if hlm:
+        p.update(inclination=numpy.pi / 3, Compute_hlm_Modes=True)
+        out = pyEFPE(p).generate_hlm_modes(
+            f, return_waveform_pieces=True)['modes']
+        modes = {}
+        for key, m in out.items():
+            l, mm = int(key[0]), int(key[1])
+            idx = m['freq_idxs']
+            amp = numpy.zeros((2, len(f)), complex)
+            psi = numpy.zeros(len(f))
+            have = numpy.zeros(len(f), bool)
+            psi[idx] = numpy.asarray(m['psi_SPA'])
+            amp[0, idx] = numpy.asarray(m['hlm'])[:, mm + l] * numpy.exp(
+                1j * psi[idx])
+            if taper and len(idx) > 1:
+                fi = f[idx]
+                t = numpy.gradient(psi[idx], fi) / (2 * numpy.pi)
+                amp[:, idx] *= _ramp(abs(t - t[0]) / taper) * \
+                    _ramp(abs(t[-1] - t) / taper)
+            have[idx] = True
+            modes[tuple(int(v) for v in key)] = (amp, psi, have)
+        return modes
     out = pyEFPE(p).generate_modes(f, return_waveform_pieces=True)['modes']
     modes = {}
     for key, m in out.items():

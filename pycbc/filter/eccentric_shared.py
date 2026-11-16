@@ -657,8 +657,7 @@ class EccentricSharedRegion(object):
         nk = z.shape[1]
         zs = xp.moveaxis(z, 0, 2).reshape(nk, 2, -1)
         gs = self._gram_at(stack, rows, delays.ravel())
-        twof = host(mean_anomaly_twof_analytic(zs / var, gs / var, offsets, m.screen_anomalies,
-                                               xp=xp)[0].max(axis=0)).reshape(Mi, W)
+        twof = host(m._twof(zs / var, gs / var, m.screen_anomalies)[0].max(axis=0)).reshape(Mi, W)
         del z, zs, gs
         F = numpy.where(valid, twof / 2, -numpy.inf)
         top = F.max(axis=1)
@@ -681,7 +680,7 @@ class EccentricSharedRegion(object):
         zf = xp.moveaxis(zf, 0, 2).reshape(nk, 2, -1)[..., xp.asarray(flat)]
         gf = self._gram_at(stack, frows, fdel.ravel()[flat])
         del stack
-        ftwof = host(mean_anomaly_twof_analytic(zf / var, gf / var, offsets, m.n_l0, xp=xp)[0].max(axis=0))
+        ftwof = host(m._twof(zf / var, gf / var, m.n_l0)[0].max(axis=0))
         # each point's best sample: its ln B sets which samples matter (F bounds ln B from above)
         starts = numpy.concatenate([[0], numpy.cumsum(nf)[:-1]])
         best_at = numpy.array([s0 + numpy.argmax(ftwof[s0:s0 + n]) for s0, n in zip(starts, nf)])
@@ -820,9 +819,17 @@ class EccentricPhaseCoordinates(object):
         self._G = (psi * (r_all * sw)[None]).T                                    # (nf, 16)
         for m in self._modes:
             m['V'] = m['V'] * sw[m['block']][None]
-        # what the marginalised phases absorb, 2 phi + (n - 2) l0 (a constant and one linear in the harmonic's
-        # r_k = n / 2), and a common arrival time
-        cols = [sw, sw * r_all, sw * f / f[w > 0].mean()]
+        # what the marginalised phases absorb, m phi + (n - m) l0 (for the (2,2,n) modes alone a constant and one
+        # linear in the harmonic's r_k = n / 2; with other patterns, the span of m_k and n_k), and a common
+        # arrival time
+        m_all = numpy.concatenate([numpy.full(m['block'].stop - m['block'].start, float(m['key'][1]))
+                                   for m in self._modes])
+        n_all = numpy.concatenate([numpy.full(m['block'].stop - m['block'].start,
+                                              float(m['key'][2]) if len(m['key']) > 2 else float(m['key'][1]))
+                                   for m in self._modes])
+        cols = [sw * m_all, sw * n_all, sw * f / f[w > 0].mean()]
+        if numpy.all(m_all == m_all[0]) and m_all[0] != 0:
+            cols = [sw, sw * r_all, sw * f / f[w > 0].mean()]
         self._Q = numpy.linalg.qr(numpy.array(cols).T)[0]
         self._vs = None
 

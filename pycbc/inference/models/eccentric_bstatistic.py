@@ -198,6 +198,20 @@ class EccentricCellPE(BaseModel):
     apart where it matters (see :meth:`evaluate`); check convergence in
     ``oversampling``. Mean anomaly is uniform on ``n_l0`` nodes, the
     orientation on ``OrientationNodes(*orientation_nodes)``.
+
+    ``template_convention='hlm'`` (with ``mode_keys``, the block's modes
+    ``(l, m, n)``): the block's templates are multipole moments without
+    angular factors (:func:`pycbc.waveform.eccentric_mode_family.efpe_modes`
+    with ``hlm=True``), possibly with modes of other patterns than (2,2). The
+    sampler's likelihood is then the (2,2,n) modes' (their face-on
+    normalisation restored by one constant), exactly as before; the
+    reconstruction draws one arrival-time sample per point from it and
+    evaluates there the likelihood of every mode
+    (:func:`pycbc.filter.hm_marginal.hm_draw_batch`): ``marginal_loglr`` is
+    the (2,2) model's plus that sample's difference, an unbiased estimate of
+    the full model's whose importance weights (the driver's own ln B against
+    the box) give the full model's posterior; the angles are drawn from the
+    full model, ``coa_phase`` over ``[0, 2 pi)``.
     """
     name = 'eccentric_cell_pe'
     intrinsic = ('mchirp', 'eccentricity', 'chi_eff', 'q')
@@ -205,9 +219,22 @@ class EccentricCellPE(BaseModel):
     def __init__(self, variable_params, block_model, sky_reference, delay_window, distance_prior,
                  n_l0=64, orientation_nodes=(16, 8), amplitude_order=64, oversampling=4,
                  screen_margin=40.0, bayes_margin=30.0, noise_variance=1.0, amplitude_table=None,
-                 screen_anomalies=None, shared_options=None, **kwargs):
+                 screen_anomalies=None, shared_options=None, template_convention='face-on', mode_keys=None,
+                 **kwargs):
         super().__init__(variable_params, **kwargs)
         self.block = block_model
+        self.patterns = None
+        if template_convention == 'hlm':
+            from pycbc.filter.hm_marginal import PatternSet, projector
+            if mode_keys is None:
+                raise ValueError('template_convention hlm needs mode_keys')
+            self.patterns = PatternSet(mode_keys)
+            self._k22 = numpy.array([i for i, k in enumerate(self.patterns.keys) if k[:2] == (2, 2)])
+            self._off22 = numpy.asarray(block_model.offsets)[self._k22]
+            # the face-on plus polarisation of a (2,2) mode is its hlm times conj(Ap22(0))
+            self._a22 = complex(numpy.conj(projector(2, 2, 0.)[0]))
+        elif template_convention != 'face-on':
+            raise ValueError('template_convention: face-on or hlm')
         self.xp = block_model.xp
         self.sky_reference = tuple(float(v) for v in sky_reference)
         lo, hi = (float(v) for v in delay_window)
@@ -400,8 +427,23 @@ class EccentricCellPE(BaseModel):
         sky = numpy.array([dlon / slon, (params['eclipticlatitude'] - lat0) / slat])
         return theta, sky
 
+    def _sub22(self, z, g):
+        """The (2,2,n) modes' correlations and Grams in the face-on normalisation, and their offsets."""
+        if self.patterns is None:
+            return z, g, self.block.offsets
+        k = self._k22
+        a = self._a22
+        return numpy.conj(a) * z[k], abs(a) ** 2 * g[k][:, :, k], self._off22
+
+    def _twof(self, z, g, n_l0):
+        """2F of the (2,2) model per anomaly node and sample (the screens)."""
+        from pycbc.filter.eccentric_fast_search import mean_anomaly_twof_analytic
+        z, g, off = self._sub22(z, g)
+        return mean_anomaly_twof_analytic(z, g, off, n_l0, xp=self.xp)
+
     def _log_bayes(self, z, g, validate=True):
-        return mean_anomaly_log_bayes(z, g, self.block.offsets, self.distance_prior, self.nodes, n_l0=self.n_l0,
+        z, g, offsets = self._sub22(z, g)
+        return mean_anomaly_log_bayes(z, g, offsets, self.distance_prior, self.nodes, n_l0=self.n_l0,
                                       noise_variance=self.noise_variance, order=self.amplitude_order,
                                       table=self.table, xp=self.xp, validate=validate)
 
@@ -435,8 +477,7 @@ class EccentricCellPE(BaseModel):
         var = self.noise_variance
         z = engine.correlations(lags)
         g = WindowedModeFFT.interpolated_gram(engine, lags * dt, atimes, ganchors)
-        twof = host(mean_anomaly_twof_analytic(z / var, g / var, self.block.offsets, self.screen_anomalies,
-                                               xp=xp)[0].max(axis=0))
+        twof = host(self._twof(z / var, g / var, self.screen_anomalies)[0].max(axis=0))
         keep = numpy.flatnonzero(twof / 2 >= twof.max() / 2 - self.screen_margin)
         # the neighbours too: F between whole lags can exceed both ends
         keep = numpy.unique(numpy.clip(numpy.concatenate([keep - 1, keep, keep + 1]), 0, len(lags) - 1))
@@ -445,7 +486,7 @@ class EccentricCellPE(BaseModel):
         zf = zf.reshape(zf.shape[0], 2, -1)
         fdelays = fdelays.ravel()
         gf = WindowedModeFFT.interpolated_gram(engine, fdelays, atimes, ganchors)
-        ftwof = host(mean_anomaly_twof_analytic(zf / var, gf / var, self.block.offsets, self.n_l0, xp=xp)[0].max(axis=0))
+        ftwof = host(self._twof(zf / var, gf / var, self.n_l0)[0].max(axis=0))
         order = numpy.argsort(-ftwof)
         best = float(host(self._log_bayes(zf[..., order[:1]], gf[..., order[:1]])[0])[0])
         active = numpy.flatnonzero(ftwof / 2 >= best - self.bayes_margin)
@@ -568,6 +609,8 @@ class EccentricCellPE(BaseModel):
             gs.append(xp.asarray(g[..., None] if g.ndim == 4 else g[..., k:k + 1]))
         z = xp.concatenate(zs, axis=-1)
         g = xp.concatenate(gs, axis=-1)
+        if self.patterns is not None:
+            return self._draw_many_hm(evs, rngs, delays, z, g)
         _, by_angle, angles = self._log_bayes(z, g)
         by_angle = host(by_angle).reshape(len(angles), len(evs))
         zl, gl, _ = mean_anomaly_components(z, g, self.block.offsets, self.n_l0, xp=xp)
@@ -598,6 +641,32 @@ class EccentricCellPE(BaseModel):
                             loglikelihood=float(self.lognl + loglr), marginal_loglr=float(ev['loglikelihood'])))
         return out
 
+    def _draw_many_hm(self, evs, rngs, delays, z, g):
+        """The draws of :meth:`_draw_many` for an ``hlm`` model: at each point's drawn arrival-time sample, the full
+        model's ln B and angles (:func:`pycbc.filter.hm_marginal.hm_draw_batch`) and the (2,2) model's ln B there;
+        ``marginal_loglr`` is the point's (2,2) marginal plus their difference (``hm_delta``)."""
+        from pycbc.filter.bstatistic import AmplitudeTable
+        from pycbc.filter.hm_marginal import hm_draw_batch
+        xp = self.xp
+        if getattr(self, '_hm_table', None) is None:
+            self._hm_table = AmplitudeTable(self.distance_prior, kernel='cosh', xp=xp)
+        var = self.noise_variance
+        lnb22 = self._log_bayes(z, g)[0]
+        lnb22 = lnb22.get() if hasattr(lnb22, 'get') else numpy.asarray(lnb22)
+        lnb22 = numpy.ravel(lnb22)
+        lnb, draws = hm_draw_batch(z / var, g / var, self.patterns.keys, self.distance_prior, self.nodes, rngs,
+                                   n_l0=self.n_l0, table=self._hm_table, xp=xp)
+        out = []
+        for i, (ev, d) in enumerate(zip(evs, draws)):
+            delta = float(lnb[i] - lnb22[i])
+            h = d['amplitude']
+            out.append(dict(delta_tc=delays[i], mean_anomaly=d['mean_anomaly'], loglr=d['loglr'],
+                            snr=float(numpy.sqrt(max(2 * d['loglr'], 0.0))), inclination=d['inclination'],
+                            polarization=d['polarization'], distance=float(self.distance_prior.scale / h),
+                            coa_phase=d['coa_phase'], loglikelihood=float(self.lognl + d['loglr']),
+                            marginal_loglr=float(ev['loglikelihood']) + delta, hm_delta=delta))
+        return out
+
     def reconstruct(self, rec=None, seed=None, ev=None):
         """Draw the marginalised parameters at the current point: ``delta_tc``
         (the arrival-time delay, the model's lag convention), ``mean_anomaly``,
@@ -612,13 +681,16 @@ class EccentricCellPE(BaseModel):
         from pycbc.filter.bstatistic import draw_orientation, draw_amplitude, draw_phase, _project
         from pycbc.filter.mean_anomaly import mean_anomaly_components
         from pycbc.tmpltbank.fstatistic_metric import orientation_weights
-        rng = numpy.random.default_rng(seed)
         rec = {} if rec is None else rec
         if ev is None:
             # ev: the current point's quadrature when the caller has it (reconstruct_many)
             ev = self._shared_evaluate()
         if ev is None:
             ev = self.evaluate()
+        if self.patterns is not None:
+            rec.update(self._draw_many([ev], [seed])[0])
+            return rec
+        rng = numpy.random.default_rng(seed)
         terms = ev['log_bayes'] + numpy.log(ev['widths'])
         weight = numpy.exp(terms - terms.max())
         k = rng.choice(len(weight), p=weight / weight.sum())

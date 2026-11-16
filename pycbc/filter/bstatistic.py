@@ -107,13 +107,30 @@ def _log_nodes(lo, hi, order, xp):
     return h, 0.5 * (b - a) * w * h
 
 
-def log_amplitude_integrand(h, x, g, prior, xp=numpy):
-    """``ln [p(h) I0(h x) exp(-h^2 g / 2)]``."""
-    return prior.log_pdf(h, xp=xp) + log_i0(h * x, xp=xp) - 0.5 * h * h * g
+def log_cosh(y, xp=numpy):
+    """``ln cosh(y)``, stable for large ``|y|``."""
+    a = xp.abs(y)
+    return a + xp.log1p(xp.exp(-2 * a)) - numpy.log(2.0)
 
 
-def log_amplitude_marginal(x, g, prior, order=64, chunk=65536, xp=numpy):
-    """``ln int p(h) I0(h x) exp(-h^2 g / 2) dh`` over the prior.
+def log_amplitude_integrand(h, x, g, prior, xp=numpy, kernel='i0'):
+    """``ln [p(h) K(h x) exp(-h^2 g / 2)]``, ``K`` ``I0`` (a marginalised
+    common phase), ``cosh`` (a real amplitude of either sign) or ``exp``."""
+    if kernel == 'i0':
+        k = log_i0(h * x, xp=xp)
+    elif kernel == 'cosh':
+        k = log_cosh(h * x, xp=xp)
+    elif kernel == 'exp':
+        k = h * x
+    else:
+        raise ValueError('kernel must be i0, cosh or exp')
+    return prior.log_pdf(h, xp=xp) + k - 0.5 * h * h * g
+
+
+def log_amplitude_marginal(x, g, prior, order=64, chunk=65536, xp=numpy,
+                           kernel='i0'):
+    """``ln int p(h) I0(h x) exp(-h^2 g / 2) dh`` over the prior
+    (``kernel='cosh'``: ``cosh(h x)`` in place of ``I0``).
 
     The prior's support is split into the interval about the integrand's
     maximum (ten widths of a peak, or thirty decay lengths of an edge),
@@ -144,11 +161,11 @@ def log_amplitude_marginal(x, g, prior, order=64, chunk=65536, xp=numpy):
     out = xp.empty(x.shape, dtype=xp.float64)
     for k in range(0, x.size, chunk):
         out[k:k + chunk] = _log_amplitude_marginal(
-            x[k:k + chunk], g[k:k + chunk], prior, order, xp)
+            x[k:k + chunk], g[k:k + chunk], prior, order, xp, kernel)
     return out.reshape(shape)
 
 
-def _log_amplitude_marginal(x, g, prior, order, xp):
+def _log_amplitude_marginal(x, g, prior, order, xp, kernel='i0'):
     low, high = _segments(x, g, prior, xp)
     floor = xp.broadcast_to(xp.asarray(prior.hmin, dtype=xp.float64),
                             x.shape)
@@ -157,7 +174,8 @@ def _log_amplitude_marginal(x, g, prior, order, xp):
         h, w = _log_nodes(lo, xp.maximum(hi, lo), order, xp)
         with numpy.errstate(divide='ignore'):
             f = log_amplitude_integrand(h, x[..., None], g[..., None],
-                                        prior, xp=xp) + xp.log(w)
+                                        prior, xp=xp, kernel=kernel) \
+                + xp.log(w)
         f = xp.where(w > 0, f, -numpy.inf)
         parts.append(f)
     terms = xp.concatenate(parts, axis=-1)
@@ -166,7 +184,7 @@ def _log_amplitude_marginal(x, g, prior, order, xp):
             + xp.log(xp.sum(xp.exp(terms - top), axis=-1)))
 
 
-def draw_amplitude(x, g, prior, rng, order=512):
+def draw_amplitude(x, g, prior, rng, order=512, kernel='i0'):
     """Draw ``h`` from ``p(h | x, g)`` by inverting the CDF of the
     integrand on a fine logarithmic mesh of both intervals; scalar ``x``
     and ``g``."""
@@ -175,7 +193,7 @@ def draw_amplitude(x, g, prior, rng, order=512):
     tail = numpy.geomspace(prior.hmin, max(low, prior.hmin), order)
     peak = numpy.geomspace(low, max(high, low), order)
     h = numpy.unique(numpy.concatenate([tail, peak]))
-    f = log_amplitude_integrand(h, x, g, prior)
+    f = log_amplitude_integrand(h, x, g, prior, kernel=kernel)
     density = numpy.exp(f - f.max())
     cdf = numpy.concatenate([[0], numpy.cumsum(
         0.5 * (density[1:] + density[:-1]) * numpy.diff(h))])
@@ -388,9 +406,18 @@ class AmplitudeTable(object):
         Largest ``a`` tabulated; default ``y_max + 12``.
     tolerance : float
         Largest error in ``ln J`` accepted at the checks.
+    kernel : {'i0', 'cosh'}
+        ``I0(u y)`` (a marginalised common phase) or ``cosh(u y)`` (a real
+        amplitude of either sign, as the higher-mode marginalisation of
+        :mod:`pycbc.filter.hm_marginal` needs) in ``f``. The fused
+        orientation kernel is for ``i0`` only.
     """
     def __init__(self, prior, y_max=40.0, log_a_min=-12.0, a_max=None,
-                 tolerance=1e-4, checks=4000, seed=0, xp=numpy):
+                 tolerance=1e-4, checks=4000, seed=0, xp=numpy,
+                 kernel='i0'):
+        if kernel not in ('i0', 'cosh'):
+            raise ValueError('kernel must be i0 or cosh')
+        self.kernel = kernel
         self.prior = prior
         self.m = prior.power + 2
         self.log_c = prior._log_norm
@@ -449,6 +476,10 @@ class AmplitudeTable(object):
             return True
         return False
 
+    def _log_kernel(self, x, xp=numpy):
+        kernel = getattr(self, 'kernel', 'i0')
+        return log_i0(x, xp=xp) if kernel == 'i0' else log_cosh(x, xp=xp)
+
     def _exact_scaled(self, y, a, b=numpy.inf, chunk=32768):
         """ln int_a^b u^-m I0(u y) exp(-u^2 / 2) du, from the exact
         integral at unit ``g``, computed on the array module the table was
@@ -464,7 +495,8 @@ class AmplitudeTable(object):
             limits = _UnitPowerLaw(self.prior.power, a[k:k + chunk],
                                    b[k:k + chunk])
             out[k:k + chunk] = _log_amplitude_marginal(
-                y[k:k + chunk], xp.ones(len(limits.hmin)), limits, 96, xp)
+                y[k:k + chunk], xp.ones(len(limits.hmin)), limits, 96, xp,
+                getattr(self, 'kernel', 'i0'))
         out = out.get() if hasattr(out, 'get') else out
         return out.reshape(shape)
 
@@ -479,6 +511,7 @@ class AmplitudeTable(object):
             f.attrs['log_a'] = self.log_a
             f.attrs['tolerance'] = self.tolerance
             f.attrs['error'] = self.error
+            f.attrs['kernel'] = getattr(self, 'kernel', 'i0')
 
     @classmethod
     def read(cls, path, prior):
@@ -497,6 +530,9 @@ class AmplitudeTable(object):
             table.log_a = tuple(float(v) for v in f.attrs['log_a'])
             table.tolerance = float(f.attrs['tolerance'])
             table.error = float(f.attrs['error'])
+            kernel = f.attrs.get('kernel', 'i0')
+            table.kernel = kernel.decode() if isinstance(kernel, bytes) \
+                else str(kernel)
         table.prior, table.m, table.log_c = prior, m, prior._log_norm
         table._device = {}
         table._xp = numpy
@@ -517,8 +553,8 @@ class AmplitudeTable(object):
         mills = numpy.sqrt(2 / numpy.pi) * xp.where(
             s > 0, 1 / erfcx(sp), xp.exp(-sn * sn) / erfc(sn))
         u = y + mills
-        return 0.5 * y * y + log_tail + log_i0(u * y, xp=xp) - u * y \
-            - self.m * xp.log(u)
+        return 0.5 * y * y + log_tail + self._log_kernel(u * y, xp=xp) \
+            - u * y - self.m * xp.log(u)
 
     def _build(self, ny, na, nb):
         self.y = numpy.linspace(0.0, self.y_max, ny)
@@ -533,7 +569,7 @@ class AmplitudeTable(object):
         tail = self._exact_scaled(y, a, 1.0) - numpy.log1p(-a)
         # at a = 1 the tail's mean is f(1)
         self.tail = numpy.concatenate(
-            [tail, (log_i0(self.y) - 0.5)[:, None]], axis=1)
+            [tail, (self._log_kernel(self.y) - 0.5)[:, None]], axis=1)
         self.peak = self._exact_scaled(self.y, 1.0) - 0.5 * self.y ** 2
         # a >= 1: the whole integral against its envelope
         y, a = numpy.meshgrid(self.y, numpy.exp(self.lb), indexing='ij')
@@ -579,6 +615,9 @@ class AmplitudeTable(object):
         fused kernel projects, reads the table and sums over the nodes,
         and only samples with a node off the table are integrated
         exactly."""
+        if getattr(self, 'kernel', 'i0') != 'i0':
+            raise ValueError('the fused orientation marginal is for the i0 '
+                             'kernel only')
         if xp is numpy:
             return numpy.stack([log_orientation_marginal(
                 z, g00, g11, g01, self.prior, nodes, table=self, xp=xp)
@@ -690,8 +729,9 @@ class AmplitudeTable(object):
         out = self.log_c + 0.5 * (m - 1) * xp.log(g) + K
         off = (y > self.y_max) | (la > self.log_a[1]) | (b < y + 12)
         if bool(xp.any(off)):
-            out[off] = log_amplitude_marginal(x[off], g[off], self.prior,
-                                              xp=xp)
+            out[off] = log_amplitude_marginal(
+                x[off], g[off], self.prior, xp=xp,
+                kernel=getattr(self, 'kernel', 'i0'))
         return out
 
 
