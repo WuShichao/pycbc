@@ -327,6 +327,115 @@ def draw_orientation(z, gram, prior, nodes, rng, proposals=256):
     return float(cos_iota[keep]), float(psi[keep])
 
 
+def flat_choice(logp, u, xp=numpy):
+    """For each row of ``logp`` (M, N), the indices that the uniforms ``u``
+    (M, P) in ``[0, 1)`` pick by inverting the row's normalised cumulative
+    weights: all rows at once (one search over the rows' cumulative weights
+    laid end to end, each shifted by its row number)."""
+    p = xp.exp(logp - xp.max(logp, axis=1, keepdims=True))
+    c = xp.cumsum(p, axis=1)
+    c = c / c[:, -1:]
+    M, N = c.shape
+    rows = xp.arange(M)[:, None]
+    flat = (c + rows).ravel()
+    idx = xp.searchsorted(flat, (rows + u).ravel()).reshape(u.shape)
+    return xp.clip(idx - rows * N, 0, N - 1)
+
+
+def _orientation_vectors(cos_iota, psi, xp):
+    """``orientation_weights`` for arrays: (..., 2)."""
+    plus, cross = 0.5 * (1 + cos_iota ** 2), -1j * cos_iota
+    c2, s2 = xp.cos(2 * psi), xp.sin(2 * psi)
+    return xp.stack([c2 * plus - s2 * cross, s2 * plus + c2 * cross], axis=-1)
+
+
+def draw_orientation_batch(z, g00, g11, g01, prior, nodes, rng, table=None,
+                           proposals=256, xp=numpy, chunk=1024):
+    """:func:`draw_orientation` for ``M`` samples at once (``z`` (2, M), the
+    Gram elements (M,)): the node masses, the cell choices, the proposals
+    inside them and their importance resampling as array operations
+    (``table``, an ``i0`` AmplitudeTable of ``prior``, for the amplitude
+    integrals). The random numbers come from ``rng`` (one generator for all;
+    the draws are not those of the one-sample function)."""
+    M = z.shape[-1]
+    vec = xp.asarray(nodes.vectors)
+    logw = xp.log(xp.asarray(nodes.weights))
+    edges = xp.asarray(nodes._cos_edges)
+    out_c, out_p = [], []
+
+    def amp(x, g):
+        if table is None:
+            return log_amplitude_marginal(x, g, prior, xp=xp)
+        return table.log_marginal(x, g, xp=xp)
+    for c0 in range(0, M, chunk):
+        sl = slice(c0, min(M, c0 + chunk))
+        zz = xp.asarray(z[:, sl])
+        a, b, c = (xp.asarray(v[sl]) for v in (g00, g11, g01))
+        x, g = _project(zz, a, b, c, vec, xp)                   # (m, nodes)
+        node = amp(x, g) + logw[None]
+        m = node.shape[0]
+        u = xp.asarray(rng.random((m, proposals)))
+        cells = flat_choice(node, u, xp)                        # (m, P)
+        i, j = cells // nodes.n_psi, cells % nodes.n_psi
+        lo, hi = edges[i], edges[i + 1]
+        ci = lo + (hi - lo) * xp.asarray(rng.random((m, proposals)))
+        ps = (j + xp.asarray(rng.random((m, proposals)))) * nodes._psi_step
+        v = _orientation_vectors(ci, ps, xp)                    # (m, P, 2)
+        X = xp.abs(xp.conj(v[..., 0]) * zz[0][:, None]
+                   + xp.conj(v[..., 1]) * zz[1][:, None])
+        G = (xp.abs(v[..., 0]) ** 2 * a[:, None]
+             + xp.abs(v[..., 1]) ** 2 * b[:, None]
+             + 2 * xp.real(xp.conj(v[..., 0]) * v[..., 1] * c[:, None]))
+        target = amp(X, G)
+        top = xp.max(node, axis=1, keepdims=True)
+        lmass = node - top - xp.log(xp.sum(xp.exp(node - top), axis=1,
+                                           keepdims=True))
+        area = (hi - lo) * nodes._psi_step
+        lw = target - (xp.take_along_axis(lmass, cells, axis=1)
+                       - xp.log(area))
+        k = flat_choice(lw, xp.asarray(rng.random((m, 1))), xp)[:, 0]
+        r = xp.arange(m)
+        out_c.append(ci[r, k])
+        out_p.append(ps[r, k])
+    return xp.concatenate(out_c), xp.concatenate(out_p)
+
+
+def draw_amplitude_batch(x, g, prior, rng, order=512, kernel='i0',
+                         xp=numpy):
+    """:func:`draw_amplitude` for arrays ``x``, ``g`` (M,): the CDF of each
+    integrand on its own logarithmic mesh, all inverted at once."""
+    x = xp.asarray(x, dtype=xp.float64)
+    g = xp.asarray(g, dtype=xp.float64)
+    low, high = _segments(x, g, prior, xp)
+    lo0 = xp.full(x.shape, prior.hmin)
+    low = xp.maximum(low, lo0)
+    high = xp.maximum(high, low)
+    t = xp.linspace(0., 1., order)
+    tail = xp.exp(xp.log(lo0)[:, None] + (xp.log(low) - xp.log(lo0))[:, None]
+                  * t[None])
+    peak = xp.exp(xp.log(low)[:, None] + (xp.log(high) - xp.log(low))[:, None]
+                  * t[None])
+    h = xp.concatenate([tail, peak[:, 1:]], axis=1)              # (M, n)
+    f = log_amplitude_integrand(h, x[:, None], g[:, None], prior, xp=xp,
+                                kernel=kernel)
+    d = xp.exp(f - xp.max(f, axis=1, keepdims=True))
+    cdf = xp.concatenate([xp.zeros((len(x), 1)),
+                          xp.cumsum(0.5 * (d[:, 1:] + d[:, :-1])
+                                    * xp.diff(h, axis=1), axis=1)], axis=1)
+    total = cdf[:, -1:]
+    u = xp.asarray(rng.random((len(x), 1))) * total
+    M, N = cdf.shape
+    rows = xp.arange(M)[:, None]
+    scale = xp.where(total > 0, total, 1.)
+    flat = (cdf / scale + rows).ravel()
+    k = xp.searchsorted(flat, (rows + u / scale).ravel()) - rows[:, 0] * N
+    k = xp.clip(k, 1, N - 1)
+    r = xp.arange(M)
+    c0, c1 = cdf[r, k - 1], cdf[r, k]
+    w = xp.where(c1 > c0, (u[:, 0] - c0) / xp.where(c1 > c0, c1 - c0, 1.), 0.)
+    return h[r, k - 1] + w * (h[r, k] - h[r, k - 1])
+
+
 def log_orientation_terms(z, g00, g11, g01, prior, nodes, order=64):
     """``ln (weight_n B(w_n))`` of every node for one sample, the terms
     whose log-sum is :func:`log_orientation_marginal`."""

@@ -616,3 +616,17 @@ def hm_draw_batch(z, gram, keys, prior, nodes, rngs, n_l0=32, table=None,
                           coa_phase=float(numpy.mod(phi[k], 2 * numpy.pi)),
                           amplitude=float(h), loglr=float(loglr)))
     return log_b, draws
+
+
+def log_likelihood_batch(z, gram, keys, h, l0, iota, psi, phi):
+    """``ln L = h X - h^2 g / 2`` of each of ``M`` samples at its own angles
+    and amplitude (arrays (M,)): ``z (K, 2, M)``, ``gram (K, 2, K, 2, M)``
+    (numpy)."""
+    K = len(keys)
+    v = numpy.empty((K, 2, len(h)), complex)
+    for k, (l, m, n) in enumerate(keys):
+        v[k] = pattern_weights(l, m, iota, psi) \
+            * numpy.exp(1j * (m * phi + (n - m) * l0))[None]
+    X = numpy.real(numpy.einsum('kam,kam->m', numpy.conj(v), z))
+    g = numpy.real(numpy.einsum('kam,kalbm,lbm->m', numpy.conj(v), gram, v))
+    return h * X - 0.5 * h * h * g

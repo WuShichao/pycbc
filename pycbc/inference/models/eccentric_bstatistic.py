@@ -616,32 +616,31 @@ class EccentricCellPE(BaseModel):
         from pycbc.filter.hm_marginal import hm_draw_batch
         xp = self.xp
         host = lambda a: a.get() if hasattr(a, 'get') else numpy.asarray(a)
+        import time as _time
+        import logging as _logging
+        t_pass1 = _time.time()
         rngs, delays, sample_delays, lnb22, marg, params = [], [], [], [], [], []
         z22s, g22s = [], []
         for c in range(0, len(points), chunk):
             part = points[c:c + chunk]
-            evs = self._quadratures(part)
-            zs, gs = [], []
-            for ev, seed in zip(evs, seeds[c:c + len(part)]):
-                rng = numpy.random.default_rng(seed)
-                terms = ev['log_bayes'] + numpy.log(ev['widths'])
-                weight = numpy.exp(terms - terms.max())
-                k = rng.choice(len(weight), p=weight / weight.sum())
-                delays.append(float(ev['delays'][k] + rng.random() * ev['widths'][k]))
-                sample_delays.append(float(ev['delays'][k]))
+            part_rngs = [numpy.random.default_rng(seed) for seed in seeds[c:c + len(part)]]
+            recs = self._sample_times(part, part_rngs)
+            zc = numpy.stack([r['z'] for r in recs], axis=-1)
+            gc_ = numpy.stack([r['gram'] for r in recs], axis=-1)
+            for r, rng in zip(recs, part_rngs):
+                delays.append(r['delay'])
+                sample_delays.append(r['sample_delay'])
                 rngs.append(rng)
-                marg.append(float(ev['loglikelihood']))
-                params.append(self._params_of(ev['theta'], ev['sky']))
-                zs.append(xp.asarray(ev['z'][..., k:k + 1]))
-                gm = ev['gram']
-                gs.append(xp.asarray(gm[..., None] if gm.ndim == 4 else gm[..., k:k + 1]))
-            zc, gc_ = xp.concatenate(zs, axis=-1), xp.concatenate(gs, axis=-1)
-            v = self._log_bayes(zc, gc_)[0]
+                marg.append(r['loglikelihood'])
+                params.append(self._params_of(r['theta'], r['sky']))
+            v = self._log_bayes(xp.asarray(zc), xp.asarray(gc_))[0]
             lnb22.extend(numpy.ravel(host(v)).tolist())
             if getattr(self, 'hm_draws', 'importance') == 'importance':
-                z22s.append(host(zc))
-                g22s.append(host(gc_))
-            del evs, zs, gs, zc, gc_
+                z22s.append(zc)
+                g22s.append(gc_)
+            del recs, zc, gc_
+        _logging.info("reconstruction: (2,2) quadratures and time samples of %d points in %.1f s", len(points),
+                      _time.time() - t_pass1)
         # the sampler's regions released: the full model's grids (every mode) need the room
         import gc
         import logging
@@ -693,67 +692,91 @@ class EccentricCellPE(BaseModel):
         the (2,2) model's equivalent branches taken at random), and the full model's log likelihood there (``z``,
         ``g`` every mode's, from its regions): ``hm_delta = ln L_full - ln L_22`` at the drawn values, the importance
         weight that turns the (2,2) draws into the full model's (exact; efficient while the other modes move ln L
-        little across the posterior, as for stBBHs). ``marginal_loglr`` is the (2,2) marginal plus it."""
-        from pycbc.filter.bstatistic import draw_orientation, draw_amplitude, draw_phase, _project
-        from pycbc.filter.hm_marginal import PatternSet, _exact_xg
+        little across the posterior, as for stBBHs). ``marginal_loglr`` is the (2,2) marginal plus it. All points
+        at once (pycbc.filter.bstatistic's batched draws; one point at a time took 36 ms a point)."""
+        import logging
+        from pycbc.filter.bstatistic import (draw_orientation_batch, draw_amplitude_batch, flat_choice,
+                                             _orientation_vectors)
+        from pycbc.filter.hm_marginal import log_likelihood_batch
         from pycbc.filter.mean_anomaly import mean_anomaly_components
-        from pycbc.tmpltbank.fstatistic_metric import orientation_weights
+        xp = self.xp
+        host = lambda a: a.get() if hasattr(a, 'get') else numpy.asarray(a)
         M = z.shape[-1]
         var = self.noise_variance
-        # (the raw correlations; ln B divides by the noise variance itself, the rest below)
-        _, by_angle, angles = self._log_bayes(self.xp.asarray(z22), self.xp.asarray(g22))
-        by_angle = by_angle.get() if hasattr(by_angle, 'get') else numpy.asarray(by_angle)
-        by_angle = by_angle.reshape(len(angles), M)
+        rng = rngs[0] if len(rngs) else numpy.random.default_rng()
+        # the anomaly node of each point by its (2,2) ln B per node (ln B divides by the noise variance itself)
+        _, by_angle, angles = self._log_bayes(xp.asarray(z22), xp.asarray(g22))
+        by_angle = host(by_angle).reshape(len(angles), M)
+        a = flat_choice(by_angle.T, rng.random((M, 1)))[:, 0]
+        step = 2 * numpy.pi / len(angles)
+        anomaly = numpy.mod(angles[a] + (rng.random(M) - 0.5) * step, 2 * numpy.pi)
         zs, gs, off = self._sub22(z22 / var, g22 / var)
         zl, gl, _ = mean_anomaly_components(zs, gs, off, self.n_l0)
-        z, g, z22, g22 = z / var, g / var, z22 / var, g22 / var
-        step = 2 * numpy.pi / len(angles)
-        P22 = PatternSet(self.patterns.keys)
-        Pf = PatternSet(self.full_model.patterns.keys)
-        out, diag = [], []
-        for i in range(M):
+        r = numpy.arange(M)
+        zz = zl[a, :, r]                                                  # (M, 2)
+        gg = gl[a, :, :, r]                                               # (M, 2, 2)
+        g00, g11, g01 = gg[:, 0, 0].real, gg[:, 1, 1].real, gg[:, 0, 1]
+        ci, ps = draw_orientation_batch(zz.T, g00, g11, g01, self.distance_prior, self.nodes, rng,
+                                        table=self.table, xp=xp)
+        ci, ps = host(ci), host(ps)
+        wv = host(_orientation_vectors(xp.asarray(ci), xp.asarray(ps), xp))   # (M, 2)
+        X = numpy.sum(numpy.conj(wv) * zz, axis=1)
+        gx = (numpy.abs(wv[:, 0]) ** 2 * g00 + numpy.abs(wv[:, 1]) ** 2 * g11
+              + 2 * numpy.real(numpy.conj(wv[:, 0]) * wv[:, 1] * g01))
+        h = host(draw_amplitude_batch(xp.asarray(numpy.abs(X)), xp.asarray(gx), self.distance_prior, rng, xp=xp))
+        phase = numpy.mod(rng.vonmises(numpy.angle(X), h * numpy.abs(X)), 2 * numpy.pi)
+        quarter = rng.integers(4, size=M)
+        branch = rng.integers(2, size=M)
+        pol = numpy.mod(ps + quarter * numpy.pi / 2, numpy.pi)
+        phi = numpy.mod(0.5 * (phase + quarter * numpy.pi) + branch * numpy.pi, 2 * numpy.pi)
+        iota = numpy.arccos(ci)
+        lnl = log_likelihood_batch(z / var, g / var, self.full_model.patterns.keys, h, anomaly, iota, pol, phi)
+        lnl22 = log_likelihood_batch(z22 / var, g22 / var, self.patterns.keys, h, anomaly, iota, pol, phi)
+        delta = lnl - lnl22
+        logging.info("importance draws: hm_delta median %.3f, 5-95%% %s", numpy.median(delta),
+                     numpy.percentile(delta, [5, 95]).round(3).tolist())
+        return [dict(delta_tc=delays[i], mean_anomaly=float(anomaly[i]), loglr=float(lnl[i]),
+                     snr=float(numpy.sqrt(max(2 * lnl[i], 0.0))), inclination=float(iota[i]),
+                     polarization=float(pol[i]), distance=float(self.distance_prior.scale / h[i]),
+                     coa_phase=float(phi[i]), loglikelihood=float(self.lognl + lnl[i]),
+                     marginal_loglr=marg[i] + float(delta[i]), hm_delta=float(delta[i])) for i in range(M)]
+
+    def _sample_times(self, part, rngs):
+        """For each of ``part`` (dicts of the variable parameters), one arrival-time sample drawn by its ln B (with
+        its generator in ``rngs``): the point's marginal ``loglikelihood``, the sample's delay and its jittered
+        ``delay``, its correlations and Grams (host arrays), ``theta`` and ``sky``. Through the shared regions'
+        batched draw where they cover the point, directly otherwise."""
+        full = []
+        for p in part:
+            q = dict(self.static_params)
+            q.update(p)
+            full.append(q)
+        out = [None] * len(full)
+        todo = numpy.arange(len(full))
+        for shared in getattr(self, '_shared_regions', []):
+            if not len(todo):
+                break
+            sel = todo[shared.inside([full[i] for i in todo])]
+            if len(sel):
+                recs = shared._evaluate([full[i] for i in sel], keep='sample', rngs=[rngs[i] for i in sel])
+                for i, r in zip(sel, recs):
+                    out[i] = r
+            todo = numpy.array([i for i in todo if out[i] is None], dtype=int)
+        host = lambda a: a.get() if hasattr(a, 'get') else numpy.asarray(a)
+        for i in todo:
+            self.update(**part[i])
+            ev = self._shared_evaluate()
+            if ev is None:
+                ev = self.evaluate()
             rng = rngs[i]
-            w = numpy.exp(by_angle[:, i] - by_angle[:, i].max())
-            a = rng.choice(len(w), p=w / w.sum())
-            anomaly = float(numpy.mod(angles[a] + (rng.random() - 0.5) * step, 2 * numpy.pi))
-            zz = zl[a, :, i]
-            gg = gl[a][..., i]
-            gram = (float(gg[0, 0].real), float(gg[1, 1].real), complex(gg[0, 1]))
-            cos_iota, psi = draw_orientation(zz, gram, self.distance_prior, self.nodes, rng)
-            wv = orientation_weights(numpy.arccos(cos_iota), psi)
-            x, gx = _project(zz.reshape(2, 1), *(numpy.array([v]) for v in gram), wv.reshape(1, 2), numpy)
-            h = draw_amplitude(float(x[0, 0]), float(gx[0, 0]), self.distance_prior, rng)
-            X = complex(numpy.conj(wv) @ zz)
-            phase = draw_phase(h, X, rng)
-            quarter = rng.integers(4)
-            branch = rng.integers(2)
-            pol = float(numpy.mod(psi + quarter * numpy.pi / 2, numpy.pi))
-            phi = float(numpy.mod(0.5 * (phase + quarter * numpy.pi) + branch * numpy.pi, 2 * numpy.pi))
-            iota = float(numpy.arccos(cos_iota))
-            args = (numpy.array([anomaly]), numpy.array([iota]), numpy.array([pol]), numpy.array([phi]))
-            Xf, gf = _exact_xg(z[..., i], g[..., i], Pf, *args)
-            X2, g2 = _exact_xg(z22[..., i], g22[..., i], P22, *args)
-            lnl = float(h * Xf[0] - 0.5 * h * h * gf[0])
-            lnl22 = float(h * X2[0] - 0.5 * h * h * g2[0])
-            delta = lnl - lnl22
-            # diagnostics: the (2,2) modes' likelihood from the full model's correlations, and that model's own
-            # (2,2) likelihood with its ln L - ln L_22 (all from the same correlations)
-            k22 = [Pf.keys.index(k) for k in P22.keys]
-            X3, g3 = _exact_xg(z[k22][..., i], g[k22][:, :, k22][..., i], P22, *args)
-            diag.append((float(h * X3[0] - 0.5 * h * h * g3[0]) - lnl22, delta, abs(complex(z[k22][0, 0, i])),
-                         abs(complex(z22[0, 0, i])), float(numpy.angle(complex(z[k22][1, 0, i]) / complex(z22[1, 0, i])))))
-            out.append(dict(delta_tc=delays[i], mean_anomaly=anomaly, loglr=lnl,
-                            snr=float(numpy.sqrt(max(2 * lnl, 0.0))), inclination=iota, polarization=pol,
-                            distance=float(self.distance_prior.scale / h), coa_phase=phi,
-                            loglikelihood=float(self.lognl + lnl), marginal_loglr=marg[i] + delta, hm_delta=delta))
-        import logging
-        d = numpy.array(diag)
-        logging.info("importance draws: ln L_22(full model's z) - ln L_22(sampler's z) median %.3f, 5-95%% %s; "
-                     "hm_delta median %.3f, 5-95%% %s; |z(2,2,1)+| full/sampler median %.3f; arg z(2,2,2)+ "
-                     "full/sampler median %.3f, 5-95%% %s", numpy.median(d[:, 0]),
-                     numpy.percentile(d[:, 0], [5, 95]).round(3).tolist(), numpy.median(d[:, 1]),
-                     numpy.percentile(d[:, 1], [5, 95]).round(3).tolist(), numpy.median(d[:, 2] / d[:, 3]),
-                     numpy.median(d[:, 4]), numpy.percentile(d[:, 4], [5, 95]).round(3).tolist())
+            terms = ev['log_bayes'] + numpy.log(ev['widths'])
+            weight = numpy.exp(terms - terms.max())
+            k = rng.choice(len(weight), p=weight / weight.sum())
+            gm = ev['gram']
+            out[i] = dict(loglikelihood=float(ev['loglikelihood']), sample_delay=float(ev['delays'][k]),
+                          delay=float(ev['delays'][k] + rng.random() * ev['widths'][k]),
+                          z=host(ev['z'][..., k]), gram=host(gm if gm.ndim == 4 else gm[..., k]),
+                          theta=ev['theta'], sky=ev['sky'])
         return out
 
     def _quadratures(self, part):
@@ -782,7 +805,7 @@ class EccentricCellPE(BaseModel):
                     evs[i] = self.evaluate()
         return evs
 
-    def reconstruct_many(self, points, seeds, chunk=256):
+    def reconstruct_many(self, points, seeds, chunk=512):
         """:meth:`reconstruct` at each of ``points`` (dicts of the variable parameters) with its seed, ``chunk``
         points at a time: the time quadratures of the points a shared region covers computed together, the rest
         directly; then the draws per point (the quadratures' device arrays are released chunk by chunk)."""

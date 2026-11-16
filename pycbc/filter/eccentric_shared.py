@@ -646,7 +646,7 @@ class EccentricSharedRegion(object):
         out = self._evaluate([point], keep=True)
         return out[0] if out else None
 
-    def _evaluate(self, points, keep=False):
+    def _evaluate(self, points, keep=False, rngs=None):
         from pycbc.filter.eccentric_fast_search import mean_anomaly_twof_analytic
         m, xp = self.model, self.xp
         host = lambda a: a.get() if hasattr(a, 'get') else numpy.asarray(a)
@@ -744,6 +744,35 @@ class EccentricSharedRegion(object):
         if not keep:
             return out
         fd = fdel.ravel()[flat]
+        if keep == 'sample':
+            # one arrival-time sample per point drawn by its ln B (the point's own generator in rngs), all at once:
+            # the cumulative weights of the active samples, which come point by point, searched once; the drawn
+            # samples' correlations and Grams gathered together (a record per point with all its samples cost a
+            # device gather each)
+            records = [None] * M
+            ok = numpy.flatnonzero(edge)
+            if not len(ok):
+                return records
+            w = numpy.exp(terms - tops[owner])
+            cs = numpy.cumsum(w)
+            first = numpy.searchsorted(owner, numpy.arange(Mi))
+            last = numpy.searchsorted(owner, numpy.arange(Mi), side='right')
+            base = numpy.where(first > 0, cs[numpy.maximum(first - 1, 0)], 0.)
+            total = cs[numpy.maximum(last - 1, 0)] - base
+            u = numpy.array([rngs[idx[j]].random() for j in ok])
+            k = numpy.searchsorted(cs, base[ok] + u * total[ok])
+            k = numpy.clip(k, first[ok], last[ok] - 1)
+            jitter = numpy.array([rngs[idx[j]].random() for j in ok])
+            sel = xp.asarray(active[k])
+            zsel = zf[..., sel]
+            zsel = zsel.get() if hasattr(zsel, 'get') else numpy.asarray(zsel)
+            gsel = gf[..., sel]
+            gsel = gsel.get() if hasattr(gsel, 'get') else numpy.asarray(gsel)
+            for n, j in enumerate(ok):
+                records[idx[j]] = dict(loglikelihood=float(value[j]), sample_delay=float(fd[active[k[n]]]),
+                                       delay=float(fd[active[k[n]]] + jitter[n] * dt / P), z=zsel[..., n],
+                                       gram=gsel[..., n], theta=th[j], sky=sk[j])
+            return records
         # one record per point, in order; None where the region gives no value (no lags, or the edge check)
         records = [None] * M
         for j in range(Mi):
