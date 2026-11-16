@@ -308,8 +308,12 @@ class EccentricCellPE(BaseModel):
         try:
             shared = EccentricSharedRegion(self, region, **options)
         except MemoryError as err:
+            import logging
             stats['regions_refused'] += 1
             stats['largest_refused_gb'] = max(stats['largest_refused_gb'], getattr(err, 'need', 0) / 1e9)
+            used = self.xp.get_default_memory_pool().used_bytes() / 1e9 if self.xp is not numpy else 0.
+            logging.info("share refused for %d points: %s (device pool in use %.2f GB)", len(region),
+                         str(err)[:300], used)
             err.__traceback__ = None
             import gc
             gc.collect()
@@ -613,12 +617,20 @@ class EccentricCellPE(BaseModel):
             lnb22.extend(numpy.ravel(host(v)).tolist())
             del evs, zs, gs
         # the sampler's regions released: the full model's grids (every mode) need the room
+        import gc
+        import logging
         self._shared_regions = []
+        self._outside_pool = []
         self._last = None
-        self.block._prepared = None
+        self.block.release_search_cache()
+        fm = self.full_model
+        fm._last = None
+        fm.block.release_search_cache()
+        gc.collect()
         if xp is not numpy:
             xp.get_default_memory_pool().free_all_blocks()
-        fm = self.full_model
+            logging.info("full model: device pool in use %.2f GB before its regions",
+                         xp.get_default_memory_pool().used_bytes() / 1e9)
         if getattr(fm, '_hm_table', None) is None:
             fm._hm_table = AmplitudeTable(self.distance_prior, kernel='cosh', xp=xp)
         z, g = self._full_at(params, numpy.array(sample_delays))
