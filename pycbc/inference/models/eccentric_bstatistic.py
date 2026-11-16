@@ -596,6 +596,7 @@ class EccentricCellPE(BaseModel):
         xp = self.xp
         host = lambda a: a.get() if hasattr(a, 'get') else numpy.asarray(a)
         rngs, delays, sample_delays, lnb22, marg, params = [], [], [], [], [], []
+        z22s, g22s = [], []
         for c in range(0, len(points), chunk):
             part = points[c:c + chunk]
             evs = self._quadratures(part)
@@ -613,9 +614,13 @@ class EccentricCellPE(BaseModel):
                 zs.append(xp.asarray(ev['z'][..., k:k + 1]))
                 gm = ev['gram']
                 gs.append(xp.asarray(gm[..., None] if gm.ndim == 4 else gm[..., k:k + 1]))
-            v = self._log_bayes(xp.concatenate(zs, axis=-1), xp.concatenate(gs, axis=-1))[0]
+            zc, gc_ = xp.concatenate(zs, axis=-1), xp.concatenate(gs, axis=-1)
+            v = self._log_bayes(zc, gc_)[0]
             lnb22.extend(numpy.ravel(host(v)).tolist())
-            del evs, zs, gs
+            if getattr(self, 'hm_draws', 'importance') == 'importance':
+                z22s.append(host(zc))
+                g22s.append(host(gc_))
+            del evs, zs, gs, zc, gc_
         # the sampler's regions released: the full model's grids (every mode) need the room
         import gc
         import logging
@@ -639,11 +644,17 @@ class EccentricCellPE(BaseModel):
         logging.info("full model: correlations of %d points in %.1f s", len(params), time.time() - t0)
         t0 = time.time()
         var = self.noise_variance
+        if getattr(self, 'hm_draws', 'importance') == 'importance':
+            out = self._importance_draws(numpy.concatenate(z22s, axis=-1), numpy.concatenate(g22s, axis=-1),
+                                         host(z), host(g), rngs, delays, marg)
+            logging.info("full model: draws and weights of %d points in %.1f s", len(params), time.time() - t0)
+            return out
         out = []
         for c in range(0, len(points), chunk):
             sl = slice(c, min(len(points), c + chunk))
             lnb, draws = hm_draw_batch(z[..., sl] / var, g[..., sl] / var, fm.patterns.keys, self.distance_prior,
-                                       self.nodes, rngs[sl], n_l0=self.n_l0, table=fm._hm_table, xp=xp)
+                                       self.nodes, rngs[sl], n_l0=self.n_l0, table=fm._hm_table, xp=xp,
+                                       prune_margin=getattr(self, 'hm_prune_margin', 40.), table22=self.table)
             for i, d in zip(range(sl.start, sl.stop), draws):
                 delta = float(lnb[i - sl.start] - lnb22[i])
                 h = d['amplitude']
@@ -653,6 +664,61 @@ class EccentricCellPE(BaseModel):
                                 coa_phase=d['coa_phase'], loglikelihood=float(self.lognl + d['loglr']),
                                 marginal_loglr=marg[i] + delta, hm_delta=delta))
         logging.info("full model: ln B and draws of %d points in %.1f s", len(params), time.time() - t0)
+        return out
+
+    def _importance_draws(self, z22, g22, z, g, rngs, delays, marg):
+        """The extrinsic draws of the (2,2) model at each point's time sample (``z22 (K22, 2, M)``, ``g22``, the
+        sampler's own), spread over the full model's ranges (``phi`` over ``[0, 2 pi)``, ``psi`` over ``[0, pi)``:
+        the (2,2) model's equivalent branches taken at random), and the full model's log likelihood there (``z``,
+        ``g`` every mode's, from its regions): ``hm_delta = ln L_full - ln L_22`` at the drawn values, the importance
+        weight that turns the (2,2) draws into the full model's (exact; efficient while the other modes move ln L
+        little across the posterior, as for stBBHs). ``marginal_loglr`` is the (2,2) marginal plus it."""
+        from pycbc.filter.bstatistic import draw_orientation, draw_amplitude, draw_phase, _project
+        from pycbc.filter.hm_marginal import PatternSet, _exact_xg
+        from pycbc.filter.mean_anomaly import mean_anomaly_components
+        from pycbc.tmpltbank.fstatistic_metric import orientation_weights
+        M = z.shape[-1]
+        var = self.noise_variance
+        # (the raw correlations; ln B divides by the noise variance itself, the rest below)
+        _, by_angle, angles = self._log_bayes(self.xp.asarray(z22), self.xp.asarray(g22))
+        by_angle = by_angle.get() if hasattr(by_angle, 'get') else numpy.asarray(by_angle)
+        by_angle = by_angle.reshape(len(angles), M)
+        zs, gs, off = self._sub22(z22 / var, g22 / var)
+        zl, gl, _ = mean_anomaly_components(zs, gs, off, self.n_l0)
+        z, g, z22, g22 = z / var, g / var, z22 / var, g22 / var
+        step = 2 * numpy.pi / len(angles)
+        P22 = PatternSet(self.patterns.keys)
+        Pf = PatternSet(self.full_model.patterns.keys)
+        out = []
+        for i in range(M):
+            rng = rngs[i]
+            w = numpy.exp(by_angle[:, i] - by_angle[:, i].max())
+            a = rng.choice(len(w), p=w / w.sum())
+            anomaly = float(numpy.mod(angles[a] + (rng.random() - 0.5) * step, 2 * numpy.pi))
+            zz = zl[a, :, i]
+            gg = gl[a][..., i]
+            gram = (float(gg[0, 0].real), float(gg[1, 1].real), complex(gg[0, 1]))
+            cos_iota, psi = draw_orientation(zz, gram, self.distance_prior, self.nodes, rng)
+            wv = orientation_weights(numpy.arccos(cos_iota), psi)
+            x, gx = _project(zz.reshape(2, 1), *(numpy.array([v]) for v in gram), wv.reshape(1, 2), numpy)
+            h = draw_amplitude(float(x[0, 0]), float(gx[0, 0]), self.distance_prior, rng)
+            X = complex(numpy.conj(wv) @ zz)
+            phase = draw_phase(h, X, rng)
+            quarter = rng.integers(4)
+            branch = rng.integers(2)
+            pol = float(numpy.mod(psi + quarter * numpy.pi / 2, numpy.pi))
+            phi = float(numpy.mod(0.5 * (phase + quarter * numpy.pi) + branch * numpy.pi, 2 * numpy.pi))
+            iota = float(numpy.arccos(cos_iota))
+            args = (numpy.array([anomaly]), numpy.array([iota]), numpy.array([pol]), numpy.array([phi]))
+            Xf, gf = _exact_xg(z[..., i], g[..., i], Pf, *args)
+            X2, g2 = _exact_xg(z22[..., i], g22[..., i], P22, *args)
+            lnl = float(h * Xf[0] - 0.5 * h * h * gf[0])
+            lnl22 = float(h * X2[0] - 0.5 * h * h * g2[0])
+            delta = lnl - lnl22
+            out.append(dict(delta_tc=delays[i], mean_anomaly=anomaly, loglr=lnl,
+                            snr=float(numpy.sqrt(max(2 * lnl, 0.0))), inclination=iota, polarization=pol,
+                            distance=float(self.distance_prior.scale / h), coa_phase=phi,
+                            loglikelihood=float(self.lognl + lnl), marginal_loglr=marg[i] + delta, hm_delta=delta))
         return out
 
     def _quadratures(self, part):

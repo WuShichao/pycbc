@@ -189,7 +189,7 @@ def _gh(n):
     return t, w
 
 
-def _phi_rule(x, gam, m, xp, amplitude, n_gh=12, n_uniform=64, newton=6,
+def _phi_rule(x, gam, m, xp, amplitude, n_gh=10, n_uniform=64, newton=3,
               narrow=0.1):
     """Quadrature points ``phi (Q, n, s)`` and log weights (of ``dphi / 2
     pi``) for each node and sample: about each of the four peaks of
@@ -211,15 +211,20 @@ def _phi_rule(x, gam, m, xp, amplitude, n_gh=12, n_uniform=64, newton=6,
     # harmonics up to 2 m_max, so the scan resolves every maximum of it; the
     # integrand's peaks are narrow only because ln J grows with F), the
     # four highest, refined by Newton steps of ln F
-    scan = xp.asarray(2 * numpy.pi * numpy.arange(64) / 64)
+    # F has harmonics up to 2 m_max = 8: 32 points resolve its maxima
+    ns = 32
+    scan = xp.asarray(2 * numpy.pi * numpy.arange(ns) / ns)
     Xs, gs = _xg_at(x, gam, m, xp.broadcast_to(scan[:, None, None],
-                                               (64,) + shape), xp)
+                                               (ns,) + shape), xp)
     F = Xs * Xs / gs
     local = (F >= xp.roll(F, 1, axis=0)) & (F > xp.roll(F, -1, axis=0))
     Fl = xp.where(local, F, -numpy.inf)
-    # at most 2 m_max maxima; keep up to eight
-    best = xp.argsort(-Fl, axis=0)[:8]                              # (8,n,s)
+    # the four highest maxima (a dominant m = 2 pattern has four); where a
+    # fifth exists the trapezoid rule takes the cell (use below)
+    order = xp.argsort(-Fl, axis=0)
+    best = order[:4]                                                # (4,n,s)
     found = xp.take_along_axis(Fl, best, axis=0) > -numpy.inf
+    fifth = xp.take_along_axis(Fl, order[4:5], axis=0)[0] > -numpy.inf
     phi = scan[best]
     for _ in range(int(newton) + 1):
         X, g = _xg_at(x, gam, m, phi, xp)
@@ -242,7 +247,7 @@ def _phi_rule(x, gam, m, xp, amplitude, n_gh=12, n_uniform=64, newton=6,
         sigma = xp.where(cj > 0, 1 / xp.sqrt(cj), numpy.inf)
     # Gauss-Hermite where every peak found is narrow and none overlaps
     # another (their spans of 5 sigma apart)
-    use = xp.all(xp.where(found, sigma < narrow, True), axis=0)
+    use = xp.all(xp.where(found, sigma < narrow, True), axis=0) & ~fifth
     ordered = xp.sort(xp.where(found, xp.mod(phi, 2 * numpy.pi), xp.nan),
                       axis=0)
     gaps = xp.diff(ordered, axis=0)
@@ -309,7 +314,7 @@ def _peaks_marginal(x, gam, m, xp, amplitude, logw, n_gh, n_uniform,
 
 def hm_log_bayes(z, gram, keys, prior, nodes, n_l0=32, n_phi=256,
                  order=64, xp=numpy, table=None, phi_rule='uniform',
-                 sample_chunk=16, n_gh=12, n_uniform=64):
+                 sample_chunk=16, n_gh=10, n_uniform=64):
     """``ln B`` per sample, marginalised over distance, inclination and
     polarisation (``nodes``, an :class:`pycbc.filter.bstatistic.
     OrientationNodes`), coalescence phase and mean anomaly (uniform ``n_l0``
@@ -461,7 +466,7 @@ def _exact_xg(z, gram, patterns, l0, iota, psi, phi):
 
 def hm_draw_batch(z, gram, keys, prior, nodes, rngs, n_l0=32, table=None,
                   xp=numpy, chunk=16, n_phi_draw=4096, proposals=64,
-                  n_gh=12, n_uniform=64):
+                  n_gh=10, n_uniform=64, prune_margin=None, table22=None):
     """For each of ``M`` samples (``z (K, 2, M)``, ``gram (K, 2, K, 2, M)``,
     one ``numpy.random.Generator`` each in ``rngs``): ``ln B`` marginalised
     as :func:`hm_log_bayes` (``phi_rule='peaks'``), and a draw of the
@@ -475,7 +480,15 @@ def hm_draw_batch(z, gram, keys, prior, nodes, rngs, n_l0=32, table=None,
     ``psi`` a quarter. Returns ``(log_b (M,), draws)``, each draw a dict of
     ``mean_anomaly``, ``inclination``, ``polarization`` (``[0, pi)``),
     ``coa_phase`` (``phi``, ``[0, 2 pi)``), ``amplitude`` and ``loglr`` (the
-    log likelihood ratio at the drawn values)."""
+    log likelihood ratio at the drawn values).
+
+    ``prune_margin``: the full ``phi`` quadrature only at the (mean anomaly,
+    node) cells of a sample whose ``m = 2`` modes' own marginal (``I0``,
+    exact for them: ``table22``, an ``i0`` AmplitudeTable of ``prior``) is
+    within the margin of the sample's largest; the rest are left out (their
+    weight below ``exp(-margin)``, provided the other modes move a cell's
+    ``ln J`` by less than the margin, as for stBBHs, where they move ``ln L``
+    by about 0.1). Without it every cell."""
     from pycbc.filter.bstatistic import (log_amplitude_marginal,
                                          draw_amplitude)
 
@@ -495,15 +508,47 @@ def hm_draw_batch(z, gram, keys, prior, nodes, rngs, n_l0=32, table=None,
     zg, Gg, angles = hm_components(z, gram, patterns, n_l0, xp=xp)
     W = xp.asarray(patterns.weights(nodes.cos_iota, nodes.psi))
     logw = xp.log(xp.asarray(nodes.weights))
-    L = numpy.empty((len(angles), len(nodes.weights), M))
+    L = numpy.full((len(angles), len(nodes.weights), M), -numpy.inf)
+    keep = None
+    if prune_margin is not None:
+        # the m = 2 modes' marginal per cell: phi integrates to I0 for them
+        two = numpy.flatnonzero(patterns.m == 2)
+        L22 = numpy.empty_like(L)
+        for j in range(len(angles)):
+            for c0 in range(0, M, int(chunk) * 8):
+                c1 = min(M, c0 + int(chunk) * 8)
+                x, gam = _node_terms(zg[j:j + 1, ..., c0:c1],
+                                     Gg[j:j + 1, ..., c0:c1], W, xp)
+                x2 = xp.sum(x[0][two], axis=0)
+                g2 = xp.real(xp.sum(gam[0][two][:, two], axis=(0, 1)))
+                v = table22.log_marginal(xp.abs(x2), g2, xp=xp) \
+                    if table22 is not None else log_amplitude_marginal(
+                        xp.abs(x2), g2, prior, xp=xp)
+                L22[j, :, c0:c1] = host(v)
+        t22 = L22 + host(logw)[None, :, None]
+        keep = t22 >= t22.max(axis=(0, 1))[None, None] - float(prune_margin)
     for j in range(len(angles)):
         for c0 in range(0, M, int(chunk)):
             c1 = min(M, c0 + int(chunk))
             x, gam = _node_terms(zg[j:j + 1, ..., c0:c1],
                                  Gg[j:j + 1, ..., c0:c1], W, xp)
-            L[j, :, c0:c1] = host(_peaks_marginal(
-                x[0], gam[0], patterns.m, xp, amplitude, logw, n_gh,
-                n_uniform, per_node=True))
+            x, gam = x[0], gam[0]
+            if keep is None:
+                L[j, :, c0:c1] = host(_peaks_marginal(
+                    x, gam, patterns.m, xp, amplitude, logw, n_gh, n_uniform,
+                    per_node=True))
+                continue
+            ni, si = numpy.nonzero(keep[j, :, c0:c1])
+            if not len(ni):
+                continue
+            for e0 in range(0, len(ni), 16 * len(nodes.weights) // 64):
+                e1 = min(len(ni), e0 + 16 * len(nodes.weights) // 64)
+                a, b = xp.asarray(ni[e0:e1]), xp.asarray(si[e0:e1])
+                xs = x[:, a, b][:, :, None]
+                gs = gam[:, :, a, b][..., None]
+                v = _peaks_marginal(xs, gs, patterns.m, xp, amplitude,
+                                    logw[a], n_gh, n_uniform, per_node=True)
+                L[j, ni[e0:e1], c0 + si[e0:e1]] = host(v)[:, 0]
     terms = L + host(logw)[None, :, None]
     flat = terms.reshape(-1, M)
     top = flat.max(axis=0)
