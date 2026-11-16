@@ -165,15 +165,23 @@ def _phase_sums(x, gam, m, phis, xp):
 
 def _xg_at(x, gam, m, phi, xp, order=0):
     """``d^k X / dphi^k`` and ``d^k g / dphi^k`` (``k = order``) at angles
-    ``phi (Q, n, s)``, for ``x (P, n, s)``, ``gam (P, P, n, s)``."""
-    m = xp.asarray(m, dtype=float)
-    e = xp.exp(-1j * m[:, None, None, None] * phi[None])          # (P,Q,n,s)
-    X = xp.real(xp.sum((-1j * m[:, None, None, None]) ** order * e
-                       * x[:, None], axis=0))
-    d = (1j * (m[None, :] - m[:, None])) ** order                 # (g, h)
-    g = xp.real(xp.einsum('gqns,hqns,ghns->qns', e, xp.conj(e),
-                          gam * xp.asarray(d)[:, :, None, None]))
-    return X, g
+    ``phi (Q, n, s)``, for ``x (P, n, s)``, ``gam (P, P, n, s)``; summed
+    pattern by pattern, so that nothing larger than ``(Q, n, s)`` is held
+    (one einsum over the pattern pairs made a ``P^2 Q n s`` intermediate,
+    13 GB at eight patterns)."""
+    m = [float(v) for v in numpy.asarray(m)]
+    P = len(m)
+    e = [xp.exp(-1j * m[g] * phi) for g in range(P)]
+    X = xp.zeros(phi.shape)
+    g_ = xp.zeros(phi.shape)
+    for a in range(P):
+        X += xp.real((-1j * m[a]) ** order * e[a] * x[a][None])
+        for b in range(P):
+            d = (1j * (m[b] - m[a])) ** order
+            if d == 0:
+                continue
+            g_ += xp.real(d * e[a] * xp.conj(e[b]) * gam[a, b][None])
+    return X, g_
 
 
 def _gh(n):
