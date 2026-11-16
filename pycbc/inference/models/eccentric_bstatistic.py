@@ -329,6 +329,18 @@ class EccentricCellPE(BaseModel):
         todo = numpy.ones(len(full), dtype=bool)
         tick = time.time()
         regions = getattr(self, '_shared_regions', [])
+        # each region's inside() once per batch (it forms every point's sky response: it was called twice, for
+        # the coverage and again for the evaluation)
+        hits = {}
+        inside_seconds = 0.
+
+        def hit(shared):
+            nonlocal inside_seconds
+            if id(shared) not in hits:
+                t0 = time.time()
+                hits[id(shared)] = shared.inside(full)
+                inside_seconds += time.time() - t0
+            return hits[id(shared)]
         if not regions and self.shared_options is not None and len(full) >= self.min_new_region:
             # the first large batch (as a sampler's whitened frame) is its own region
             self._share_split(full)
@@ -336,7 +348,7 @@ class EccentricCellPE(BaseModel):
         elif regions:
             covered = numpy.zeros(len(full), dtype=bool)
             for shared in regions:
-                covered |= shared.inside(full)
+                covered |= hit(shared)
             outside = numpy.nonzero(~covered)[0]
             # the points outside every region, pooled over batches: a refinement's batches each hold a few dozen of
             # them, too few for a region of their own, which then went directly batch after batch
@@ -345,7 +357,10 @@ class EccentricCellPE(BaseModel):
                 # only a refinement's batches (a frame's climb asks a dozen points at a time, along its path)
                 pool.extend(full[i] for i in outside)
             if len(pool) >= self.min_new_region:
+                t0 = time.time()
                 self._share_split(pool)
+                self.shared_statistics['pool_region_seconds'] = \
+                    self.shared_statistics.get('pool_region_seconds', 0.) + time.time() - t0
                 regions = self._shared_regions
                 pool = []
             self._outside_pool = pool
@@ -354,12 +369,12 @@ class EccentricCellPE(BaseModel):
             idx = numpy.nonzero(todo)[0]
             if len(idx) == 0:
                 break
-            hit = shared.inside([full[i] for i in idx])
-            if hit.any():
-                sel = idx[hit]
+            sel = idx[hit(shared)[idx]]
+            if len(sel):
                 out[sel] = shared([full[i] for i in sel])
                 used[id(shared)] = len(sel)
                 todo[sel] = ~numpy.isfinite(out[sel])
+        self.shared_statistics['inside_seconds'] = self.shared_statistics.get('inside_seconds', 0.) + inside_seconds
         for r in regions:
             r.points_used = getattr(r, 'points_used', 0) + used.get(id(r), 0)
         middle = time.time()

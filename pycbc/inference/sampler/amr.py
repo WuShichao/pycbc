@@ -145,6 +145,18 @@ class AMRSampler(BaseSampler):
         nearest its centre).
     share_frame_radius : float, optional
         The shared ball's radius over the frame's (default 1.3).
+    layout_fraction : float, optional
+        A frame's first boxes (unit boxes in its whitened units out to its
+        radius) are made coarser where they would take more than this
+        fraction of ``max_evaluations`` (default 0.1).
+    pilot_layout_fraction : float, optional
+        The same for the frames before the last whitening round, whose
+        boxes serve only to set the next frame (default
+        ``layout_fraction``). The first frame's layout took 10500 of an
+        eccentric PE's 23400 evaluations.
+    final_share_frame_radius : float, optional
+        ``share_frame_radius`` for the last round's frame (default the
+        same).
     share_after_pilot : bool, optional
         With ``shared_region``, hand the model the pilot's region already,
         before the frame is set, so that the frame's own evaluations (the
@@ -222,7 +234,9 @@ class AMRSampler(BaseSampler):
                  shared_region=0, explore_basin=0.0, explore_miss=0.01,
                  check_points=0, check_tolerance=0.1, start_cube=None,
                  share_after_pilot=False, frame_starts=5, share_frame=False,
-                 share_frame_radius=1.3, edge_points=1, frame_moments=False):
+                 share_frame_radius=1.3, edge_points=1, frame_moments=False,
+                 layout_fraction=0.1, pilot_layout_fraction=None,
+                 final_share_frame_radius=None):
         super().__init__(model)
         self.initial_divisions = int(initial_divisions)
         self.partition_file = partition_file
@@ -238,6 +252,15 @@ class AMRSampler(BaseSampler):
         self.share_frame_radius = float(share_frame_radius)
         self.edge_points = int(edge_points)
         self.frame_moments = bool(frame_moments)
+        self.layout_fraction = float(layout_fraction)
+        self.pilot_layout_fraction = (self.layout_fraction
+                                      if pilot_layout_fraction is None
+                                      else float(pilot_layout_fraction))
+        self.final_share_frame_radius = (
+            self.share_frame_radius if final_share_frame_radius is None
+            else float(final_share_frame_radius))
+        self._layout = self.layout_fraction
+        self._ball = self.share_frame_radius
         self.explore_basin = float(explore_basin)
         self.explore_miss = float(explore_miss)
         if not 0 <= self.explore_basin < 1 or not 0 < self.explore_miss < 1:
@@ -601,6 +624,11 @@ class AMRSampler(BaseSampler):
                     # does not fit is offered again after the frame
                     self._share()
                     self._next_share = 0
+                last = whitening_round == self.whitening_rounds - 1
+                self._layout = (self.layout_fraction if last
+                                else self.pilot_layout_fraction)
+                self._ball = (self.final_share_frame_radius if last
+                              else self.share_frame_radius)
                 if self.curvilinear_frame:
                     self._curvilinear(starts=self.frame_starts, moments=(
                         self.frame_moments and whitening_round > 0))
@@ -916,7 +944,7 @@ class AMRSampler(BaseSampler):
         if self.share_frame and self.shared_region:
             # the boxes reach past the radius by up to half a box (those whose nearest point lies within it), and the
             # refinement past them
-            self._share_ball(low, span, self.share_frame_radius * radius)
+            self._share_ball(low, span, self._ball * radius)
         self._start_frame(low, span, radius)
 
     def _share_ball(self, low, span, radius):
@@ -1039,9 +1067,10 @@ class AMRSampler(BaseSampler):
     def _start_frame(self, low, span, radius):
         """A new tree over the frame whose box coordinates ``s`` are
         ``low + span s`` in whitened units: unit boxes out to ``radius``
-        of the origin, unless that would take a tenth of the budget."""
+        of the origin, unless that would take more than ``_layout`` (a
+        tenth by default) of the budget."""
         self._grid(evaluate=False)
-        target = max(1.0, 2 * radius / (0.1 * self.max_evaluations)
+        target = max(1.0, 2 * radius / (self._layout * self.max_evaluations)
                      ** (1.0 / self.ndim))
         while True:
             leaves = self._leaves()

@@ -363,8 +363,15 @@ class EccentricSharedRegion(object):
                      "(training residual rms %s rad)", len(region), time.time() - tick,
                      [c.basis_rank for c in self.correlators],
                      ['%.1e' % c.basis_residual for c in self.correlators])
-        # the grid times the region needs (per mode, T = delay + shift): where the probes' ln B lies within
-        # edge_margin of each one's largest, for the probes within it of the best, widened by itself and eight lags
+        # the grid times the region needs (per mode, T = delay + shift). The posterior's arrival time is set by the
+        # dominant (2,2,2) mode, whose T at the peak hardly moves over a region (170 s over a posterior where its
+        # shift moves 6000 s): its window is where the probes' ln B lies within edge_margin of each one's largest,
+        # for the probes within it of the best, widened by itself and eight lags. Another mode's T at the same delay
+        # is the reference's plus shift_k - shift_ref, which moves by up to 3e4 s over a posterior (each mode's
+        # frame splits phase and time its own way): its window is the reference's moved by that difference's range
+        # over the region's points, widened by the grid margin of it. From the probes alone (8 points) those
+        # windows missed most of a posterior that reached past a frame ball's spread: no lags on the weak modes'
+        # grids for 90% of the posterior points (timecheck0, fig10k)
         rng = numpy.random.default_rng(seed)
         pick = rng.choice(len(region), min(int(probes), len(region)), replace=False)
         curves, values = [], []
@@ -378,16 +385,26 @@ class EccentricSharedRegion(object):
         good = numpy.nonzero(tops >= tops.max() - self.edge_margin)[0]
         logging.info("EccentricSharedRegion: %d probes in %.1f s", len(pick), time.time() - tick)
         options = dict(grid_options or {})
+        keys = [tuple(int(v) for v in key) for key in self.keys]
+        ref = keys.index((2, 2, 2)) if (2, 2, 2) in keys else 0
+        tlo, thi = numpy.inf, -numpy.inf
+        for i in good:
+            d, v = curves[i]
+            T = d[v >= tops[i] - self.edge_margin] + shifts[ref][pick[i]]
+            tlo, thi = min(tlo, T.min()), max(thi, T.max())
+        base_pad = (thi - tlo) + 8 * dt
+        margin = float(options.get('margin', 0.05))
         for k in range(len(self.keys)):
-            tlo, thi = numpy.inf, -numpy.inf
-            for i in good:
-                d, v = curves[i]
-                T = d[v >= tops[i] - self.edge_margin] + shifts[k][pick[i]]
-                tlo, thi = min(tlo, T.min()), max(thi, T.max())
-            pad = (thi - tlo) + 8 * dt
+            diff = shifts[k] - shifts[ref]
+            dmin, dmax = float(diff.min()), float(diff.max())
+            pad = base_pad + margin * (dmax - dmin)
             reach = (self.lags[0] * dt + shifts[k].min() - dt, self.lags[-1] * dt + shifts[k].max() + 2 * dt)
-            window = (max(tlo - pad, reach[0]), min(thi + pad, reach[1]))
+            window = (max(tlo + dmin - pad, reach[0]), min(thi + dmax + pad, reach[1]))
             self.grids.append(PhaseGrid(self.correlators[k], thetas, (lo, hi), time_range=window, **options))
+            g = self.grids[-1]
+            logging.info("EccentricSharedRegion: mode %d grid times %.0f to %.0f s (step %.1f s, %d cells); "
+                         "the region's whole lag reach %.0f to %.0f s", k, window[0], window[1], g.step[-1],
+                         g.size[-1], reach[0], reach[1])
             self.correlators[k].release()
             if self.xp is not numpy:
                 self.xp.get_default_memory_pool().free_all_blocks()
@@ -442,6 +459,14 @@ class EccentricSharedRegion(object):
             ok &= on & taylor & phase
         has_lags = last - first >= 2
         reasons['no_lags'] = int((~has_lags).sum())
+        if len(points) >= 100 and reasons['no_lags']:
+            # where the lost points' lags lie against the grids' times (in lags of L; first > L - 1: the grids'
+            # times all lie after the point's window, last < 0: all before; both inside: the modes disagree)
+            lost = ~has_lags & ok
+            if lost.any():
+                logging.info("EccentricSharedRegion.inside: no_lags (otherwise inside) %d; first %s, last %s of %d",
+                             int(lost.sum()), numpy.percentile(first[lost], [0, 10, 50, 90, 100]).tolist(),
+                             numpy.percentile(last[lost], [0, 10, 50, 90, 100]).tolist(), L)
         ok &= has_lags
         if ok.any():
             sky = self.correlators[0].sky_error(skies[ok]) <= self.sky_tolerance
