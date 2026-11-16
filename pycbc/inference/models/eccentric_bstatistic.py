@@ -730,7 +730,9 @@ class EccentricCellPE(BaseModel):
         X = numpy.sum(numpy.conj(wv) * zz, axis=1)
         gx = (numpy.abs(wv[:, 0]) ** 2 * g00 + numpy.abs(wv[:, 1]) ** 2 * g11
               + 2 * numpy.real(numpy.conj(wv[:, 0]) * wv[:, 1] * g01))
-        h = host(draw_amplitude_batch(xp.asarray(numpy.abs(X)), xp.asarray(gx), self.distance_prior, rng, xp=xp))
+        h = numpy.concatenate([host(draw_amplitude_batch(xp.asarray(numpy.abs(X[c:c + 4096])),
+                                                         xp.asarray(gx[c:c + 4096]), self.distance_prior, rng,
+                                                         xp=xp)) for c in range(0, M, 4096)])
         phase = numpy.mod(rng.vonmises(numpy.angle(X), h * numpy.abs(X)), 2 * numpy.pi)
         quarter = rng.integers(4, size=M)
         branch = rng.integers(2, size=M)
