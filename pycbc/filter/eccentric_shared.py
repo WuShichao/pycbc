@@ -161,6 +161,25 @@ class EccentricModePhaseCorrelation(PhaseNUFFTCorrelation):
             D[:, inside] = spline(f[inside])
             Dp[:, inside] = spline(f[inside], 1)
             D_all[:, inside_c] = spline(self._fc[inside_c])
+        # a precessing cell (family.precession, a PrecessionMainRow): the main row's phase shapes of this mode as
+        # further basis rows, their coefficients the model's emulator at the template's 7 parameters
+        prec = getattr(family, 'precession', None)
+        self._prec = prec if (prec is not None and tuple(key) in prec.shapes) else None
+        self._nprec = self._prec.nshape if self._prec is not None else 0
+        if self._nprec:
+            from scipy.interpolate import CubicSpline as _CS
+            Sk = self._prec.shapes[tuple(key)]
+            # the shapes are smooth over the model's whole grid; past it they hold their edge values (as the
+            # device source's interpolation does), so neither path has a jump
+            Psp = _CS(self._prec.f, Sk, axis=1)
+            fx_lo, fx_hi = self._prec.f[0], self._prec.f[-1]
+            fcl = numpy.clip(f, fx_lo, fx_hi)
+            inside_p = (f >= fx_lo) & (f <= fx_hi)
+            Dq = Psp(fcl)
+            Dqp = Psp(fcl, 1) * inside_p[None]
+            Dq_all = Psp(numpy.clip(self._fc, fx_lo, fx_hi))
+            D, Dp = numpy.vstack([D, Dq]), numpy.vstack([Dp, Dqp])
+            D_all = numpy.vstack([D_all, Dq_all])
         self._D, self._Dp = xp.asarray(D), xp.asarray(Dp)
         # the clock: every mode is anchored to the (2,2,2) mode's time at f_ref, which moves with that mode's
         # correction slope there, (W(x) - W0) . S
@@ -201,7 +220,7 @@ class EccentricModePhaseCorrelation(PhaseNUFFTCorrelation):
 
     @staticmethod
     def _pn_params(theta):
-        mc, e, chi, q = theta
+        mc, e, chi, q = theta[:4]
         return mc, q, chi, chi
 
     def _coefficients(self, thetas):
@@ -217,7 +236,14 @@ class EccentricModePhaseCorrelation(PhaseNUFFTCorrelation):
         ecc = (self._corr_weights(X) - self._W0[None]) @ self._P
         slope = (self._222_weights(X) - self._W0_222[None]) @ self._S
         amp = self._amp_weights(X) @ self._Ra
-        return numpy.column_stack([self.r * numpy.array(dC), ecc, slope]), amp
+        cols = [self.r * numpy.array(dC), ecc]
+        if self._nprec:
+            # the precession main row: its shapes' coefficients (zero for an aligned template, 4 parameters)
+            if thetas.shape[1] > 4:
+                cols.append(self._prec.coefficients(thetas[:, :7]))
+            else:
+                cols.append(numpy.zeros((len(thetas), self._nprec)))
+        return numpy.column_stack(cols + [slope]), amp
 
     def _pins(self, c):
         psi_l, dpsi_l = _basis([self.f_lower])
@@ -467,9 +493,7 @@ class EccentricSharedRegion(object):
                 lo = grid.start[d] + hw[d] * grid.step[d]
                 hi = grid.start[d] + (grid.size[d] - hw[d] - 1) * grid.step[d]
                 on &= (s[:, d] >= lo) & (s[:, d] <= hi)
-            taylor = numpy.ones(len(points), dtype=bool)
-            if grid.terms > 1:
-                taylor = numpy.abs(s[:, grid.ndir] - grid.middle) <= grid.s3_half
+            taylor = grid.taylor_inside(s)
             phase = grid.correlator.phase_residual(thetas, grid.frame) <= grid.phase_tolerance
             reasons['off_grid_%d' % k] = int((~on).sum())
             reasons['taylor_%d' % k] = int((~taylor).sum())

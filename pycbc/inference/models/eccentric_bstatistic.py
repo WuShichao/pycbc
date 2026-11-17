@@ -220,9 +220,18 @@ class EccentricCellPE(BaseModel):
                  n_l0=64, orientation_nodes=(16, 8), amplitude_order=64, oversampling=4,
                  screen_margin=40.0, bayes_margin=30.0, noise_variance=1.0, amplitude_table=None,
                  screen_anomalies=None, shared_options=None, template_convention='face-on', mode_keys=None,
-                 **kwargs):
+                 precession=False, spin_log_prior=None, **kwargs):
         super().__init__(variable_params, **kwargs)
         self.block = block_model
+        # precession=True: the block's family carries a main-row model (family.precession, a
+        # pycbc.waveform.precession_main_row.PrecessionMainRow) and the intrinsic parameters gain the in-plane spins
+        # and their azimuth difference at f_ref (theta of 7). spin_log_prior(points) -> ln of the spins' prior
+        # density over the sampler's uniform box, added by loglikelihoods() and _loglikelihood() (the sampler's
+        # target; evaluate() and the reconstruction stay the likelihood alone)
+        self.precession = bool(precession)
+        if self.precession:
+            self.intrinsic = self.intrinsic + ('spin1_perp', 'spin2_perp', 'spin_dphi')
+        self.spin_log_prior = spin_log_prior
         self.patterns = None
         if template_convention == 'hlm':
             from pycbc.filter.hm_marginal import PatternSet, projector
@@ -422,10 +431,12 @@ class EccentricCellPE(BaseModel):
         stats['single_seconds'] += time.time() - middle
         logging.info("batch of %d: %d shared in %.2f s, %d directly in %.2f s", len(full), nshared, middle - tick,
                      int(todo.sum()), time.time() - middle)
+        if self.spin_log_prior is not None:
+            out = out + numpy.asarray(self.spin_log_prior(full), dtype=float)
         return out
 
     def _theta_sky(self, params):
-        theta = numpy.array([params['mchirp'], params['eccentricity'], params['chi_eff'], params['q']], float)
+        theta = numpy.array([params[k] for k in self.intrinsic], float)
         lon0, lat0, slon, slat = self.sky_reference
         dlon = numpy.mod(params['eclipticlongitude'] - lon0 + numpy.pi, 2 * numpy.pi) - numpy.pi
         sky = numpy.array([dlon / slon, (params['eclipticlatitude'] - lat0) / slat])
@@ -515,7 +526,12 @@ class EccentricCellPE(BaseModel):
         return out
 
     def _loglikelihood(self):
-        return self.evaluate()['loglikelihood']
+        value = self.evaluate()['loglikelihood']
+        if self.spin_log_prior is not None:
+            params = dict(self.static_params)
+            params.update(self.current_params)
+            value = value + float(numpy.asarray(self.spin_log_prior([params]))[0])
+        return value
 
     def _shared_evaluate(self, params=None):
         """The current point's quadrature from a shared region that covers it, or ``None``."""
@@ -546,6 +562,8 @@ class EccentricCellPE(BaseModel):
         q.update(mchirp=float(theta[0]), eccentricity=float(theta[1]), chi_eff=float(theta[2]), q=float(theta[3]),
                  eclipticlongitude=float(numpy.mod(lon0 + sky[0] * slon, 2 * numpy.pi)),
                  eclipticlatitude=float(lat0 + sky[1] * slat))
+        if len(theta) > 4:
+            q.update(spin1_perp=float(theta[4]), spin2_perp=float(theta[5]), spin_dphi=float(theta[6]))
         return q
 
     def _full_at(self, params, delays):

@@ -20,7 +20,8 @@ class DeviceEccentricModeSource:
     Physical coordinates are chirp mass, eccentricity, and optionally the
     common aligned spin chi (both spin1z and spin2z, a cell with step_chi)
     and the mass ratio q = m1/m2 (a cell with step_q): theta = (Mc, e[, chi[,
-    q]]).
+    q]]); with a family carrying a ``precession`` main-row model, theta = (Mc,
+    e, chi, q, chi1_perp, chi2_perp, dphi) adds its phase correction.
     source_weight includes whitening and any frequency notches/band masks.
     """
     def __init__(self,family,frequencies,keys,source_weight,
@@ -44,9 +45,15 @@ class DeviceEccentricModeSource:
         source=EccentricModeFamilySource(self.family,d=d,de=de,dq=dq,dchi=dchi,clock_time=self.clock_time)
         b=xp.zeros((len(self.keys),len(self.f)),dtype=xp.complex64)
         t=xp.zeros(b.shape,dtype=xp.float64)
+        # a precessing source (theta of 7: ..., chi1_perp, chi2_perp, dphi): the main row's phase correction of the
+        # family's pycbc.waveform.precession_main_row.PrecessionMainRow, if it has one
+        prec=getattr(self.family,'precession',None) if len(theta)>4 else None
         for key,sl,amp,phase,have in self.family._windows(d,de,dq,circular=source.circular,dchi=dchi):
             if key not in self.keys:continue
             k=self.keys.index(key)
+            if prec is not None and tuple(key) in prec.shapes:
+                phase=phase+prec.phase(key,numpy.asarray(theta,dtype=float)[None],
+                                       frequencies=self.family.f[sl])[0]
             active=numpy.flatnonzero(have)
             pieces=numpy.split(active,numpy.flatnonzero(numpy.diff(active)!=1)+1)
             for bins in pieces:

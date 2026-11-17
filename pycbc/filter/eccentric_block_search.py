@@ -246,7 +246,11 @@ class EccentricFFTBlockModel:
     def _mc_anchor_gram(self, x, theta, sky, anchor_indices, delay_bounds, response, chi=None, q=None):
         # the anchor: ln Mc offset x, the cell's reference e, and the spin anchor chi if given, else the template's
         # own coordinates beyond Mc and e, which are then part of the key
-        anchor = numpy.array(theta, dtype=float)
+        # a precessing template's (theta of 7, the in-plane spins after the cell's four) anchor is the aligned one:
+        # the main row changes the modes' phases, not their power, and cross-mode Gram terms (two harmonics at one
+        # frequency, their phases far apart) average out; with the spins in the key every new spin draw rebuilt
+        # its anchors (90 s a direct evaluation)
+        anchor = numpy.array(theta[:4], dtype=float)
         anchor[0] = self.coordinates.mchirp*numpy.exp(x)
         if self.coordinates.ndim >= 2:
             anchor[1] = self.coordinates.eccentricity

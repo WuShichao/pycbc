@@ -67,6 +67,11 @@ def efpe_modes(params, frequencies, f_ref, amplitude_tol=1e-12,
              f22_start=lo * 0.999, f22_ref=f_ref, f22_end=hi * 1.001,
              distance=100.0, inclination=params.get('inclination', 0.0),
              Amplitude_tol=amplitude_tol)
+    # in-plane spins (at f_ref), when given: a precessing source. With hlm=True each co-precessing mode (l, m, n)'s
+    # m' = m column is then its main row, the co-precessing mode turned by D^l_{mm}(alpha, beta, gamma)(t)
+    for k in ('spin1x', 'spin1y', 'spin2x', 'spin2y'):
+        if params.get(k, 0.0):
+            p[k] = float(params[k])
     if mode_array is not None:
         p['mode_array'] = [list(v) for v in mode_array]
     try:
@@ -669,3 +674,29 @@ def _tensor_quadratic(v, steps):
     # contract a projection of the stacked values as a tensor, one direction at a time)
     poly.index, poly.nodes, poly.steps = index, nodes, tuple(steps)
     return poly
+
+
+class EfpeMainRowGenerator(object):
+    """pyEFPEHM's modes for :func:`pycbc.waveform.precession_main_row.
+    build_precession_main_row`: ``(lam, inplane)`` with ``lam = (Mc, e, chi,
+    q, chi1_perp, chi2_perp, dphi)`` (both aligned spins at ``chi``; in-plane
+    spins at azimuths 0 and ``-dphi`` at ``f_ref``, a common rotation being the
+    observer's azimuth) to ``efpe_modes(..., hlm=True)``, the precessing source
+    (``inplane``) or the aligned one."""
+
+    def __init__(self, frequencies, f_ref, f22_window):
+        self.f = numpy.asarray(frequencies, dtype=float)
+        self.f_ref = float(f_ref)
+        self.f22_window = tuple(float(v) for v in f22_window)
+
+    def __call__(self, lam, inplane):
+        from pycbc.conversions import mass1_from_mchirp_q, mass2_from_mchirp_q
+        mc, e, chi, q, s1, s2, dphi = (float(v) for v in lam)
+        p = dict(mass1=float(mass1_from_mchirp_q(mc, q)),
+                 mass2=float(mass2_from_mchirp_q(mc, q)), spin1z=chi,
+                 spin2z=chi, eccentricity=e)
+        if inplane:
+            p.update(spin1x=s1, spin1y=0.0, spin2x=s2 * numpy.cos(dphi),
+                     spin2y=-s2 * numpy.sin(dphi))
+        return efpe_modes(p, self.f, self.f_ref, f22_window=self.f22_window,
+                          hlm=True)

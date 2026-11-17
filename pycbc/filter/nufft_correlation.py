@@ -571,6 +571,37 @@ class PhaseNUFFTCorrelation(object):
         return x_phase[d] - w / (2 * numpy.pi) * x_slope[d]
 
 
+def _taylor_terms(reaches, tolerance):
+    """The multi-indices of a multivariate Taylor series in variables of
+    the given reaches: the constant term, and every term reached from one
+    whose size ``prod reach_d^alpha_d / alpha_d!`` exceeds ``tolerance`` by
+    one more order in one variable; in order of degree, with each term's
+    parent ``(index, variable)`` (its strength is the parent's times ``i
+    x_d / alpha_d``). One variable gives the orders while the previous
+    term exceeds the tolerance, as the single-direction series did."""
+    m = len(reaches)
+    zero = (0,) * m
+    alphas, parents, index = [zero], [None], {zero: 0}
+
+    def size(alpha):
+        out = 1.0
+        for r, a in zip(reaches, alpha):
+            out *= r ** a / math.factorial(a)
+        return out
+    q = 0
+    while q < len(alphas):
+        alpha = alphas[q]
+        if size(alpha) > tolerance:
+            for d in range(m):
+                child = tuple(a + (j == d) for j, a in enumerate(alpha))
+                if child not in index:
+                    index[child] = len(alphas)
+                    alphas.append(child)
+                    parents.append((q, d))
+        q += 1
+    return alphas, parents
+
+
 class PhaseGrid(object):
     """The correlations of a PN-coefficient family over a region, on a
     uniform grid of two phase coordinates and arrival time, from one type-1
@@ -606,7 +637,9 @@ class PhaseGrid(object):
                  half_width=(6, 6, 12), beta=(14.0, 14.0, 18.0),
                  upsampfac=2.0, nufft_options=None, margin=0.05,
                  memory_limit=2.2e9, phase_tolerance=1e-4,
-                 time_range=None):
+                 time_range=None, taylor_directions=1,
+                 max_taylor_directions=4, taylor_margin=0.1,
+                 taylor_extent_margin=None):
         import logging
         import time
         xp = self.xp = correlator.xp
@@ -614,7 +647,21 @@ class PhaseGrid(object):
         self.correlator = correlator
         region = numpy.atleast_2d(numpy.asarray(region, dtype=float))
         ndir = max(1, min(ndir, len(region)))
-        frame = correlator.frame(region, ndir + 1)
+        if taylor_directions == 'auto':
+            # as many Taylor directions (up to max_taylor_directions) as bring
+            # the region's own points within taylor_margin of the phase
+            # tolerance, so that points between them stay inside it (a
+            # precessing cell's main row needed one or two more than the
+            # aligned cell's one)
+            for m in range(1, int(max_taylor_directions) + 1):
+                frame = correlator.frame(region, ndir + m)
+                if float(correlator.phase_residual(region, frame).max()) \
+                        <= taylor_margin * phase_tolerance:
+                    break
+            taylor_directions = m
+        else:
+            frame = correlator.frame(region,
+                                     ndir + max(int(taylor_directions), 1))
         self.frame = frame
         ndir = min(ndir, frame['directions'].shape[1])
         self.ndir = ndir
@@ -632,23 +679,50 @@ class PhaseGrid(object):
                 r = correlator.node_row(parts, d, k)
                 lo_, hi_ = min(lo_, float(r.min())), max(hi_, float(r.max()))
             return lo_, hi_
-        # Taylor variable: the third direction about the region's middle
-        self.terms, self.middle, self.s3_half = 1, 0.0, numpy.inf
-        third = s.shape[1] > ndir
-        if third:
-            self.middle = 0.5 * (s[:, ndir].max() + s[:, ndir].min())
-            self.s3_half = numpy.abs(s[:, ndir] - self.middle).max() * (
-                1 + margin)
+        # Taylor variables: the directions after the grid's, each about the
+        # region's middle; a multivariate series whose terms (multi-indices
+        # alpha) are those reached from the constant one through a term
+        # larger than taylor_tolerance (its size prod reach_d^alpha_d /
+        # alpha_d!): with one direction, as many orders as bring the largest
+        # omitted below the tolerance. A precessing cell's main row needs a
+        # second (its reach is small, so few terms)
+        ntay = max(0, min(int(taylor_directions), s.shape[1] - ndir))
+        self.taylor_dirs = list(range(ndir, ndir + ntay))
+        self.middles = numpy.array([0.5 * (s[:, d].max() + s[:, d].min())
+                                    for d in self.taylor_dirs])
+        # the series' reach past the region's own points (taylor_extent_margin,
+        # by default the grid's margin): a wider one keeps points between and
+        # just beyond them inside at the cost of a few terms where the reach
+        # is small
+        # (the first Taylor direction keeps the grid's margin: widening a
+        # direction of large reach multiplies the terms of every other)
+        tmargin = margin if taylor_extent_margin is None \
+            else float(taylor_extent_margin)
+        tmargins = [margin] + [tmargin] * (ntay - 1)
+        self.halves = numpy.array([numpy.abs(s[:, d] - m).max() * (1 + tm)
+                                   for d, m, tm in zip(self.taylor_dirs,
+                                                       self.middles,
+                                                       tmargins)])
+        reaches = []
+        for d, m, tm in zip(self.taylor_dirs, self.middles, tmargins):
+            xlo, xhi = extent(d)
+            reaches.append(max(abs(xlo), abs(xhi)) * float(
+                numpy.abs(s[:, d] - m).max()) * (1 + tm))
+        self.alphas, self._parents = _taylor_terms(reaches, taylor_tolerance)
+        self.terms = len(self.alphas)
+        self.taylor_reaches = list(map(float, reaches))
+        if ntay > 1:
+            logging.info("PhaseGrid: %d Taylor directions, reaches %s, %d "
+                         "terms", ntay, ['%.3g' % r for r in reaches],
+                         self.terms)
+        third = ntay > 0
+        self.middle = float(self.middles[0]) if ntay else 0.0
+        self.s3_half = float(self.halves[0]) if ntay else numpy.inf
+        if ntay:
             x3lo, x3hi = extent(ndir)
-            reach = max(abs(x3lo), abs(x3hi)) * float(
-                numpy.abs(s[:, ndir] - self.middle).max()) * (1 + margin)
             # the templates' spacing along it, as along the grid's axes
             self.s3_step = numpy.pi / (oversample[0] * max(
                 0.5 * (x3hi - x3lo), 1e-300))
-            term = 1.0
-            while term > taylor_tolerance:
-                term *= reach / self.terms
-                self.terms += 1
         if time_range is None:
             time_range = (delay_range[0] + shift.min(),
                           delay_range[1] + shift.max())
@@ -744,11 +818,11 @@ class PhaseGrid(object):
                 scaled.append(((x - self.centre[d]) * self.step[d]).astype(
                     real))
                 phase = phase + 0.5 * (hi[d] + lo[d]) * (x - self.centre[d])
-            ix3 = None
-            if third:
-                x3 = correlator.node_row(parts, ndir, k)
-                phase = phase + self.middle * x3
-                ix3 = (1j * x3).astype(cplx)
+            ixs = []
+            for d, m in zip(self.taylor_dirs, self.middles):
+                xd = correlator.node_row(parts, d, k)
+                phase = phase + m * xd
+                ixs.append((1j * xd).astype(cplx))
             centring = xp.exp(1j * phase).astype(cplx)
             del x, phase
             blocked = _BlockedNodes(scaled, 1, N, self.size, correlator.eps,
@@ -767,18 +841,21 @@ class PhaseGrid(object):
                 rows_at.clear()
                 stack.clear()
             for p in range(npoly):
-                current = correlator.strength(i, p) * centring[None]
+                currents = [correlator.strength(i, p) * centring[None]]
+                for q in range(1, self.terms):
+                    par, d = self._parents[q]
+                    currents.append(currents[par] * ixs[d][None]
+                                    / self.alphas[q][d])
                 for q in range(self.terms):
-                    if q:
-                        current = current * ix3[None] / q
                     for a in range(2):
                         rows_at.append((q * npoly + p) * 2 + a)
-                        stack.append(current[a])
+                        stack.append(currents[q][a])
                         if len(stack) == stack_rows:
                             flush()
+                del currents
             if stack:
                 flush()
-            del current, centring, ix3, blocked
+            del centring, ixs, blocked
             if xp is not numpy:
                 xp.get_default_memory_pool().free_all_blocks()
         parts = None
@@ -814,12 +891,12 @@ class PhaseGrid(object):
                 scaled.append(((x - self.centre[d]) * self.step[d]).astype(
                     real))
                 phase = phase + mids[d] * (x - self.centre[d])
-            ix3 = None
-            if third:
-                x3 = correlator.node_row(parts, self.ndir, k)
-                phase = phase + self.middle * x3
-                ix3 = (1j * x3).astype(cplx)
-            return scaled, xp.exp(1j * phase).astype(cplx), ix3
+            ixs = []
+            for d, m in zip(self.taylor_dirs, self.middles):
+                xd = correlator.node_row(parts, d, k)
+                phase = phase + m * xd
+                ixs.append((1j * xd).astype(cplx))
+            return scaled, xp.exp(1j * phase).astype(cplx), ixs
         # the worst harmonic's reach of each layout's runs
         reach = []
         for k in orders:
@@ -866,7 +943,7 @@ class PhaseGrid(object):
         node_rows = [[] for _ in range(D)]
         data_moments = []                          # (terms, 2 nch, A, R)
         for i, k in enumerate(orders):
-            scaled, centring, ix3 = nodes_of(k)
+            scaled, centring, ixs = nodes_of(k)
             runs.deltas = [y[take] - y[mid][:, None] for y in scaled]
             for d in range(D):
                 node_rows[d].append(xp.ascontiguousarray(scaled[d][mid]))
@@ -879,18 +956,22 @@ class PhaseGrid(object):
                                 for v in (data[c] * (1 - w), data[c] * w)])
             del data, centring
             per_term = []
+            currents = [current]
             for q in range(self.terms):
                 if q:
-                    current = current * ix3[None] / q
+                    par, d = self._parents[q]
+                    currents.append(currents[par] * ixs[d][None]
+                                    / self.alphas[q][d])
+                cur = currents[q]
                 parts_q = []
-                for r0 in range(0, len(current), rows_at_once):
-                    c = runs._runs(current[r0:r0 + rows_at_once], runs.width,
+                for r0 in range(0, len(cur), rows_at_once):
+                    c = runs._runs(cur[r0:r0 + rows_at_once], runs.width,
                                    zero=True)
                     parts_q.append(xp.stack(list(runs._moments(c)), axis=1))
                     del c
                 per_term.append(xp.concatenate(parts_q))
             data_moments.append(xp.stack(per_term))
-            del current, ix3, per_term, runs.deltas
+            del current, currents, ixs, per_term, runs.deltas
         runs.nodes = [xp.concatenate(v) for v in node_rows]
         del node_rows
         runs.plan(lib, options, cplx, upsampfac, eps)
@@ -959,6 +1040,8 @@ class PhaseGrid(object):
             G.append((g00 / det, g11 / det, g01 / det))
         mono = c.sky_weights(sky)                          # (npoly, S)
         s3 = numpy.asarray(s3_values, dtype=float)
+        if len(getattr(self, 'taylor_dirs', [])) > 1:
+            raise NotImplementedError('grid_twof searches one Taylor direction')
         taylor = s3[None, :] ** numpy.arange(self.terms)[:, None]
         # (S, n_s3, terms, npoly), the vectors' order in the grid
         weight = (mono.T[:, None, None, :] * taylor.T[None, :, :, None])
@@ -991,6 +1074,26 @@ class PhaseGrid(object):
         out = (len(sky), len(s3), n1, n2)
         return best.reshape(out), where.reshape(out), nodes
 
+    def taylor_inside(self, s):
+        """Whether each template's Taylor variables lie within the series'
+        reach, from its phase coordinates ``s`` (M, all directions)."""
+        ok = numpy.ones(len(s), dtype=bool)
+        if self.terms > 1:
+            for d, m, h in zip(self.taylor_dirs, self.middles, self.halves):
+                ok &= numpy.abs(s[:, d] - m) <= h
+        return ok
+
+    def taylor_weights(self, s):
+        """Each template's Taylor monomials (M, terms) from its phase
+        coordinates ``s``."""
+        out = numpy.ones((len(s), self.terms))
+        offs = [s[:, d] - m for d, m in zip(self.taylor_dirs, self.middles)]
+        for q, alpha in enumerate(self.alphas):
+            for d, power in enumerate(alpha):
+                if power:
+                    out[:, q] = out[:, q] * offs[d] ** power
+        return out
+
     def time_limits(self):
         """The grid times, s, interpolation can reach."""
         hw = self.half_width[-1]
@@ -1012,8 +1115,7 @@ class PhaseGrid(object):
             lo, hi = self.time_limits()
             ok &= (delay_range[0] + shift >= lo) & (
                 delay_range[1] + shift <= hi)
-        if self.terms > 1:
-            ok &= numpy.abs(s[:, self.ndir] - self.middle) <= self.s3_half
+        ok &= self.taylor_inside(s)
         ok &= self.correlator.phase_residual(thetas, self.frame) \
             <= self.phase_tolerance
         return ok
@@ -1039,9 +1141,7 @@ class PhaseGrid(object):
         npoly = self.correlator.sky_sets
         weight = numpy.ones((M, self.terms, npoly), dtype=complex)
         if self.terms > 1:
-            s3 = s[:, nd] - self.middle
-            weight = weight * (s3[:, None] ** numpy.arange(self.terms)
-                               )[:, :, None]
+            weight = weight * self.taylor_weights(s)[:, :, None]
         if npoly > 1 or getattr(self.correlator, 'sky_basis',
                                 None) is not None:
             if sky is None:
