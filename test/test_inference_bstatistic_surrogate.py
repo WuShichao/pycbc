@@ -519,6 +519,57 @@ def test_a_recentred_model_is_the_model_built_there():
                                   there.loglikelihoods(points), atol=0.02)
 
 
+def _built_at(longitude, latitude, data, psds):
+    """The test model with its reference sky at ``longitude``, ``latitude``."""
+    from pycbc.inference import models
+    from pycbc.workflow import WorkflowConfigParser
+    lon, lat = 3.5763564997428436, 0.3429283438977949
+    cp = WorkflowConfigParser()
+    cp.read_string(CONFIG.replace(
+        'grid-periods = 1', 'grid-periods = 1\nharmonics = 8\n'
+        'amplitude-table-file = ' + table_file()).replace(
+        'eclipticlongitude = %r' % lon, 'eclipticlongitude = %r' % longitude)
+        .replace('eclipticlatitude = %r' % lat,
+                 'eclipticlatitude = %r' % latitude))
+    return models.read_from_config(cp, data=data, psds=psds)
+
+
+def test_sky_shape_units_at_the_reference_are_from_datas():
+    """Measured at its own reference sky, sky_shape_units gives the units
+    from_data set (the same metric, from the family's own tangents)."""
+    lon, lat = 3.5763564997428436, 0.3429283438977949
+    data, psds, _, _ = stbbh_data()
+    m = _built_at(lon, lat, data, psds)
+    (slon, slat), metric = m.sky_shape_units(lon, lat)
+    numpy.testing.assert_allclose([slon, slat],
+                                  [m.scales['eclipticlongitude'],
+                                   m.scales['eclipticlatitude']], rtol=1e-2)
+    numpy.testing.assert_allclose(numpy.diag(metric)[-2:], 1.0, rtol=1e-6)
+
+
+def test_a_model_moved_across_the_sky_takes_the_sky_units_there():
+    """A model recentred far across the sky (latitude 0.34 to -1.2) has the
+    sky shape units and sky metric of a model built there, not those of its
+    old centre, which differ several times (2026-11-18: an all-sky search
+    built at the pole laid out each ecliptic block's sky points in the
+    pole's units, one longitude per block, and missed a source)."""
+    lon, lat = 3.5763564997428436, 0.3429283438977949
+    lon2, lat2 = lon + 1.0, -1.2
+    data, psds, _, _ = stbbh_data()
+    base = _built_at(lon, lat, data, psds)
+    there = _built_at(lon2, lat2, data, psds)
+    moved = base.recentred(lon2, lat2, 0.02, sky_block_points=200)
+    sky = ('eclipticlongitude', 'eclipticlatitude')
+    old = numpy.array([base.scales[k] for k in sky])
+    new = numpy.array([there.scales[k] for k in sky])
+    # the test means something only if the units do change across the sky
+    assert numpy.max(numpy.abs(numpy.log(old / new))) > numpy.log(2.0)
+    numpy.testing.assert_allclose([moved.scales[k] for k in sky], new,
+                                  rtol=2e-2)
+    numpy.testing.assert_allclose(moved.metric[-2:, -2:],
+                                  there.metric[-2:, -2:], atol=3e-2)
+
+
 def test_a_sky_block_search_finds_the_source_in_its_block():
     """Two blocks of the sky, the injection inside the second: the merged
     candidates put the source there, once."""

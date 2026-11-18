@@ -44,6 +44,38 @@ from pycbc.tmpltbank.fstatistic_metric import orientation_weights
 from .base import BaseModel
 
 
+#: the sky probe of the shape units, rad: the metric's sky derivatives are taken over this step
+SKY_PROBE = 1e-6
+
+
+def _orientation_averaged_metric(fam, grid, nodes=None):
+    """The F-statistic metric of a family's tangents at its reference, in the family's own coordinates, averaged
+    over orientations (``OrientationNodes(4, 2)`` by default), the correlations windowed to the grid's data; and the
+    whitened power at each frequency. The shape units of :meth:`BStatisticSurrogate.from_data` come from its
+    diagonal."""
+    from pycbc.tmpltbank.fstatistic_metric import (
+        metric_from_gram, tangent_gram)
+    nodes = OrientationNodes(4, 2) if nodes is None else nodes
+    # the derivatives on the host, one on the device at a time
+    y, dy = fam.tangents(host=True)
+    window = fam.xp.asarray(grid.in_data)
+
+    def windowed(s):
+        s = fam.xp.asarray(s)
+        return _to_numpy(fam.xp.fft.fft(
+            fam.xp.fft.ifft(s, axis=-1) * window, axis=-1))
+    # one derivative at a time to the host, which sums the Gram
+    y = windowed(y)
+    host = numpy.empty(dy.shape, dtype=numpy.complex64)
+    for i in range(len(dy)):
+        host[i] = windowed(dy[i])
+    del dy
+    gram = tangent_gram(y, host, grid.frequencies)
+    metric = sum(w * metric_from_gram(gram, v)
+                 for w, v in zip(nodes.weights, nodes.vectors))
+    return metric, numpy.sum(numpy.abs(y) ** 2, axis=(0, 1))
+
+
 def _measured_coordinates(surrogate, reference, coarse=4000):
     """:class:`pycbc.waveform.taylorf2_jets.MeasuredPhaseCoordinates` of
     the family, weighted by the reference's power at the frequencies it
@@ -865,29 +897,12 @@ class BStatisticSurrogate(BaseModel):
         def unit_lengths(fam):
             """The metric in the family's shape units, averaged over
             orientations, and the whitened power at each frequency."""
-            # the derivatives on the host, one on the device at a time
-            y, dy = fam.tangents(host=True)
-            window = fam.xp.asarray(grid.in_data)
-
-            def windowed(s):
-                s = fam.xp.asarray(s)
-                return _to_numpy(fam.xp.fft.fft(
-                    fam.xp.fft.ifft(s, axis=-1) * window, axis=-1))
-            # one derivative at a time to the host, which sums the Gram
-            y = windowed(y)
-            host = numpy.empty(dy.shape, dtype=numpy.complex64)
-            for i in range(len(dy)):
-                host[i] = windowed(dy[i])
-            del dy
-            gram = tangent_gram(y, host, grid.frequencies)
-            metric = sum(w * metric_from_gram(gram, v)
-                         for w, v in zip(nodes.weights, nodes.vectors))
-            return metric, numpy.sum(numpy.abs(y) ** 2, axis=(0, 1))
+            return _orientation_averaged_metric(fam, grid, nodes)
 
         # the metric from derivatives over a part in 1e6 of each value and
         # 1e-6 rad of sky, checked against steps ten times smaller
         probe = {k: 1e-6 * max(abs(reference[k]), 1e-3) for k in intrinsic}
-        probe.update(eclipticlongitude=1e-6, eclipticlatitude=1e-6)
+        probe.update(eclipticlongitude=SKY_PROBE, eclipticlatitude=SKY_PROBE)
         metric, y = unit_lengths(build(probe, 1.0,
                                        derivatives=source_derivatives))
         finer, _ = unit_lengths(build(probe, 0.1,
@@ -951,6 +966,45 @@ class BStatisticSurrogate(BaseModel):
             time_window=time_window, kwargs=kwargs)
         return model
 
+    def sky_shape_units(self, longitude, latitude):
+        """The sky's shape units at ``longitude``, ``latitude``, measured
+        as :meth:`from_data` measures them at its reference: ``SKY_PROBE``
+        rad over the square root of the orientation-averaged F-statistic
+        metric's diagonal, from this family's intrinsic part and the
+        response (and its sky derivatives) of that sky. A diagonal element
+        involves its own tangent and the projected signal and timing
+        directions only, so these are the units of a model built there.
+
+        Returns the two units (longitude, latitude), rad, and the metric in
+        the coordinates of a model there: this family's intrinsic shape
+        units and the new sky units."""
+        import copy
+        from pycbc.tdi.ssb_yearly_harmonics import (sky_log_derivatives,
+                                                    yearly_response_samples)
+        a = getattr(self, '_recentre_args', None)
+        if a is None:
+            raise ValueError("only a model from from_data can measure its "
+                             "sky units elsewhere")
+        fam = copy.copy(self.surrogate)
+        fam.sky_block = None
+        xp = fam.xp
+        response = yearly_response_samples(
+            a['orbit'], a['terms'], a['coarse'], longitude, latitude,
+            longitude, latitude, samples=a['samples'])
+        sky = sky_log_derivatives(
+            a['orbit'], a['terms'], a['coarse'], longitude, latitude,
+            scales=(SKY_PROBE, SKY_PROBE), samples=a['samples'])
+        dtype = self.surrogate.R0.dtype
+        fam.R0 = (xp.asarray(response, dtype=dtype)
+                  * xp.asarray(a['ratio'])[None, None]).astype(dtype)
+        fam.L = xp.asarray(sky, dtype=self.surrogate.L.dtype)
+        metric, _ = _orientation_averaged_metric(fam, a['grid'])
+        units = numpy.sqrt(numpy.diag(metric))
+        nint = len(metric) - 2
+        scale = numpy.concatenate([numpy.ones(nint), units[nint:]])
+        return ((SKY_PROBE / units[nint], SKY_PROBE / units[nint + 1]),
+                metric / numpy.outer(scale, scale))
+
     def recentred(self, longitude, latitude, sky_block_radius,
                   sky_block_points=600, sky_block_tolerance=1e-4):
         """The model of a block of the sky centred at ``longitude`` and
@@ -980,10 +1034,19 @@ class BStatisticSurrogate(BaseModel):
         a = getattr(self, '_recentre_args', None)
         if a is None:
             raise ValueError("only a model from from_data can be recentred")
+        # the sky's shape units of the new centre, not the old one's: the
+        # sky metric changes across the sky (near a pole longitude is wide
+        # and latitude narrow, near the ecliptic the reverse), and the
+        # block's fit, its sky points and the lattice are laid out in these
+        # units. Kept from the old centre they were wrong by up to 12 times
+        # (2026-11-18: an all-sky search built at a pole sampled each
+        # ecliptic block at one longitude and missed a source there)
+        (slon, slat), metric = self.sky_shape_units(longitude, latitude)
+        scales = dict(self.scales, eclipticlongitude=slon,
+                      eclipticlatitude=slat)
         blocks = sky_blocks(
             a['orbit'], a['terms'], a['coarse'], (longitude, latitude),
-            (self.scales['eclipticlongitude'],
-             self.scales['eclipticlatitude']), sky_block_radius,
+            (slon, slat), sky_block_radius,
             tolerances=sky_block_tolerances, kmax=a['harmonics'],
             samples=a['samples'], ratio=a['ratio'],
             weight=source_power_weights(self.surrogate),
@@ -998,6 +1061,7 @@ class BStatisticSurrogate(BaseModel):
         point.update(eclipticlongitude=float(longitude),
                      eclipticlatitude=float(latitude))
         kwargs = dict(a['kwargs'])
+        kwargs['metric'] = metric
         if self.table is not None:
             kwargs['amplitude_table'] = self.table
         models = []
@@ -1006,7 +1070,7 @@ class BStatisticSurrogate(BaseModel):
             fam.sky_block = block
             model = type(self)(list(self.variable_params), fam,
                                DailyGram(fam), spectrum, noise, point,
-                               self.scales, self.distance_prior,
+                               scales, self.distance_prior,
                                a['time_window'],
                                oversampling=self.oversampling, **kwargs)
             model._recentre_args = a
