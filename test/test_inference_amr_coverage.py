@@ -77,3 +77,29 @@ def test_the_bound_is_the_triangle_inequality():
     logl = numpy.array([0.5 * 3.0 ** 2, 0.0, -numpy.inf])
     bound = sampler._coverage_bound(logl, numpy.array([2.0, 5.0, 1.0]))
     assert bound == pytest.approx([0.5 * 25.0, 12.5, -numpy.inf])
+
+
+def test_an_snr_bound_gives_the_distance_bound_it_is_built_from():
+    def snr_bound(centre, probes, rho):
+        d = distance(centre, probes).max(axis=1)
+        return rho + d, d
+    a = run(box_distance=distance)
+    b = run(box_snr_bound=snr_bound)
+    assert b.logz == pytest.approx(a.logz, abs=1e-9)
+    assert b.diagnostics['evaluations'] == a.diagnostics['evaluations']
+
+
+def test_a_global_bound_certifies_the_far_prior_and_the_start_is_probed():
+    # the signal estimated at the start (the peak itself): far from it the
+    # SNR is at most its match with the signal, nothing of the noise here
+    def snr_bound(centre, probes, rho):
+        pts = numpy.concatenate([centre[:, None, :], probes], axis=1)
+        far = numpy.linalg.norm(pts - MEAN, axis=-1).min(axis=1)
+        top = numpy.maximum(PEAK - RHO * far, 0.0)
+        d = distance(centre, probes).max(axis=1)
+        return numpy.minimum(rho + d, top), d
+    start = (numpy.array(MEAN) + HALF) / (2 * HALF)
+    sampler = run(box_snr_bound=snr_bound, start_cube=start)
+    assert sampler.logz == pytest.approx(exact_logz(), abs=0.05)
+    full = run(box_distance=distance)
+    assert sampler.diagnostics['evaluations'] < full.diagnostics['evaluations']

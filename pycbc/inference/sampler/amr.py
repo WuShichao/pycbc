@@ -269,12 +269,20 @@ class AMRSampler(BaseSampler):
                  layout_fraction=0.1, pilot_layout_fraction=None,
                  final_share_frame_radius=None, linear_posterior=False,
                  linear_cap=10.0, box_distance=None, coverage_kappa=0.0,
-                 coverage_resolution=0.5, coverage_probes=4):
+                 coverage_resolution=0.5, coverage_probes=4,
+                 box_snr_bound=None):
         super().__init__(model)
         # the coverage bound (see _coverage_bound): a box is refined while
         # the most posterior mass its template distance allows exceeds
         # mass_fraction of Z, until that distance is below the resolution
         self.box_distance = box_distance
+        # or the bound itself: box_snr_bound(centre, probes, rho_centre) the
+        # largest SNR anywhere in each box and its template distance
+        self.box_snr_bound = box_snr_bound
+        if box_distance is not None and box_snr_bound is not None:
+            raise ValueError("give box_distance or box_snr_bound, not both")
+        self._coverage = box_distance is not None or box_snr_bound is not None
+        self._peak_cube = None
         self.coverage_kappa = float(coverage_kappa)
         self.coverage_resolution = float(coverage_resolution)
         self.coverage_probes = int(coverage_probes)
@@ -664,6 +672,9 @@ class AMRSampler(BaseSampler):
                                                 self.start_cube]),
                                   numpy.concatenate([self._explored[1],
                                                      logl]))
+        if self._coverage and self.start_cube is not None:
+            # the start the peak's first estimate, until a frame's climb
+            self._peak_cube = numpy.array(self.start_cube[0], dtype=float)
         self._grid()
         if self.pilot_evaluations > 0:
             for whitening_round in range(self.whitening_rounds):
@@ -763,6 +774,7 @@ class AMRSampler(BaseSampler):
         self._logerr = numpy.full(len(self._lower), numpy.nan)
         self._logjac = numpy.full(len(self._lower), numpy.nan)
         self._dist = numpy.full(len(self._lower), numpy.nan)
+        self._snr = numpy.full(len(self._lower), numpy.nan)
         if evaluate:
             self._evaluate_leaves()
 
@@ -786,7 +798,7 @@ class AMRSampler(BaseSampler):
             refine |= self._neighbour_flags(leaves, logmass - logz > threshold,
                                             logz + threshold)
             bound = None
-            if self.box_distance is not None:
+            if self._coverage:
                 bound, cover = self._coverage_flags(leaves, logz, threshold)
                 refine |= cover
             refine &= self._level[leaves] < self.max_level
@@ -845,15 +857,67 @@ class AMRSampler(BaseSampler):
             self._probes = numpy.vstack(off)
         return self._probes
 
-    def _box_distances(self, index):
-        """Each box's template distance: the largest of ``box_distance``
-        from its centre to its probe points (:meth:`_probe_offsets`), its
-        part inside the prior (points beyond it clipped onto the prior's
-        edge); ``inf`` where no point maps, so that the box is refined."""
+    def _box_probes(self, index):
+        """Each box's probe points in its box coordinates, ``(n, k,
+        ndim)``: :meth:`_probe_offsets` and, once a peak is known, the box's
+        point nearest it (a narrow ridge through a large box can pass
+        between its faces' centres and corners)."""
         off = self._probe_offsets()
-        n, k = len(index), len(off)
         centre = self._lower[index] + 0.5 * self._width[index]
         s = centre[:, None, :] + 0.5 * off[None] * self._width[index][:, None, :]
+        if self._peak_cube is not None:
+            with numpy.errstate(invalid='ignore'):
+                sp = self._unmap(numpy.asarray(self._peak_cube)[None])[0]
+            if numpy.all(numpy.isfinite(sp)):
+                near = numpy.clip(sp[None], self._lower[index],
+                                  self._lower[index] + self._width[index])
+                s = numpy.concatenate([s, near[:, None, :]], axis=1)
+        return centre, s
+
+    def _box_thetas(self, index):
+        """The parameters at each box's centre and probes (beyond the prior
+        clipped onto its edge; ``nan`` where a point does not map)."""
+        centre, s = self._box_probes(index)
+        n, k = s.shape[:2]
+        cube_c, _ = self._map(centre)
+        cube_p, _ = self._map(s.reshape(-1, self.ndim))
+        cube_c = numpy.clip(cube_c, 0, 1)
+        cube_p = numpy.clip(cube_p, 0, 1)
+        good_c = numpy.all(numpy.isfinite(cube_c), axis=1)
+        good_p = numpy.all(numpy.isfinite(cube_p), axis=1).reshape(n, k)
+        theta_c = numpy.full((n, self.ndim), numpy.nan)
+        theta_p = numpy.full((n * k, self.ndim), numpy.nan)
+        theta_c[good_c] = [self._prior_transform(c) for c in cube_c[good_c]]
+        gp = good_p.ravel()
+        theta_p[gp] = [self._prior_transform(c) for c in cube_p[gp]]
+        theta_p = theta_p.reshape(n, k, self.ndim)
+        both = good_c[:, None] & good_p
+        # a probe that does not map is given the centre (distance 0); the
+        # box is then refined through ``bad``
+        theta_p = numpy.where(both[:, :, None], theta_p, theta_c[:, None, :])
+        bad = ~both.all(axis=1)
+        return theta_c, theta_p, good_c, bad
+
+    def _box_snr_bounds(self, index, rho):
+        """``box_snr_bound`` at boxes ``index`` with centre SNRs ``rho``:
+        the largest SNR in each and its template distance (``inf`` both
+        where a probe does not map)."""
+        theta_c, theta_p, good, bad = self._box_thetas(index)
+        snr = numpy.full(len(index), numpy.inf)
+        dist = numpy.full(len(index), numpy.inf)
+        if good.any():
+            a, b = self.box_snr_bound(theta_c[good], theta_p[good], rho[good])
+            snr[good], dist[good] = a, b
+        snr[bad] = dist[bad] = numpy.inf
+        return snr, dist
+
+    def _box_distances(self, index):
+        """Each box's template distance: the largest of ``box_distance``
+        from its centre to its probe points (:meth:`_box_probes`), its
+        part inside the prior (points beyond it clipped onto the prior's
+        edge); ``inf`` where no point maps, so that the box is refined."""
+        centre, s = self._box_probes(index)
+        n, k = s.shape[:2]
         cube_c, jc = self._map(centre)
         cube_p, jp = self._map(s.reshape(-1, self.ndim))
         cube_c = numpy.clip(cube_c, 0, 1)
@@ -887,16 +951,35 @@ class AMRSampler(BaseSampler):
         template distance still above ``coverage_resolution``, below which
         the likelihood is smooth over the box and the midpoint rules
         refine it."""
-        need = leaves[numpy.isnan(self._dist[leaves])]
-        if len(need):
-            self._dist[need] = self._box_distances(need)
-        dist = self._dist[leaves]
         logvol = (numpy.sum(numpy.log(self._width[leaves]), axis=1)
                   + self._logjac[leaves])
-        with numpy.errstate(invalid='ignore'):
-            bound = numpy.where(numpy.isfinite(logvol),
-                                self._coverage_bound(self._logl[leaves], dist)
-                                + logvol, -numpy.inf)
+        if self.box_snr_bound is not None:
+            need = leaves[numpy.isnan(self._snr[leaves])
+                          & numpy.isfinite(self._logl[leaves])]
+            if len(need):
+                with numpy.errstate(invalid='ignore'):
+                    rho = numpy.sqrt(2 * numpy.clip(
+                        self._logl[need] + self.coverage_kappa, 0, None))
+                self._snr[need], self._dist[need] = self._box_snr_bounds(
+                    need, rho)
+            dist = self._dist[leaves]
+            with numpy.errstate(invalid='ignore'):
+                top = numpy.where(numpy.isfinite(self._logl[leaves]),
+                                  0.5 * self._snr[leaves] ** 2
+                                  - self.coverage_kappa, -numpy.inf)
+                bound = numpy.where(numpy.isfinite(logvol), top + logvol,
+                                    -numpy.inf)
+            dist = numpy.where(numpy.isfinite(self._logl[leaves]), dist, 0.0)
+        else:
+            need = leaves[numpy.isnan(self._dist[leaves])]
+            if len(need):
+                self._dist[need] = self._box_distances(need)
+            dist = self._dist[leaves]
+            with numpy.errstate(invalid='ignore'):
+                bound = numpy.where(numpy.isfinite(logvol),
+                                    self._coverage_bound(self._logl[leaves],
+                                                         dist)
+                                    + logvol, -numpy.inf)
         unresolved = dist > self.coverage_resolution
         cover = (bound - logz > threshold) & unresolved
         # the most mass the boxes left unresolved could hold, as a fraction
@@ -1117,9 +1200,12 @@ class AMRSampler(BaseSampler):
             # refinement past them
             self._share_ball(low, span, self._ball * radius)
         # a distance relative to the signal (the frame's peak its estimate) learns where the peak is
-        at_peak = getattr(self.box_distance, 'at_peak', None)
+        peak = from_y(numpy.asarray(mean, dtype=float)[None])[0]
+        self._peak_cube = (peak - bottom) / prior_range
+        at_peak = getattr(self.box_distance or self.box_snr_bound, 'at_peak',
+                          None)
         if at_peak is not None:
-            at_peak(from_y(numpy.asarray(mean, dtype=float)[None])[0])
+            at_peak(peak)
         self._start_frame(low, span, radius)
 
     def _share_ball(self, low, span, radius):
@@ -1224,7 +1310,10 @@ class AMRSampler(BaseSampler):
         self._grid(evaluate=False)
         target = max(1.0, 2 * radius / (self._layout * self.max_evaluations)
                      ** (1.0 / self.ndim))
-        while True:
+        # under the coverage bound the frame starts from its roots: the bound
+        # orders the refinement (a layout of unit boxes spent 11475 of 20000
+        # evaluations on pp 9, 2026-11-18)
+        while not self._coverage:
             leaves = self._leaves()
             zlow = low + span * self._lower[leaves]
             zwidth = span * self._width[leaves]
@@ -1335,6 +1424,8 @@ class AMRSampler(BaseSampler):
                                                      numpy.nan)])
         self._dist = numpy.concatenate([self._dist,
                                         numpy.full(2 * len(index), numpy.nan)])
+        self._snr = numpy.concatenate([self._snr,
+                                       numpy.full(2 * len(index), numpy.nan)])
         self._children = numpy.vstack([self._children,
                                        numpy.full((2 * len(index), 2), -1)])
         return first, second
