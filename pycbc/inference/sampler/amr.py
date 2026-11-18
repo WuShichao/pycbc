@@ -890,9 +890,12 @@ class AMRSampler(BaseSampler):
         good_p = numpy.all(numpy.isfinite(cube_p), axis=1).reshape(n, k)
         theta_c = numpy.full((n, self.ndim), numpy.nan)
         theta_p = numpy.full((n * k, self.ndim), numpy.nan)
-        theta_c[good_c] = [self._prior_transform(c) for c in cube_c[good_c]]
+        if good_c.any():
+            theta_c[good_c] = [self._prior_transform(c)
+                               for c in cube_c[good_c]]
         gp = good_p.ravel()
-        theta_p[gp] = [self._prior_transform(c) for c in cube_p[gp]]
+        if gp.any():
+            theta_p[gp] = [self._prior_transform(c) for c in cube_p[gp]]
         theta_p = theta_p.reshape(n, k, self.ndim)
         both = good_c[:, None] & good_p
         # a probe that does not map is given the centre (distance 0); the
@@ -929,9 +932,12 @@ class AMRSampler(BaseSampler):
         good_p = numpy.all(numpy.isfinite(cube_p), axis=1).reshape(n, k)
         theta_c = numpy.full((n, self.ndim), numpy.nan)
         theta_p = numpy.full((n * k, self.ndim), numpy.nan)
-        theta_c[good_c] = [self._prior_transform(c) for c in cube_c[good_c]]
+        if good_c.any():
+            theta_c[good_c] = [self._prior_transform(c)
+                               for c in cube_c[good_c]]
         gp = good_p.ravel()
-        theta_p[gp] = [self._prior_transform(c) for c in cube_p[gp]]
+        if gp.any():
+            theta_p[gp] = [self._prior_transform(c) for c in cube_p[gp]]
         theta_p = theta_p.reshape(n, k, self.ndim)
         d = numpy.full((n, k), numpy.inf)
         both = good_c[:, None] & good_p

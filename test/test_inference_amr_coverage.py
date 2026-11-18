@@ -103,3 +103,39 @@ def test_a_global_bound_certifies_the_far_prior_and_the_start_is_probed():
     assert sampler.logz == pytest.approx(exact_logz(), abs=0.05)
     full = run(box_distance=distance)
     assert sampler.diagnostics['evaluations'] < full.diagnostics['evaluations']
+
+
+class Sheared(object):
+    """Curvilinear coordinates in which the prior's image is a thin, long
+    parallelogram: a frame's first box, its bound, is mostly empty."""
+    names = ('x', 'y')
+
+    def forward(self, theta):
+        theta = numpy.atleast_2d(theta)
+        return numpy.column_stack([theta[:, 0] + 30 * theta[:, 1],
+                                   theta[:, 1]])
+
+    def inverse(self, y):
+        y = numpy.atleast_2d(y)
+        return numpy.column_stack([y[:, 0] - 30 * y[:, 1], y[:, 1]])
+
+    def log_jacobian(self, theta):
+        return numpy.zeros(len(numpy.atleast_2d(theta)))
+
+
+def test_the_bound_runs_in_a_curvilinear_frame_whose_first_box_is_mostly_empty():
+    def snr_bound(centre, probes, rho):
+        pts = numpy.concatenate([centre[:, None, :], probes], axis=1)
+        far = numpy.linalg.norm(pts - MEAN, axis=-1).min(axis=1)
+        top = numpy.maximum(PEAK - RHO * far, 0.0)
+        d = distance(centre, probes).max(axis=1)
+        return numpy.minimum(rho + d, top), d
+    m = model()
+    m.curvilinear_coordinates = Sheared()
+    start = (numpy.array(MEAN) + HALF) / (2 * HALF)
+    sampler = AMRSampler(m, initial_divisions=1, pilot_evaluations=200,
+                         curvilinear_frame=True, mass_fraction=1e-4,
+                         max_evaluations=20000, posterior_samples=2000,
+                         seed=2, box_snr_bound=snr_bound, start_cube=start)
+    sampler.run()
+    assert sampler.logz == pytest.approx(exact_logz(), abs=0.05)
