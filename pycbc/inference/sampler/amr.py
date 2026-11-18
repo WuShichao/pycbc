@@ -775,6 +775,9 @@ class AMRSampler(BaseSampler):
         self._logjac = numpy.full(len(self._lower), numpy.nan)
         self._dist = numpy.full(len(self._lower), numpy.nan)
         self._snr = numpy.full(len(self._lower), numpy.nan)
+        # the prior's draws in this tree's box coordinates (a new frame, a
+        # new tree)
+        self._prior_s = None
         if evaluate:
             self._evaluate_leaves()
 
@@ -944,6 +947,31 @@ class AMRSampler(BaseSampler):
         d = numpy.where(numpy.isnan(d), numpy.inf, d)
         return d.max(axis=1)
 
+    #: prior draws that bound the prior mass of a box none of its volume
+    #: points fall inside of
+    coverage_prior_draws = 16384
+
+    def _prior_fraction_bound(self, leaves):
+        """``ln`` of an upper bound on the prior mass of each leaf, from the
+        prior's draws it holds: ``(count + 3) / N`` (with no draw inside, a
+        box holds less than ``3 / N`` of the prior at 95% confidence). For a
+        box none of whose volume points (:meth:`_volume`) is inside the
+        prior, which is not thereby empty: a frame's first box is the bound
+        of the prior's image, which can fill a small part of it."""
+        if getattr(self, '_prior_cube', None) is None:
+            from scipy.stats import qmc
+            self._prior_cube = qmc.Sobol(self.ndim, seed=self.seed + 17
+                                         ).random(self.coverage_prior_draws)
+        if self._prior_s is None:
+            with numpy.errstate(invalid='ignore'):
+                sp = self._unmap(self._prior_cube)
+            ok = numpy.all(numpy.isfinite(sp) & (sp >= 0) & (sp <= 1), axis=1)
+            self._prior_s = sp[ok]
+        found = self._locate(self._prior_s)
+        counts = numpy.bincount(found[found >= 0], minlength=len(self._lower))
+        n = len(self._prior_cube)
+        return numpy.log((counts[leaves] + 3.0) / n)
+
     def _coverage_flags(self, leaves, logz, threshold):
         """The coverage bound of each leaf's mass, ``ln`` of its largest
         likelihood (:meth:`_coverage_bound`) times its volume, and the flag
@@ -954,22 +982,29 @@ class AMRSampler(BaseSampler):
         logvol = (numpy.sum(numpy.log(self._width[leaves]), axis=1)
                   + self._logjac[leaves])
         if self.box_snr_bound is not None:
-            need = leaves[numpy.isnan(self._snr[leaves])
-                          & numpy.isfinite(self._logl[leaves])]
+            need = leaves[numpy.isnan(self._snr[leaves])]
             if len(need):
+                # a box with no value (none of its points inside the prior)
+                # has its SNR bounded globally: an infinite centre SNR
                 with numpy.errstate(invalid='ignore'):
-                    rho = numpy.sqrt(2 * numpy.clip(
-                        self._logl[need] + self.coverage_kappa, 0, None))
+                    rho = numpy.where(
+                        numpy.isfinite(self._logl[need]),
+                        numpy.sqrt(2 * numpy.clip(
+                            self._logl[need] + self.coverage_kappa, 0, None)),
+                        numpy.inf)
                 self._snr[need], self._dist[need] = self._box_snr_bounds(
                     need, rho)
             dist = self._dist[leaves]
+            unknown = ~(numpy.isfinite(logvol)
+                        & numpy.isfinite(self._logl[leaves]))
+            if unknown.any():
+                logvol = numpy.where(unknown, numpy.nan, logvol)
+                logvol[unknown] = self._prior_fraction_bound(leaves[unknown])
             with numpy.errstate(invalid='ignore'):
-                top = numpy.where(numpy.isfinite(self._logl[leaves]),
-                                  0.5 * self._snr[leaves] ** 2
-                                  - self.coverage_kappa, -numpy.inf)
-                bound = numpy.where(numpy.isfinite(logvol), top + logvol,
-                                    -numpy.inf)
-            dist = numpy.where(numpy.isfinite(self._logl[leaves]), dist, 0.0)
+                top = 0.5 * self._snr[leaves] ** 2 - self.coverage_kappa
+                bound = numpy.where(numpy.isfinite(top), top, numpy.inf) \
+                    + logvol
+            dist = numpy.where(numpy.isfinite(dist), dist, numpy.inf)
         else:
             need = leaves[numpy.isnan(self._dist[leaves])]
             if len(need):
@@ -1193,6 +1228,7 @@ class AMRSampler(BaseSampler):
         self._curve = curve
         self._uncurve = uncurve
         self._scale = span
+        self._prior_cube = (draws - bottom) / prior_range
         logging.info("AMR: curvilinear frame after %d evaluations",
                      self.nevaluations)
         if self.share_frame and self.shared_region:
