@@ -100,9 +100,11 @@ def test_reconstruct_many_draws_what_reconstruct_draws():
             np.testing.assert_allclose(got[k],v,rtol=1e-9,atol=1e-12,err_msg=k)
 
 
-def test_a_point_without_a_template_has_no_likelihood_and_is_counted():
-    """Where the cell makes no template (TemplateDomainError, a mode clock that stops increasing) ln B is -inf,
-    directly and in a batch, the count is kept, and the next point is evaluated as before."""
+def test_a_point_outside_the_cells_coverage_is_an_error_not_a_zero_likelihood():
+    """Where the cell makes no template (TemplateDomainError, a mode clock that stops increasing) the evaluation
+    raises, naming the point, directly and in a batch: the prior is never cut there unseen. The next point inside
+    is evaluated as before."""
+    import pytest
     from pycbc.waveform.eccentric_mode_gpu import TemplateDomainError
     model,block,grid=toy()
     good=dict(mchirp=30.,q=1.5,eccentricity=.05,chi_eff=0.,eclipticlongitude=1.,eclipticlatitude=.2)
@@ -118,7 +120,9 @@ def test_a_point_without_a_template_has_no_likelihood_and_is_counted():
     block.source_builder=source
     model._last=None
     model.update(**bad)
-    assert model.loglikelihood==-np.inf
-    out=model.loglikelihoods([bad,good])
-    assert out[0]==-np.inf and abs(out[1]-expected)<1e-9
-    assert model.shared_statistics['outside_template_domain']==2
+    with pytest.raises(TemplateDomainError, match="another cell"):
+        model.loglikelihood
+    with pytest.raises(TemplateDomainError, match="'q': 1.9"):
+        model.loglikelihoods([bad,good])
+    model._last=None
+    assert abs(model.loglikelihoods([good])[0]-expected)<1e-9

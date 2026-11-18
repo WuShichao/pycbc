@@ -554,23 +554,23 @@ class EccentricCellPE(BaseModel):
         return out
 
     def _direct_loglikelihood(self, params=None):
-        """ln B of :meth:`evaluate`, or -inf where the cell makes no
-        template (:class:`pycbc.waveform.eccentric_mode_gpu.TemplateDomainError`):
-        the prior is then the box less the points the cell cannot reach,
-        counted in ``shared_statistics['outside_template_domain']``. Without
-        it one such point drawn by a proposal over the whole box stopped the
-        run (Yorsh sobhb6, 2026-11-18, the box's q 1.9 and chi_eff +-0.9
-        corners)."""
+        """ln B of :meth:`evaluate`. Where the cell makes no template
+        (:class:`pycbc.waveform.eccentric_mode_gpu.TemplateDomainError`) the
+        point lies outside the cell's coverage: that is an error of the prior
+        box's partition into cells, never a zero likelihood (which would cut
+        that part of the prior away unseen), and is raised with the point."""
         from pycbc.waveform.eccentric_mode_gpu import TemplateDomainError
         try:
             return self.evaluate(params)['loglikelihood']
-        except TemplateDomainError:
+        except TemplateDomainError as err:
             self._last = None
             self.block._prepared = None
-            stats = getattr(self, 'shared_statistics', None)
-            if stats is not None:
-                stats['outside_template_domain'] = stats.get('outside_template_domain', 0) + 1
-            return -numpy.inf
+            point = dict(self.current_params if params is None else params)
+            raise TemplateDomainError(
+                "%s at %s: the point lies outside this cell's coverage; the "
+                "prior box needs another cell there" % (err, {
+                    k: float(v) for k, v in point.items()
+                    if k in self.intrinsic})) from err
 
     def _loglikelihood(self):
         value = self._direct_loglikelihood()
