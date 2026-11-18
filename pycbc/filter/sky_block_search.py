@@ -29,19 +29,22 @@ from pycbc.filter.nufft_correlation import (PhaseNUFFTCorrelation,
 
 
 def sky_block_centres(longitudes, latitudes, radius):
-    """Centres of blocks of half-width ``radius`` (``|lon - lon0| cos(lat0)
-    <= radius``, ``|lat - lat0| <= radius``) covering the ecliptic
-    ``longitudes`` and ``latitudes`` ranges, rad: latitude bands of width
-    ``2 radius``, each cut in longitude at the spacing its edge nearer the
-    equator needs."""
+    """Centres of blocks of half-width ``radius`` (``|lon - lon0|
+    cos(|lat0| - radius) <= radius``, ``|lat - lat0| <= radius``, as
+    :class:`pycbc.tdi.sky_block_response.SkyBlockResponse` takes them)
+    covering the ecliptic ``longitudes`` and ``latitudes`` ranges, rad:
+    latitude bands of width at most ``2 radius``, each cut in longitude at
+    the block's own longitude width
+    (:func:`pycbc.tdi.sky_block_response.block_longitude_half_width`), so
+    that every tile lies inside its block."""
+    from pycbc.tdi.sky_block_response import block_longitude_half_width
     lat_lo, lat_hi = latitudes
     lon_lo, lon_hi = longitudes
     nlat = max(1, int(numpy.ceil((lat_hi - lat_lo) / (2 * radius) - 1e-9)))
     centres = []
     for i in range(nlat):
         lat = lat_lo + (i + 0.5) * (lat_hi - lat_lo) / nlat
-        edge = min(abs(lat) - (lat_hi - lat_lo) / (2 * nlat), numpy.pi / 2)
-        width = 2 * radius / max(numpy.cos(max(edge, 0.0)), 1e-6)
+        width = 2 * block_longitude_half_width(lat, radius)
         nlon = max(1, int(numpy.ceil((lon_hi - lon_lo) / width - 1e-9)))
         for j in range(nlon):
             centres.append((lon_lo + (j + 0.5) * (lon_hi - lon_lo) / nlon,
@@ -53,8 +56,10 @@ def block_sky_points(model, radius, step):
     """Sky offsets, in the model's shape units, of a square lattice of
     spacing ``step`` (shape units) over the model's sky block of half-width
     ``radius``."""
+    from pycbc.tdi.sky_block_response import block_longitude_half_width
     lat0 = model.reference['eclipticlatitude']
-    half = (radius / numpy.cos(lat0) / model.scales['eclipticlongitude'],
+    half = (block_longitude_half_width(lat0, radius)
+            / model.scales['eclipticlongitude'],
             radius / model.scales['eclipticlatitude'])
     axes = [numpy.arange(-numpy.floor(h / step), numpy.floor(h / step) + 1)
             * step for h in half]

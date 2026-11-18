@@ -98,11 +98,27 @@ def _response_factors(g, omega, lon, lat, xp):
     return out
 
 
+def block_longitude_half_width(latitude, radius):
+    """The longitude half-width, rad, of a sky block of half-width
+    ``radius`` centred at ``latitude``: ``radius / cos(|latitude| -
+    radius)``, its edge nearer the equator (the equator itself for a block
+    that straddles it), where a degree of longitude is longest."""
+    edge = max(abs(float(latitude)) - float(radius), 0.0)
+    return float(radius) / numpy.cos(edge)
+
+
 class SkyBlockResponse(object):
     """The response harmonics over a block of the sky.
 
-    The block is ``|lon - lon0| cos(lat0) <= radius`` and
-    ``|lat - lat0| <= radius``. Offsets are in the family's shape units,
+    The block is ``|lon - lon0| cos(|lat0| - radius) <= radius`` and
+    ``|lat - lat0| <= radius``: its longitude half-width is taken at its
+    edge nearer the equator (:func:`block_longitude_half_width`), so that
+    no point of it lies farther than ``radius`` from the centre's meridian
+    along its parallel. (Until 2026-11-18 it was ``radius / cos(lat0)``: at
+    latitude 1.50 the block then reached 0.14 rad along its equatorward
+    edge, twice its radius, and 2.3 times its tile's width; the fit and the
+    Gram's sky interpolation failed in those corners and pure noise gave
+    2F 405 there for a 30 mHz source.) Offsets are in the family's shape units,
     ``(lon - lon0) / scales[0]`` and ``(lat - lat0) / scales[1]``, so that
     :meth:`responses` stands in for the family's own.
 
@@ -339,7 +355,7 @@ class SkyBlockResponse(object):
     def _offsets(self, unit):
         """Family offsets of points of the unit square."""
         lon0, lat0 = self.centre
-        lon = lon0 + unit[:, 0] * self.radius / numpy.cos(lat0)
+        lon = lon0 + unit[:, 0] * block_longitude_half_width(lat0, self.radius)
         lat = lat0 + unit[:, 1] * self.radius
         return numpy.column_stack([(lon - lon0) / self.scales[0],
                                    (lat - lat0) / self.scales[1]])
@@ -348,7 +364,8 @@ class SkyBlockResponse(object):
         lat0 = self.centre[1]
         d = numpy.atleast_2d(numpy.asarray(offsets, dtype=float))
         return numpy.column_stack([
-            d[:, 0] * self.scales[0] * numpy.cos(lat0) / self.radius,
+            d[:, 0] * self.scales[0]
+            / block_longitude_half_width(lat0, self.radius),
             d[:, 1] * self.scales[1] / self.radius])
 
     def _rows(self, rho):
@@ -468,6 +485,9 @@ class SkyBlockResponse(object):
         import hashlib
         import os
         h = hashlib.sha256()
+        # the block's shape: its longitude half-width at the equatorward edge
+        # (2026-11-18); blocks fitted before have other unit squares
+        h.update(b'longitude half-width at the equatorward edge')
         for v in list(args[2:]) + [kwargs[k] for k in sorted(kwargs)
                                    if k != 'xp']:
             h.update(numpy.ascontiguousarray(

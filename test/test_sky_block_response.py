@@ -229,3 +229,36 @@ def test_exact_frequency_indices_add_the_dense_bands():
     assert set(inside) <= set(dense)
     assert set(plain) <= set(dense)
     assert dense[0] == 0 and dense[-1] == len(f) - 1
+
+
+def test_a_polar_block_is_no_wider_than_its_radius_anywhere():
+    """The block's longitude half-width is taken at its equatorward edge:
+    every point of a block at latitude 1.50 (and at 0.3, and one straddling
+    the equator) lies within ``radius`` of the centre's meridian along its
+    own parallel, and the block still holds a tile of the tiling."""
+    import numpy
+    from pycbc.tdi.sky_block_response import block_longitude_half_width
+    from pycbc.filter.sky_block_search import sky_block_centres
+    radius = 0.07
+    for lat0 in (1.5025, -1.5025, 0.3, 0.02):
+        half = block_longitude_half_width(lat0, radius)
+        lat = numpy.linspace(lat0 - radius, lat0 + radius, 201)
+        lat = lat[numpy.abs(lat) <= numpy.pi / 2]
+        assert numpy.all(half * numpy.cos(lat) <= radius * (1 + 1e-12))
+    # the old width at the pole was twice the radius at the equatorward edge
+    assert 0.07 / numpy.cos(1.5025) * numpy.cos(1.4325) > 1.9 * radius
+    # every sky point lies in the block of some centre of the tiling
+    centres = sky_block_centres((0, 2 * numpy.pi), (-numpy.pi / 2,
+                                                    numpy.pi / 2), radius)
+    rng = numpy.random.default_rng(1)
+    z = rng.uniform(-1, 1, 20000)
+    pts = numpy.column_stack([rng.uniform(0, 2 * numpy.pi, 20000),
+                              numpy.arcsin(z)])
+    dlon = (pts[:, None, 0] - centres[None, :, 0] + numpy.pi) \
+        % (2 * numpy.pi) - numpy.pi
+    half = numpy.array([block_longitude_half_width(c, radius)
+                        for c in centres[:, 1]])
+    inside = (numpy.abs(dlon) <= half[None] * (1 + 1e-9)) & (
+        numpy.abs(pts[:, None, 1] - centres[None, :, 1])
+        <= radius * (1 + 1e-9))
+    assert inside.any(axis=1).all()
