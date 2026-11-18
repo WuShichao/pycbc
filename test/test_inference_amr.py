@@ -711,3 +711,59 @@ def test_the_trust_region_climb_reaches_the_peak_of_a_curved_valley():
     assert value > 49.99
     assert numpy.allclose(x, [0.7, 0.49], atol=2e-3)
     assert sum(calls) < 3000
+
+
+def test_fisher_scoring_climbs_from_a_convex_tail_with_fewer_evaluations():
+    """climb_hessian='metric': the curvilinear frame's climb takes its curvature from the expected information (here
+    the peak's own, 60 / sigma^2 on the narrow axis and 60 / 0.05^2 on the others) and differences only the gradient:
+    from the convex tail it reaches the peak, in fewer evaluations than the differenced Hessian."""
+    names = ['a', 'b', 'c']
+    centre = numpy.array([0.5, 0.5, 0.5])
+    width = numpy.array([1e-3, 0.05, 0.05])
+
+    class Narrow(models.base.BaseModel):
+        name = 'test_narrow_peak_fisher'
+        curvilinear_coordinates = IdentityCoordinates()
+
+        def _loglikelihood(self):
+            x = numpy.array([self.current_params[n] for n in names])
+            return 60.0 * numpy.exp(-0.5 * numpy.sum(((x - centre) / width)
+                                                     ** 2))
+    prior = JointDistribution(names, *[Uniform(**{n: (0.0, 1.0)})
+                                       for n in names])
+    start = centre + numpy.array([-2.0 * width[0], 0.3 * width[1], 0.0])
+    info = numpy.diag(60.0 / width ** 2)
+    used = {}
+    for hessian in ('differences', 'metric'):
+        sampler = AMRSampler(Narrow(names, prior=prior), initial_divisions=1,
+                             pilot_evaluations=2, curvilinear_frame=True,
+                             mass_fraction=1e-3, max_evaluations=600,
+                             posterior_samples=100, seed=3,
+                             start_cube=[start], frame_starts=1,
+                             climb_precision=info, climb_hessian=hessian)
+        sampler.run()
+        assert sampler.diagnostics['frame_peak'] > 59.9
+        used[hessian] = sampler.diagnostics['frame_evaluations']
+    assert used['metric'] < used['differences']
+    with pytest.raises(ValueError):
+        AMRSampler(Narrow(names, prior=prior), climb_hessian='metric')
+
+
+def test_fisher_scoring_follows_a_curved_valley_with_its_local_information():
+    """Gauss-Newton on the banana valley of the test above: the information J^T J of its two residuals, evaluated
+    where the climb is, takes it to the peak."""
+    from pycbc.inference.sampler.amr import _climb
+
+    def f(X):
+        X = numpy.atleast_2d(X)
+        x, y = X[:, 0], X[:, 1]
+        return 50 - 0.5 * ((y - x ** 2) / 0.01) ** 2 \
+            - 0.5 * ((x - 0.7) / 0.05) ** 2
+
+    def information(p):
+        J = numpy.array([[-2 * p[0] / 0.01, 1 / 0.01], [1 / 0.05, 0.]])
+        return J.T @ J
+    x, precision, value = _climb(f, numpy.array([0.2, 0.1]), numpy.eye(2) * 1e-6, metric=information,
+                                 resolve=2.0, iterations=200, hessian='metric')
+    assert value > 49.99
+    assert numpy.allclose(x, [0.7, 0.49], atol=2e-3)

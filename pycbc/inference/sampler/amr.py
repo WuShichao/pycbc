@@ -152,6 +152,13 @@ class AMRSampler(BaseSampler):
         convex tail of a peak) the Newton step takes this curvature instead
         of the prior's. The climb's scale is then the measurement's, not the
         prior's: the same for a peak 1e-4 or 1e-1 of the prior wide.
+    climb_hessian : {'differences', 'metric'}, optional
+        'metric': Fisher scoring, the climbs' curvature the expected
+        information ``climb_precision`` gives (a callable of ``y``, or a
+        matrix), positive definite, only the gradient of ln L differenced.
+        Its dimension is the frame's, whatever the parameters stand for: the
+        information of several overlapping sources, with their cross terms,
+        is a larger matrix of the same kind. Default 'differences'.
     share_frame : bool, optional
         With ``shared_region`` and a curvilinear frame, hand the model the
         frame's whitened ball before its first boxes are evaluated (see
@@ -257,6 +264,7 @@ class AMRSampler(BaseSampler):
                  check_points=0, check_tolerance=0.1, start_cube=None,
                  share_after_pilot=False, frame_starts=5, share_frame=False,
                  climb_resolve=2.0, climb_precision=None,
+                 climb_hessian='differences',
                  share_frame_radius=1.3, edge_points=1, frame_moments=False,
                  layout_fraction=0.1, pilot_layout_fraction=None,
                  final_share_frame_radius=None, linear_posterior=False,
@@ -276,6 +284,11 @@ class AMRSampler(BaseSampler):
         self.frame_starts = int(frame_starts)
         self.climb_resolve = None if climb_resolve is None else float(climb_resolve)
         self.climb_precision = climb_precision
+        if climb_hessian not in ('differences', 'metric'):
+            raise ValueError("climb_hessian is 'differences' or 'metric'")
+        if climb_hessian == 'metric' and climb_precision is None:
+            raise ValueError("climb_hessian='metric' needs climb_precision")
+        self.climb_hessian = climb_hessian
         self.share_frame = bool(share_frame)
         self.share_frame_radius = float(share_frame_radius)
         self.edge_points = int(edge_points)
@@ -890,15 +903,21 @@ class AMRSampler(BaseSampler):
                 return self._cube_loglikelihoods(u)
             metric = None
             if self.climb_precision is not None:
-                # the expected precision, in z
-                given = self.climb_precision(y0) \
-                    if callable(self.climb_precision) else self.climb_precision
-                metric = unit[:, None] * numpy.asarray(given, dtype=float) \
-                    * unit[None, :]
+                # the expected precision, in z: a callable of y evaluated
+                # where the climb is (Fisher scoring re-evaluates it after
+                # every accepted step), or a fixed matrix
+                given = self.climb_precision
+                if callable(given):
+                    def metric(z):
+                        return unit[:, None] * numpy.asarray(
+                            given(y0 + unit * z), dtype=float) * unit[None, :]
+                else:
+                    metric = unit[:, None] * numpy.asarray(
+                        given, dtype=float) * unit[None, :]
             x, precision, value = _climb(
                 logl_zs, numpy.zeros(self.ndim), prior_precision,
                 metric=metric, resolve=self.climb_resolve, top=1e-1,
-                iterations=iterations)
+                iterations=iterations, hessian=self.climb_hessian)
             return y0 + unit * x, precision, value
         if moment_frame is not None:
             mean, cov = moment_frame
@@ -1572,7 +1591,8 @@ def _boolean(value):
 
 
 def _climb(f, x, prior_precision, metric=None, resolve=None, top=1e-1,
-           iterations=50, project=None, radius=3.0, tolerance=1e-3):
+           iterations=50, project=None, radius=3.0, tolerance=1e-3,
+           hessian='differences'):
     """A trust-region Newton climb of ``f`` (rows to values) from ``x``:
     the end point, the precision there and ``f`` there.
 
@@ -1595,22 +1615,45 @@ def _climb(f, x, prior_precision, metric=None, resolve=None, top=1e-1,
     Newton steps, each halved at most six times from three prior standard
     deviations; a peak 1.5e-4 of the prior wide was never reached.)
 
-    ``project`` maps a trial point back into the support (the cube)."""
+    ``project`` maps a trial point back into the support (the cube).
+
+    ``hessian='metric'`` (Fisher scoring): the model's precision is the
+    ``metric`` alone, with the prior's -- the expected Fisher information,
+    positive definite wherever it is taken -- and only the gradient is
+    differenced (2 n evaluations an iteration instead of about n^2 / 2).
+    ``metric`` may then be a callable of the current point, evaluated again
+    after every accepted step. The differences' Hessian of a noisy ln L is
+    convex on a peak's tail; the information matrix never is."""
     x = numpy.array(x, dtype=float)
     value = float(f(x[None])[0])
-    precision = prior_precision if metric is None else prior_precision + metric
+    if hessian not in ('differences', 'metric'):
+        raise ValueError("hessian is 'differences' or 'metric'")
+    if hessian == 'metric' and metric is None:
+        raise ValueError("Fisher scoring needs the metric")
+    information = metric if callable(metric) else (lambda at: metric)
+    current = None if metric is None else numpy.asarray(information(x), dtype=float)
+    precision = prior_precision if current is None else prior_precision + current
     step = numpy.minimum(1e-3, numpy.clip(
         0.5 / numpy.sqrt(numpy.diag(precision)), 1e-9, None))
     fresh = True
     for _ in range(int(iterations)):
-        if fresh:
+        if fresh and hessian == 'metric':
+            grad, used = _gradient(f, x, step, resolve=resolve)
+            current = numpy.asarray(information(x), dtype=float)
+            precision = current + prior_precision
+            curved = numpy.ones(len(x), dtype=bool)
+            newton = numpy.linalg.solve(precision, grad)
+            fresh = False
+        elif fresh:
+            metric_x = current
             grad, hess, used = _finite_differences(
                 f, x, step, resolve=resolve, return_step=True)
             values, vectors = numpy.linalg.eigh(-0.5 * (hess + hess.T))
             found = (vectors * numpy.maximum(values, 0)) @ vectors.T
             curved = values > 0
-            if metric is not None:
-                along = numpy.einsum('ji,jk,ki->i', vectors, metric, vectors)
+            if metric_x is not None:
+                along = numpy.einsum('ji,jk,ki->i', vectors, metric_x,
+                                     vectors)
                 flat = ~curved & (along > 0)
                 found = found + (vectors[:, flat] * along[flat]) \
                     @ vectors[:, flat].T
@@ -1640,6 +1683,57 @@ def _climb(f, x, prior_precision, metric=None, resolve=None, top=1e-1,
         if radius < 1e-4:
             break
     return x, precision, value
+
+
+def _gradient(f, x, step, resolve=None, refine=6, shrink=6):
+    """The gradient of ``f`` at ``x`` by central differences along the axes
+    (one-sided, second order, where ``f`` is not finite on one side, as at a
+    prior bound; an axis with neither side finite has its step halved up to
+    ``shrink`` times), the steps cut by eight up to ``refine`` times where
+    one changes ``f`` by more than ``resolve``: the gradient and the steps
+    used."""
+    n = len(x)
+    step = numpy.array(step, dtype=float)
+    f0 = float(f(x[None])[0])
+    plus, minus = numpy.full(n, numpy.nan), numpy.full(n, numpy.nan)
+
+    def at(todo):
+        eye = numpy.diag(step)
+        values = numpy.asarray(f(numpy.array(
+            [x + eye[i] for i in todo] + [x - eye[i] for i in todo])),
+            dtype=float)
+        plus[todo], minus[todo] = values[:len(todo)], values[len(todo):]
+    todo = numpy.arange(n)
+    for _ in range(shrink + 1):
+        at(todo)
+        todo = todo[~numpy.isfinite(plus[todo]) & ~numpy.isfinite(minus[todo])]
+        if not len(todo):
+            break
+        step[todo] /= 2
+    if resolve is not None and numpy.isfinite(f0):
+        for _ in range(refine):
+            with numpy.errstate(invalid='ignore'):
+                change = numpy.fmax(numpy.abs(plus - f0), numpy.abs(minus - f0))
+            todo = numpy.flatnonzero(change > resolve)
+            if not len(todo):
+                break
+            step[todo] /= 8
+            at(todo)
+    grad = numpy.zeros(n)
+    both = numpy.isfinite(plus) & numpy.isfinite(minus)
+    grad[both] = (plus[both] - minus[both]) / (2 * step[both])
+    for i in numpy.flatnonzero(~both):
+        sign = 1 if numpy.isfinite(plus[i]) else -1
+        if not numpy.isfinite(plus[i]) and not numpy.isfinite(minus[i]):
+            continue
+        h = sign * step[i]
+        near = plus[i] if sign > 0 else minus[i]
+        two = float(f((x + 2 * h * numpy.eye(n)[i])[None])[0])
+        if numpy.isfinite(two):
+            grad[i] = (-3 * f0 + 4 * near - two) / (2 * h)
+        else:
+            grad[i] = (near - f0) / h
+    return grad, step
 
 
 def _trust(move, curvatures, steps, resolve, reach=8.0):
