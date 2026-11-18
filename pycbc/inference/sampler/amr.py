@@ -812,11 +812,12 @@ class AMRSampler(BaseSampler):
 
     def _coverage_bound(self, logl, distance):
         """The largest log likelihood anywhere in a box whose centre has
-        ``logl`` and whose points all lie within template ``distance`` of the
-        centre's (noise units, the data's own amplitude): with ``rho(x) =
-        sqrt(2 F(x))`` the matched-filter SNR, ``rho(x) <= rho(c) + ||h(x) -
-        h(c)||`` by the triangle inequality in the noise-weighted inner
-        product, and ``ln L = rho^2 / 2 - kappa`` with ``kappa`` the
+        ``logl`` and whose matched-filter SNR ``rho(x) = sqrt(2 F(x))`` rises
+        by at most ``distance`` from the centre's (``box_distance`` gives it:
+        ``|<d, h(x) - h(c)>|`` bounded through the triangle inequality in the
+        noise-weighted inner product, ``h`` unit templates; a box far from
+        the signal has only the noise's projection on its template
+        differences), and ``ln L = rho^2 / 2 - kappa`` with ``kappa`` the
         marginalisation's Occam offset (``coverage_kappa``, measured at the
         start): ``ln L(x) <= (sqrt(2 (ln L(c) + kappa)) + distance)^2 / 2 -
         kappa``. The same covering argument as a search lattice's: there the
@@ -1115,6 +1116,10 @@ class AMRSampler(BaseSampler):
             # the boxes reach past the radius by up to half a box (those whose nearest point lies within it), and the
             # refinement past them
             self._share_ball(low, span, self._ball * radius)
+        # a distance relative to the signal (the frame's peak its estimate) learns where the peak is
+        at_peak = getattr(self.box_distance, 'at_peak', None)
+        if at_peak is not None:
+            at_peak(from_y(numpy.asarray(mean, dtype=float)[None])[0])
         self._start_frame(low, span, radius)
 
     def _share_ball(self, low, span, radius):
