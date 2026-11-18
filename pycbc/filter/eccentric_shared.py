@@ -937,7 +937,14 @@ class EccentricPhaseCoordinates(object):
     keys : list, optional
         The modes; all the cell's by default.
     ndir : int
-        The number of phase directions; the coordinates are ``ndir + 1`` and the parameters four, so 3.
+        The number of phase directions: 3, the coordinates ``(s_1, s_2, s_3, q)``; or 2, ``(s_1, s_2, q, e)``,
+        the eccentricity itself the fourth coordinate. The phase depends on ``e`` through ``e^2`` near ``e = 0``,
+        so with three directions the map folds there: its Jacobian vanishes at ``e = 0`` (the density in ``y``
+        grows as ``1 / e``) and two parameter points can share one ``y`` (Yorsh sobhb6, 2026-11-18: chi_eff
+        -0.169 at e 0 and -0.429 at e 0.00106, both in the prior, the same ``y`` and ln L, the inverse returning
+        one of them). The third direction carried 0.002 rad rms of phase over that prior, which no data resolve.
+        With two, ``(mchirp, chi_eff)`` at given ``(q, e)`` map to ``(s_1, s_2)`` one to one (Jacobian
+        determinant 27 in prior units at that truth) and ``e`` keeps its uniform prior density.
     coarse : int
         Frequencies kept per mode.
     guess : array_like, optional
@@ -955,8 +962,8 @@ class EccentricPhaseCoordinates(object):
         self.e0 = float(ref.get('eccentricity', 0.))
         self.chi0 = float(ref.get('spin1z', 0.))
         self.guess = numpy.array([self.mc0, self.q0, self.e0, self.chi0] if guess is None else guess, dtype=float)
-        if ndir != 3:
-            raise ValueError("four parameters: three phase directions and q")
+        if ndir not in (2, 3):
+            raise ValueError("four parameters: three phase directions and q, or two and (q, e)")
         self.ndir = int(ndir)
         self.max_fit = int(max_fit)
         self.keys = sorted(family._expansions) if keys is None else list(keys)
@@ -1094,7 +1101,8 @@ class EccentricPhaseCoordinates(object):
             R = numpy.einsum('maij,mj->mai', R, L[1])
             v += numpy.einsum('mai,mi->am', R, L[0])
             s[:, sl] = v - self._s0[:, None]
-        return numpy.concatenate([s, q_[None]]).reshape((4,) + shape)
+        free = [q_[None]] if self.ndir == 3 else [q_[None], e[None]]
+        return numpy.concatenate([s] + free).reshape((4,) + shape)
 
     def forward(self, theta):
         return self._forward(*numpy.asarray(theta, dtype=float).T).T
@@ -1103,11 +1111,14 @@ class EccentricPhaseCoordinates(object):
         from pycbc.waveform.taylorf2_jets import from_phase_coordinates
         y = numpy.atleast_2d(numpy.asarray(y, dtype=float))
         out = numpy.full(y.shape, numpy.nan)
-        # q is the last coordinate itself: rows below q = 1 have no parameters
-        ok = numpy.all(numpy.isfinite(y), axis=1) & (y[:, 3] >= 1)
+        # q (and with two directions e) are coordinates themselves: rows below q = 1 have no parameters
+        nd = self.ndir
+        ok = numpy.all(numpy.isfinite(y), axis=1) & (y[:, nd] >= 1)
         if ok.any():
             guess = numpy.repeat(self.guess[:, None], ok.sum(), axis=1)
-            guess[1] = y[ok, 3]
+            guess[1] = y[ok, nd]
+            if nd == 2:
+                guess[2] = y[ok, 3]
             # residuals in units of 100 rad: steps stop at 1e-8 rad, above the forward map's rounding (about
             # 2e-10 rad for a one-ulp change of the parameters), which a tolerance of 1e-10 rad never reached
             out[ok] = from_phase_coordinates(y[ok].T, guess, iterations=60, forward=self._forward,

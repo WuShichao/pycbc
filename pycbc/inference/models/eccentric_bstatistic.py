@@ -450,7 +450,7 @@ class EccentricCellPE(BaseModel):
             # the direct engine's workspace: the shared evaluation's freed blocks back to the device
             self.xp.get_default_memory_pool().free_all_blocks()
         for i in numpy.nonzero(todo)[0]:
-            out[i] = self.evaluate(full[i])['loglikelihood']
+            out[i] = self._direct_loglikelihood(full[i])
         stats = self.shared_statistics
         stats['shared_points'] += nshared
         stats['single_points'] += int(todo.sum())
@@ -553,8 +553,27 @@ class EccentricCellPE(BaseModel):
         self._last = (key, out)
         return out
 
+    def _direct_loglikelihood(self, params=None):
+        """ln B of :meth:`evaluate`, or -inf where the cell makes no
+        template (:class:`pycbc.waveform.eccentric_mode_gpu.TemplateDomainError`):
+        the prior is then the box less the points the cell cannot reach,
+        counted in ``shared_statistics['outside_template_domain']``. Without
+        it one such point drawn by a proposal over the whole box stopped the
+        run (Yorsh sobhb6, 2026-11-18, the box's q 1.9 and chi_eff +-0.9
+        corners)."""
+        from pycbc.waveform.eccentric_mode_gpu import TemplateDomainError
+        try:
+            return self.evaluate(params)['loglikelihood']
+        except TemplateDomainError:
+            self._last = None
+            self.block._prepared = None
+            stats = getattr(self, 'shared_statistics', None)
+            if stats is not None:
+                stats['outside_template_domain'] = stats.get('outside_template_domain', 0) + 1
+            return -numpy.inf
+
     def _loglikelihood(self):
-        value = self.evaluate()['loglikelihood']
+        value = self._direct_loglikelihood()
         if self.spin_log_prior is not None:
             params = dict(self.static_params)
             params.update(self.current_params)

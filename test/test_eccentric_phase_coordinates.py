@@ -73,3 +73,33 @@ def test_the_family_pickles_and_evaluates_the_same():
         for k in want:
             for a, b in zip(want[k], got[k]):
                 np.testing.assert_array_equal(a, b)
+
+
+def test_two_phase_directions_keep_q_and_e_and_invert_one_to_one():
+    """ndir=2: the coordinates are (s_1, s_2, q, e); they invert to the drawn parameters, the (mchirp, chi_eff)
+    block of the Jacobian at fixed (q, e) is regular everywhere in the box, and the inverse from the default
+    guess returns the drawn point (not another root sharing its y)."""
+    fam = _family()
+    c = EccentricPhaseCoordinates(fam, lambda f: np.ones_like(f), (-1e15, 1e15), coarse=1000, ndir=2)
+    rng = np.random.default_rng(5)
+    lo = np.array([c.mc0 * np.exp(-.01), 1.5 * np.exp(-.1), .048, -.05])
+    hi = np.array([c.mc0 * np.exp(.01), 1.5 * np.exp(.1), .052, .05])
+    draws = lo + rng.random((300, 4)) * (hi - lo)
+    c.fit(draws)
+    y = c.forward(draws[:60])
+    np.testing.assert_allclose(y[:, 2], draws[:60, 1])
+    np.testing.assert_allclose(y[:, 3], draws[:60, 2])
+    back = c.inverse(y)
+    assert np.all(np.isfinite(back))
+    np.testing.assert_allclose(back, draws[:60], rtol=0, atol=1e-8 * np.max(hi))
+    assert np.all(np.isfinite(c.log_jacobian(draws[:10])))
+    span = hi - lo
+    for t in draws[:20]:
+        J = np.empty((2, 2))
+        for col, j in enumerate((0, 3)):
+            d = np.zeros(4)
+            d[j] = 1e-4 * span[j]
+            J[:, col] = (c.forward((t + d)[None])[0, :2] - c.forward((t - d)[None])[0, :2]) / 2e-4
+        assert abs(np.linalg.det(J)) > 1e-6 * np.abs(J).max() ** 2
+    with np.testing.assert_raises(ValueError):
+        EccentricPhaseCoordinates(fam, lambda f: np.ones_like(f), (-1e15, 1e15), coarse=1000, ndir=4)

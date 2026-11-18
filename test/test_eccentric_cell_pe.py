@@ -98,3 +98,27 @@ def test_reconstruct_many_draws_what_reconstruct_draws():
         want=model.reconstruct(seed=seed)
         for k,v in want.items():
             np.testing.assert_allclose(got[k],v,rtol=1e-9,atol=1e-12,err_msg=k)
+
+
+def test_a_point_without_a_template_has_no_likelihood_and_is_counted():
+    """Where the cell makes no template (TemplateDomainError, a mode clock that stops increasing) ln B is -inf,
+    directly and in a batch, the count is kept, and the next point is evaluated as before."""
+    from pycbc.waveform.eccentric_mode_gpu import TemplateDomainError
+    model,block,grid=toy()
+    good=dict(mchirp=30.,q=1.5,eccentricity=.05,chi_eff=0.,eclipticlongitude=1.,eclipticlatitude=.2)
+    bad=dict(good,q=1.9)
+    model.update(**good)
+    expected=model.loglikelihood
+    inner=block.source_builder
+
+    def source(theta):
+        if theta[3]>1.8:
+            raise TemplateDomainError('device mode clock must increase')
+        return inner(theta)
+    block.source_builder=source
+    model._last=None
+    model.update(**bad)
+    assert model.loglikelihood==-np.inf
+    out=model.loglikelihoods([bad,good])
+    assert out[0]==-np.inf and abs(out[1]-expected)<1e-9
+    assert model.shared_statistics['outside_template_domain']==2

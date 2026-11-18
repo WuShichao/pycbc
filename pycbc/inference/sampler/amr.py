@@ -819,7 +819,7 @@ class AMRSampler(BaseSampler):
         logging.info("AMR: shared region of %d points set up in %.0f s",
                      len(full), time.time() - tick)
 
-    def _curvilinear(self, radius=4.0, prior_draws=20000, iterations=8,
+    def _curvilinear(self, radius=4.0, prior_draws=20000, iterations=50,
                      starts=5, moments=False):
         """Partition in the model's curvilinear coordinates ``y``, whitened
         by the Laplace approximation about the likelihood's maximum there:
@@ -878,9 +878,9 @@ class AMRSampler(BaseSampler):
                                                                    unit))
 
         def climb(y0):
-            """Newton steps of ln L in ``z``, ``y = y0 + unit z``, each
-            halved while it lowers ln L: the end point, the precision
-            there and ln L."""
+            """The trust-region Newton climb of ln L (:func:`_climb`) in
+            ``z``, ``y = y0 + unit z``: the end point, the precision there
+            and ln L."""
             def logl_zs(z):
                 """ln L at the rows y = y0 + unit z, the map inverted and
                 the likelihood evaluated for all rows together."""
@@ -888,13 +888,6 @@ class AMRSampler(BaseSampler):
                 u = (theta - bottom) / prior_range
                 u[~numpy.all(numpy.isfinite(u), axis=1)] = -1.0
                 return self._cube_loglikelihoods(u)
-
-            def logl_z(z):
-                return float(logl_zs(z)[0])
-            x = numpy.zeros(self.ndim)
-            value = logl_z(x)
-            step = numpy.full(self.ndim, 1e-3)
-            precision = prior_precision
             metric = None
             if self.climb_precision is not None:
                 # the expected precision, in z
@@ -902,43 +895,10 @@ class AMRSampler(BaseSampler):
                     if callable(self.climb_precision) else self.climb_precision
                 metric = unit[:, None] * numpy.asarray(given, dtype=float) \
                     * unit[None, :]
-                precision = prior_precision + metric
-                step = numpy.minimum(step, numpy.clip(
-                    0.5 / numpy.sqrt(numpy.diag(precision)), 1e-9, None))
-            for _ in range(iterations):
-                grad, hess, used = _finite_differences(
-                    logl_zs, x, step, resolve=self.climb_resolve,
-                    return_step=True)
-                values, vectors = numpy.linalg.eigh(-0.5 * (hess + hess.T))
-                found = (vectors * numpy.maximum(values, 0)) @ vectors.T
-                curved = values > 0
-                if metric is not None:
-                    # where the differences find no curvature, the metric's
-                    # along that direction
-                    along = numpy.einsum('ji,jk,ki->i', vectors, metric,
-                                         vectors)
-                    flat = ~curved & (along > 0)
-                    found = found + (vectors[:, flat] * along[flat]) \
-                        @ vectors[:, flat].T
-                    curved = curved | flat
-                precision = found + prior_precision
-                move = numpy.linalg.solve(precision, grad)
-                size = numpy.sqrt(move @ precision @ move)
-                if size > 3:
-                    move *= 3 / size
-                move = _trust(move, curved.astype(float), used,
-                              self.climb_resolve)
-                for _ in range(6):
-                    trial = logl_z(x + move)
-                    if trial >= value:
-                        break
-                    move = 0.5 * move
-                else:
-                    break
-                x, value = x + move, trial
-                step = _next_step(precision, used, self.climb_resolve, 1e-1)
-                if size < 0.05:
-                    break
+            x, precision, value = _climb(
+                logl_zs, numpy.zeros(self.ndim), prior_precision,
+                metric=metric, resolve=self.climb_resolve, top=1e-1,
+                iterations=iterations)
             return y0 + unit * x, precision, value
         if moment_frame is not None:
             mean, cov = moment_frame
@@ -950,18 +910,33 @@ class AMRSampler(BaseSampler):
             # from the pilot's and the exploration's best, separate points, the
             # highest maximum
             best = None
+            climbs = []
             for point in self._climb_starts(starts):
                 start = numpy.array(self._prior_transform(point))
                 y0 = to_y(start[None])[0]
                 if not numpy.all(numpy.isfinite(y0)):
                     continue
                 found = climb(y0)
+                climbs.append(found)
                 if best is None or found[2] > best[2]:
                     best = found
             mean, precision, peak = best
             logging.info("AMR: frame about ln L %.3f", peak)
+            # every climb's end: another peak within 5 of the highest and
+            # more than 5 of its standard deviations from it is a second mode
+            # the frame (one whitening) is not laid out for
+            sd = numpy.sqrt(numpy.diag(numpy.linalg.inv(precision)))
+            ends = [dict(peak=float(c[2]), distance_sd=float(numpy.max(
+                numpy.abs((c[0] - mean) / unit / sd)))) for c in climbs]
+            second = [e for e in ends if e['peak'] > peak - 5
+                      and e['distance_sd'] > 5]
+            if second:
+                logging.warning("AMR: %d climbs end at another peak within 5 "
+                                "of the highest (%s)", len(second), second)
             self._diagnostics.update(frame_peak=float(peak),
                                      frame_starts=int(starts),
+                                     frame_climbs=ends,
+                                     frame_second_modes=len(second),
                                      frame_evaluations=self.nevaluations)
             chol = numpy.linalg.cholesky(numpy.linalg.inv(precision)) \
                 * unit[:, None]
@@ -1031,7 +1006,7 @@ class AMRSampler(BaseSampler):
         logging.info("AMR: shared the frame's ball, %d points, in %.0f s",
                      len(full), time.time() - tick)
 
-    def _laplace(self, iterations=8, starts=5):
+    def _laplace(self, iterations=50, starts=5):
         """Mean and covariance, in the cube, of the Laplace approximation
         about the likelihood's highest maximum the Newton climbs from the
         pilot's (and the exploration's) best separate points reach, each
@@ -1046,35 +1021,10 @@ class AMRSampler(BaseSampler):
             return float(logl_us(u)[0])
 
         def climb(x):
-            value = logl_at(x)
-            step = numpy.full(self.ndim, 1e-3)
-            precision = prior
-            for _ in range(iterations):
-                grad, hess, used = _finite_differences(
-                    logl_us, x, step, resolve=self.climb_resolve,
-                    return_step=True)
-                values, vectors = numpy.linalg.eigh(-0.5 * (hess + hess.T))
-                precision = (vectors * numpy.maximum(values, 0)) @ vectors.T \
-                    + prior
-                move = numpy.linalg.solve(precision, grad)
-                # at most three standard deviations, and inside the cube
-                size = numpy.sqrt(move @ precision @ move)
-                if size > 3:
-                    move *= 3 / size
-                move = _trust(move, values, used, self.climb_resolve)
-                for _ in range(6):
-                    trial_x = numpy.clip(x + move, 1e-9, 1 - 1e-9)
-                    trial = logl_at(trial_x)
-                    if trial >= value:
-                        break
-                    move = 0.5 * move
-                else:
-                    break
-                x, value = trial_x, trial
-                step = _next_step(precision, used, self.climb_resolve, 1e-2)
-                if size < 0.05:
-                    break
-            return x, precision, value
+            return _climb(logl_us, numpy.asarray(x, dtype=float), prior,
+                          resolve=self.climb_resolve, top=1e-2,
+                          iterations=iterations,
+                          project=lambda v: numpy.clip(v, 1e-9, 1 - 1e-9))
         best = None
         for point in self._climb_starts(starts):
             found = climb(numpy.array(point, dtype=float))
@@ -1619,6 +1569,77 @@ class AMRSampler(BaseSampler):
 
 def _boolean(value):
     return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _climb(f, x, prior_precision, metric=None, resolve=None, top=1e-1,
+           iterations=50, project=None, radius=3.0, tolerance=1e-3):
+    """A trust-region Newton climb of ``f`` (rows to values) from ``x``:
+    the end point, the precision there and ``f`` there.
+
+    Each iteration takes the gradient and Hessian by finite differences
+    (:func:`_finite_differences`, steps resolved to ``resolve`` and half a
+    standard deviation of the last precision); the model's precision is the
+    differences' concave part, the ``metric`` (the expected precision) along
+    directions where they find no curvature, and ``prior_precision``. The
+    step is the Newton step held within ``radius`` in that precision's norm
+    (the exact solution of the trust-region problem in that norm) and within
+    eight resolved steps where no curvature is known at all. It is taken if
+    ``f`` rises by more than a tenth of the model's prediction; the radius
+    is quartered when the rise is below a quarter of it and doubled (up to
+    ten) when it is above three quarters at the boundary. The climb ends
+    when the model predicts less than ``tolerance``, the radius falls below
+    1e-4, or after ``iterations`` iterations. The ratio test makes every
+    accepted step a sufficient rise, so the climb converges to a stationary
+    point (the standard trust-region result); a start within the main lobe
+    of the peak then reaches the peak. (Until 2026-11-18: at most eight
+    Newton steps, each halved at most six times from three prior standard
+    deviations; a peak 1.5e-4 of the prior wide was never reached.)
+
+    ``project`` maps a trial point back into the support (the cube)."""
+    x = numpy.array(x, dtype=float)
+    value = float(f(x[None])[0])
+    precision = prior_precision if metric is None else prior_precision + metric
+    step = numpy.minimum(1e-3, numpy.clip(
+        0.5 / numpy.sqrt(numpy.diag(precision)), 1e-9, None))
+    fresh = True
+    for _ in range(int(iterations)):
+        if fresh:
+            grad, hess, used = _finite_differences(
+                f, x, step, resolve=resolve, return_step=True)
+            values, vectors = numpy.linalg.eigh(-0.5 * (hess + hess.T))
+            found = (vectors * numpy.maximum(values, 0)) @ vectors.T
+            curved = values > 0
+            if metric is not None:
+                along = numpy.einsum('ji,jk,ki->i', vectors, metric, vectors)
+                flat = ~curved & (along > 0)
+                found = found + (vectors[:, flat] * along[flat]) \
+                    @ vectors[:, flat].T
+                curved = curved | flat
+            precision = found + prior_precision
+            newton = numpy.linalg.solve(precision, grad)
+            fresh = False
+        size = numpy.sqrt(newton @ precision @ newton)
+        move = newton if size <= radius else newton * (radius / size)
+        move = _trust(move, curved.astype(float), used, resolve)
+        size = numpy.sqrt(move @ precision @ move)
+        predicted = grad @ move - 0.5 * move @ precision @ move
+        if not predicted > tolerance:
+            break
+        trial_x = x + move if project is None else project(x + move)
+        trial = float(f(trial_x[None])[0])
+        ratio = (trial - value) / predicted if numpy.isfinite(trial) \
+            else -numpy.inf
+        if ratio > 0.1:
+            x, value = trial_x, trial
+            step = _next_step(precision, used, resolve, top)
+            fresh = True
+        if ratio < 0.25:
+            radius = 0.25 * size
+        elif ratio > 0.75 and size >= 0.99 * radius:
+            radius = min(2 * radius, 10.0)
+        if radius < 1e-4:
+            break
+    return x, precision, value
 
 
 def _trust(move, curvatures, steps, resolve, reach=8.0):

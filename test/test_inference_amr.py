@@ -587,7 +587,11 @@ def test_the_frame_climbs_a_peak_far_narrower_than_its_difference_steps(
     either side; the frame stayed at 33). With the steps resolved and the
     move held within them the climb reaches the peak; with the fixed steps
     the Hessian is convex, the step goes to the prior's scale, six halvings
-    leave it past the peak, and the climb stops at its start."""
+    leave it past the peak, and the climb stopped at its start (ln L 8.1,
+    before the trust-region climb). The trust-region climb with resolved
+    steps (the default) reaches the peak; without them it still rises (the
+    ratio test) but the differences' Hessian, over a width of the peak, is
+    wrong near the top and it stops short of it."""
     names = ['a', 'b', 'c']
     centre = numpy.array([0.5, 0.5, 0.5])
     width = numpy.array([1e-3, 0.05, 0.05])
@@ -609,7 +613,7 @@ def test_the_frame_climbs_a_peak_far_narrower_than_its_difference_steps(
                          frame_starts=1, climb_resolve=resolve)
     sampler.run()
     if resolve is None:
-        assert sampler.diagnostics['frame_peak'] < 40
+        assert sampler.diagnostics['frame_peak'] > 30
     else:
         assert sampler.diagnostics['frame_peak'] > 59.9
 
@@ -650,10 +654,10 @@ class IdentityCoordinates(object):
 
 def test_the_metric_gives_the_curvilinear_climb_its_scale():
     """The narrow peak of the test above in a curvilinear frame, its start
-    on the convex tail: with the fixed steps alone (no resolution) the
-    climb stops at its start; with the expected precision (``1 / sigma^2``
-    on the narrow axis, as a phase metric gives it) it reaches the peak,
-    and its frame's width there is the peak's."""
+    on the convex tail, the steps not resolved: the climb reaches the peak
+    with and without the expected precision (``1 / sigma^2`` on the narrow
+    axis, as a phase metric gives it), and with it the frame's width there
+    is the peak's."""
     names = ['a', 'b', 'c']
     centre = numpy.array([0.5, 0.5, 0.5])
     width = numpy.array([1e-3, 0.05, 0.05])
@@ -683,5 +687,27 @@ def test_the_metric_gives_the_curvilinear_climb_its_scale():
         if metric is not None:
             sd = sampler.frame['chol'][0, 0]
             assert sd == pytest.approx(width[0] / numpy.sqrt(60.0), rel=0.2)
-    assert peaks['none'] < 40
-    assert peaks['metric'] > 59.9
+    assert peaks['none'] > 59.9 and peaks['metric'] > 59.9
+
+
+def test_the_trust_region_climb_reaches_the_peak_of_a_curved_valley():
+    """A banana valley (ln L 50 - ((y - x^2) / 0.01)^2 / 2 - (x - 0.7)^2 / 2 /
+    0.05^2) from a start far down it: the trust-region climb reaches the
+    peak, and stops there."""
+    from pycbc.inference.sampler.amr import _climb
+
+    def f(X):
+        X = numpy.atleast_2d(X)
+        x, y = X[:, 0], X[:, 1]
+        return 50 - 0.5 * ((y - x ** 2) / 0.01) ** 2 \
+            - 0.5 * ((x - 0.7) / 0.05) ** 2
+    calls = []
+
+    def counted(X):
+        calls.append(len(numpy.atleast_2d(X)))
+        return f(X)
+    x, precision, value = _climb(counted, numpy.array([0.2, 0.1]),
+                                 numpy.eye(2), resolve=2.0, iterations=200)
+    assert value > 49.99
+    assert numpy.allclose(x, [0.7, 0.49], atol=2e-3)
+    assert sum(calls) < 3000

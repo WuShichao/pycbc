@@ -13,6 +13,13 @@ from scipy.interpolate import CubicSpline
 from pycbc.tdi.eccentric_mode_source import EccentricModeFamilySource
 
 
+class TemplateDomainError(ValueError):
+    """The cell makes no template at this point: a mode's clock (its
+    stationary time against frequency) stops increasing, as it does where
+    the cell is extrapolated too far (the Yorsh sobhb6 cell at q 1.9 and
+    chi_eff +-0.9, stbbh_cell_box_check.py)."""
+
+
 class DeviceEccentricModeSource:
     """Whitened face-on (2,2,n) mode arrays for a dense FFT grid.
 
@@ -75,7 +82,7 @@ class DeviceEccentricModeSource:
                 a=((ac[0,index]*dx+ac[1,index])*dx+ac[2,index])*dx+ac[3,index]
                 time=((3*pc[0,index]*dx+2*pc[1,index])*dx+pc[2,index])/(2*numpy.pi)+source.shift
                 if bool(xp.any(xp.diff(time)<=0)):
-                    raise ValueError('device mode clock must increase')
+                    raise TemplateDomainError('device mode clock must increase')
                 angle=-p-2*numpy.pi*fine*source.shift
                 b[k,lo:hi]=(a*xp.exp(1j*angle)*self.weight[lo:hi]).astype(xp.complex64)
                 t[k,lo:hi]=time
