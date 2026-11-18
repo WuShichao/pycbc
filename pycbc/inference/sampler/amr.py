@@ -130,6 +130,28 @@ class AMRSampler(BaseSampler):
         The number of Newton climbs the Laplace or curvilinear frame takes
         its maximum from (the pilot's best separate points and the start
         cube). Default 5.
+    climb_resolve : float or None, optional
+        The largest change of ln L a finite-difference step of those climbs
+        may make: an axis whose step changes ln L by more has its step cut
+        by eight, up to six times, before the gradient and Hessian are
+        taken; where the Hessian has no curvature the Newton step is then
+        held within eight such steps. A likelihood far narrower than the
+        prior (the Yorsh sobhb6 chirp mass, 1.5e-4 of the frame's prior
+        width) was otherwise differenced over seven of its widths, the
+        Hessian came out convex, and the step went to the prior's edge.
+        None keeps the fixed steps. Default 2.
+    climb_precision : array or callable, optional
+        The curvilinear frame's climbs: the likelihood's expected precision
+        (minus its Hessian) in the frame's coordinates ``y`` (the model's
+        parameter order, the curvilinear ones in place of theirs), or a
+        callable of the start's ``y`` that returns it. A model whose
+        coordinates are the rms phase change (radians) has it as about
+        ``2F / 2`` on each phase direction, ``2F`` the start's: the climb's
+        first steps are then half its standard deviations, and along a
+        direction where the differences find no curvature (a start on the
+        convex tail of a peak) the Newton step takes this curvature instead
+        of the prior's. The climb's scale is then the measurement's, not the
+        prior's: the same for a peak 1e-4 or 1e-1 of the prior wide.
     share_frame : bool, optional
         With ``shared_region`` and a curvilinear frame, hand the model the
         frame's whitened ball before its first boxes are evaluated (see
@@ -234,6 +256,7 @@ class AMRSampler(BaseSampler):
                  shared_region=0, explore_basin=0.0, explore_miss=0.01,
                  check_points=0, check_tolerance=0.1, start_cube=None,
                  share_after_pilot=False, frame_starts=5, share_frame=False,
+                 climb_resolve=2.0, climb_precision=None,
                  share_frame_radius=1.3, edge_points=1, frame_moments=False,
                  layout_fraction=0.1, pilot_layout_fraction=None,
                  final_share_frame_radius=None, linear_posterior=False,
@@ -251,6 +274,8 @@ class AMRSampler(BaseSampler):
         self.shared_region = int(shared_region)
         self.share_after_pilot = bool(share_after_pilot)
         self.frame_starts = int(frame_starts)
+        self.climb_resolve = None if climb_resolve is None else float(climb_resolve)
+        self.climb_precision = climb_precision
         self.share_frame = bool(share_frame)
         self.share_frame_radius = float(share_frame_radius)
         self.edge_points = int(edge_points)
@@ -870,15 +895,39 @@ class AMRSampler(BaseSampler):
             value = logl_z(x)
             step = numpy.full(self.ndim, 1e-3)
             precision = prior_precision
+            metric = None
+            if self.climb_precision is not None:
+                # the expected precision, in z
+                given = self.climb_precision(y0) \
+                    if callable(self.climb_precision) else self.climb_precision
+                metric = unit[:, None] * numpy.asarray(given, dtype=float) \
+                    * unit[None, :]
+                precision = prior_precision + metric
+                step = numpy.minimum(step, numpy.clip(
+                    0.5 / numpy.sqrt(numpy.diag(precision)), 1e-9, None))
             for _ in range(iterations):
-                grad, hess = _finite_differences(logl_zs, x, step)
+                grad, hess, used = _finite_differences(
+                    logl_zs, x, step, resolve=self.climb_resolve,
+                    return_step=True)
                 values, vectors = numpy.linalg.eigh(-0.5 * (hess + hess.T))
-                precision = (vectors * numpy.maximum(values, 0)) @ vectors.T \
-                    + prior_precision
+                found = (vectors * numpy.maximum(values, 0)) @ vectors.T
+                curved = values > 0
+                if metric is not None:
+                    # where the differences find no curvature, the metric's
+                    # along that direction
+                    along = numpy.einsum('ji,jk,ki->i', vectors, metric,
+                                         vectors)
+                    flat = ~curved & (along > 0)
+                    found = found + (vectors[:, flat] * along[flat]) \
+                        @ vectors[:, flat].T
+                    curved = curved | flat
+                precision = found + prior_precision
                 move = numpy.linalg.solve(precision, grad)
                 size = numpy.sqrt(move @ precision @ move)
                 if size > 3:
                     move *= 3 / size
+                move = _trust(move, curved.astype(float), used,
+                              self.climb_resolve)
                 for _ in range(6):
                     trial = logl_z(x + move)
                     if trial >= value:
@@ -887,8 +936,7 @@ class AMRSampler(BaseSampler):
                 else:
                     break
                 x, value = x + move, trial
-                step = numpy.clip(0.5 / numpy.sqrt(numpy.diag(precision)),
-                                  1e-7, 1e-1)
+                step = _next_step(precision, used, self.climb_resolve, 1e-1)
                 if size < 0.05:
                     break
             return y0 + unit * x, precision, value
@@ -1002,7 +1050,9 @@ class AMRSampler(BaseSampler):
             step = numpy.full(self.ndim, 1e-3)
             precision = prior
             for _ in range(iterations):
-                grad, hess = _finite_differences(logl_us, x, step)
+                grad, hess, used = _finite_differences(
+                    logl_us, x, step, resolve=self.climb_resolve,
+                    return_step=True)
                 values, vectors = numpy.linalg.eigh(-0.5 * (hess + hess.T))
                 precision = (vectors * numpy.maximum(values, 0)) @ vectors.T \
                     + prior
@@ -1011,6 +1061,7 @@ class AMRSampler(BaseSampler):
                 size = numpy.sqrt(move @ precision @ move)
                 if size > 3:
                     move *= 3 / size
+                move = _trust(move, values, used, self.climb_resolve)
                 for _ in range(6):
                     trial_x = numpy.clip(x + move, 1e-9, 1 - 1e-9)
                     trial = logl_at(trial_x)
@@ -1020,8 +1071,7 @@ class AMRSampler(BaseSampler):
                 else:
                     break
                 x, value = trial_x, trial
-                step = numpy.clip(0.5 / numpy.sqrt(numpy.diag(precision)),
-                                  1e-7, 1e-2)
+                step = _next_step(precision, used, self.climb_resolve, 1e-2)
                 if size < 0.05:
                     break
             return x, precision, value
@@ -1571,7 +1621,33 @@ def _boolean(value):
     return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
 
 
-def _finite_differences(f, x, step, shrink=6):
+def _trust(move, curvatures, steps, resolve, reach=8.0):
+    """A climb's Newton ``move`` held within ``reach`` resolved steps per
+    axis where the Hessian (eigenvalues ``curvatures`` of -H) has a
+    direction without curvature: there the precision is the prior's alone
+    and says nothing of how far the local model holds."""
+    if resolve is None or numpy.all(curvatures > 0):
+        return move
+    limit = reach * numpy.asarray(steps, dtype=float)
+    big = numpy.abs(move) > limit
+    if not big.any():
+        return move
+    return move * numpy.min(limit[big] / numpy.abs(move[big]))
+
+
+def _next_step(precision, steps, resolve, top):
+    """The next difference steps: half a standard deviation of the
+    precision, clipped; with ``resolve`` at most four times the steps just
+    resolved (a precision that is the prior's alone would otherwise put
+    them back at the prior's scale)."""
+    step = 0.5 / numpy.sqrt(numpy.diag(precision))
+    if resolve is not None:
+        step = numpy.minimum(step, 4 * numpy.asarray(steps, dtype=float))
+    return numpy.clip(step, 1e-7, top)
+
+
+def _finite_differences(f, x, step, shrink=6, resolve=None, refine=6,
+                        return_step=False):
     """Gradient and Hessian of ``f`` at ``x``: central differences along
     the axes and forward ones for the mixed terms. ``f`` takes the rows of
     an array of points and returns their values, so that all the points
@@ -1582,7 +1658,12 @@ def _finite_differences(f, x, step, shrink=6):
     sided, from the points at one and two steps on the other side, and the
     mixed terms go to the sides that are inside; an axis with neither side
     inside has its step halved, up to ``shrink`` times. A peak on a prior
-    bound then has the curvature it has inside rather than none."""
+    bound then has the curvature it has inside rather than none.
+
+    With ``resolve``, an axis whose step changes ``f`` by more than it (on
+    either side) has its step cut by eight, up to ``refine`` times, so that
+    the differences see the function's curvature rather than its shape
+    over several of its widths. ``return_step``: the steps used too."""
     n = len(x)
     step = numpy.array(step, dtype=float)
     eye = numpy.diag(step)
@@ -1600,6 +1681,19 @@ def _finite_differences(f, x, step, shrink=6):
         if not len(todo):
             break
         step[todo] /= 2
+    if resolve is not None:
+        for _ in range(refine):
+            with numpy.errstate(invalid='ignore'):
+                change = numpy.fmax(numpy.abs(plus - f0), numpy.abs(minus - f0))
+            todo = numpy.flatnonzero(change > resolve)
+            if not len(todo) or not numpy.isfinite(f0):
+                break
+            step[todo] /= 8
+            eye = numpy.diag(step)
+            values = numpy.asarray(f(numpy.array(
+                [x + eye[i] for i in todo] + [x - eye[i] for i in todo])),
+                dtype=float)
+            plus[todo], minus[todo] = values[:len(todo)], values[len(todo):]
     # the side each axis is differenced on: 0 both, +1 or -1 one
     side = numpy.where(numpy.isfinite(plus) & numpy.isfinite(minus), 0,
                        numpy.where(numpy.isfinite(plus), 1, -1))
@@ -1630,5 +1724,7 @@ def _finite_differences(f, x, step, shrink=6):
             sign[i] * step[i] * sign[j] * step[j])
     grad[~numpy.isfinite(grad)] = 0.0
     hess[~numpy.isfinite(hess)] = 0.0
+    if return_step:
+        return grad, hess, step
     return grad, hess
 

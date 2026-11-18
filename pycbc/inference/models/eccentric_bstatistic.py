@@ -542,7 +542,8 @@ class EccentricCellPE(BaseModel):
         logl = float(top + numpy.log(numpy.sum(numpy.exp(terms - top))) - numpy.log(hi - lo))
         out = dict(loglikelihood=logl, delays=fdelays[active], widths=numpy.full(len(active), width), log_bayes=lnb,
                    z=zf[..., active], gram=gf[..., active], anchor_times=atimes, anchor_grams=ganchors,
-                   theta=theta, sky=sky, lags_screened=int(len(keep)), samples_active=int(len(active)))
+                   theta=theta, sky=sky, lags_screened=int(len(keep)), samples_active=int(len(active)),
+                   twof_max=float(ftwof.max()))
         # the engine (all mode spectra on the full grid) is not kept: neither here (unless keep_engine) nor in the
         # block model's last-prepared slot
         if getattr(self, 'keep_engine', False):

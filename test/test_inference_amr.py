@@ -575,3 +575,113 @@ def test_share_after_pilot_is_read_from_the_config(tmp_path):
     sampler = AMRSampler.from_config(cp, normal_model(),
                                      output_file=str(tmp_path / 'amr.hdf'))
     assert sampler.share_after_pilot is True
+
+
+@pytest.mark.parametrize('resolve', [None, 2.0])
+def test_the_frame_climbs_a_peak_far_narrower_than_its_difference_steps(
+        resolve):
+    """A peak 1e-3 of the cube wide along one axis (ln L 60 exp(-d^2 / 2
+    sigma^2)), the start two widths off it on its convex tail and the
+    climb's first difference steps one width long, as the Yorsh sobhb6
+    frame's (2026-11-18: ln L 14.3, 33.0, 54.9 at the start and one step
+    either side; the frame stayed at 33). With the steps resolved and the
+    move held within them the climb reaches the peak; with the fixed steps
+    the Hessian is convex, the step goes to the prior's scale, six halvings
+    leave it past the peak, and the climb stops at its start."""
+    names = ['a', 'b', 'c']
+    centre = numpy.array([0.5, 0.5, 0.5])
+    width = numpy.array([1e-3, 0.05, 0.05])
+
+    class Narrow(models.base.BaseModel):
+        name = 'test_narrow_peak'
+
+        def _loglikelihood(self):
+            x = numpy.array([self.current_params[n] for n in names])
+            return 60.0 * numpy.exp(-0.5 * numpy.sum(((x - centre) / width)
+                                                     ** 2))
+    prior = JointDistribution(names, *[Uniform(**{n: (0.0, 1.0)})
+                                       for n in names])
+    start = centre + numpy.array([-2.0 * width[0], 0.3 * width[1], 0.0])
+    sampler = AMRSampler(Narrow(names, prior=prior), initial_divisions=1,
+                         pilot_evaluations=2, laplace_frame=True,
+                         mass_fraction=1e-3, max_evaluations=600,
+                         posterior_samples=100, seed=3, start_cube=[start],
+                         frame_starts=1, climb_resolve=resolve)
+    sampler.run()
+    if resolve is None:
+        assert sampler.diagnostics['frame_peak'] < 40
+    else:
+        assert sampler.diagnostics['frame_peak'] > 59.9
+
+
+def test_resolved_differences_take_the_curvature_of_a_narrow_peak():
+    """``resolve`` cuts the step of the narrow axis until a step changes
+    the function by at most ``resolve``: the Hessian is then the peak's;
+    the fixed step, five widths, gives a tenth of it."""
+    from pycbc.inference.sampler.amr import _finite_differences
+    sd = numpy.array([2e-4, 0.05])
+
+    def f(X):
+        X = numpy.atleast_2d(X)
+        return 60.0 * numpy.exp(-0.5 * numpy.sum((X / sd) ** 2, axis=1))
+    x = numpy.array([0.3 * sd[0], 0.0])
+    _, fixed = _finite_differences(f, x, numpy.full(2, 1e-3))
+    assert abs(fixed[0, 0]) < 0.2 * abs(-60.0 / sd[0] ** 2)
+    grad, hess, used = _finite_differences(f, x, numpy.full(2, 1e-3),
+                                           resolve=2.0, return_step=True)
+    exact = -60.0 * numpy.exp(-0.5 * 0.09) * (1 - 0.09) / sd[0] ** 2
+    assert used[0] < sd[0] and used[1] == 1e-3
+    assert hess[0, 0] == pytest.approx(exact, rel=0.05)
+
+
+class IdentityCoordinates(object):
+    """``y = theta`` for ``a``: a curvilinear frame that changes nothing."""
+    names = ['a']
+
+    def forward(self, theta):
+        return numpy.array(theta, dtype=float)
+
+    def inverse(self, y):
+        return numpy.array(y, dtype=float)
+
+    def log_jacobian(self, theta):
+        return numpy.zeros(len(theta))
+
+
+def test_the_metric_gives_the_curvilinear_climb_its_scale():
+    """The narrow peak of the test above in a curvilinear frame, its start
+    on the convex tail: with the fixed steps alone (no resolution) the
+    climb stops at its start; with the expected precision (``1 / sigma^2``
+    on the narrow axis, as a phase metric gives it) it reaches the peak,
+    and its frame's width there is the peak's."""
+    names = ['a', 'b', 'c']
+    centre = numpy.array([0.5, 0.5, 0.5])
+    width = numpy.array([1e-3, 0.05, 0.05])
+
+    class Narrow(models.base.BaseModel):
+        name = 'test_narrow_peak_curvilinear'
+        curvilinear_coordinates = IdentityCoordinates()
+
+        def _loglikelihood(self):
+            x = numpy.array([self.current_params[n] for n in names])
+            return 60.0 * numpy.exp(-0.5 * numpy.sum(((x - centre) / width)
+                                                     ** 2))
+    prior = JointDistribution(names, *[Uniform(**{n: (0.0, 1.0)})
+                                       for n in names])
+    start = centre + numpy.array([-2.0 * width[0], 0.3 * width[1], 0.0])
+    peaks = {}
+    for label, metric in (('none', None),
+                          ('metric', numpy.diag([60.0 / width[0] ** 2, 0, 0]))):
+        sampler = AMRSampler(Narrow(names, prior=prior), initial_divisions=1,
+                             pilot_evaluations=2, curvilinear_frame=True,
+                             mass_fraction=1e-3, max_evaluations=600,
+                             posterior_samples=100, seed=3,
+                             start_cube=[start], frame_starts=1,
+                             climb_resolve=None, climb_precision=metric)
+        sampler.run()
+        peaks[label] = sampler.diagnostics['frame_peak']
+        if metric is not None:
+            sd = sampler.frame['chol'][0, 0]
+            assert sd == pytest.approx(width[0] / numpy.sqrt(60.0), rel=0.2)
+    assert peaks['none'] < 40
+    assert peaks['metric'] > 59.9
