@@ -76,6 +76,60 @@ def _orientation_averaged_metric(fam, grid, nodes=None):
     return metric, numpy.sum(numpy.abs(y) ** 2, axis=(0, 1))
 
 
+def _sky_response_and_derivatives(args, longitude, latitude, step=1e-4,
+                                  xp=numpy):
+    """What :func:`pycbc.tdi.ssb_yearly_harmonics.yearly_response_samples`
+    and :func:`~pycbc.tdi.ssb_yearly_harmonics.sky_log_derivatives` (scales
+    ``SKY_PROBE``) give at one sky with itself as the reference, from the
+    constellation's geometry at the samples' times, made once per model
+    (``args``: a model's ``_recentre_args``) and kept there: those functions
+    rebuild it for each of their five skies, 30 s a block of an all-sky
+    search against the block's own 4.6 (2026-11-18). The five skies'
+    response on ``xp``; the results on the host."""
+    from pycbc.tdi.onthefly import MultiChannelTermGeometry
+    from pycbc.tdi.ssb_yearly_harmonics import ORBITAL_PERIOD, ssb_delay
+    from pycbc.tdi.sky_block_response import _response_factors
+    f = numpy.asarray(args['coarse'], dtype=float)
+    ns, nf = int(args['samples']), len(f)
+    cache = args.get('_sky_geometry')
+    if cache is None or cache[0] != (ns, nf, xp):
+        # the times of yearly_response_samples: one period in ns samples,
+        # the frequencies a millisecond apart
+        times = (numpy.arange(ns)[:, None] * ORBITAL_PERIOD / ns
+                 + 1e-3 * numpy.arange(nf)[None]).ravel()
+        geometry = MultiChannelTermGeometry(args['orbit'], times,
+                                            args['terms'])
+        g = dict(coefficient=geometry.coefficient[:, 0], ltt=geometry.ltt,
+                 chain_delay=geometry.chain_delay, n_hat=geometry.n_hat,
+                 r_emit=geometry.r_emit, r_recv=geometry.r_recv,
+                 velocity_order=geometry.velocity_order,
+                 channels=[numpy.nonzero(geometry.term_channel == i)[0]
+                           for i in range(len(geometry.channel_names))])
+        if geometry.velocity_order:
+            g.update(v_emit=geometry.v_emit, v_recv=geometry.v_recv,
+                     n_dot_v_recv=geometry.n_dot_v_recv,
+                     n_dot_v_mix=geometry.n_dot_v_mix)
+        g = {k: (v if k == 'velocity_order' else
+                 [xp.asarray(c) for c in v] if k == 'channels' else
+                 xp.asarray(v)) for k, v in g.items()}
+        cache = ((ns, nf, xp), g, times)
+        args['_sky_geometry'] = cache
+    _, g, times = cache
+    lon = longitude + step * numpy.array([0., 1., -1., 0., 0.])
+    lat = latitude + step * numpy.array([0., 0., 0., 1., -1.])
+    omega = 2 * numpy.pi * numpy.tile(f, ns)
+    shift = numpy.exp(-2j * numpy.pi * numpy.tile(f, ns) * ssb_delay(
+        args['orbit'], times, longitude, latitude))
+    r = _response_factors(g, xp.asarray(omega), lon, lat, xp) \
+        * xp.asarray(shift)
+    # (point, plus/cross, channel, sample x frequency) -> (point, sample,
+    # plus/cross, channel, frequency)
+    r = r.reshape(len(lon), 2, -1, ns, nf).transpose(0, 3, 1, 2, 4)
+    sky = xp.stack([xp.log(r[1] / r[2]), xp.log(r[3] / r[4])]) \
+        / (2 * step) * SKY_PROBE
+    return _to_numpy(r[0]), _to_numpy(sky)
+
+
 def _measured_coordinates(surrogate, reference, coarse=4000):
     """:class:`pycbc.waveform.taylorf2_jets.MeasuredPhaseCoordinates` of
     the family, weighted by the reference's power at the frequencies it
@@ -979,8 +1033,6 @@ class BStatisticSurrogate(BaseModel):
         the coordinates of a model there: this family's intrinsic shape
         units and the new sky units."""
         import copy
-        from pycbc.tdi.ssb_yearly_harmonics import (sky_log_derivatives,
-                                                    yearly_response_samples)
         a = getattr(self, '_recentre_args', None)
         if a is None:
             raise ValueError("only a model from from_data can measure its "
@@ -988,12 +1040,8 @@ class BStatisticSurrogate(BaseModel):
         fam = copy.copy(self.surrogate)
         fam.sky_block = None
         xp = fam.xp
-        response = yearly_response_samples(
-            a['orbit'], a['terms'], a['coarse'], longitude, latitude,
-            longitude, latitude, samples=a['samples'])
-        sky = sky_log_derivatives(
-            a['orbit'], a['terms'], a['coarse'], longitude, latitude,
-            scales=(SKY_PROBE, SKY_PROBE), samples=a['samples'])
+        response, sky = _sky_response_and_derivatives(a, longitude, latitude,
+                                                      xp=xp)
         dtype = self.surrogate.R0.dtype
         fam.R0 = (xp.asarray(response, dtype=dtype)
                   * xp.asarray(a['ratio'])[None, None]).astype(dtype)

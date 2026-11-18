@@ -1033,3 +1033,42 @@ def test_sky_accumulated_fft_block_search_is_the_same_on_the_gpu():
         assert cb[k]['twof'] == pytest.approx(ca[k]['twof'], rel=1e-5)
         assert cb[k]['time'] == ca[k]['time'] and cb[k]['sky'] == ca[k]['sky']
     assert a['survivors'].shape == b['survivors'].shape
+
+
+def test_sky_response_from_the_kept_geometry_is_the_yearly_samples():
+    """sky_shape_units' response and sky log-derivatives, from the
+    constellation geometry made once per model, equal
+    yearly_response_samples and sky_log_derivatives (which rebuild it for
+    each sky: ten times a block's own build in an all-sky search)."""
+    import time
+    from pycbc.inference.models.bstatistic_surrogate import (
+        SKY_PROBE, _sky_response_and_derivatives)
+    from pycbc.tdi.ssb_yearly_harmonics import (sky_log_derivatives,
+                                                yearly_response_samples)
+    lon, lat = 3.5763564997428436, 0.3429283438977949
+    data, psds, _, _ = stbbh_data()
+    m = _built_at(lon, lat, data, psds)
+    a = m._recentre_args
+    for lon2, lat2 in [(lon, lat), (lon + 1.0, -1.2), (0.4, 1.45)]:
+        tick = time.time()
+        r, sky = _sky_response_and_derivatives(a, lon2, lat2)
+        fast = time.time() - tick
+        tick = time.time()
+        r0 = yearly_response_samples(a['orbit'], a['terms'], a['coarse'], lon2, lat2, lon2, lat2,
+                                     samples=a['samples'])
+        sky0 = sky_log_derivatives(a['orbit'], a['terms'], a['coarse'], lon2, lat2,
+                                   scales=(SKY_PROBE, SKY_PROBE), samples=a['samples'])
+        slow = time.time() - tick
+        assert r.shape == r0.shape and sky.shape == sky0.shape
+        numpy.testing.assert_allclose(r, r0, rtol=1e-9, atol=1e-12 * numpy.abs(r0).max())
+        numpy.testing.assert_allclose(sky, sky0, rtol=1e-6, atol=1e-9 * numpy.abs(sky0).max())
+        try:
+            import cupy
+            cupy.cuda.runtime.getDeviceCount()
+        except Exception:
+            continue
+        rg, skyg = _sky_response_and_derivatives(a, lon2, lat2, xp=cupy)
+        numpy.testing.assert_allclose(rg, r, rtol=1e-9, atol=1e-12 * numpy.abs(r).max())
+        numpy.testing.assert_allclose(skyg, sky, rtol=1e-6, atol=1e-9 * numpy.abs(sky).max())
+    assert '_sky_geometry' in a
+    assert fast < slow
