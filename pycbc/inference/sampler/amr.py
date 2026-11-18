@@ -268,8 +268,20 @@ class AMRSampler(BaseSampler):
                  share_frame_radius=1.3, edge_points=1, frame_moments=False,
                  layout_fraction=0.1, pilot_layout_fraction=None,
                  final_share_frame_radius=None, linear_posterior=False,
-                 linear_cap=10.0):
+                 linear_cap=10.0, box_distance=None, coverage_kappa=0.0,
+                 coverage_resolution=0.5, coverage_probes=4):
         super().__init__(model)
+        # the coverage bound (see _coverage_bound): a box is refined while
+        # the most posterior mass its template distance allows exceeds
+        # mass_fraction of Z, until that distance is below the resolution
+        self.box_distance = box_distance
+        self.coverage_kappa = float(coverage_kappa)
+        self.coverage_resolution = float(coverage_resolution)
+        self.coverage_probes = int(coverage_probes)
+        if self.coverage_resolution <= 0 or self.coverage_probes < 0:
+            raise ValueError("coverage-resolution must be positive and "
+                             "coverage-probes not negative")
+        self._dist = None
         self.linear_posterior = bool(linear_posterior)
         self.linear_cap = float(linear_cap)
         self.initial_divisions = int(initial_divisions)
@@ -750,6 +762,7 @@ class AMRSampler(BaseSampler):
         self._logl = numpy.full(len(self._lower), numpy.nan)
         self._logerr = numpy.full(len(self._lower), numpy.nan)
         self._logjac = numpy.full(len(self._lower), numpy.nan)
+        self._dist = numpy.full(len(self._lower), numpy.nan)
         if evaluate:
             self._evaluate_leaves()
 
@@ -772,7 +785,13 @@ class AMRSampler(BaseSampler):
             refine = self._logerr[leaves] - logz > threshold
             refine |= self._neighbour_flags(leaves, logmass - logz > threshold,
                                             logz + threshold)
+            bound = None
+            if self.box_distance is not None:
+                bound, cover = self._coverage_flags(leaves, logz, threshold)
+                refine |= cover
             refine &= self._level[leaves] < self.max_level
+            if bound is not None:
+                bound = bound[refine]
             refine = leaves[refine]
             finite = numpy.isfinite(self._logerr[leaves])
             dlogz = (float(numpy.exp(logsumexp(self._logerr[leaves][finite])
@@ -786,8 +805,112 @@ class AMRSampler(BaseSampler):
             if len(refine) > room:
                 priority = numpy.maximum(self._logerr[refine],
                                          self._log_mass(refine))
+                if bound is not None:
+                    priority = numpy.fmax(priority, bound)
                 refine = refine[numpy.argsort(-priority)[:room]]
             self._bisect(refine)
+
+    def _coverage_bound(self, logl, distance):
+        """The largest log likelihood anywhere in a box whose centre has
+        ``logl`` and whose points all lie within template ``distance`` of the
+        centre's (noise units, the data's own amplitude): with ``rho(x) =
+        sqrt(2 F(x))`` the matched-filter SNR, ``rho(x) <= rho(c) + ||h(x) -
+        h(c)||`` by the triangle inequality in the noise-weighted inner
+        product, and ``ln L = rho^2 / 2 - kappa`` with ``kappa`` the
+        marginalisation's Occam offset (``coverage_kappa``, measured at the
+        start): ``ln L(x) <= (sqrt(2 (ln L(c) + kappa)) + distance)^2 / 2 -
+        kappa``. The same covering argument as a search lattice's: there the
+        distance is set so that no signal is missed, here so that no box
+        misses posterior mass."""
+        k = self.coverage_kappa
+        with numpy.errstate(invalid='ignore'):
+            rho = numpy.sqrt(2 * numpy.clip(logl + k, 0, None))
+            return numpy.where(numpy.isfinite(logl),
+                               0.5 * (rho + distance) ** 2 - k, -numpy.inf)
+
+    def _probe_offsets(self):
+        """Box offsets (in units of its half-widths, about its centre) at
+        which the distance from the centre is measured: the centres of its
+        ``2 ndim`` faces, its two opposite corners along ``(1, .., 1)`` and
+        ``coverage_probes`` further corners from a fixed sample."""
+        if getattr(self, '_probes', None) is None:
+            n = self.ndim
+            off = [numpy.eye(n), -numpy.eye(n), numpy.ones((1, n)),
+                   -numpy.ones((1, n))]
+            if self.coverage_probes:
+                rng = numpy.random.default_rng(self.seed + 13)
+                off.append(rng.choice([-1., 1.],
+                                      size=(self.coverage_probes, n)))
+            self._probes = numpy.vstack(off)
+        return self._probes
+
+    def _box_distances(self, index):
+        """Each box's template distance: the largest of ``box_distance``
+        from its centre to its probe points (:meth:`_probe_offsets`), its
+        part inside the prior (points beyond it clipped onto the prior's
+        edge); ``inf`` where no point maps, so that the box is refined."""
+        off = self._probe_offsets()
+        n, k = len(index), len(off)
+        centre = self._lower[index] + 0.5 * self._width[index]
+        s = centre[:, None, :] + 0.5 * off[None] * self._width[index][:, None, :]
+        cube_c, jc = self._map(centre)
+        cube_p, jp = self._map(s.reshape(-1, self.ndim))
+        cube_c = numpy.clip(cube_c, 0, 1)
+        cube_p = numpy.clip(cube_p, 0, 1)
+        good_c = numpy.all(numpy.isfinite(cube_c), axis=1)
+        good_p = numpy.all(numpy.isfinite(cube_p), axis=1).reshape(n, k)
+        theta_c = numpy.full((n, self.ndim), numpy.nan)
+        theta_p = numpy.full((n * k, self.ndim), numpy.nan)
+        theta_c[good_c] = [self._prior_transform(c) for c in cube_c[good_c]]
+        gp = good_p.ravel()
+        theta_p[gp] = [self._prior_transform(c) for c in cube_p[gp]]
+        theta_p = theta_p.reshape(n, k, self.ndim)
+        d = numpy.full((n, k), numpy.inf)
+        both = good_c[:, None] & good_p
+        rows = numpy.nonzero(both.any(axis=1))[0]
+        if len(rows):
+            # every row's centre with each of its probes, the probes that do
+            # not map given the centre itself (distance 0, overwritten)
+            tp = numpy.where(both[rows][:, :, None], theta_p[rows],
+                             theta_c[rows][:, None, :])
+            d[rows] = numpy.asarray(self.box_distance(theta_c[rows], tp),
+                                    dtype=float).reshape(len(rows), k)
+            d[rows] = numpy.where(both[rows], d[rows], numpy.inf)
+        d = numpy.where(numpy.isnan(d), numpy.inf, d)
+        return d.max(axis=1)
+
+    def _coverage_flags(self, leaves, logz, threshold):
+        """The coverage bound of each leaf's mass, ``ln`` of its largest
+        likelihood (:meth:`_coverage_bound`) times its volume, and the flag
+        to refine it: a bound above ``mass_fraction`` of ``Z`` with the box's
+        template distance still above ``coverage_resolution``, below which
+        the likelihood is smooth over the box and the midpoint rules
+        refine it."""
+        need = leaves[numpy.isnan(self._dist[leaves])]
+        if len(need):
+            self._dist[need] = self._box_distances(need)
+        dist = self._dist[leaves]
+        logvol = (numpy.sum(numpy.log(self._width[leaves]), axis=1)
+                  + self._logjac[leaves])
+        with numpy.errstate(invalid='ignore'):
+            bound = numpy.where(numpy.isfinite(logvol),
+                                self._coverage_bound(self._logl[leaves], dist)
+                                + logvol, -numpy.inf)
+        unresolved = dist > self.coverage_resolution
+        cover = (bound - logz > threshold) & unresolved
+        # the most mass the boxes left unresolved could hold, as a fraction
+        # of Z: the guarantee the refinement gives on stopping
+        if unresolved.any() and numpy.isfinite(bound[unresolved]).any():
+            missing = float(logsumexp(bound[unresolved]) - logz)
+        else:
+            missing = -numpy.inf
+        self._diagnostics.update(
+            coverage_flagged=int(cover.sum()),
+            coverage_unresolved=int(unresolved.sum()),
+            coverage_log_bound_fraction=missing,
+            coverage_largest_distance=float(numpy.max(dist[numpy.isfinite(
+                logvol)])) if numpy.isfinite(logvol).any() else 0.0)
+        return bound, cover
 
     def _share(self, spans=(20.0, 15.0, 10.0, 6.0)):
         """Hand the model the region the refinement still works in: points
@@ -1205,6 +1328,8 @@ class AMRSampler(BaseSampler):
         self._logjac = numpy.concatenate([self._logjac,
                                           numpy.full(2 * len(index),
                                                      numpy.nan)])
+        self._dist = numpy.concatenate([self._dist,
+                                        numpy.full(2 * len(index), numpy.nan)])
         self._children = numpy.vstack([self._children,
                                        numpy.full((2 * len(index), 2), -1)])
         return first, second
