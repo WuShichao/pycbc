@@ -631,6 +631,10 @@ class PhaseGrid(object):
         outside the grid's directions (see
         :meth:`PhaseNUFFTCorrelation.phase_residual`); :meth:`inside` is
         false beyond it.
+    size_only : bool
+        Lay the grid out and size it (``size``, ``need``, ``kept``,
+        ``vectors``, ``memory_limit``; ``MemoryError`` as a build would
+        raise it) without building it.
     """
     def __init__(self, correlator, region, delay_range, ndir=2,
                  taylor_tolerance=1e-4, oversample=(4.0, 4.0, 2.0),
@@ -639,7 +643,7 @@ class PhaseGrid(object):
                  memory_limit=2.2e9, phase_tolerance=1e-4,
                  time_range=None, taylor_directions=1,
                  max_taylor_directions=4, taylor_margin=0.1,
-                 taylor_extent_margin=None):
+                 taylor_extent_margin=None, size_only=False):
         import logging
         import time
         xp = self.xp = correlator.xp
@@ -764,6 +768,12 @@ class PhaseGrid(object):
                 # the pool's own limit, less what it holds
                 memory_limit = min(memory_limit, pool.get_limit()
                                    - pool.used_bytes() - 2e8)
+        # what a caller sizing several grids before building any needs: the
+        # bytes this one keeps once built (the grid) and the vectors its build
+        # transforms (its time grows with both)
+        self.need, self.memory_limit = float(need), float(memory_limit)
+        self.kept = float(2 * self.terms * npoly * cells * item)
+        self.vectors = int(2 * self.terms * npoly)
         if need > memory_limit:
             err = MemoryError(
                 "the region needs a grid of {:.2f} GB ({} Taylor terms, "
@@ -772,6 +782,9 @@ class PhaseGrid(object):
                                               self.size, memory_limit / 1e9))
             err.need, err.size = need, list(self.size)
             raise err
+        if size_only:
+            # the grid's layout, size and memory, without its build
+            return
         # the grid first, while the device memory is free: an array
         # allocated after the transforms' work space may land in host-shared
         # memory, where every read crosses the bus

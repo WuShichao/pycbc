@@ -311,6 +311,62 @@ class EccentricModePhaseCorrelation(PhaseNUFFTCorrelation):
         return out
 
 
+class RegionTooCostly(MemoryError):
+    """A shared region whose grids would take longer to build than the
+    direct evaluations they would save (a ``MemoryError``, so that a caller
+    that splits or skips a region that does not fit does the same)."""
+
+
+def admit_region(sizes, max_build_seconds=None, build_rate=0.05):
+    """Whether a shared region's grids, built one after another and each
+    kept, fit the device and are worth building.
+
+    Parameters
+    ----------
+    sizes : list of tuple
+        Per grid in build order: (need, kept, vectors, memory_limit, size) --
+        the bytes its build needs, the bytes it keeps once built, its
+        transformed vectors, the bytes allowed when it was sized (nothing of
+        the region held), its layout.
+    max_build_seconds : float, optional
+        The longest the grids may be expected to take to build.
+    build_rate : float
+        Expected seconds per GB of a grid's need and per vector.
+
+    Returns
+    -------
+    dict
+        ``work`` (sum of need in GB times vectors), ``seconds`` (expected
+        build time) and ``peak`` (bytes at the largest build). Raises
+        ``MemoryError`` when a grid with the ones before it does not fit,
+        :class:`RegionTooCostly` when the build is expected to take longer
+        than ``max_build_seconds``.
+    """
+    held, peak = 0.0, 0.0
+    for need, kept, vectors, limit, size in sizes:
+        if held + need > limit:
+            err = MemoryError(
+                "the region's grids need {:.2f} GB at grid {} ({:.2f} GB of "
+                "the grids before it held) and {:.2f} GB are allowed".format(
+                    (held + need) / 1e9, size, held / 1e9, limit / 1e9))
+            err.need, err.size = held + need, list(size)
+            raise err
+        peak = max(peak, held + need)
+        held += kept
+    work = float(sum(need / 1e9 * vectors for need, _, vectors, _, _ in sizes))
+    seconds = float(build_rate) * work
+    if max_build_seconds is not None and seconds > max_build_seconds:
+        err = RegionTooCostly(
+            "the region's grids {} would take about {:.0f} s to build ({:.0f} "
+            "GB-vectors at {:.3f} s each) and {:.0f} s are allowed".format(
+                [list(s[4]) for s in sizes], seconds, work, build_rate,
+                max_build_seconds))
+        err.need, err.size = 0.0, [list(s[4]) for s in sizes]
+        err.seconds, err.allowed = seconds, float(max_build_seconds)
+        raise err
+    return dict(work=work, seconds=seconds, peak=peak)
+
+
 class EccentricSharedRegion(object):
     """The marginal log likelihood of
     :class:`pycbc.inference.models.eccentric_bstatistic.EccentricCellPE` for
@@ -342,9 +398,23 @@ class EccentricSharedRegion(object):
         its log likelihood is ``nan`` and the model computes it directly.
     probes : int
         Points of the region whose direct likelihood sets the grid's times.
+    max_build_seconds : float, optional
+        The longest the modes' grids may be expected to take to build: a
+        region whose grids are expected to take longer raises
+        :class:`RegionTooCostly` before any is built (by default any
+        region whose grids fit is built).
+    build_rate : float
+        The expected build time of a grid per GB of its memory and per
+        transformed vector, s (0.05: the median on TalaIA's H200s, 2026-11-18,
+        0.035, and 0.1 for grids beyond 25 GB).
+
+    Every mode's grid is laid out and sized first, then built: a region
+    whose last grid did not fit had its first ones built for nothing
+    (13 minutes of 38 GB of a pp injection's 3 hours).
     """
     def __init__(self, model, region, data_window, family=None, keys=None, band_margin=60 * 86400.0,
-                 sky_tolerance=1e-4, edge_margin=30.0, probes=8, grid_options=None, seed=0):
+                 sky_tolerance=1e-4, edge_margin=30.0, probes=8, grid_options=None, seed=0, max_build_seconds=None,
+                 build_rate=0.05):
         import logging
         import time
         tick = time.time()
@@ -415,18 +485,23 @@ class EccentricSharedRegion(object):
         # over the region's points, widened by the grid margin of it. From the probes alone (8 points) those
         # windows missed most of a posterior that reached past a frame ball's spread: no lags on the weak modes'
         # grids for 90% of the posterior points (timecheck0, fig10k)
-        for k in [ref] + [j for j in range(K) if j != ref]:
-            key = self.keys[k]
+        order = [ref] + [j for j in range(K) if j != ref]
+
+        def mode(k):
             view = EccentricModeView(block, theta0, k, response, family.f_ref,
                                      block.response_frequencies)
             # a gridded response: sky errors and coordinates as combinations of the grid nodes' (SkyBasis)
             if isinstance(builder, GridSkyResponse):
                 view.grid_response = builder
-            corr = EccentricModePhaseCorrelation(family, key, view, theta0, block.data, skies, thetas,
+            corr = EccentricModePhaseCorrelation(family, self.keys[k], view, theta0, block.data, skies, thetas,
                                                  sky_tolerance=self.sky_tolerance, window=self.data_window,
                                                  band_margin=band_margin)
+            return view, corr
+        # the first pass: every mode's grid times and its grid's layout and size, no grid built
+        windows, sizes = [None] * K, [None] * K
+        for k in order:
+            view, corr = mode(k)
             frame = corr.frame(thetas, 3)
-            self.views[k], self.correlators[k] = view, corr
             shifts[k] = corr.project(thetas, frame)[1]
             if k == ref:
                 tlo, thi = numpy.inf, -numpy.inf
@@ -440,6 +515,20 @@ class EccentricSharedRegion(object):
             pad = base_pad + margin * (dmax - dmin)
             reach = (self.lags[0] * dt + shifts[k].min() - dt, self.lags[-1] * dt + shifts[k].max() + 2 * dt)
             window = (max(tlo + dmin - pad, reach[0]), min(thi + dmax + pad, reach[1]))
+            windows[k] = (window, reach)
+            g = PhaseGrid(corr, thetas, (lo, hi), time_range=window, size_only=True, **options)
+            sizes[k] = (g.need, g.kept, g.vectors, g.memory_limit, list(g.size))
+            del g, corr, view, frame
+            if self.xp is not numpy:
+                self.xp.get_default_memory_pool().free_all_blocks()
+        self.planned = admit_region([sizes[k] for k in order], max_build_seconds, build_rate)
+        logging.info("EccentricSharedRegion: grids %s planned, %.0f GB-vectors, about %.0f s to build",
+                     [sizes[k][4] for k in order], self.planned['work'], self.planned['seconds'])
+        tock = time.time()
+        for k in order:
+            view, corr = mode(k)
+            self.views[k], self.correlators[k] = view, corr
+            window, reach = windows[k]
             self.grids[k] = PhaseGrid(corr, thetas, (lo, hi), time_range=window, **options)
             g = self.grids[k]
             logging.info("EccentricSharedRegion: mode %d grid times %.0f to %.0f s (step %.1f s, %d cells); "
@@ -448,6 +537,7 @@ class EccentricSharedRegion(object):
             corr.release()
             if self.xp is not numpy:
                 self.xp.get_default_memory_pool().free_all_blocks()
+        self.build_seconds = time.time() - tock
         logging.info("EccentricSharedRegion: %d points, correlators, frames and grids in %.1f s; eccentric ranks %s "
                      "(training residual rms %s rad)", len(region), time.time() - tick,
                      [c.basis_rank for c in self.correlators],

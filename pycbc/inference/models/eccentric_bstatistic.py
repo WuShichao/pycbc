@@ -272,6 +272,14 @@ class EccentricCellPE(BaseModel):
     max_region_points = 4000
     #: points outside every shared region that one batch must have before a new region is built for them
     min_new_region = 3000
+    #: a region is built only when its grids are expected to take at most this many times the direct evaluation of
+    #: the points it is built for (it serves them and the refinement's points among them later)
+    share_payback = 2.0
+    #: the direct evaluation's time per point until the model has measured its own, s (0.12-0.15 on TalaIA)
+    direct_seconds = 0.15
+    #: a grid's expected build time per GB of its memory and per transformed vector, s; updated from the regions
+    #: the model builds (see EccentricSharedRegion)
+    build_rate = 0.05
 
     @property
     def batches_points(self):
@@ -308,6 +316,13 @@ class EccentricCellPE(BaseModel):
         stats = self.shared_statistics
         tick = time.time()
         options = dict(self.shared_options)
+        # what building the region may take: share_payback times the direct evaluation of its points, at the
+        # model's measured direct time per point. A pp injection's regions of 64-512 points took 12-23 minutes each
+        # to build, against 8-60 s for their points directly (2026-11-18)
+        direct = stats['single_seconds'] / stats['single_points'] if stats['single_points'] >= 50 \
+            else self.direct_seconds
+        options.setdefault('max_build_seconds', self.share_payback * len(region) * direct)
+        options.setdefault('build_rate', self.build_rate)
         options.update(kwargs)
         if len(region) > self.max_region_points:
             # the region's extent from a uniform subsample: its sky basis and frames grow with the points (a
@@ -318,7 +333,10 @@ class EccentricCellPE(BaseModel):
             shared = EccentricSharedRegion(self, region, **options)
         except MemoryError as err:
             import logging
+            from pycbc.filter.eccentric_shared import RegionTooCostly
             stats['regions_refused'] += 1
+            if isinstance(err, RegionTooCostly):
+                stats['regions_too_costly'] = stats.get('regions_too_costly', 0) + 1
             stats['largest_refused_gb'] = max(stats['largest_refused_gb'], getattr(err, 'need', 0) / 1e9)
             used = self.xp.get_default_memory_pool().used_bytes() / 1e9 if self.xp is not numpy else 0.
             logging.info("share refused for %d points: %s (device pool in use %.2f GB)", len(region),
@@ -331,6 +349,12 @@ class EccentricCellPE(BaseModel):
             raise
         stats['regions'] += 1
         stats['region_seconds'] += time.time() - tick
+        work = shared.planned['work']
+        if work > 1.0 and shared.build_seconds > 0:
+            # the rate this device builds at: a geometric running mean of the regions' own (the large grids
+            # build at twice or three times the small ones' rate per GB and vector)
+            seen = shared.build_seconds / work
+            self.build_rate = float(numpy.exp(0.7 * numpy.log(self.build_rate) + 0.3 * numpy.log(seen)))
         shared.points_used = 0
         regions.append(shared)
         self._shared_regions = regions
@@ -340,8 +364,11 @@ class EccentricCellPE(BaseModel):
         try:
             self.share(points)
             return True
-        except MemoryError:
-            if depth >= 3 or len(points) < 2 * self.min_new_region // 4:
+        except MemoryError as err:
+            from pycbc.filter.eccentric_shared import RegionTooCostly
+            # a region too costly for its points stays so when halved: its grids shrink with its extent as its
+            # points do
+            if isinstance(err, RegionTooCostly) or depth >= 3 or len(points) < 2 * self.min_new_region // 4:
                 return False
             # halve along the points' widest direction: the leading principal axis of their standardised
             # coordinates (the posterior is widest along q, which ln Mc alone does not separate)
