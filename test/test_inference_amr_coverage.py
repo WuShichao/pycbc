@@ -105,37 +105,69 @@ def test_a_global_bound_certifies_the_far_prior_and_the_start_is_probed():
     assert sampler.diagnostics['evaluations'] < full.diagnostics['evaluations']
 
 
-class Sheared(object):
-    """Curvilinear coordinates in which the prior's image is a thin, long
-    parallelogram: a frame's first box, its bound, is mostly empty."""
-    names = ('x', 'y')
 
-    def forward(self, theta):
-        theta = numpy.atleast_2d(theta)
-        return numpy.column_stack([theta[:, 0] + 30 * theta[:, 1],
-                                   theta[:, 1]])
-
-    def inverse(self, y):
-        y = numpy.atleast_2d(y)
-        return numpy.column_stack([y[:, 0] - 30 * y[:, 1], y[:, 1]])
-
-    def log_jacobian(self, theta):
-        return numpy.zeros(len(numpy.atleast_2d(theta)))
+# a thin ridge across the prior, at 30 degrees to the axes: the SNR falls by
+# RHO per unit across it and by EPS RHO along it
+EPS = 0.02
+ANGLE = numpy.radians(30)
+NORMAL = numpy.array([-numpy.sin(ANGLE), numpy.cos(ANGLE)])
+ALONG = numpy.array([numpy.cos(ANGLE), numpy.sin(ANGLE)])
 
 
-def test_the_bound_runs_in_a_curvilinear_frame_whose_first_box_is_mostly_empty():
-    def snr_bound(centre, probes, rho):
-        pts = numpy.concatenate([centre[:, None, :], probes], axis=1)
-        far = numpy.linalg.norm(pts - MEAN, axis=-1).min(axis=1)
-        top = numpy.maximum(PEAK - RHO * far, 0.0)
-        d = distance(centre, probes).max(axis=1)
-        return numpy.minimum(rho + d, top), d
-    m = model()
-    m.curvilinear_coordinates = Sheared()
-    start = (numpy.array(MEAN) + HALF) / (2 * HALF)
-    sampler = AMRSampler(m, initial_divisions=1, pilot_evaluations=200,
-                         curvilinear_frame=True, mass_fraction=1e-4,
-                         max_evaluations=20000, posterior_samples=2000,
-                         seed=2, box_snr_bound=snr_bound, start_cube=start)
+def ridge_metric(z):
+    return numpy.sqrt((z @ NORMAL) ** 2 + (EPS * (z @ ALONG)) ** 2)
+
+
+class FilterRidge(BaseModel):
+    name = 'test_filter_ridge'
+
+    def _loglikelihood(self):
+        x = numpy.array([self.current_params[p] for p in ('x', 'y')])
+        return 0.5 * max(PEAK - RHO * ridge_metric(x - MEAN), 0.0) ** 2
+
+
+def ridge_bound(centre, probes, rho):
+    """The SNR bound with each probe's distance: the local one, and the
+    global one, the match with the signal at the probes (no noise)."""
+    pts = numpy.concatenate([centre[:, None, :], probes], axis=1)
+    top = numpy.maximum(PEAK - RHO * ridge_metric(pts - MEAN), 0).max(axis=1)
+    d = RHO * ridge_metric(probes - centre[:, None, :])
+    return numpy.minimum(rho + d.max(axis=1), top), d.max(axis=1), d
+
+
+def ridge_exact():
+    """ln Z and the posterior's sd along the ridge, on a fine grid."""
+    g = numpy.linspace(-HALF, HALF, 4001)
+    x, y = numpy.meshgrid(g, g)
+    z = numpy.stack([x - MEAN[0], y - MEAN[1]], axis=-1)
+    logl = 0.5 * numpy.maximum(PEAK - RHO * ridge_metric(z), 0) ** 2
+    top = logl.max()
+    w = numpy.exp(logl - top)
+    mean = numpy.trapz(numpy.trapz(w, g), g)
+    t = z @ ALONG
+    m1 = numpy.trapz(numpy.trapz(w * t, g), g) / mean
+    m2 = numpy.trapz(numpy.trapz(w * t ** 2, g), g) / mean
+    return top + numpy.log(mean / (2 * HALF) ** 2), numpy.sqrt(m2 - m1 ** 2)
+
+
+def test_the_bound_follows_a_thin_oblique_ridge_from_its_start():
+    prior = JointDistribution(
+        ['x', 'y'], Uniform(x=(-HALF, HALF)), Uniform(y=(-HALF, HALF)))
+    start = (numpy.array(MEAN) + 3 * ALONG + HALF) / (2 * HALF)
+    sampler = AMRSampler(FilterRidge(['x', 'y'], prior=prior),
+                         initial_divisions=1, mass_fraction=1e-4,
+                         max_evaluations=40000, posterior_samples=2000,
+                         seed=2, box_snr_bound=ridge_bound, start_cube=start)
     sampler.run()
-    assert sampler.logz == pytest.approx(exact_logz(), abs=0.05)
+    assert sampler.diagnostics['stopped_by'] == 'convergence'
+    assert sampler.diagnostics['coverage_peak_moves'] >= 1
+    logz, sd = ridge_exact()
+    assert sampler.logz == pytest.approx(logz, abs=0.05)
+    x = numpy.column_stack([sampler.samples['x'], sampler.samples['y']])
+    assert ((x - MEAN) @ ALONG).std() == pytest.approx(sd, rel=0.1)
+
+
+def test_the_coverage_tree_refuses_a_frame():
+    with pytest.raises(ValueError):
+        AMRSampler(model(), box_snr_bound=lambda c, p, r: (r, r),
+                   curvilinear_frame=True, pilot_evaluations=100)

@@ -282,7 +282,14 @@ class AMRSampler(BaseSampler):
         if box_distance is not None and box_snr_bound is not None:
             raise ValueError("give box_distance or box_snr_bound, not both")
         self._coverage = box_distance is not None or box_snr_bound is not None
+        if self._coverage and (pilot_evaluations or curvilinear_frame
+                               or laplace_frame or partition_file
+                               or check_points):
+            raise ValueError("the coverage bound refines a tree over the "
+                             "prior cube itself: no pilot, frame, partition "
+                             "or check points")
         self._peak_cube = None
+        self._peak_logl = -numpy.inf
         self.coverage_kappa = float(coverage_kappa)
         self.coverage_resolution = float(coverage_resolution)
         self.coverage_probes = int(coverage_probes)
@@ -673,8 +680,10 @@ class AMRSampler(BaseSampler):
                                   numpy.concatenate([self._explored[1],
                                                      logl]))
         if self._coverage and self.start_cube is not None:
-            # the start the peak's first estimate, until a frame's climb
-            self._peak_cube = numpy.array(self.start_cube[0], dtype=float)
+            # the start the peak's first estimate (see _update_peak)
+            best = int(numpy.argmax(self._explored[1]))
+            self._peak_cube = numpy.array(self._explored[0][best], dtype=float)
+            self._peak_logl = float(self._explored[1][best])
         self._grid()
         if self.pilot_evaluations > 0:
             for whitening_round in range(self.whitening_rounds):
@@ -702,6 +711,10 @@ class AMRSampler(BaseSampler):
                     self._whiten()
                 if self.shared_region and not self._batched:
                     self._share()
+        elif self.shared_region and not self._batched and self._coverage:
+            # the coverage tree starts from the whole prior: its region is
+            # shared once the refinement has found where ln L is large
+            self._next_share = self.coverage_share_after
         elif self.shared_region and not self._batched:
             # no pilot, as from a search's cells: share the starting boxes'
             # region
@@ -775,9 +788,7 @@ class AMRSampler(BaseSampler):
         self._logjac = numpy.full(len(self._lower), numpy.nan)
         self._dist = numpy.full(len(self._lower), numpy.nan)
         self._snr = numpy.full(len(self._lower), numpy.nan)
-        # the prior's draws in this tree's box coordinates (a new frame, a
-        # new tree)
-        self._prior_s = None
+        self._axis_dist = numpy.full((len(self._lower), self.ndim), numpy.nan)
         if evaluate:
             self._evaluate_leaves()
 
@@ -906,16 +917,52 @@ class AMRSampler(BaseSampler):
 
     def _box_snr_bounds(self, index, rho):
         """``box_snr_bound`` at boxes ``index`` with centre SNRs ``rho``:
-        the largest SNR in each and its template distance (``inf`` both
-        where a probe does not map)."""
+        the largest SNR in each, its template distance and the distance
+        along each axis (to the farther of its two faces' centres, from the
+        bound's distances to each probe when it gives them); ``inf`` where
+        a probe does not map."""
         theta_c, theta_p, good, bad = self._box_thetas(index)
-        snr = numpy.full(len(index), numpy.inf)
-        dist = numpy.full(len(index), numpy.inf)
+        n = len(index)
+        snr = numpy.full(n, numpy.inf)
+        dist = numpy.full(n, numpy.inf)
+        axis = numpy.full((n, self.ndim), numpy.nan)
         if good.any():
-            a, b = self.box_snr_bound(theta_c[good], theta_p[good], rho[good])
-            snr[good], dist[good] = a, b
+            out = self.box_snr_bound(theta_c[good], theta_p[good], rho[good])
+            snr[good], dist[good] = out[0], out[1]
+            if len(out) > 2:
+                d = numpy.asarray(out[2], dtype=float)
+                k = self.ndim
+                axis[good] = numpy.maximum(d[:, :k], d[:, k:2 * k])
         snr[bad] = dist[bad] = numpy.inf
-        return snr, dist
+        return snr, dist, axis
+
+    #: the rise in the largest box value that moves the signal's estimate
+    coverage_peak_step = 2.0
+    #: evaluations after which the coverage tree's region is first shared
+    coverage_share_after = 2000
+
+    def _update_peak(self, leaves):
+        """Move the signal's estimate to the box with the largest ln L once
+        it exceeds the estimate's by ``coverage_peak_step``: the bound's
+        match is with the template there (``box_snr_bound.at_peak``), and
+        every box's bound is recomputed."""
+        logl = numpy.where(numpy.isfinite(self._logl[leaves]),
+                           self._logl[leaves], -numpy.inf)
+        best = int(numpy.argmax(logl))
+        if logl[best] <= self._peak_logl + self.coverage_peak_step:
+            return
+        box = leaves[best]
+        cube, _ = self._map((self._lower[box] + 0.5 * self._width[box])[None])
+        self._peak_cube, self._peak_logl = cube[0], float(logl[best])
+        at_peak = getattr(self.box_snr_bound, 'at_peak', None)
+        if at_peak is not None:
+            at_peak(numpy.array(self._prior_transform(cube[0])))
+        self._snr[:] = numpy.nan
+        self._axis_dist[:] = numpy.nan
+        self._diagnostics['coverage_peak_moves'] = self._diagnostics.get(
+            'coverage_peak_moves', 0) + 1
+        logging.info("AMR coverage: the signal's estimate moved to ln L %.3f",
+                     self._peak_logl)
 
     def _box_distances(self, index):
         """Each box's template distance: the largest of ``box_distance``
@@ -953,31 +1000,6 @@ class AMRSampler(BaseSampler):
         d = numpy.where(numpy.isnan(d), numpy.inf, d)
         return d.max(axis=1)
 
-    #: prior draws that bound the prior mass of a box none of its volume
-    #: points fall inside of
-    coverage_prior_draws = 16384
-
-    def _prior_fraction_bound(self, leaves):
-        """``ln`` of an upper bound on the prior mass of each leaf, from the
-        prior's draws it holds: ``(count + 3) / N`` (with no draw inside, a
-        box holds less than ``3 / N`` of the prior at 95% confidence). For a
-        box none of whose volume points (:meth:`_volume`) is inside the
-        prior, which is not thereby empty: a frame's first box is the bound
-        of the prior's image, which can fill a small part of it."""
-        if getattr(self, '_prior_cube', None) is None:
-            from scipy.stats import qmc
-            self._prior_cube = qmc.Sobol(self.ndim, seed=self.seed + 17
-                                         ).random(self.coverage_prior_draws)
-        if self._prior_s is None:
-            with numpy.errstate(invalid='ignore'):
-                sp = self._unmap(self._prior_cube)
-            ok = numpy.all(numpy.isfinite(sp) & (sp >= 0) & (sp <= 1), axis=1)
-            self._prior_s = sp[ok]
-        found = self._locate(self._prior_s)
-        counts = numpy.bincount(found[found >= 0], minlength=len(self._lower))
-        n = len(self._prior_cube)
-        return numpy.log((counts[leaves] + 3.0) / n)
-
     def _coverage_flags(self, leaves, logz, threshold):
         """The coverage bound of each leaf's mass, ``ln`` of its largest
         likelihood (:meth:`_coverage_bound`) times its volume, and the flag
@@ -988,29 +1010,23 @@ class AMRSampler(BaseSampler):
         logvol = (numpy.sum(numpy.log(self._width[leaves]), axis=1)
                   + self._logjac[leaves])
         if self.box_snr_bound is not None:
+            self._update_peak(leaves)
             need = leaves[numpy.isnan(self._snr[leaves])]
             if len(need):
-                # a box with no value (none of its points inside the prior)
-                # has its SNR bounded globally: an infinite centre SNR
                 with numpy.errstate(invalid='ignore'):
                     rho = numpy.where(
                         numpy.isfinite(self._logl[need]),
                         numpy.sqrt(2 * numpy.clip(
                             self._logl[need] + self.coverage_kappa, 0, None)),
                         numpy.inf)
-                self._snr[need], self._dist[need] = self._box_snr_bounds(
-                    need, rho)
+                (self._snr[need], self._dist[need],
+                 self._axis_dist[need]) = self._box_snr_bounds(need, rho)
             dist = self._dist[leaves]
-            unknown = ~(numpy.isfinite(logvol)
-                        & numpy.isfinite(self._logl[leaves]))
-            if unknown.any():
-                logvol = numpy.where(unknown, numpy.nan, logvol)
-                logvol[unknown] = self._prior_fraction_bound(leaves[unknown])
             with numpy.errstate(invalid='ignore'):
                 top = 0.5 * self._snr[leaves] ** 2 - self.coverage_kappa
-                bound = numpy.where(numpy.isfinite(top), top, numpy.inf) \
-                    + logvol
-            dist = numpy.where(numpy.isfinite(dist), dist, numpy.inf)
+                bound = numpy.where(numpy.isfinite(logvol),
+                                    numpy.where(numpy.isnan(top), numpy.inf,
+                                                top) + logvol, -numpy.inf)
         else:
             need = leaves[numpy.isnan(self._dist[leaves])]
             if len(need):
@@ -1234,20 +1250,12 @@ class AMRSampler(BaseSampler):
         self._curve = curve
         self._uncurve = uncurve
         self._scale = span
-        self._prior_cube = (draws - bottom) / prior_range
         logging.info("AMR: curvilinear frame after %d evaluations",
                      self.nevaluations)
         if self.share_frame and self.shared_region:
             # the boxes reach past the radius by up to half a box (those whose nearest point lies within it), and the
             # refinement past them
             self._share_ball(low, span, self._ball * radius)
-        # a distance relative to the signal (the frame's peak its estimate) learns where the peak is
-        peak = from_y(numpy.asarray(mean, dtype=float)[None])[0]
-        self._peak_cube = (peak - bottom) / prior_range
-        at_peak = getattr(self.box_distance or self.box_snr_bound, 'at_peak',
-                          None)
-        if at_peak is not None:
-            at_peak(peak)
         self._start_frame(low, span, radius)
 
     def _share_ball(self, low, span, radius):
@@ -1352,10 +1360,7 @@ class AMRSampler(BaseSampler):
         self._grid(evaluate=False)
         target = max(1.0, 2 * radius / (self._layout * self.max_evaluations)
                      ** (1.0 / self.ndim))
-        # under the coverage bound the frame starts from its roots: the bound
-        # orders the refinement (a layout of unit boxes spent 11475 of 20000
-        # evaluations on pp 9, 2026-11-18)
-        while not self._coverage:
+        while True:
             leaves = self._leaves()
             zlow = low + span * self._lower[leaves]
             zwidth = span * self._width[leaves]
@@ -1443,6 +1448,14 @@ class AMRSampler(BaseSampler):
         returns the indices of the lower and the upper halves."""
         lower, width = self._lower[index], self._width[index]
         axis = numpy.argmax(width * self._scale, axis=1)
+        if self._coverage:
+            # under the coverage bound, along the axis over which the box's
+            # template changes most: the box's template diameter falls
+            # fastest, and boxes stretch along a ridge's zero-information
+            # directions
+            dist = self._axis_dist[index]
+            known = numpy.all(numpy.isfinite(dist), axis=1)
+            axis[known] = numpy.argmax(dist[known], axis=1)
         rows = numpy.arange(len(index))
         half = width.copy()
         half[rows, axis] /= 2
@@ -1468,6 +1481,8 @@ class AMRSampler(BaseSampler):
                                         numpy.full(2 * len(index), numpy.nan)])
         self._snr = numpy.concatenate([self._snr,
                                        numpy.full(2 * len(index), numpy.nan)])
+        self._axis_dist = numpy.vstack([self._axis_dist, numpy.full(
+            (2 * len(index), self.ndim), numpy.nan)])
         self._children = numpy.vstack([self._children,
                                        numpy.full((2 * len(index), 2), -1)])
         return first, second
