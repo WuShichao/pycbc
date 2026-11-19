@@ -301,11 +301,10 @@ class Steep(Mixed):
         return numpy.column_stack([y[:, 0] - 300 * y[:, 1], y[:, 1]])
 
 
-@pytest.mark.xfail(strict=True, reason="known (2026-11-19): a box whose template distance is below "
-                   "coverage_resolution is left to the midpoint rules, but near a peak the triangle bound's slack is "
-                   "rho_c D, not D: here the tree stops 0.03 from the peak (ln L 57 of 72), ln Z 46.4 against 56.9. "
-                   "Needs a second-order local bound (the gradient at the centre)")
 def test_a_chart_whose_prior_image_is_a_sliver_of_its_bound():
+    # the bound's metric (in the chart) puts the peak probe at each box's
+    # point nearest the peak in the template metric; without it the
+    # Euclidean nearest point missed the peak and its box was certified
     prior = JointDistribution(
         ['x', 'y'], Uniform(x=(-HALF, HALF)), Uniform(y=(-HALF, HALF)))
     m = FilterPeak(['x', 'y'], prior=prior)
@@ -318,10 +317,41 @@ def test_a_chart_whose_prior_image_is_a_sliver_of_its_bound():
         top = numpy.maximum(PEAK - RHO * far, 0.0)
         d = distance(centre, probes)
         return numpy.minimum(rho + d.max(axis=1), top), d.max(axis=1), d
+    dtheta = numpy.array([[1., -300.], [0., 1.]])
+    bound.metric = dtheta.T @ (RHO ** 2 * numpy.eye(2)) @ dtheta
     sampler = AMRSampler(m, initial_divisions=1, mass_fraction=1e-4,
                          max_evaluations=20000, posterior_samples=2000,
                          seed=2, box_snr_bound=bound, start_cube=start,
-                         coverage_chart=True, coverage_resolution=3.0)
+                         coverage_chart=True, coverage_resolution=3.0,
+                         max_level=100)
     sampler.run()
-    assert sampler.logz == pytest.approx(exact_logz(), abs=0.1)
     assert sampler.diagnostics['coverage_draw_valued_boxes'] >= 1
+    u, logq = sampler.tree_proposal(20000, numpy.random.default_rng(4))
+    ok = numpy.all((u >= 0) & (u <= 1), axis=1)
+    x = -HALF + 2 * HALF * u[ok]
+    logl = 0.5 * numpy.maximum(PEAK - RHO * numpy.linalg.norm(x - MEAN, axis=1),
+                               0) ** 2
+    lw = logl - logq[ok]
+    w = numpy.exp(lw - lw.max())
+    assert logsumexp(lw) - numpy.log(len(u)) == pytest.approx(exact_logz(),
+                                                               abs=0.05)
+    assert w.sum() ** 2 / numpy.sum(w ** 2) > 0.3 * len(u)
+
+
+def test_the_nearest_point_of_a_box_in_a_metric():
+    from pycbc.inference.sampler.amr import _nearest_in_boxes
+    rng = numpy.random.default_rng(1)
+    a = rng.normal(size=(3, 3))
+    g = a @ a.T
+    g[0, 0] += 1e3
+    g[:, 2] = g[2, :] = 0          # a direction of no information
+    p = rng.uniform(-1, 2, 3)
+    lo = rng.uniform(0, 0.5, (4, 3))
+    hi = lo + rng.uniform(0.1, 0.5, (4, 3))
+    x = _nearest_in_boxes(g, p, lo, hi)
+    for b in range(4):
+        grid = numpy.stack(numpy.meshgrid(*[numpy.linspace(lo[b, i], hi[b, i], 41)
+                                            for i in range(3)], indexing='ij'),
+                           -1).reshape(-1, 3)
+        q = numpy.einsum('ni,ij,nj->n', grid - p, g, grid - p)
+        assert (x[b] - p) @ g @ (x[b] - p) <= q.min() + 1e-9

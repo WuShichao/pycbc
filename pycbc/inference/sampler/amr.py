@@ -298,9 +298,9 @@ class AMRSampler(BaseSampler):
         self.coverage_kappa = float(coverage_kappa)
         self.coverage_resolution = float(coverage_resolution)
         self.coverage_probes = int(coverage_probes)
-        if self.coverage_resolution <= 0 or self.coverage_probes < 0:
-            raise ValueError("coverage-resolution must be positive and "
-                             "coverage-probes not negative")
+        if self.coverage_resolution < 0 or self.coverage_probes < 0:
+            raise ValueError("coverage-resolution and coverage-probes must "
+                             "not be negative")
         self._dist = None
         self.linear_posterior = bool(linear_posterior)
         self.linear_cap = float(linear_cap)
@@ -893,8 +893,12 @@ class AMRSampler(BaseSampler):
     def _box_probes(self, index):
         """Each box's probe points in its box coordinates, ``(n, k,
         ndim)``: :meth:`_probe_offsets` and, once a peak is known, the box's
-        point nearest it (a narrow ridge through a large box can pass
-        between its faces' centres and corners)."""
+        point nearest it. Nearest in the template metric when the bound
+        gives one (``box_snr_bound.metric``): a match with the signal falls
+        with the metric distance from its peak, so its largest value over a
+        box is there (cover6 toy, 2026-11-19: the Euclidean nearest point of
+        a box in a sheared chart missed the peak and the box was certified,
+        ln Z 1-2 low); and the Euclidean nearest point too."""
         off = self._probe_offsets()
         centre = self._lower[index] + 0.5 * self._width[index]
         s = centre[:, None, :] + 0.5 * off[None] * self._width[index][:, None, :]
@@ -902,10 +906,31 @@ class AMRSampler(BaseSampler):
             with numpy.errstate(invalid='ignore'):
                 sp = self._unmap(numpy.asarray(self._peak_cube)[None])[0]
             if numpy.all(numpy.isfinite(sp)):
-                near = numpy.clip(sp[None], self._lower[index],
-                                  self._lower[index] + self._width[index])
-                s = numpy.concatenate([s, near[:, None, :]], axis=1)
+                lo = self._lower[index]
+                hi = lo + self._width[index]
+                near = [numpy.clip(sp[None], lo, hi)]
+                metric = self._probe_metric()
+                if metric is not None:
+                    near.append(_nearest_in_boxes(metric, sp, lo, hi))
+                s = numpy.concatenate([s] + [x[:, None, :] for x in near],
+                                      axis=1)
         return centre, s
+
+    def _probe_metric(self):
+        """``box_snr_bound.metric`` (in the chart's coordinates for a chart
+        tree, else in the parameters) in the box coordinates, or None."""
+        given = getattr(self.box_snr_bound or self.box_distance, 'metric',
+                        None)
+        if given is None:
+            return None
+        if self.coverage_chart:
+            scale = numpy.asarray(self.frame['span'], dtype=float)
+        else:
+            bottom = numpy.array(self._prior_transform(numpy.zeros(self.ndim)))
+            top = numpy.array(self._prior_transform(numpy.ones(self.ndim)))
+            scale = top - bottom
+        g = numpy.asarray(given, dtype=float)
+        return scale[:, None] * g * scale[None, :]
 
     def _box_thetas(self, index):
         """The parameters at each box's centre and probes (beyond the prior
@@ -2065,6 +2090,34 @@ class AMRSampler(BaseSampler):
 
 def _boolean(value):
     return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _nearest_in_boxes(metric, point, lower, upper, sweeps=200):
+    """The point of each box ``[lower, upper]`` (rows) nearest ``point`` in
+    the quadratic form ``metric``: the box-constrained least squares
+    ``min (x - p)^T G (x - p)``, solved by cyclic coordinate descent (each
+    step the exact minimum along one coordinate, clipped to the box; it
+    converges for a positive semidefinite G). Directions of no information
+    (``G_ii = 0``) keep the point's own coordinate, clipped."""
+    g = numpy.asarray(metric, dtype=float)
+    g = 0.5 * (g + g.T)
+    diag = numpy.diag(g).copy()
+    x = numpy.clip(numpy.asarray(point, dtype=float)[None], lower, upper)
+    p = numpy.asarray(point, dtype=float)
+    free = diag > 0
+    for _ in range(int(sweeps)):
+        moved = 0.0
+        for i in numpy.flatnonzero(free):
+            r = (x - p) @ g[:, i] - (x[:, i] - p[i]) * g[i, i]
+            new = numpy.clip(p[i] - r / g[i, i], lower[:, i], upper[:, i])
+            moved = max(moved, float(numpy.max(numpy.abs(new - x[:, i])
+                                               / numpy.maximum(upper[:, i]
+                                                               - lower[:, i],
+                                                               1e-300))))
+            x[:, i] = new
+        if moved < 1e-9:
+            break
+    return x
 
 
 def _climb(f, x, prior_precision, metric=None, resolve=None, top=1e-1,
