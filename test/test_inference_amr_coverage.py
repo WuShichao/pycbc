@@ -127,13 +127,34 @@ class FilterRidge(BaseModel):
         return 0.5 * max(PEAK - RHO * ridge_metric(x - MEAN), 0.0) ** 2
 
 
+class RidgeBound(object):
+    """The SNR bound as the driver builds it, with each probe's distance:
+    the local one, and the global one relative to the signal's estimate
+    (the AMR's, through ``at_peak``): by the triangle inequality in the
+    ridge's metric, ``rho(x) <= max(PEAK - RHO m(x - est), 0) + mu`` with the
+    misfit ``mu = RHO m(est - MEAN)`` (no noise here). Its ``metric`` puts
+    the AMR's peak probe at each box's metric-nearest point to the estimate."""
+
+    def __init__(self):
+        self.est = numpy.array(MEAN, dtype=float)
+        # the metric in the parameters: the ridge's, at SNR RHO
+        self.metric = RHO ** 2 * (numpy.outer(NORMAL, NORMAL)
+                                  + EPS ** 2 * numpy.outer(ALONG, ALONG))
+
+    def at_peak(self, theta):
+        self.est = numpy.asarray(theta, dtype=float)
+
+    def __call__(self, centre, probes, rho):
+        pts = numpy.concatenate([centre[:, None, :], probes], axis=1)
+        mu = RHO * ridge_metric(self.est - MEAN)
+        top = (numpy.maximum(PEAK - RHO * ridge_metric(pts - self.est), 0).max(
+            axis=1) + mu)
+        d = RHO * ridge_metric(probes - centre[:, None, :])
+        return numpy.minimum(rho + d.max(axis=1), top), d.max(axis=1), d
+
+
 def ridge_bound(centre, probes, rho):
-    """The SNR bound with each probe's distance: the local one, and the
-    global one, the match with the signal at the probes (no noise)."""
-    pts = numpy.concatenate([centre[:, None, :], probes], axis=1)
-    top = numpy.maximum(PEAK - RHO * ridge_metric(pts - MEAN), 0).max(axis=1)
-    d = RHO * ridge_metric(probes - centre[:, None, :])
-    return numpy.minimum(rho + d.max(axis=1), top), d.max(axis=1), d
+    return RidgeBound()(centre, probes, rho)
 
 
 def ridge_exact():
@@ -155,10 +176,12 @@ def test_the_bound_follows_a_thin_oblique_ridge_from_its_start():
     prior = JointDistribution(
         ['x', 'y'], Uniform(x=(-HALF, HALF)), Uniform(y=(-HALF, HALF)))
     start = (numpy.array(MEAN) + 3 * ALONG + HALF) / (2 * HALF)
+    bound = RidgeBound()
+    bound.at_peak(-HALF + 2 * HALF * start)
     sampler = AMRSampler(FilterRidge(['x', 'y'], prior=prior),
                          initial_divisions=1, mass_fraction=1e-4,
                          max_evaluations=40000, posterior_samples=2000,
-                         seed=2, box_snr_bound=ridge_bound, start_cube=start)
+                         seed=2, box_snr_bound=bound, start_cube=start)
     sampler.run()
     assert sampler.diagnostics['stopped_by'] == 'convergence'
     assert sampler.diagnostics['coverage_peak_moves'] >= 1
@@ -180,9 +203,11 @@ def test_the_tree_proposal_gives_the_evidence_by_importance_sampling():
         ['x', 'y'], Uniform(x=(-HALF, HALF)), Uniform(y=(-HALF, HALF)))
     m = FilterRidge(['x', 'y'], prior=prior)
     start = (numpy.array(MEAN) + 3 * ALONG + HALF) / (2 * HALF)
+    bound = RidgeBound()
+    bound.at_peak(-HALF + 2 * HALF * start)
     sampler = AMRSampler(m, initial_divisions=1, mass_fraction=1e-4,
                          max_evaluations=40000, posterior_samples=2000,
-                         seed=2, box_snr_bound=ridge_bound, start_cube=start)
+                         seed=2, box_snr_bound=bound, start_cube=start)
     sampler.run()
     cube, logq = sampler.tree_proposal(20000, numpy.random.default_rng(5))
     x = -HALF + 2 * HALF * cube

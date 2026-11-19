@@ -290,6 +290,8 @@ class AMRSampler(BaseSampler):
                              "or check points")
         self._peak_cube = None
         self._peak_logl = -numpy.inf
+        # the evidence so far, for certifying new boxes before evaluating them
+        self._current_logz = -numpy.inf
         # the coverage tree in the model's curvilinear coordinates (see
         # _chart_frame) rather than the prior cube
         # True: the model's curvilinear coordinates; a matrix A: the affine
@@ -536,7 +538,14 @@ class AMRSampler(BaseSampler):
         """The log likelihood of each box of ``index`` at its centre, or,
         when the centre lies beyond the prior, at the box's point nearest it
         of those :meth:`_volume` finds inside; and the box's mean Jacobian
-        over the prior."""
+        over the prior. Under a coverage bound a box the bound alone
+        certifies (:meth:`_certify`) is not evaluated."""
+        index = numpy.asarray(index)
+        if self.box_snr_bound is not None and numpy.isfinite(
+                self._current_logz) and len(index):
+            index = self._certify(index)
+            if not len(index):
+                return
         centre = self._lower[index] + 0.5 * self._width[index]
         cube, logjac = self._map(centre)
         out = ~(numpy.all((cube >= 0) & (cube <= 1), axis=1)
@@ -809,6 +818,7 @@ class AMRSampler(BaseSampler):
         self._dist = numpy.full(len(self._lower), numpy.nan)
         self._snr = numpy.full(len(self._lower), numpy.nan)
         self._axis_dist = numpy.full((len(self._lower), self.ndim), numpy.nan)
+        self._certified = numpy.zeros(len(self._lower), dtype=bool)
         if evaluate:
             self._evaluate_leaves()
 
@@ -828,6 +838,7 @@ class AMRSampler(BaseSampler):
             logmass = self._log_mass(leaves)
             logz = logsumexp(logmass)
             self.history.append((len(leaves), self.nevaluations, logz))
+            self._current_logz = logz
             refine = self._logerr[leaves] - logz > threshold
             refine |= self._neighbour_flags(leaves, logmass - logz > threshold,
                                             logz + threshold)
@@ -1168,6 +1179,42 @@ class AMRSampler(BaseSampler):
                    - numpy.sum(numpy.log(self._width[box]), axis=1) - logjac)
         return out
 
+    def _certify(self, index):
+        """Of new boxes ``index``, those the coverage bound certifies without
+        a likelihood value: the bound with no centre value (the global part,
+        an infinite centre SNR), times the box's prior mass, below
+        ``mass_fraction`` of the evidence so far. They are marked certified,
+        given no value (no mass in the evidence; the bound's share of the
+        tree proposal keeps them sampled) and not refined. Returns the rest,
+        to evaluate. A likelihood is computed only where the certificate
+        cannot exclude posterior mass (cover7, 2026-11-19: 1350-2680 s of
+        2130-3590 s went on direct evaluations of far boxes outside the
+        shared region)."""
+        mean, _, _, _ = self._volume(index)
+        logvol = numpy.sum(numpy.log(self._width[index]), axis=1) + mean
+        if self.coverage_chart:
+            missing = ~numpy.isfinite(logvol)
+            if missing.any():
+                lv, held = self._chart_prior_mass(index[missing])
+                logvol[missing] = numpy.where(held, lv, -numpy.inf)
+        snr, dist, axis = self._box_snr_bounds(index, numpy.full(len(index),
+                                                                 numpy.inf))
+        with numpy.errstate(invalid='ignore'):
+            top = 0.5 * snr ** 2 - self._kappa(snr)
+            bound = numpy.where(numpy.isfinite(top), top, numpy.inf) + logvol
+        ok = (bound - self._current_logz < numpy.log(self.mass_fraction)) \
+            | ~numpy.isfinite(logvol)
+        done = index[ok]
+        self._certified[done] = True
+        self._logl[done] = -numpy.inf
+        self._logjac[done] = mean[ok]
+        self._snr[done], self._dist[done] = snr[ok], dist[ok]
+        self._axis_dist[done] = axis[ok]
+        self._diagnostics['coverage_certified_unevaluated'] = \
+            self._diagnostics.get('coverage_certified_unevaluated', 0) + int(
+                ok.sum())
+        return index[~ok]
+
     def _coverage_flags(self, leaves, logz, threshold):
         """The coverage bound of each leaf's mass, ``ln`` of its largest
         likelihood (:meth:`_coverage_bound`) times its volume, and the flag
@@ -1191,7 +1238,7 @@ class AMRSampler(BaseSampler):
                         coverage_empty_boxes=int((~held).sum()),
                         coverage_prior_draws=int(self._chart_ndraw))
             need = leaves[numpy.isnan(self._snr[leaves])
-                          & numpy.isfinite(logvol)]
+                          & numpy.isfinite(logvol) & ~self._certified[leaves]]
             if len(need):
                 rho = self._snr_of(self._logl[need])
                 (self._snr[need], self._dist[need],
@@ -1218,8 +1265,9 @@ class AMRSampler(BaseSampler):
         # its mass counted nowhere but the bound) is refined whatever its
         # distance, until its halves have values: the resolution leaves a box
         # to the midpoint rules, which need its value
-        unresolved |= ~numpy.isfinite(self._logl[leaves]) & numpy.isfinite(bound)
-        cover = (bound - logz > threshold) & unresolved
+        unresolved |= (~numpy.isfinite(self._logl[leaves]) & numpy.isfinite(bound)
+                       & ~self._certified[leaves])
+        cover = (bound - logz > threshold) & unresolved & ~self._certified[leaves]
         # the most mass the boxes left unresolved could hold, as a fraction
         # of Z: the guarantee the refinement gives on stopping
         if unresolved.any() and numpy.isfinite(bound[unresolved]).any():
@@ -1719,6 +1767,11 @@ class AMRSampler(BaseSampler):
                 coarseness = (self._width[found] * self._scale).max(axis=1)
                 coarse = ((coarseness > 2 * size[inside])
                           & (self._logl[origin] + logvol > logbound))
+                # a certified box has no value: it is not refined for being
+                # coarse, and there is no step to it
+                cert = getattr(self, '_certified', None)
+                if cert is not None and len(cert) == len(self._lower):
+                    coarse &= ~cert[found]
                 flag[found[coarse]] = True
                 with numpy.errstate(invalid='ignore'):
                     step = ~(numpy.abs(self._logl[origin] - self._logl[found])
@@ -1726,6 +1779,8 @@ class AMRSampler(BaseSampler):
                 # two boxes outside the likelihood's support do not step
                 step &= numpy.isfinite(self._logl[origin])
                 step &= flag_significant[origin]
+                if cert is not None and len(cert) == len(self._lower):
+                    step &= ~cert[found]
                 flag[origin[step]] = True
                 flag[found[step & (coarseness >= size[inside])]] = True
         return flag[leaves]
@@ -1770,6 +1825,8 @@ class AMRSampler(BaseSampler):
                                        numpy.full(2 * len(index), numpy.nan)])
         self._axis_dist = numpy.vstack([self._axis_dist, numpy.full(
             (2 * len(index), self.ndim), numpy.nan)])
+        self._certified = numpy.concatenate([self._certified, numpy.zeros(
+            2 * len(index), dtype=bool)])
         self._children = numpy.vstack([self._children,
                                        numpy.full((2 * len(index), 2), -1)])
         return first, second
