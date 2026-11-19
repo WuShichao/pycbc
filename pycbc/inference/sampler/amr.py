@@ -828,6 +828,18 @@ class AMRSampler(BaseSampler):
             room = (budget - self.nevaluations) // 2
             if len(refine) == 0 or room <= 0:
                 return leaves, logmass, logz, refine
+            if bound is not None:
+                # best first: of the flagged boxes, those whose bound is within
+                # a factor 1 / mass_fraction of the largest, at most a batch;
+                # the evidence found where the bound is largest then prunes
+                # the rest (cover4, 2026-11-19: with every flagged box split
+                # each round, Z stayed near 0 and the whole prior was halved
+                # uniformly)
+                top = numpy.max(bound)
+                if numpy.isfinite(top):
+                    near = bound >= top + threshold
+                    refine, bound = refine[near], bound[near]
+                room = min(room, self.coverage_batch)
             if len(refine) > room:
                 priority = numpy.maximum(self._logerr[refine],
                                          self._log_mass(refine))
@@ -940,6 +952,8 @@ class AMRSampler(BaseSampler):
     coverage_peak_step = 2.0
     #: evaluations after which the coverage tree's region is first shared
     coverage_share_after = 2000
+    #: the most boxes the coverage bound splits per round, largest bound first
+    coverage_batch = 256
 
     def _update_peak(self, leaves):
         """Move the signal's estimate to the box with the largest ln L once
@@ -1000,28 +1014,17 @@ class AMRSampler(BaseSampler):
         d = numpy.where(numpy.isnan(d), numpy.inf, d)
         return d.max(axis=1)
 
-    def tree_proposal(self, n, rng=None, bound_share=0.1):
-        """``n`` draws from the tree's leaves as a proposal of exact
-        density, for importance sampling: a leaf chosen with probability
-        ``(1 - bound_share)`` of its midpoint mass and ``bound_share`` of its
-        coverage-bound mass (each normalised over the leaves), a point
-        uniform inside it. Returns the cube points and ``ln q`` there (the
-        density in the cube, piecewise constant).
-
-        The bound's share bounds the importance weights: in a box b,
-        ``L(x) / q(x) <= exp(U_b) V_b / (bound_share exp(U_b) V_b / B) =
-        B / bound_share`` with ``B`` the bound's total mass, so no box the
-        midpoints undervalue can give one weight that dominates."""
+    def _tree_weights(self, bound_share):
+        """The leaves, each one's probability in the tree proposal and its
+        log volume in the cube (see :meth:`tree_proposal`)."""
         if self._curve is not None:
             raise ValueError("a tree proposal needs boxes that are uniform "
                              "in the cube (no curvilinear frame)")
-        rng = numpy.random.default_rng(self.seed + 23) if rng is None else rng
         leaves = self._leaves()
         logvol = (numpy.sum(numpy.log(self._width[leaves]), axis=1)
                   + self._logjac[leaves])
         mid = self._log_mass(leaves)
         logp = mid - logsumexp(mid[numpy.isfinite(mid)])
-        bound = None
         if self._coverage and bound_share > 0:
             top = 0.5 * self._snr[leaves] ** 2 - self.coverage_kappa
             bound = numpy.where(numpy.isfinite(top) & numpy.isfinite(logvol),
@@ -1031,7 +1034,24 @@ class AMRSampler(BaseSampler):
                 logp = numpy.logaddexp(numpy.log1p(-bound_share) + logp,
                                        numpy.log(bound_share) + bound)
         p = numpy.exp(logp - logsumexp(logp))
-        p /= p.sum()
+        return leaves, p / p.sum(), logvol
+
+    def tree_proposal(self, n, rng=None, bound_share=0.1):
+        """``n`` draws from the tree's leaves as a proposal of exact
+        density, for importance sampling: a leaf chosen with probability
+        ``(1 - bound_share)`` of its midpoint mass and ``bound_share`` of its
+        coverage-bound mass (each normalised over the leaves), a point
+        uniform inside it. Returns the cube points and ``ln q`` there (the
+        density in the cube, piecewise constant); :meth:`tree_log_density`
+        gives it at any point, for mixing the tree with other proposals.
+
+        The bound's share bounds the importance weights: in a box b,
+        ``L(x) / q(x) <= exp(U_b) V_b / (bound_share exp(U_b) V_b / B) =
+        B / bound_share`` with ``B`` the bound's total mass, so no box the
+        midpoints undervalue can give one weight that dominates."""
+        rng = numpy.random.default_rng(self.seed + 23) if rng is None else rng
+        leaves, p, logvol = self._tree_weights(bound_share)
+        self._tree = (leaves, p, logvol, bound_share)
         pick = rng.choice(len(leaves), size=int(n), p=p)
         box = leaves[pick]
         s = self._lower[box] + rng.random((len(box), self.ndim)) \
@@ -1041,6 +1061,30 @@ class AMRSampler(BaseSampler):
         self._diagnostics.update(tree_proposal_boxes=int(len(numpy.unique(
             box))), tree_proposal_bound_share=float(bound_share))
         return cube, logq
+
+    def tree_log_density(self, cube, bound_share=None):
+        """``ln q`` of the tree proposal (:meth:`tree_proposal`, the last
+        one's share unless ``bound_share`` is given) at cube points;
+        ``-inf`` outside the tree."""
+        if bound_share is None and getattr(self, '_tree', None) is not None:
+            leaves, p, logvol, _ = self._tree
+        else:
+            leaves, p, logvol = self._tree_weights(
+                0.1 if bound_share is None else bound_share)
+        cube = numpy.atleast_2d(numpy.asarray(cube, dtype=float))
+        out = numpy.full(len(cube), -numpy.inf)
+        with numpy.errstate(invalid='ignore'):
+            s = self._unmap(cube)
+        ok = numpy.all(numpy.isfinite(s) & (s >= 0) & (s <= 1), axis=1)
+        found = numpy.full(len(cube), -1)
+        found[ok] = self._locate(s[ok])
+        row = numpy.full(len(self._lower), -1)
+        row[leaves] = numpy.arange(len(leaves))
+        hit = found >= 0
+        k = row[found[hit]]
+        out[numpy.flatnonzero(hit)[k >= 0]] = (numpy.log(p[k[k >= 0]])
+                                               - logvol[k[k >= 0]])
+        return out
 
     def _coverage_flags(self, leaves, logz, threshold):
         """The coverage bound of each leaf's mass, ``ln`` of its largest

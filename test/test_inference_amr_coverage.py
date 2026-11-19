@@ -195,3 +195,4 @@ def test_the_tree_proposal_gives_the_evidence_by_importance_sampling():
     assert logz == pytest.approx(ridge_exact()[0], abs=0.03)
     assert ess > 0.5 * len(logw)
     assert numpy.all((cube >= 0) & (cube <= 1))
+    assert sampler.tree_log_density(cube) == pytest.approx(logq)
