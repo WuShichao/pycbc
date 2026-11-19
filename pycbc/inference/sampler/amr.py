@@ -270,7 +270,7 @@ class AMRSampler(BaseSampler):
                  final_share_frame_radius=None, linear_posterior=False,
                  linear_cap=10.0, box_distance=None, coverage_kappa=0.0,
                  coverage_resolution=0.5, coverage_probes=4,
-                 box_snr_bound=None):
+                 box_snr_bound=None, coverage_chart=False):
         super().__init__(model)
         # the coverage bound (see _coverage_bound): a box is refined while
         # the most posterior mass its template distance allows exceeds
@@ -290,6 +290,11 @@ class AMRSampler(BaseSampler):
                              "or check points")
         self._peak_cube = None
         self._peak_logl = -numpy.inf
+        # the coverage tree in the model's curvilinear coordinates (see
+        # _chart_frame) rather than the prior cube
+        self.coverage_chart = bool(coverage_chart)
+        if self.coverage_chart and not self._coverage:
+            raise ValueError("coverage_chart is for a coverage bound's tree")
         self.coverage_kappa = float(coverage_kappa)
         self.coverage_resolution = float(coverage_resolution)
         self.coverage_probes = int(coverage_probes)
@@ -679,6 +684,8 @@ class AMRSampler(BaseSampler):
                                                 self.start_cube]),
                                   numpy.concatenate([self._explored[1],
                                                      logl]))
+        if self.coverage_chart:
+            self._chart_frame()
         if self._coverage and self.start_cube is not None:
             # the start the peak's first estimate (see _update_peak)
             best = int(numpy.argmax(self._explored[1]))
@@ -1017,9 +1024,9 @@ class AMRSampler(BaseSampler):
     def _tree_weights(self, bound_share):
         """The leaves, each one's probability in the tree proposal and its
         log volume in the cube (see :meth:`tree_proposal`)."""
-        if self._curve is not None:
-            raise ValueError("a tree proposal needs boxes that are uniform "
-                             "in the cube (no curvilinear frame)")
+        if self._curve is not None and not self.coverage_chart:
+            raise ValueError("a tree proposal needs the cube's or the "
+                             "coverage chart's boxes")
         leaves = self._leaves()
         logvol = (numpy.sum(numpy.log(self._width[leaves]), axis=1)
                   + self._logjac[leaves])
@@ -1056,8 +1063,12 @@ class AMRSampler(BaseSampler):
         box = leaves[pick]
         s = self._lower[box] + rng.random((len(box), self.ndim)) \
             * self._width[box]
-        cube, _ = self._map(s)
-        logq = numpy.log(p[pick]) - logvol[pick]
+        cube, logjac = self._map(s)
+        # uniform in the box coordinates: q(u) = p_b / prod(width_b) / |du/ds|
+        # (a draw beyond the prior, possible in a chart's box, comes back
+        # outside the cube or nan: weight 0)
+        logq = (numpy.log(p[pick])
+                - numpy.sum(numpy.log(self._width[box]), axis=1) - logjac)
         self._diagnostics.update(tree_proposal_boxes=int(len(numpy.unique(
             box))), tree_proposal_bound_share=float(bound_share))
         return cube, logq
@@ -1082,8 +1093,11 @@ class AMRSampler(BaseSampler):
         row[leaves] = numpy.arange(len(leaves))
         hit = found >= 0
         k = row[found[hit]]
-        out[numpy.flatnonzero(hit)[k >= 0]] = (numpy.log(p[k[k >= 0]])
-                                               - logvol[k[k >= 0]])
+        at = numpy.flatnonzero(hit)[k >= 0]
+        box = leaves[k[k >= 0]]
+        _, logjac = self._map(s[at])
+        out[at] = (numpy.log(p[k[k >= 0]])
+                   - numpy.sum(numpy.log(self._width[box]), axis=1) - logjac)
         return out
 
     def _coverage_flags(self, leaves, logz, threshold):
@@ -1343,6 +1357,70 @@ class AMRSampler(BaseSampler):
             # refinement past them
             self._share_ball(low, span, self._ball * radius)
         self._start_frame(low, span, radius)
+
+    def _chart_frame(self, prior_draws=20000):
+        """The coverage tree's boxes in the model's curvilinear coordinates
+        ``y`` (``model.curvilinear_coordinates``: for a template family its
+        phase coordinates, the chart a search lattice is laid in), over the
+        bound of the prior's image there: ``y = low + span s``, no climb and
+        no whitening. Where the template's phase is nearly linear in ``y``
+        the posterior's thin directions are nearly along its axes; in the
+        prior cube they are oblique (cover5 pp 63, 2026-11-19: Fisher
+        eigenvalues 0 to 3e9, the posterior a sheet in (mchirp, e, chi_eff)
+        that 10000 axis-aligned boxes did not resolve, ESS 15). Unlike a
+        Laplace-whitened frame, whose bound was 1e7 posterior widths along a
+        zero-information direction, the image fills much of this bound."""
+        coords = self.model.curvilinear_coordinates
+        names = list(self.model.variable_params)
+        idx = [names.index(n) for n in coords.names]
+        bottom = numpy.array(self._prior_transform(numpy.zeros(self.ndim)))
+        top = numpy.array(self._prior_transform(numpy.ones(self.ndim)))
+        prior_range = top - bottom
+
+        def to_y(theta):
+            y = numpy.array(theta, dtype=float, copy=True)
+            y[:, idx] = coords.forward(theta[:, idx])
+            return y
+
+        def from_y(y):
+            theta = numpy.array(y, dtype=float, copy=True)
+            theta[:, idx] = coords.inverse(y[:, idx])
+            return theta
+        from scipy.stats import qmc
+        draws = bottom + qmc.Sobol(self.ndim, seed=self.seed + 19).random_base2(
+            int(numpy.ceil(numpy.log2(prior_draws)))) * prior_range
+        if hasattr(coords, 'fit'):
+            coords.fit(draws[:, idx])
+        image = to_y(draws)
+        image = image[numpy.all(numpy.isfinite(image), axis=1)]
+        low, high = image.min(axis=0), image.max(axis=0)
+        span = high - low
+        low, span = low - 0.01 * span, 1.02 * span
+        logdet = float(numpy.sum(numpy.log(span))
+                       - numpy.sum(numpy.log(prior_range)))
+
+        def curve(s):
+            theta = from_y(low + span * s)
+            cube = (theta - bottom) / prior_range
+            logjac = logdet + coords.log_jacobian(theta[:, idx])
+            bad = ~numpy.all(numpy.isfinite(theta), axis=1)
+            cube[bad] = numpy.nan
+            logjac = numpy.where(bad, -numpy.inf, logjac)
+            return cube, logjac
+
+        def uncurve(cube):
+            with numpy.errstate(invalid='ignore'):
+                y = to_y(bottom + cube * prior_range)
+            return (y - low) / span
+        self._curve, self._uncurve = curve, uncurve
+        self._scale = numpy.ones(self.ndim)
+        self.frame = dict(mean=numpy.zeros(self.ndim), chol=numpy.eye(self.ndim),
+                          low=low, span=span, names=names,
+                          coords=list(coords.names), chart=True)
+        self._diagnostics.update(chart_log_volume=float(numpy.sum(numpy.log(
+            span))))
+        logging.info("AMR coverage: the tree in the chart %s over the prior's"
+                     " image's bound", list(coords.names))
 
     def _share_ball(self, low, span, radius):
         """Hand the model, before the frame's first boxes are evaluated, the

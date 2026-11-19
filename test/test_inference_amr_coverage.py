@@ -196,3 +196,91 @@ def test_the_tree_proposal_gives_the_evidence_by_importance_sampling():
     assert ess > 0.5 * len(logw)
     assert numpy.all((cube >= 0) & (cube <= 1))
     assert sampler.tree_log_density(cube) == pytest.approx(logq)
+
+
+
+class Mixed(object):
+    """Curvilinear coordinates in which a sheet oblique in the parameters is
+    along an axis: y1 = x + 3 y + 0.02 y^2 (thin), y2 = y."""
+    names = ('x', 'y')
+
+    def forward(self, theta):
+        theta = numpy.atleast_2d(theta)
+        return numpy.column_stack([theta[:, 0] + 3 * theta[:, 1]
+                                   + 0.02 * theta[:, 1] ** 2, theta[:, 1]])
+
+    def inverse(self, y):
+        y = numpy.atleast_2d(y)
+        return numpy.column_stack([y[:, 0] - 3 * y[:, 1] - 0.02 * y[:, 1] ** 2,
+                                   y[:, 1]])
+
+    def log_jacobian(self, theta):
+        return numpy.zeros(len(numpy.atleast_2d(theta)))
+
+
+SHEET = numpy.array([400.0, 4.0])      # SNR per unit of y1 and y2
+
+
+def sheet_metric(theta, at):
+    c = Mixed()
+    d = c.forward(theta.reshape(-1, 2)) - c.forward(at.reshape(-1, 2))
+    return numpy.sqrt(numpy.sum((d * SHEET) ** 2, axis=1)).reshape(
+        theta.shape[:-1])
+
+
+class FilterSheet(BaseModel):
+    name = 'test_filter_sheet'
+
+    def _loglikelihood(self):
+        x = numpy.array([self.current_params[p] for p in ('x', 'y')])
+        return 0.5 * max(PEAK - sheet_metric(x, numpy.array(MEAN)), 0.0) ** 2
+
+
+def sheet_bound(centre, probes, rho):
+    pts = numpy.concatenate([centre[:, None, :], probes], axis=1)
+    top = numpy.maximum(PEAK - sheet_metric(pts, numpy.array(MEAN)[None, None]
+                                            .repeat(pts.shape[0], 0)
+                                            .repeat(pts.shape[1], 1)), 0)
+    d = sheet_metric(probes, centre[:, None, :].repeat(probes.shape[1], 1))
+    return numpy.minimum(rho + d.max(axis=1), top.max(axis=1)), d.max(axis=1), d
+
+
+def sheet_logz(n=6001):
+    g = numpy.linspace(-HALF, HALF, n)
+    x, y = numpy.meshgrid(g, g)
+    pts = numpy.stack([x, y], axis=-1)
+    logl = 0.5 * numpy.maximum(PEAK - sheet_metric(
+        pts, numpy.broadcast_to(numpy.array(MEAN), pts.shape)), 0) ** 2
+    top = logl.max()
+    return top + numpy.log(numpy.trapz(numpy.trapz(numpy.exp(logl - top), g), g)
+                           / (2 * HALF) ** 2)
+
+
+def sheet_run(chart):
+    prior = JointDistribution(
+        ['x', 'y'], Uniform(x=(-HALF, HALF)), Uniform(y=(-HALF, HALF)))
+    m = FilterSheet(['x', 'y'], prior=prior)
+    m.curvilinear_coordinates = Mixed()
+    start = (numpy.array(MEAN) + HALF) / (2 * HALF)
+    sampler = AMRSampler(m, initial_divisions=1, mass_fraction=1e-4,
+                         max_evaluations=40000, posterior_samples=2000,
+                         seed=2, box_snr_bound=sheet_bound, start_cube=start,
+                         coverage_chart=chart, coverage_resolution=3.0)
+    sampler.run()
+    return sampler
+
+
+def test_the_chart_tree_resolves_an_oblique_sheet_with_fewer_boxes():
+    cube, chart = sheet_run(False), sheet_run(True)
+    exact = sheet_logz()
+    assert chart.logz == pytest.approx(exact, abs=0.1)
+    assert chart.diagnostics['evaluations'] < cube.diagnostics['evaluations']
+    # the chart tree's proposal: exact density (with the map's Jacobian)
+    u, logq = chart.tree_proposal(20000, numpy.random.default_rng(4))
+    ok = numpy.all((u >= 0) & (u <= 1), axis=1)
+    assert chart.tree_log_density(u[ok]) == pytest.approx(logq[ok])
+    x = -HALF + 2 * HALF * u[ok]
+    logl = 0.5 * numpy.maximum(PEAK - sheet_metric(
+        x, numpy.broadcast_to(numpy.array(MEAN), x.shape)), 0) ** 2
+    logz = logsumexp(logl - logq[ok]) - numpy.log(len(u))
+    assert logz == pytest.approx(exact, abs=0.05)
