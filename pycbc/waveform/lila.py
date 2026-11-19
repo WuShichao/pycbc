@@ -166,15 +166,31 @@ def _lila_response_core(fm, base_approximant, mode_array, ref_position,
 
     det = _get_cached_detector(longitude_site, latitude_site, orientation,
                                arm_length, cadence)
-    if channel_set.upper() == "LDC":
-        channels, prefix = det.ldc_channels, "LILA_"
-        pattern_fn = det.ldc_antenna_pattern
-    else:
-        channels, prefix = det.channels, "LILA_"
-        pattern_fn = det.antenna_pattern
+
+    requested = channel_set.upper()
+    if requested not in ("GDC", "LDC", "ALL"):
+        raise ValueError("channel_set must be 'GDC', 'LDC' or 'ALL'")
+
+    # Each entry: (channel names, pattern function, delay-weight map).
+    # A GDC vertex sits at one point, so it takes that vertex's delay. An
+    # LDC baseline spans two vertices, so it takes their mean: the
+    # measured quantity is the differential motion of the two ends, whose
+    # natural timing reference is the midpoint. The two ends differ by at
+    # most L/c = 133 us, so the choice matters only at that level, but the
+    # midpoint is the defensible one.
+    sets = []
+    if requested in ("GDC", "ALL"):
+        sets.append((det.channels, det.antenna_pattern,
+                     {c: (c,) for c in det.channels}))
+    if requested in ("LDC", "ALL"):
+        verts = det.channels
+        sets.append((det.ldc_channels, det.ldc_antenna_pattern,
+                     {c: (verts[i], verts[(i + 1) % 3])
+                      for i, c in enumerate(det.ldc_channels)}))
 
     modes = mode_array if mode_array else [(2, 2)]
-    totals = {c: np.zeros(len(fm), dtype=complex) for c in channels}
+    all_channels = [c for chans, _, _ in sets for c in chans]
+    totals = {c: np.zeros(len(fm), dtype=complex) for c in all_channels}
 
     for ell, m in modes:
         hp_lm, hc_lm = get_fd_waveform_sequence(
@@ -187,7 +203,6 @@ def _lila_response_core(fm, base_approximant, mode_array, ref_position,
         t_rel = _time_of_f_local(fm, base_approximant, (ell, m), cbc_params)
         t_det = t_ssb_merger + t_rel
 
-        patterns = pattern_fn(ra, dec, psi, t_det)
         delays = det.vertex_delays(lamb, beta, t_det)
 
         # Anchor the waveform's coalescence reference, which
@@ -196,16 +211,21 @@ def _lila_response_core(fm, base_approximant, mode_array, ref_position,
         hp_arr = hp_lm.numpy() * shift
         hc_arr = hc_lm.numpy() * shift
 
-        for idx, chan in enumerate(channels):
-            fplus, fcross = patterns[chan]
-            # A time delay is an exact phase factor in the frequency
-            # domain; under the SPA a time-*varying* delay is applied by
-            # evaluating it at the epoch each frequency corresponds to.
-            delay = delays[det.channels[idx]]
-            phase = np.exp(-2j * np.pi * fm * delay)
-            totals[chan] += phase * (hp_arr * fplus + hc_arr * fcross)
+        for chans, pattern_fn, delay_map in sets:
+            patterns = pattern_fn(ra, dec, psi, t_det)
+            for chan in chans:
+                fplus, fcross = patterns[chan]
+                # A time delay is an exact phase factor in the frequency
+                # domain; under the SPA a time-*varying* delay is applied
+                # by evaluating it at the epoch each frequency
+                # corresponds to.
+                refs = delay_map[chan]
+                delay = sum(delays[r] for r in refs) / len(refs)
+                phase = np.exp(-2j * np.pi * fm * delay)
+                totals[chan] += phase * (hp_arr * fplus
+                                         + hc_arr * fcross)
 
-    return {prefix + c: totals[c] for c in channels}
+    return {"LILA_" + c: totals[c] for c in all_channels}
 
 
 def lila_fd_response(ifos=None, sample_points=None, delta_f=None,
@@ -235,14 +255,19 @@ def lila_fd_response(ifos=None, sample_points=None, delta_f=None,
         Bearing of the first vertex from the centroid, in radians.
     arm_length : float
         Triangle side length in metres; 40 km for LILA Observatory.
-    channel_set : {'GDC', 'LDC'}
-        Which set of channels to return.
+    channel_set : {'GDC', 'LDC', 'ALL'}
+        Which channels to return: the three GDC vertex
+        interferometers, the three LDC baselines, or all six. 'ALL' is
+        what a joint two-channel analysis wants, and costs little extra
+        since the intrinsic waveform and the stationary-phase times are
+        computed once and shared.
 
     Returns
     -------
     dict of pycbc.types.FrequencySeries
-        Keyed 'LILA_1'/'LILA_2'/'LILA_3' for the GDC, or
-        'LILA_LDC_1'/... for the LDC.
+        Keyed 'LILA_1'/'LILA_2'/'LILA_3' for the GDC and
+        'LILA_LDC_1'/... for the LDC. Note the two sets have different
+        noise spectra, so each must be paired with its own PSD.
     """
     if base_approximant is None:
         raise ValueError("base_approximant is required")
@@ -254,6 +279,23 @@ def lila_fd_response(ifos=None, sample_points=None, delta_f=None,
 
     cbc_params = {k: v for k, v in params.items()
                   if k not in ("approximant", "base_approximant")}
+
+    # When specific channels are requested, infer which sets are needed
+    # from their names rather than relying on channel_set being threaded
+    # through. relbin asks for one ifo at a time via
+    # get_fd_det_waveform_sequence(ifos=...), with only the model's
+    # static_params to go on, so requiring channel_set there would be an
+    # easy and silent way to get a KeyError for the LDC channels.
+    if ifos is not None:
+        wanted = [ifos] if isinstance(ifos, str) else list(ifos)
+        has_ldc = any('LDC' in str(name) for name in wanted)
+        has_gdc = any('LDC' not in str(name) for name in wanted)
+        if has_ldc and has_gdc:
+            channel_set = 'ALL'
+        elif has_ldc:
+            channel_set = 'LDC'
+        elif has_gdc:
+            channel_set = 'GDC'
     # f_lower/f_ref are named arguments here, so they never reach
     # **params; the intrinsic waveform still needs them.
     cbc_params["f_lower"] = f_lower

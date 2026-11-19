@@ -116,6 +116,60 @@ class TestFDResponse(unittest.TestCase):
         self.assertEqual(sorted(out),
                          ['LILA_LDC_1', 'LILA_LDC_2', 'LILA_LDC_3'])
 
+    def test_channel_set_all_returns_both(self):
+        out = self.fd(sample_points=self.fpts, channel_set='ALL',
+                      **self.kw)
+        self.assertEqual(sorted(out),
+                         ['LILA_1', 'LILA_2', 'LILA_3',
+                          'LILA_LDC_1', 'LILA_LDC_2', 'LILA_LDC_3'])
+
+    def test_all_agrees_with_the_sets_computed_separately(self):
+        """'ALL' shares the intrinsic waveform and stationary-phase times
+        between the two channel sets, so it must give bit-comparable
+        results to computing them one at a time."""
+        both = self.fd(sample_points=self.fpts, channel_set='ALL',
+                       **self.kw)
+        for cs in ('GDC', 'LDC'):
+            one = self.fd(sample_points=self.fpts, channel_set=cs,
+                          **self.kw)
+            for name, series in one.items():
+                self.assertTrue(numpy.allclose(
+                    numpy.asarray(both[name]), numpy.asarray(series)))
+
+    def test_requested_ifos_select_the_channel_set(self):
+        """Regression: relbin calls get_fd_det_waveform_sequence with one
+        ifo and only static_params to go on, so asking for an LDC channel
+        must work without channel_set being threaded through. Before this
+        was handled, that raised KeyError('LILA_LDC_1')."""
+        for req, expect in [
+                ('LILA_1', ['LILA_1']),
+                ('LILA_LDC_2', ['LILA_LDC_2']),
+                (['LILA_1', 'LILA_LDC_3'], ['LILA_1', 'LILA_LDC_3'])]:
+            out = self.fd(sample_points=self.fpts, ifos=req, **self.kw)
+            self.assertEqual(sorted(out), sorted(expect))
+
+    def test_unknown_channel_set_rejected(self):
+        self.assertRaises(ValueError, self.fd, sample_points=self.fpts,
+                          channel_set='BOGUS', **self.kw)
+
+    def test_ldc_timing_sits_between_its_two_endpoints(self):
+        """An LDC baseline spans two vertices and takes their mean delay,
+        the midpoint being the natural reference for a differential
+        measurement. Its implied timing must therefore lie between the
+        two endpoint vertices' and not coincide with either."""
+        from pycbc.detector import SpaceDetector
+
+        det = SpaceDetector('LILA', backend='LILAResponse', **SITE).backend
+        times = numpy.array([self.kw['tc'], self.kw['tc']])
+        delays = det.vertex_delays(self.kw['eclipticlongitude'],
+                                   self.kw['eclipticlatitude'], times)
+        d1, d2 = delays['1'][0], delays['2'][0]
+        mid = 0.5 * (d1 + d2)
+        self.assertLess(abs(mid - d1), abs(d2 - d1))
+        self.assertLess(abs(mid - d2), abs(d2 - d1))
+        # and the endpoints differ, so the choice is not vacuous
+        self.assertGreater(abs(d2 - d1), 1e-9)
+
     def test_site_is_required(self):
         kw = dict(self.kw)
         kw.pop('longitude_site')
