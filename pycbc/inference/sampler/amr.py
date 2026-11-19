@@ -1000,6 +1000,48 @@ class AMRSampler(BaseSampler):
         d = numpy.where(numpy.isnan(d), numpy.inf, d)
         return d.max(axis=1)
 
+    def tree_proposal(self, n, rng=None, bound_share=0.1):
+        """``n`` draws from the tree's leaves as a proposal of exact
+        density, for importance sampling: a leaf chosen with probability
+        ``(1 - bound_share)`` of its midpoint mass and ``bound_share`` of its
+        coverage-bound mass (each normalised over the leaves), a point
+        uniform inside it. Returns the cube points and ``ln q`` there (the
+        density in the cube, piecewise constant).
+
+        The bound's share bounds the importance weights: in a box b,
+        ``L(x) / q(x) <= exp(U_b) V_b / (bound_share exp(U_b) V_b / B) =
+        B / bound_share`` with ``B`` the bound's total mass, so no box the
+        midpoints undervalue can give one weight that dominates."""
+        if self._curve is not None:
+            raise ValueError("a tree proposal needs boxes that are uniform "
+                             "in the cube (no curvilinear frame)")
+        rng = numpy.random.default_rng(self.seed + 23) if rng is None else rng
+        leaves = self._leaves()
+        logvol = (numpy.sum(numpy.log(self._width[leaves]), axis=1)
+                  + self._logjac[leaves])
+        mid = self._log_mass(leaves)
+        logp = mid - logsumexp(mid[numpy.isfinite(mid)])
+        bound = None
+        if self._coverage and bound_share > 0:
+            top = 0.5 * self._snr[leaves] ** 2 - self.coverage_kappa
+            bound = numpy.where(numpy.isfinite(top) & numpy.isfinite(logvol),
+                                top + logvol, -numpy.inf)
+            if numpy.isfinite(bound).any():
+                bound = bound - logsumexp(bound[numpy.isfinite(bound)])
+                logp = numpy.logaddexp(numpy.log1p(-bound_share) + logp,
+                                       numpy.log(bound_share) + bound)
+        p = numpy.exp(logp - logsumexp(logp))
+        p /= p.sum()
+        pick = rng.choice(len(leaves), size=int(n), p=p)
+        box = leaves[pick]
+        s = self._lower[box] + rng.random((len(box), self.ndim)) \
+            * self._width[box]
+        cube, _ = self._map(s)
+        logq = numpy.log(p[pick]) - logvol[pick]
+        self._diagnostics.update(tree_proposal_boxes=int(len(numpy.unique(
+            box))), tree_proposal_bound_share=float(bound_share))
+        return cube, logq
+
     def _coverage_flags(self, leaves, logz, threshold):
         """The coverage bound of each leaf's mass, ``ln`` of its largest
         likelihood (:meth:`_coverage_bound`) times its volume, and the flag

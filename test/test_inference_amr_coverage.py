@@ -4,6 +4,7 @@ evidence, so a peak narrower than the starting grid, unseen by every box
 centre, is still found."""
 import numpy
 import pytest
+from scipy.special import logsumexp
 
 from pycbc.distributions import JointDistribution, Uniform
 from pycbc.inference.models.base import BaseModel
@@ -171,3 +172,26 @@ def test_the_coverage_tree_refuses_a_frame():
     with pytest.raises(ValueError):
         AMRSampler(model(), box_snr_bound=lambda c, p, r: (r, r),
                    curvilinear_frame=True, pilot_evaluations=100)
+
+
+
+def test_the_tree_proposal_gives_the_evidence_by_importance_sampling():
+    prior = JointDistribution(
+        ['x', 'y'], Uniform(x=(-HALF, HALF)), Uniform(y=(-HALF, HALF)))
+    m = FilterRidge(['x', 'y'], prior=prior)
+    start = (numpy.array(MEAN) + 3 * ALONG + HALF) / (2 * HALF)
+    sampler = AMRSampler(m, initial_divisions=1, mass_fraction=1e-4,
+                         max_evaluations=40000, posterior_samples=2000,
+                         seed=2, box_snr_bound=ridge_bound, start_cube=start)
+    sampler.run()
+    cube, logq = sampler.tree_proposal(20000, numpy.random.default_rng(5))
+    x = -HALF + 2 * HALF * cube
+    logl = 0.5 * numpy.maximum(PEAK - RHO * ridge_metric(x - MEAN), 0) ** 2
+    # the cube's density, the prior uniform on it: Z = mean of L / q
+    logw = logl - logq
+    logz = logsumexp(logw) - numpy.log(len(logw))
+    w = numpy.exp(logw - logw.max())
+    ess = w.sum() ** 2 / numpy.sum(w ** 2)
+    assert logz == pytest.approx(ridge_exact()[0], abs=0.03)
+    assert ess > 0.5 * len(logw)
+    assert numpy.all((cube >= 0) & (cube <= 1))
