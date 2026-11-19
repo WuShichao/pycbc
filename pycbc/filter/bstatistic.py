@@ -35,15 +35,49 @@ from scipy.special import i0e, roots_legendre
 _PEAK_WIDTHS, _EDGE_LENGTHS = 10.0, 30.0
 
 
+_I0E_CHEBYSHEV = None
+
+
+def _i0e_coefficients():
+    """Chebyshev interpolants (degree 40) of ``i0e``: of ``i0e(x)`` in ``t =
+    x / 4 - 1`` on ``[0, 8]``, and of ``sqrt(x) i0e(x)`` in ``t = 16 / x - 1``
+    beyond, both from scipy's on the host once (relative error 1.8e-14 to
+    1e6)."""
+    global _I0E_CHEBYSHEV
+    if _I0E_CHEBYSHEV is None:
+        from numpy.polynomial import chebyshev
+        _I0E_CHEBYSHEV = (
+            chebyshev.chebinterpolate(lambda t: i0e(4 * (t + 1)), 40),
+            chebyshev.chebinterpolate(
+                lambda t: i0e(16 / (t + 1)) * numpy.sqrt(16 / (t + 1)), 40))
+    return _I0E_CHEBYSHEV
+
+
+def _clenshaw(t, coefficients):
+    b1 = b2 = 0.0
+    for c in coefficients[:0:-1]:
+        b1, b2 = 2 * t * b1 - b2 + c, b1
+    return t * b1 - b2 + coefficients[0]
+
+
+def i0e_array(x, xp=numpy):
+    """``i0e(x)`` for ``x >= 0`` by array operations alone, the same on any
+    array module: cupyx's ``i0e`` on an NVIDIA B200 (CuPy 14.2.0) is right
+    on its first call and wrong by up to 2.7e-3 (relative) on every later
+    one, while an L40S agrees with scipy to 1e-15 (2026-11-19: the eccentric
+    PE's amplitude table failed its check on B200 nodes)."""
+    near, far = _i0e_coefficients()
+    small = _clenshaw(x / 4.0 - 1.0, near)
+    big = xp.maximum(x, 8.0)
+    large = _clenshaw(16.0 / big - 1.0, far) / xp.sqrt(big)
+    return xp.where(x <= 8.0, small, large)
+
+
 def log_i0(x, xp=numpy):
     """``ln I0(x)`` without overflow, for ``x >= 0``: from the scaled Bessel
-    function up to 700 and its asymptotic series, good to 1e-12, above
-    (cupy's scaled Bessel function overflows beyond 709)."""
-    if xp is numpy:
-        scaled = i0e
-    else:
-        from cupyx.scipy.special import i0e as scaled
-    small = x + xp.log(scaled(xp.minimum(x, 700.0)))
+    function (:func:`i0e_array`) up to 700 and its asymptotic series, good
+    to 1e-12, above."""
+    small = x + xp.log(i0e_array(xp.minimum(x, 700.0), xp))
     big = xp.maximum(x, 700.0)
     series = 1 + 1 / (8 * big) + 9 / (128 * big ** 2) \
         + 225 / (3072 * big ** 3)
