@@ -241,12 +241,14 @@ class AMRSampler(BaseSampler):
         Laplace approximation, say. The refinement's thresholds are then
         ``mass_fraction`` of the larger of it and the tree's own evidence so
         far; the reported evidence stays the tree's. A tree that starts from
-        the whole prior resolves its peak last, and its own evidence lies far
+        the whole prior resolves its peak last, and its own evidence lies
         below the true one until then: in the eccentric PE's pp injections it
-        was 12-28 below at the end of a 10000-evaluation budget, so no far box
-        was certified and every one was evaluated (2026-11-19). An estimate
-        that misses mass elsewhere is smaller than the true evidence and only
-        makes the refinement more cautious. Default None.
+        was 1.6-28.1 below at the end of a 10000-evaluation budget (cover10,
+        2026-11-19). With the reference (cover11) the evidence was unchanged
+        and the evaluations were not fewer: the mid-range boxes are flagged by
+        the bound's own slack, not by the threshold. An estimate that misses
+        mass elsewhere is smaller than the true evidence and only makes the
+        refinement more cautious. Default None.
     max_evaluations : int, optional
         Budget of likelihood evaluations. Default 100000.
     posterior_samples : int, optional
