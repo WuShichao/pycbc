@@ -256,6 +256,75 @@ def test_a_reference_evidence_spares_evaluations_and_keeps_the_answer():
     assert out[True][1] == pytest.approx(exact, abs=0.03)
 
 
+class PeakOverlap(object):
+    """The cone's bound as the PE's: its sup part carries the noise's
+    supremum over the prior, NOISE, as large as the peak's SNR (the eccentric
+    PE's nu + mu = 13.5 against rho 12.7-20), so that it certifies nothing
+    with a match; with the fractional certificate's overlap: the signal at
+    MEAN with SNR PEAK, its overlap with a box at most the cone's value at the
+    box's point nearest MEAN (a probe once the start is the peak), and the
+    box's independent templates the product of its edges in units of the
+    template's width 1 / RHO (Hadamard: at least the volume's)."""
+    dof = 2
+    NOISE = 11.0
+
+    def __init__(self, fractional=True):
+        self.metric = RHO ** 2 * numpy.eye(2)
+        if not fractional:
+            self.overlap = None
+
+    def at_peak(self, theta):
+        pass
+
+    def _cone(self, pts):
+        return numpy.maximum(PEAK - RHO * numpy.linalg.norm(
+            pts - numpy.asarray(MEAN), axis=-1), 0.0)
+
+    def __call__(self, centre, probes, rho):
+        pts = numpy.concatenate([centre[:, None, :], probes], axis=1)
+        d = distance(centre, probes)
+        top = self._cone(pts).max(axis=1) + self.NOISE
+        return numpy.minimum(rho + d.max(axis=1), top), d.max(axis=1), d
+
+    def overlap(self, centre, probes):
+        pts = numpy.concatenate([centre[:, None, :], probes], axis=1)
+        nu = self._cone(pts).max(axis=1)
+        n = centre.shape[1]
+        edges = probes[:, :n, :] - probes[:, n:2 * n, :]
+        lncells = numpy.sum(numpy.log(numpy.maximum(
+            1.0, RHO * numpy.linalg.norm(edges, axis=-1))), axis=1)
+        return nu, lncells
+
+
+def test_the_fractional_certificate_certifies_the_far_prior_in_few_boxes():
+    # the cone from its peak, its evidence known (as the PE's efficient part
+    # gives it), the sup bound carrying a noise supremum as large as the
+    # peak's SNR: the fractional certificate takes the far prior the sup
+    # bound cannot, with fewer evaluations; the evidence is unchanged and the
+    # boxes the certificate holds carry less than mass_fraction of it
+    start = (numpy.array(MEAN) + HALF) / (2 * HALF)
+    frac = run(box_snr_bound=PeakOverlap(), start_cube=start,
+               reference_logz=exact_logz())
+    plain = run(box_snr_bound=PeakOverlap(fractional=False),
+                start_cube=start, reference_logz=exact_logz())
+    assert frac.logz == pytest.approx(exact_logz(), abs=0.05)
+    diag = frac.diagnostics
+    assert diag['certificate_boxes'] > 0
+    assert diag['certificate_log_fraction'] < numpy.log(1e-4)
+    assert diag['evaluations'] <= plain.diagnostics['evaluations']
+    # the held boxes' true mass, by quadrature on each
+    held = numpy.flatnonzero(frac._cert_group >= 0)
+    rng = numpy.random.default_rng(3)
+    mass = []
+    for b in held:
+        u = frac._lower[b] + rng.random((400, 2)) * frac._width[b]
+        x = -HALF + 2 * HALF * u
+        rho = numpy.maximum(PEAK - RHO * numpy.linalg.norm(x - MEAN, axis=1), 0)
+        mass.append(logsumexp(0.5 * rho ** 2) - numpy.log(400)
+                    + numpy.sum(numpy.log(frac._width[b])))
+    assert logsumexp(mass) - exact_logz() < numpy.log(1e-4)
+
+
 class Mixed(object):
     """Curvilinear coordinates in which a sheet oblique in the parameters is
     along an axis: y1 = x + 3 y + 0.02 y^2 (thin), y2 = y."""
