@@ -954,15 +954,25 @@ class AMRSampler(BaseSampler):
                     and self.nevaluations >= self._next_share):
                 self._share()
             leaves = self._leaves()
-            if self._shell is not None and numpy.isfinite(self._current_logz):
-                self._shell_round(leaves, self._current_logz)
+            if self._shell is not None:
+                # the signal's estimate first: the certificate's overlaps are
+                # with it (Gemini review: a move after the shells left this
+                # round's threshold the old estimate's)
+                self._update_peak(leaves)
             logmass = self._log_mass(leaves)
             logz = logsumexp(logmass)
-            self.history.append((len(leaves), self.nevaluations, logz))
             # the thresholds' evidence: the tree's own, or a larger one known
             # from elsewhere (reference_logz)
             ref = (logz if self.reference_logz is None
                    else max(logz, self.reference_logz))
+            if (self._shell is not None and numpy.isfinite(ref)
+                    and self._shell_round(leaves, ref)):
+                # released boxes were evaluated: their mass enters
+                logmass = self._log_mass(leaves)
+                logz = logsumexp(logmass)
+                ref = (logz if self.reference_logz is None
+                       else max(logz, self.reference_logz))
+            self.history.append((len(leaves), self.nevaluations, logz))
             self._current_logz = ref
             refine = self._logerr[leaves] - ref > threshold
             refine |= self._neighbour_flags(leaves, logmass - ref > threshold,
@@ -1191,8 +1201,9 @@ class AMRSampler(BaseSampler):
         self._axis_dist[:] = numpy.nan
         if self._shell is not None:
             # the overlaps were with the old estimate: recomputed, and the
-            # certificate with them, next round
+            # certificate with them, before this round's refinement
             self._nu[:] = numpy.nan
+            self._cert_threshold = -numpy.inf
         self._diagnostics['coverage_peak_moves'] = self._diagnostics.get(
             'coverage_peak_moves', 0) + 1
         logging.info("AMR coverage: the signal's estimate moved to ln L %.3f",
@@ -1373,8 +1384,10 @@ class AMRSampler(BaseSampler):
         if len(need):
             theta_c, theta_p, good, bad = self._thetas_of(need)
             ok = good & ~bad
+            # a box whose probes do not map: neither its overlap nor its
+            # cells are known (not with the cube or an affine chart)
             nu = numpy.full(len(need), numpy.inf)
-            ln = numpy.zeros(len(need))
+            ln = numpy.full(len(need), numpy.inf)
             if ok.any():
                 a, b = self.box_snr_bound.overlap(theta_c[ok], theta_p[ok])
                 nu[ok] = a
@@ -1395,7 +1408,8 @@ class AMRSampler(BaseSampler):
     def _shell_round(self, leaves, logz):
         """Recompute the certificate from the leaves (see
         :class:`_ShellCertificate`): the threshold, the leaves it holds, and,
-        for a leaf it no longer holds that has no value, its evaluation."""
+        for a leaf it no longer holds that has no value, its evaluation.
+        Returns the number of boxes so evaluated."""
         nu, ln = self._box_overlaps(leaves)
         thr, logsum, used = self._shell.threshold(
             nu, self._log_prior_bound(leaves), ln,
@@ -1415,6 +1429,7 @@ class AMRSampler(BaseSampler):
             certificate_boxes=int(held.sum()),
             certificate_released=self._diagnostics.get(
                 'certificate_released', 0) + int(len(released)))
+        return len(valueless)
 
     def _coverage_flags(self, leaves, logz, threshold):
         """The coverage bound of each leaf's mass, ``ln`` of its largest
