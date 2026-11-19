@@ -292,7 +292,17 @@ class AMRSampler(BaseSampler):
         self._peak_logl = -numpy.inf
         # the coverage tree in the model's curvilinear coordinates (see
         # _chart_frame) rather than the prior cube
-        self.coverage_chart = bool(coverage_chart)
+        # True: the model's curvilinear coordinates; a matrix A: the affine
+        # chart y = A theta (no inverse map to solve)
+        if isinstance(coverage_chart, (bool, numpy.bool_)) or coverage_chart is None:
+            self._chart_matrix = None
+            self.coverage_chart = bool(coverage_chart)
+        else:
+            self._chart_matrix = numpy.asarray(coverage_chart, dtype=float)
+            if self._chart_matrix.shape != (len(model.variable_params),) * 2:
+                raise ValueError("an affine coverage chart is a square matrix "
+                                 "over the variable parameters")
+            self.coverage_chart = True
         if self.coverage_chart and not self._coverage:
             raise ValueError("coverage_chart is for a coverage bound's tree")
         # the Occam offset kappa in ln L = rho^2 / 2 - kappa(rho): a number, or
@@ -1441,27 +1451,49 @@ class AMRSampler(BaseSampler):
         that 10000 axis-aligned boxes did not resolve, ESS 15). Unlike a
         Laplace-whitened frame, whose bound was 1e7 posterior widths along a
         zero-information direction, the image fills much of this bound."""
-        coords = self.model.curvilinear_coordinates
         names = list(self.model.variable_params)
-        idx = [names.index(n) for n in coords.names]
         bottom = numpy.array(self._prior_transform(numpy.zeros(self.ndim)))
         top = numpy.array(self._prior_transform(numpy.ones(self.ndim)))
         prior_range = top - bottom
-
-        def to_y(theta):
-            y = numpy.array(theta, dtype=float, copy=True)
-            y[:, idx] = coords.forward(theta[:, idx])
-            return y
-
-        def from_y(y):
-            theta = numpy.array(y, dtype=float, copy=True)
-            theta[:, idx] = coords.inverse(y[:, idx])
-            return theta
         from scipy.stats import qmc
         draws = bottom + qmc.Sobol(self.ndim, seed=self.seed + 19).random_base2(
             int(numpy.ceil(numpy.log2(prior_draws)))) * prior_range
-        if hasattr(coords, 'fit'):
-            coords.fit(draws[:, idx])
+        if self._chart_matrix is not None:
+            # the affine chart: y = A theta, its inverse a solve, its Jacobian
+            # a constant (the tree only orients its boxes; the bound is
+            # exact at the parameters)
+            amat = self._chart_matrix
+            ainv = numpy.linalg.inv(amat)
+            lnabs = float(numpy.linalg.slogdet(amat)[1])
+            cnames = names
+
+            def to_y(theta):
+                return numpy.asarray(theta, dtype=float) @ amat.T
+
+            def from_y(y):
+                return numpy.asarray(y, dtype=float) @ ainv.T
+
+            def log_jacobian(theta):
+                return numpy.full(len(theta), -lnabs)
+        else:
+            coords = self.model.curvilinear_coordinates
+            idx = [names.index(n) for n in coords.names]
+            cnames = list(coords.names)
+
+            def to_y(theta):
+                y = numpy.array(theta, dtype=float, copy=True)
+                y[:, idx] = coords.forward(theta[:, idx])
+                return y
+
+            def from_y(y):
+                theta = numpy.array(y, dtype=float, copy=True)
+                theta[:, idx] = coords.inverse(y[:, idx])
+                return theta
+
+            def log_jacobian(theta):
+                return coords.log_jacobian(theta[:, idx])
+            if hasattr(coords, 'fit'):
+                coords.fit(draws[:, idx])
         image = to_y(draws)
         image = image[numpy.all(numpy.isfinite(image), axis=1)]
         low, high = image.min(axis=0), image.max(axis=0)
@@ -1473,10 +1505,11 @@ class AMRSampler(BaseSampler):
         def curve(s):
             theta = from_y(low + span * s)
             cube = (theta - bottom) / prior_range
-            logjac = logdet + coords.log_jacobian(theta[:, idx])
             bad = ~numpy.all(numpy.isfinite(theta), axis=1)
+            logjac = numpy.full(len(theta), -numpy.inf)
+            if (~bad).any():
+                logjac[~bad] = logdet + log_jacobian(theta[~bad])
             cube[bad] = numpy.nan
-            logjac = numpy.where(bad, -numpy.inf, logjac)
             return cube, logjac
 
         def uncurve(cube):
@@ -1491,12 +1524,13 @@ class AMRSampler(BaseSampler):
         self._chart_draws = sp[numpy.all((sp >= 0) & (sp <= 1), axis=1)]
         self._chart_ndraw = len(draws)
         self.frame = dict(mean=numpy.zeros(self.ndim), chol=numpy.eye(self.ndim),
-                          low=low, span=span, names=names,
-                          coords=list(coords.names), chart=True)
+                          low=low, span=span, names=names, coords=cnames,
+                          chart='affine' if self._chart_matrix is not None
+                          else 'curvilinear')
         self._diagnostics.update(chart_log_volume=float(numpy.sum(numpy.log(
             span))))
-        logging.info("AMR coverage: the tree in the chart %s over the prior's"
-                     " image's bound", list(coords.names))
+        logging.info("AMR coverage: the tree in the %s chart over the prior's "
+                     "image's bound", self.frame['chart'])
 
     def _chart_prior_mass(self, leaves):
         """``ln`` of the prior mass of chart boxes from the prior's draws they

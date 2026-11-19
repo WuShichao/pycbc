@@ -355,3 +355,31 @@ def test_the_nearest_point_of_a_box_in_a_metric():
                            -1).reshape(-1, 3)
         q = numpy.einsum('ni,ij,nj->n', grid - p, g, grid - p)
         assert (x[b] - p) @ g @ (x[b] - p) <= q.min() + 1e-9
+
+
+
+def test_an_affine_chart_matches_the_curvilinear_one_and_costs_no_inverse():
+    # the sheet's chart linearised at the peak: y = A theta
+    yp = MEAN[1]
+    amat = numpy.array([[1.0, 3 + 0.04 * yp], [0.0, 1.0]])
+    prior = JointDistribution(
+        ['x', 'y'], Uniform(x=(-HALF, HALF)), Uniform(y=(-HALF, HALF)))
+    m = FilterSheet(['x', 'y'], prior=prior)
+    start = (numpy.array(MEAN) + HALF) / (2 * HALF)
+    sampler = AMRSampler(m, initial_divisions=1, mass_fraction=1e-4,
+                         max_evaluations=40000, posterior_samples=2000,
+                         seed=2, box_snr_bound=sheet_bound, start_cube=start,
+                         coverage_chart=amat, coverage_resolution=3.0,
+                         max_level=100)
+    sampler.run()
+    exact = sheet_logz()
+    u, logq = sampler.tree_proposal(20000, numpy.random.default_rng(4))
+    ok = numpy.all((u >= 0) & (u <= 1), axis=1)
+    x = -HALF + 2 * HALF * u[ok]
+    logl = 0.5 * numpy.maximum(PEAK - sheet_metric(
+        x, numpy.broadcast_to(numpy.array(MEAN), x.shape)), 0) ** 2
+    lw = logl - logq[ok]
+    assert logsumexp(lw) - numpy.log(len(u)) == pytest.approx(exact, abs=0.05)
+    assert sampler.diagnostics['evaluations'] < sheet_run(False).diagnostics[
+        'evaluations']
+    assert sampler.frame['chart'] == 'affine'
