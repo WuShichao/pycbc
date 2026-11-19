@@ -509,3 +509,22 @@ def test_an_affine_chart_matches_the_curvilinear_one_and_costs_no_inverse():
     assert sampler.diagnostics['evaluations'] < sheet_run(False).diagnostics[
         'evaluations']
     assert sampler.frame['chart'] == 'affine'
+
+
+def test_finite_differences_at_a_prior_bound_keep_their_step():
+    # ln L Gaussian, -inf beyond x0 = 1, differenced at x0 = 1: the step
+    # beyond the bound is not a change to resolve, the one-sided difference
+    # gives the curvature (2026-11-19: the step was cut by 8^6)
+    from pycbc.inference.sampler.amr import _finite_differences
+    s0, s1 = 0.3, 0.05
+
+    def f(X):
+        X = numpy.atleast_2d(X)
+        out = -(X[:, 0] - 1) ** 2 / (2 * s0 ** 2) - X[:, 1] ** 2 / (2 * s1 ** 2)
+        return numpy.where(X[:, 0] <= 1, out, -numpy.inf)
+    _, hess, used = _finite_differences(f, numpy.array([1.0, 0.0]),
+                                        numpy.array([1e-2, 1e-3]),
+                                        resolve=0.5, return_step=True)
+    assert used[0] == pytest.approx(1e-2)
+    assert -numpy.diag(hess) == pytest.approx([1 / s0 ** 2, 1 / s1 ** 2],
+                                              rel=1e-6)

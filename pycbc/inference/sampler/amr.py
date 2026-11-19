@@ -2564,8 +2564,7 @@ def _gradient(f, x, step, resolve=None, refine=6, shrink=6):
         step[todo] /= 2
     if resolve is not None and numpy.isfinite(f0):
         for _ in range(refine):
-            with numpy.errstate(invalid='ignore'):
-                change = numpy.fmax(numpy.abs(plus - f0), numpy.abs(minus - f0))
+            change = _resolved_change(plus, minus, f0)
             todo = numpy.flatnonzero(change > resolve)
             if not len(todo):
                 break
@@ -2613,6 +2612,22 @@ def _next_step(precision, steps, resolve, top):
     return numpy.clip(step, 1e-7, top)
 
 
+def _resolved_change(plus, minus, f0):
+    """The largest change of ``f`` over an axis's two steps, of those that
+    land where ``f`` is finite: a step beyond the prior's edge (``f`` is
+    ``-inf`` there) is the one-sided differences' business, not a change to
+    resolve. (Until 2026-11-19 ``abs(-inf - f0) = inf`` counted as a change
+    larger than any ``resolve``, and an axis at a prior bound had its step cut
+    by 8 at each of the ``refine`` rounds: the eccentric PE's q at its upper
+    bound got 2.3e-10 of a 6.0e-5 step, and its Fisher information came out
+    zero; found by the Gemini review.)"""
+    with numpy.errstate(invalid='ignore'):
+        dp = numpy.where(numpy.isfinite(plus), numpy.abs(plus - f0), numpy.nan)
+        dm = numpy.where(numpy.isfinite(minus), numpy.abs(minus - f0),
+                         numpy.nan)
+        return numpy.fmax(dp, dm)
+
+
 def _finite_differences(f, x, step, shrink=6, resolve=None, refine=6,
                         return_step=False):
     """Gradient and Hessian of ``f`` at ``x``: central differences along
@@ -2650,8 +2665,7 @@ def _finite_differences(f, x, step, shrink=6, resolve=None, refine=6,
         step[todo] /= 2
     if resolve is not None:
         for _ in range(refine):
-            with numpy.errstate(invalid='ignore'):
-                change = numpy.fmax(numpy.abs(plus - f0), numpy.abs(minus - f0))
+            change = _resolved_change(plus, minus, f0)
             todo = numpy.flatnonzero(change > resolve)
             if not len(todo) or not numpy.isfinite(f0):
                 break
