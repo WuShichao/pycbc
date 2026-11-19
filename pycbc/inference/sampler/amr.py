@@ -1111,7 +1111,19 @@ class AMRSampler(BaseSampler):
                   + self._logjac[leaves])
         if self.box_snr_bound is not None:
             self._update_peak(leaves)
-            need = leaves[numpy.isnan(self._snr[leaves])]
+            if self.coverage_chart:
+                unknown = ~(numpy.isfinite(logvol)
+                            & numpy.isfinite(self._logl[leaves]))
+                if unknown.any():
+                    lv, held = self._chart_prior_mass(leaves[unknown])
+                    logvol = numpy.array(logvol, dtype=float)
+                    logvol[unknown] = numpy.where(held, lv, -numpy.inf)
+                    self._diagnostics.update(
+                        coverage_draw_valued_boxes=int(held.sum()),
+                        coverage_empty_boxes=int((~held).sum()),
+                        coverage_prior_draws=int(self._chart_ndraw))
+            need = leaves[numpy.isnan(self._snr[leaves])
+                          & numpy.isfinite(logvol)]
             if len(need):
                 with numpy.errstate(invalid='ignore'):
                     rho = numpy.where(
@@ -1138,6 +1150,11 @@ class AMRSampler(BaseSampler):
                                                          dist)
                                     + logvol, -numpy.inf)
         unresolved = dist > self.coverage_resolution
+        # a box with no value (its centre and volume points outside the prior,
+        # its mass counted nowhere but the bound) is refined whatever its
+        # distance, until its halves have values: the resolution leaves a box
+        # to the midpoint rules, which need its value
+        unresolved |= ~numpy.isfinite(self._logl[leaves]) & numpy.isfinite(bound)
         cover = (bound - logz > threshold) & unresolved
         # the most mass the boxes left unresolved could hold, as a fraction
         # of Z: the guarantee the refinement gives on stopping
@@ -1414,6 +1431,11 @@ class AMRSampler(BaseSampler):
             return (y - low) / span
         self._curve, self._uncurve = curve, uncurve
         self._scale = numpy.ones(self.ndim)
+        # the prior's draws in the tree's coordinates: a box's prior mass where
+        # its volume points miss the prior's image (see _chart_prior_mass)
+        sp = (image - low) / span
+        self._chart_draws = sp[numpy.all((sp >= 0) & (sp <= 1), axis=1)]
+        self._chart_ndraw = len(draws)
         self.frame = dict(mean=numpy.zeros(self.ndim), chol=numpy.eye(self.ndim),
                           low=low, span=span, names=names,
                           coords=list(coords.names), chart=True)
@@ -1421,6 +1443,19 @@ class AMRSampler(BaseSampler):
             span))))
         logging.info("AMR coverage: the tree in the chart %s over the prior's"
                      " image's bound", list(coords.names))
+
+    def _chart_prior_mass(self, leaves):
+        """``ln`` of the prior mass of chart boxes from the prior's draws they
+        hold, ``(count + 3) / N``, and which hold any. The prior's image is a
+        curved part of the chart's bound: a box's 16 volume points
+        (:meth:`_volume`) can all miss it although the box holds some of it
+        (cover6 pp 5, 2026-11-19: the root box, ln Z -inf). A box holding no
+        draw is taken as empty; together those hold less than ``3 / N`` of
+        the prior (95%)."""
+        found = self._locate(self._chart_draws)
+        counts = numpy.bincount(found[found >= 0], minlength=len(self._lower))
+        c = counts[leaves]
+        return numpy.log((c + 3.0) / self._chart_ndraw), c > 0
 
     def _share_ball(self, low, span, radius):
         """Hand the model, before the frame's first boxes are evaluated, the

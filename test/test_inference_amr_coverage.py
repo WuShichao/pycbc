@@ -284,3 +284,44 @@ def test_the_chart_tree_resolves_an_oblique_sheet_with_fewer_boxes():
         x, numpy.broadcast_to(numpy.array(MEAN), x.shape)), 0) ** 2
     logz = logsumexp(logl - logq[ok]) - numpy.log(len(u))
     assert logz == pytest.approx(exact, abs=0.05)
+
+
+
+class Steep(Mixed):
+    """A chart whose image of the prior fills 0.3% of its bound: y1 = x +
+    300 y, y2 = y (the root box's volume points miss it)."""
+
+    def forward(self, theta):
+        theta = numpy.atleast_2d(theta)
+        return numpy.column_stack([theta[:, 0] + 300 * theta[:, 1],
+                                   theta[:, 1]])
+
+    def inverse(self, y):
+        y = numpy.atleast_2d(y)
+        return numpy.column_stack([y[:, 0] - 300 * y[:, 1], y[:, 1]])
+
+
+@pytest.mark.xfail(strict=True, reason="known (2026-11-19): a box whose template distance is below "
+                   "coverage_resolution is left to the midpoint rules, but near a peak the triangle bound's slack is "
+                   "rho_c D, not D: here the tree stops 0.03 from the peak (ln L 57 of 72), ln Z 46.4 against 56.9. "
+                   "Needs a second-order local bound (the gradient at the centre)")
+def test_a_chart_whose_prior_image_is_a_sliver_of_its_bound():
+    prior = JointDistribution(
+        ['x', 'y'], Uniform(x=(-HALF, HALF)), Uniform(y=(-HALF, HALF)))
+    m = FilterPeak(['x', 'y'], prior=prior)
+    m.curvilinear_coordinates = Steep()
+    start = (numpy.array(MEAN) + HALF) / (2 * HALF)
+
+    def bound(centre, probes, rho):
+        pts = numpy.concatenate([centre[:, None, :], probes], axis=1)
+        far = numpy.linalg.norm(pts - MEAN, axis=-1).min(axis=1)
+        top = numpy.maximum(PEAK - RHO * far, 0.0)
+        d = distance(centre, probes)
+        return numpy.minimum(rho + d.max(axis=1), top), d.max(axis=1), d
+    sampler = AMRSampler(m, initial_divisions=1, mass_fraction=1e-4,
+                         max_evaluations=20000, posterior_samples=2000,
+                         seed=2, box_snr_bound=bound, start_cube=start,
+                         coverage_chart=True, coverage_resolution=3.0)
+    sampler.run()
+    assert sampler.logz == pytest.approx(exact_logz(), abs=0.1)
+    assert sampler.diagnostics['coverage_draw_valued_boxes'] >= 1
