@@ -1596,8 +1596,20 @@ class AMRSampler(BaseSampler):
         image = image[numpy.all(numpy.isfinite(image), axis=1)]
         prior_cov = numpy.cov(image.T)
         unit = numpy.sqrt(numpy.diag(prior_cov))
-        prior_precision = numpy.linalg.inv(prior_cov / numpy.outer(unit,
-                                                                   unit))
+        # the prior's precision in units of its standard deviations: the
+        # identity. The prior is uniform on a box in the parameters, with no
+        # Gaussian cross-curvature between the coordinates y; the inverse of
+        # its draws' correlation (until 2026-11-19) narrowed q about fivefold
+        # at fixed phase coordinates, as it did the eccentric PE's Laplace
+        # (cover14; Gemini review)
+        prior_precision = numpy.eye(self.ndim)
+
+        def psd(m):
+            # the information is positive semidefinite: a negative eigenvalue
+            # is the differences' rounding
+            m = 0.5 * (m + m.T)
+            ev, vec = numpy.linalg.eigh(m)
+            return (vec * numpy.clip(ev, 0, None)) @ vec.T
 
         def climb(y0):
             """The trust-region Newton climb of ln L (:func:`_climb`) in
@@ -1618,11 +1630,12 @@ class AMRSampler(BaseSampler):
                 given = self.climb_precision
                 if callable(given):
                     def metric(z):
-                        return unit[:, None] * numpy.asarray(
-                            given(y0 + unit * z), dtype=float) * unit[None, :]
+                        return psd(unit[:, None] * numpy.asarray(
+                            given(y0 + unit * z), dtype=float)
+                            * unit[None, :])
                 else:
-                    metric = unit[:, None] * numpy.asarray(
-                        given, dtype=float) * unit[None, :]
+                    metric = psd(unit[:, None] * numpy.asarray(
+                        given, dtype=float) * unit[None, :])
             x, precision, value = _climb(
                 logl_zs, numpy.zeros(self.ndim), prior_precision,
                 metric=metric, resolve=self.climb_resolve, top=1e-1,
