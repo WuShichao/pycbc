@@ -295,7 +295,10 @@ class AMRSampler(BaseSampler):
         self.coverage_chart = bool(coverage_chart)
         if self.coverage_chart and not self._coverage:
             raise ValueError("coverage_chart is for a coverage bound's tree")
-        self.coverage_kappa = float(coverage_kappa)
+        # the Occam offset kappa in ln L = rho^2 / 2 - kappa(rho): a number, or
+        # a callable of the SNR rho (see _kappa)
+        self.coverage_kappa = (coverage_kappa if callable(coverage_kappa)
+                               else float(coverage_kappa))
         self.coverage_resolution = float(coverage_resolution)
         self.coverage_probes = int(coverage_probes)
         if self.coverage_resolution < 0 or self.coverage_probes < 0:
@@ -868,11 +871,41 @@ class AMRSampler(BaseSampler):
         kappa``. The same covering argument as a search lattice's: there the
         distance is set so that no signal is missed, here so that no box
         misses posterior mass."""
-        k = self.coverage_kappa
         with numpy.errstate(invalid='ignore'):
-            rho = numpy.sqrt(2 * numpy.clip(logl + k, 0, None))
+            rho = self._snr_of(logl)
+            top = rho + distance
             return numpy.where(numpy.isfinite(logl),
-                               0.5 * (rho + distance) ** 2 - k, -numpy.inf)
+                               0.5 * top ** 2 - self._kappa(top), -numpy.inf)
+
+    def _kappa(self, rho):
+        """The Occam offset at SNR ``rho``: ``coverage_kappa`` itself, or its
+        value there when it is a callable (the marginalised extrinsics'
+        Laplace factor grows as ``k ln rho``; a constant measured at the peak
+        overstates it at lower SNR, and the bound there)."""
+        rho = numpy.asarray(rho, dtype=float)
+        if callable(self.coverage_kappa):
+            with numpy.errstate(invalid='ignore'):
+                out = numpy.asarray(self.coverage_kappa(
+                    numpy.where(numpy.isfinite(rho), rho, 1.0)), dtype=float)
+            return numpy.where(numpy.isfinite(rho), out, 0.0)
+        return numpy.full(rho.shape, self.coverage_kappa)
+
+    def _snr_of(self, logl, iterations=40):
+        """The SNR at which ``rho^2 / 2 - kappa(rho)`` is ``logl`` (a fixed
+        point: kappa changes slowly with rho), ``inf`` where ``logl`` is not
+        finite."""
+        logl = numpy.asarray(logl, dtype=float)
+        fin = numpy.isfinite(logl)
+        out = numpy.full(logl.shape, numpy.inf)
+        if not fin.any():
+            return out
+        rho = numpy.sqrt(2 * numpy.clip(logl[fin] + self._kappa(
+            numpy.full(fin.sum(), 10.0)), 0, None))
+        for _ in range(iterations):
+            rho = numpy.sqrt(2 * numpy.clip(logl[fin] + self._kappa(rho), 0,
+                                            None))
+        out[fin] = rho
+        return out
 
     def _probe_offsets(self):
         """Box offsets (in units of its half-widths, about its centre) at
@@ -1058,7 +1091,7 @@ class AMRSampler(BaseSampler):
         mid = self._log_mass(leaves)
         logp = mid - logsumexp(mid[numpy.isfinite(mid)])
         if self._coverage and bound_share > 0:
-            top = 0.5 * self._snr[leaves] ** 2 - self.coverage_kappa
+            top = 0.5 * self._snr[leaves] ** 2 - self._kappa(self._snr[leaves])
             bound = numpy.where(numpy.isfinite(top) & numpy.isfinite(logvol),
                                 top + logvol, -numpy.inf)
             if numpy.isfinite(bound).any():
@@ -1150,17 +1183,13 @@ class AMRSampler(BaseSampler):
             need = leaves[numpy.isnan(self._snr[leaves])
                           & numpy.isfinite(logvol)]
             if len(need):
-                with numpy.errstate(invalid='ignore'):
-                    rho = numpy.where(
-                        numpy.isfinite(self._logl[need]),
-                        numpy.sqrt(2 * numpy.clip(
-                            self._logl[need] + self.coverage_kappa, 0, None)),
-                        numpy.inf)
+                rho = self._snr_of(self._logl[need])
                 (self._snr[need], self._dist[need],
                  self._axis_dist[need]) = self._box_snr_bounds(need, rho)
             dist = self._dist[leaves]
             with numpy.errstate(invalid='ignore'):
-                top = 0.5 * self._snr[leaves] ** 2 - self.coverage_kappa
+                top = (0.5 * self._snr[leaves] ** 2
+                       - self._kappa(self._snr[leaves]))
                 bound = numpy.where(numpy.isfinite(logvol),
                                     numpy.where(numpy.isnan(top), numpy.inf,
                                                 top) + logvol, -numpy.inf)
