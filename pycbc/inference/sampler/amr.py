@@ -80,85 +80,72 @@ from .base import BaseSampler, setup_output
 from .base_cube import setup_calls
 
 
-class _FractionalCertificate(object):
-    """Markov's inequality on a fractional moment of the evidence a set of
-    boxes holds (lisa_tests_with_cc, notes/2026/11/
-    2026-11-19-fractional-moment-coverage-bound.md).
+class _ShellCertificate(object):
+    """The fractional-moment certificate over shells of the signal's
+    overlap (lisa_tests_with_cc, notes/2026/11/
+    2026-11-19-fractional-moment-coverage-bound.md; the shells from the
+    Gemini review of 2026-11-19).
 
     For unit templates the marginal likelihood ratio is at most
     ``exp(z^2 / 2)``, ``z^2 = 2F`` noncentral chi^2 with ``k`` degrees of
     freedom and noncentrality ``nu^2``, ``nu`` the true signal's overlap with
-    the template. Cut a box of prior mass ``pi`` into ``N`` cells; for
-    ``beta = 1 - eps`` in (0, 1), ``t -> t^beta`` is subadditive and ``E
-    exp(beta z^2 / 2) = eps^(-k/2) exp(beta nu^2 / (2 eps))``, so by Markov,
-    with probability at least ``1 - delta``,
+    the template. The shells ``S_g = {x : tau_{g-1} < nu_true(x) <= tau_g}``
+    depend on the signal alone, not on the noise. For a fixed set cut into
+    cells, ``t -> t^beta`` (``beta = 1 - eps`` in (0, 1)) is subadditive,
+    ``E exp(beta z^2 / 2) = eps^(-k/2) exp(beta nu^2 / (2 eps))``, and by
+    Markov, with probability at least ``1 - delta / G`` for each shell,
 
-        ln Z_cert <= (1/beta) [ln(1/delta)
-                               + ln sum_boxes pi^beta N^eps eps^(-k/2)
-                                 exp(beta nu^2 / (2 eps))].
+        ln Z_{S_g} <= (1/beta) [ln(G/delta) + beta ln pi(S_g) + eps ln N(S_g)
+                                - (k/2) ln eps + beta tau_g^2 / (2 eps)],
 
-    The sum is additive over boxes: one ``delta`` covers all the boxes the
-    certificate holds, however many. Far from the signal (``nu`` small) the
-    noise costs ``eps ln N`` in place of the sup bound's ``(sqrt(2 ln N) +
-    tau)^2 / 2``. Boxes go to one of ``G = len(betas)`` groups, each with
-    ``delta / G`` and ``1 / G`` of the budget, to the group whose capacity
-    they use least; within a group the smallest terms go first. Each cell
-    stands for its continuum (its sup ignored; held in the 1-d and 2-d toys).
+    ``pi`` the prior mass and ``N`` the cells. Where the data's overlaps
+    bound the true ones (``nu_hat >= nu_true``, the bound's own event),
+    ``S_g`` lies in ``U_{g-1}``, the leaves with ``nu_hat > tau_{g-1}``,
+    whatever the tree: ``pi(U_{g-1})`` and ``N(U_{g-1})`` stand for ``pi(S_g)``
+    and ``N(S_g)``, and the minimum over ``beta`` is taken after (the bound
+    grows with both). The leaves with ``nu_hat <= tau_g`` lie in the union of
+    the first ``g`` shells; the largest ``g`` whose shells' bounds sum within
+    the budget certifies them. No state: recomputed from the leaves each
+    round, so neither the order boxes arrive in nor the tree's shape enters.
+    Each cell stands for its continuum (its sup ignored; held in the 1-d and
+    2-d toys).
     """
 
-    def __init__(self, delta, k, betas):
-        self.betas = numpy.asarray(betas, dtype=float)
+    def __init__(self, delta, k, shells, betas=None):
+        self.shells = numpy.sort(numpy.asarray(shells, dtype=float))
         self.k = float(k)
-        self.log_inv_delta = float(numpy.log(len(self.betas) / float(delta)))
-        self.sums = numpy.full(len(self.betas), -numpy.inf)
+        self.log_inv_delta = float(numpy.log(len(self.shells) / float(delta)))
+        self.betas = (numpy.linspace(0.02, 0.995, 400) if betas is None
+                      else numpy.asarray(betas, dtype=float))
 
-    def reset(self):
-        self.sums[:] = -numpy.inf
-
-    def terms(self, logmass, nu, lncells):
-        """``ln pi^beta N^eps eps^(-k/2) exp(beta nu^2 / (2 eps))``, boxes by
-        groups."""
-        b = self.betas[None, :]
+    def bounds(self, nu, logmass, lncells):
+        """``ln`` of the most evidence each shell can hold, from the leaves'
+        overlaps, prior masses (upper bounds) and cell counts."""
+        b = self.betas
         e = 1. - b
-        return (b * logmass[:, None] + e * lncells[:, None]
-                - 0.5 * self.k * numpy.log(e)
-                + b * nu[:, None] ** 2 / (2. * e))
-
-    def capacity(self, budget):
-        """The largest ``ln`` sum each group may hold for its bound to stay
-        within ``exp(budget) / G``."""
-        return (self.betas * (budget - numpy.log(len(self.betas)))
-                - self.log_inv_delta)
-
-    def admit(self, logmass, nu, lncells, budget):
-        """Takes the boxes that fit; returns each box's group and whether it
-        was taken."""
-        t = self.terms(logmass, nu, lncells)
-        cap = self.capacity(budget)
-        group = numpy.argmin(t - cap[None, :], axis=1)
-        took = numpy.zeros(len(t), dtype=bool)
-        for g in range(len(self.betas)):
-            sel = numpy.flatnonzero(group == g)
-            if not len(sel):
+        lower = numpy.concatenate([[-numpy.inf], self.shells[:-1]])
+        out = numpy.full(len(self.shells), -numpy.inf)
+        for g, (lo, tau) in enumerate(zip(lower, self.shells)):
+            u = nu > lo
+            if not u.any():
                 continue
-            tg = t[sel, g]
-            order = numpy.argsort(tg)
-            cum = numpy.logaddexp.accumulate(
-                numpy.concatenate([[self.sums[g]], tg[order]]))[1:]
-            fit = cum <= cap[g]
-            n_fit = len(fit) if fit.all() else int(numpy.argmin(fit))
-            if n_fit:
-                took[sel[order[:n_fit]]] = True
-                self.sums[g] = cum[n_fit - 1]
-        return group, took
+            lp = min(float(logsumexp(logmass[u])), 0.)
+            ln = float(logsumexp(lncells[u]))
+            f = (self.log_inv_delta + b * lp + e * ln - 0.5 * self.k * numpy.log(e)
+                 + b * tau ** 2 / (2. * e)) / b
+            out[g] = float(f.min())
+        return out
 
-    def log_bound(self):
-        """``ln`` of the most evidence the held boxes hold, at probability
-        ``1 - delta``: the groups' bounds summed."""
-        with numpy.errstate(invalid='ignore'):
-            per = (self.log_inv_delta + self.sums) / self.betas
-        per = per[numpy.isfinite(per)]
-        return float(logsumexp(per)) if len(per) else -numpy.inf
+    def threshold(self, nu, logmass, lncells, budget):
+        """The largest shell threshold whose shells' bounds sum within
+        ``exp(budget)`` (``-inf`` when not even the first fits), the ``ln``
+        of that sum, and the number of shells used."""
+        cum = numpy.logaddexp.accumulate(self.bounds(nu, logmass, lncells))
+        fit = cum <= budget
+        g = len(fit) if fit.all() else int(numpy.argmin(fit))
+        if not g:
+            return -numpy.inf, -numpy.inf, 0
+        return float(self.shells[g - 1]), float(cum[g - 1]), g
 
 
 class AMRSampler(BaseSampler):
@@ -333,18 +320,19 @@ class AMRSampler(BaseSampler):
     certificate_delta : float, optional
         With a ``box_snr_bound`` that has an ``overlap`` method (``overlap(
         centre, probes) -> (nu, ln_cells)``: each box's largest overlap of the
-        true signal with its templates, in SNR, and the log of the number of
-        its independent templates) and a ``dof`` (the degrees of freedom of
-        ``2F`` at a fixed template), boxes are certified by the
-        fractional-moment bound on the evidence they hold together instead of
-        one by one by the sup bound (see :class:`_FractionalCertificate`): the
-        probability that the certified boxes hold more than
-        ``mass_fraction`` of the evidence is at most this, given the overlaps.
-        Default 1e-3.
-    certificate_betas : tuple of float, optional
-        The fractional moments the certificate's groups use, each with its
-        share of ``certificate_delta`` and of the budget; a box goes to the
-        group it uses least. Default (0.95, 0.85, 0.7, 0.5, 0.3).
+        true signal with its templates, in SNR, an upper bound, and the log of
+        the number of its independent templates) and a ``dof`` (the degrees
+        of freedom of ``2F`` at a fixed template), boxes are certified by the
+        fractional-moment bound over shells of the overlap (see
+        :class:`_ShellCertificate`) instead of one by one by the sup bound:
+        the probability that the certified boxes hold more than
+        ``mass_fraction`` of the evidence is at most this, on the event that
+        the overlaps bound the true ones. Needs the prior cube or an affine
+        chart (the boxes' prior masses bounded by their volumes). Default
+        1e-3.
+    certificate_shells : tuple of float, optional
+        The shells' upper overlaps ``tau_g`` (SNR), fixed before the data.
+        Default (0.5, 1, 1.5, 2, 3, 4, 5, 6, 8, 10).
     max_evaluations : int, optional
         Budget of likelihood evaluations. Default 100000.
     posterior_samples : int, optional
@@ -382,7 +370,8 @@ class AMRSampler(BaseSampler):
                  coverage_resolution=0.5, coverage_probes=4,
                  box_snr_bound=None, coverage_chart=False,
                  reference_logz=None, certificate_delta=1e-3,
-                 certificate_betas=(0.95, 0.85, 0.7, 0.5, 0.3)):
+                 certificate_shells=(0.5, 1., 1.5, 2., 3., 4., 5., 6., 8.,
+                                     10.)):
         super().__init__(model)
         self.reference_logz = (None if reference_logz is None
                                else float(reference_logz))
@@ -409,11 +398,12 @@ class AMRSampler(BaseSampler):
                               else self.reference_logz)
         # the fractional-moment certificate, when the bound gives the boxes'
         # overlaps with the signal
-        self._fraction = (
-            _FractionalCertificate(certificate_delta,
-                                   getattr(box_snr_bound, 'dof', 2),
-                                   certificate_betas)
+        self._shell = (
+            _ShellCertificate(certificate_delta,
+                              getattr(box_snr_bound, 'dof', 2),
+                              certificate_shells)
             if getattr(box_snr_bound, 'overlap', None) is not None else None)
+        self._cert_threshold = -numpy.inf
         self._last_thetas = None
         # the coverage tree in the model's curvilinear coordinates (see
         # _chart_frame) rather than the prior cube
@@ -430,6 +420,10 @@ class AMRSampler(BaseSampler):
             self.coverage_chart = True
         if self.coverage_chart and not self._coverage:
             raise ValueError("coverage_chart is for a coverage bound's tree")
+        if (self._shell is not None and self.coverage_chart
+                and self._chart_matrix is None):
+            raise ValueError("the certificate bounds a box's prior mass by its "
+                             "volume: the prior cube or an affine chart")
         # the Occam offset kappa in ln L = rho^2 / 2 - kappa(rho): a number, or
         # a callable of the SNR rho (see _kappa)
         self.coverage_kappa = (coverage_kappa if callable(coverage_kappa)
@@ -899,15 +893,6 @@ class AMRSampler(BaseSampler):
                     dlogz=float(self._dlogz), seconds=seconds,
                     seconds_per_evaluation=seconds / max(self.nevaluations,
                                                          1))
-        if self._fraction is not None:
-            ref = (float(self._logz) if self.reference_logz is None
-                   else max(float(self._logz), self.reference_logz))
-            diag.update(
-                certificate_boxes=int((self._cert_group >= 0).sum()),
-                certificate_log_fraction=self._fraction.log_bound() - ref,
-                certificate_groups=numpy.bincount(
-                    self._cert_group[self._cert_group >= 0],
-                    minlength=len(self._fraction.betas)).tolist())
         stats = getattr(self.model, 'shared_statistics', None)
         if stats is not None:
             stats = {k: v - before.get(k, 0) for k, v in stats.items()}
@@ -951,7 +936,8 @@ class AMRSampler(BaseSampler):
         self._snr = numpy.full(len(self._lower), numpy.nan)
         self._axis_dist = numpy.full((len(self._lower), self.ndim), numpy.nan)
         self._certified = numpy.zeros(len(self._lower), dtype=bool)
-        self._cert_group = numpy.full(len(self._lower), -1)
+        self._nu = numpy.full(len(self._lower), numpy.nan)
+        self._lncells = numpy.full(len(self._lower), numpy.nan)
         if evaluate:
             self._evaluate_leaves()
 
@@ -968,6 +954,8 @@ class AMRSampler(BaseSampler):
                     and self.nevaluations >= self._next_share):
                 self._share()
             leaves = self._leaves()
+            if self._shell is not None and numpy.isfinite(self._current_logz):
+                self._shell_round(leaves, self._current_logz)
             logmass = self._log_mass(leaves)
             logz = logsumexp(logmass)
             self.history.append((len(leaves), self.nevaluations, logz))
@@ -983,6 +971,10 @@ class AMRSampler(BaseSampler):
             if self._coverage:
                 bound, cover = self._coverage_flags(leaves, ref, threshold)
                 refine |= cover
+            if self._shell is not None:
+                # a box the certificate holds is not refined, whatever flagged
+                # it
+                refine &= ~self._certified[leaves]
             refine &= self._level[leaves] < self.max_level
             if bound is not None:
                 bound = bound[refine]
@@ -1197,8 +1189,10 @@ class AMRSampler(BaseSampler):
             at_peak(numpy.array(self._prior_transform(cube[0])))
         self._snr[:] = numpy.nan
         self._axis_dist[:] = numpy.nan
-        if self._fraction is not None:
-            self._reset_certificate()
+        if self._shell is not None:
+            # the overlaps were with the old estimate: recomputed, and the
+            # certificate with them, next round
+            self._nu[:] = numpy.nan
         self._diagnostics['coverage_peak_moves'] = self._diagnostics.get(
             'coverage_peak_moves', 0) + 1
         logging.info("AMR coverage: the signal's estimate moved to ln L %.3f",
@@ -1342,13 +1336,14 @@ class AMRSampler(BaseSampler):
         with numpy.errstate(invalid='ignore'):
             top = 0.5 * snr ** 2 - self._kappa(snr)
             bound = numpy.where(numpy.isfinite(top), top, numpy.inf) + logvol
-        ok = (bound - self._current_logz < numpy.log(self.mass_fraction)) \
-            | ~numpy.isfinite(logvol)
-        if self._fraction is not None:
-            # either bound excludes a box: the sup bound where the noise's
-            # supremum is small against the box's distance from the signal,
-            # the fractional certificate where it is not
-            ok[~ok] = self._admit(index[~ok], logvol[~ok], self._current_logz)
+        if self._shell is not None:
+            # one certificate: the shells' threshold of the last round (a box
+            # the next round no longer holds is evaluated then)
+            nu, _ = self._box_overlaps(index)
+            ok = nu <= self._cert_threshold
+        else:
+            ok = (bound - self._current_logz < numpy.log(self.mass_fraction)) \
+                | ~numpy.isfinite(logvol)
         done = index[ok]
         self._certified[done] = True
         self._logl[done] = -numpy.inf
@@ -1369,45 +1364,57 @@ class AMRSampler(BaseSampler):
             return last[1:]
         return self._box_thetas(index)
 
-    def _admit(self, index, logmass, logz):
-        """Of boxes ``index``, with prior masses ``exp(logmass)``, those the
-        fractional-moment certificate takes while the boxes it holds stay
-        within ``mass_fraction`` of ``exp(logz)`` (see
-        :class:`_FractionalCertificate`). Returns the mask of those taken."""
-        took = numpy.zeros(len(index), dtype=bool)
-        if not len(index) or not numpy.isfinite(logz):
-            return took
-        theta_c, theta_p, good, bad = self._thetas_of(index)
-        ok = good & ~bad & numpy.isfinite(logmass)
-        if not ok.any():
-            return took
-        nu, lncells = self.box_snr_bound.overlap(theta_c[ok], theta_p[ok])
-        sel = numpy.flatnonzero(ok)
-        group, fit = self._fraction.admit(
-            numpy.asarray(logmass, dtype=float)[ok], numpy.asarray(nu, float),
-            numpy.maximum(numpy.asarray(lncells, float), 0.),
-            logz + numpy.log(self.mass_fraction))
-        took[sel[fit]] = True
-        self._cert_group[index[sel[fit]]] = group[fit]
-        return took
+    def _box_overlaps(self, index):
+        """Each box's overlap bound and log cell count (``box_snr_bound.
+        overlap``), computed once per signal estimate; ``inf`` where a probe
+        does not map."""
+        index = numpy.asarray(index)
+        need = index[numpy.isnan(self._nu[index])]
+        if len(need):
+            theta_c, theta_p, good, bad = self._thetas_of(need)
+            ok = good & ~bad
+            nu = numpy.full(len(need), numpy.inf)
+            ln = numpy.zeros(len(need))
+            if ok.any():
+                a, b = self.box_snr_bound.overlap(theta_c[ok], theta_p[ok])
+                nu[ok] = a
+                ln[ok] = numpy.maximum(numpy.asarray(b, dtype=float), 0.)
+            self._nu[need], self._lncells[need] = nu, ln
+        return self._nu[index], self._lncells[index]
 
-    def _reset_certificate(self):
-        """The signal's estimate moved: the overlaps the certificate holds
-        were with the old one. Its boxes are released; those it held without
-        a value are evaluated (and offered to the certificate again)."""
-        held = numpy.flatnonzero(self._cert_group >= 0)
-        self._fraction.reset()
-        if not len(held):
-            return
-        self._cert_group[held] = -1
-        self._certified[held] = False
-        valueless = held[~numpy.isfinite(self._logl[held])]
-        self._diagnostics['certificate_resets'] = \
-            self._diagnostics.get('certificate_resets', 0) + 1
+    def _log_prior_bound(self, index):
+        """An upper bound on each box's prior mass: its volume times the
+        chart's constant Jacobian (the cube's or an affine chart's), at most
+        1 (not the volume points' estimate, which can miss a box's corner
+        inside the prior)."""
+        centre = self._lower[index] + 0.5 * self._width[index]
+        _, logjac = self._map(centre)
+        lv = numpy.sum(numpy.log(self._width[index]), axis=1) + logjac
+        return numpy.minimum(numpy.where(numpy.isfinite(lv), lv, 0.), 0.)
+
+    def _shell_round(self, leaves, logz):
+        """Recompute the certificate from the leaves (see
+        :class:`_ShellCertificate`): the threshold, the leaves it holds, and,
+        for a leaf it no longer holds that has no value, its evaluation."""
+        nu, ln = self._box_overlaps(leaves)
+        thr, logsum, used = self._shell.threshold(
+            nu, self._log_prior_bound(leaves), ln,
+            logz + numpy.log(self.mass_fraction))
+        self._cert_threshold = thr
+        held = nu <= thr
+        released = leaves[self._certified[leaves] & ~held]
+        self._certified[leaves] = held
+        valueless = released[~numpy.isfinite(self._logl[released])]
         if len(valueless):
             self._logl[valueless] = numpy.nan
             self._evaluate(valueless)
             self._logerr[valueless] = self._log_mass(valueless)
+        self._diagnostics.update(
+            certificate_threshold=thr, certificate_shells_used=used,
+            certificate_log_fraction=logsum - logz,
+            certificate_boxes=int(held.sum()),
+            certificate_released=self._diagnostics.get(
+                'certificate_released', 0) + int(len(released)))
 
     def _coverage_flags(self, leaves, logz, threshold):
         """The coverage bound of each leaf's mass, ``ln`` of its largest
@@ -1462,12 +1469,6 @@ class AMRSampler(BaseSampler):
         unresolved |= (~numpy.isfinite(self._logl[leaves]) & numpy.isfinite(bound)
                        & ~self._certified[leaves])
         cover = (bound - logz > threshold) & unresolved & ~self._certified[leaves]
-        if self._fraction is not None and cover.any():
-            # a flagged box the fractional certificate can take is not refined
-            idx = numpy.flatnonzero(cover)
-            took = self._admit(leaves[idx], logvol[idx], logz)
-            self._certified[leaves[idx[took]]] = True
-            cover[idx[took]] = False
         # the most mass the boxes left unresolved could hold, as a fraction
         # of Z: the guarantee the refinement gives on stopping
         if unresolved.any() and numpy.isfinite(bound[unresolved]).any():
@@ -2027,8 +2028,10 @@ class AMRSampler(BaseSampler):
             (2 * len(index), self.ndim), numpy.nan)])
         self._certified = numpy.concatenate([self._certified, numpy.zeros(
             2 * len(index), dtype=bool)])
-        self._cert_group = numpy.concatenate([self._cert_group, numpy.full(
-            2 * len(index), -1)])
+        self._nu = numpy.concatenate([self._nu, numpy.full(2 * len(index),
+                                                           numpy.nan)])
+        self._lncells = numpy.concatenate([self._lncells, numpy.full(
+            2 * len(index), numpy.nan)])
         self._children = numpy.vstack([self._children,
                                        numpy.full((2 * len(index), 2), -1)])
         return first, second

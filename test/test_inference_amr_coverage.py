@@ -301,7 +301,8 @@ def test_the_fractional_certificate_certifies_the_far_prior_in_few_boxes():
     # gives it), the sup bound carrying a noise supremum as large as the
     # peak's SNR: the fractional certificate takes the far prior the sup
     # bound cannot, with fewer evaluations; the evidence is unchanged and the
-    # boxes the certificate holds carry less than mass_fraction of it
+    # boxes the certificate holds carry less than mass_fraction of it, the
+    # certificate's own bound too
     start = (numpy.array(MEAN) + HALF) / (2 * HALF)
     frac = run(box_snr_bound=PeakOverlap(), start_cube=start,
                reference_logz=exact_logz())
@@ -310,10 +311,11 @@ def test_the_fractional_certificate_certifies_the_far_prior_in_few_boxes():
     assert frac.logz == pytest.approx(exact_logz(), abs=0.05)
     diag = frac.diagnostics
     assert diag['certificate_boxes'] > 0
-    assert diag['certificate_log_fraction'] < numpy.log(1e-4)
+    assert diag['certificate_log_fraction'] <= numpy.log(1e-4)
     assert diag['evaluations'] <= plain.diagnostics['evaluations']
     # the held boxes' true mass, by quadrature on each
-    held = numpy.flatnonzero(frac._cert_group >= 0)
+    leaves = frac._leaves()
+    held = leaves[frac._certified[leaves]]
     rng = numpy.random.default_rng(3)
     mass = []
     for b in held:
