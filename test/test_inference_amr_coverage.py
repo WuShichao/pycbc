@@ -224,6 +224,38 @@ def test_the_tree_proposal_gives_the_evidence_by_importance_sampling():
 
 
 
+def test_a_reference_evidence_spares_evaluations_and_keeps_the_answer():
+    # the ridge from a start off it, with and without its evidence known
+    # beforehand (as the PE's Laplace importance sampling gives it): the
+    # thresholds relative to the known evidence certify the far boxes the
+    # tree's own, still small, evidence could not; the tree proposal's
+    # importance-sampling evidence is the same
+    prior = JointDistribution(
+        ['x', 'y'], Uniform(x=(-HALF, HALF)), Uniform(y=(-HALF, HALF)))
+    start = (numpy.array(MEAN) + 3 * ALONG + HALF) / (2 * HALF)
+    exact = ridge_exact()[0]
+    out = {}
+    for ref in (None, exact):
+        bound = RidgeBound()
+        bound.at_peak(-HALF + 2 * HALF * start)
+        sampler = AMRSampler(FilterRidge(['x', 'y'], prior=prior),
+                             initial_divisions=1, mass_fraction=1e-4,
+                             max_evaluations=40000, posterior_samples=2000,
+                             seed=2, box_snr_bound=bound, start_cube=start,
+                             reference_logz=ref)
+        sampler.run()
+        cube, logq = sampler.tree_proposal(20000, numpy.random.default_rng(5))
+        x = -HALF + 2 * HALF * cube
+        logl = 0.5 * numpy.maximum(PEAK - RHO * ridge_metric(x - MEAN),
+                                   0) ** 2
+        logw = logl - logq
+        out[ref is None] = (sampler.diagnostics['evaluations'],
+                            logsumexp(logw) - numpy.log(len(logw)))
+    assert out[False][0] < out[True][0]
+    assert out[False][1] == pytest.approx(exact, abs=0.03)
+    assert out[True][1] == pytest.approx(exact, abs=0.03)
+
+
 class Mixed(object):
     """Curvilinear coordinates in which a sheet oblique in the parameters is
     along an axis: y1 = x + 3 y + 0.02 y^2 (thin), y2 = y."""

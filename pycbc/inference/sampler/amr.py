@@ -235,6 +235,18 @@ class AMRSampler(BaseSampler):
         A box is refined while its error estimate, or its volume times the
         likelihood of a much finer neighbour, exceeds this fraction of the
         evidence. Default 1e-4.
+    reference_logz : float, optional
+        The evidence known from elsewhere, ``ln`` of the likelihood's integral
+        over the prior cube (as :attr:`logz`): from importance sampling of a
+        Laplace approximation, say. The refinement's thresholds are then
+        ``mass_fraction`` of the larger of it and the tree's own evidence so
+        far; the reported evidence stays the tree's. A tree that starts from
+        the whole prior resolves its peak last, and its own evidence lies far
+        below the true one until then: in the eccentric PE's pp injections it
+        was 12-28 below at the end of a 10000-evaluation budget, so no far box
+        was certified and every one was evaluated (2026-11-19). An estimate
+        that misses mass elsewhere is smaller than the true evidence and only
+        makes the refinement more cautious. Default None.
     max_evaluations : int, optional
         Budget of likelihood evaluations. Default 100000.
     posterior_samples : int, optional
@@ -270,8 +282,11 @@ class AMRSampler(BaseSampler):
                  final_share_frame_radius=None, linear_posterior=False,
                  linear_cap=10.0, box_distance=None, coverage_kappa=0.0,
                  coverage_resolution=0.5, coverage_probes=4,
-                 box_snr_bound=None, coverage_chart=False):
+                 box_snr_bound=None, coverage_chart=False,
+                 reference_logz=None):
         super().__init__(model)
+        self.reference_logz = (None if reference_logz is None
+                               else float(reference_logz))
         # the coverage bound (see _coverage_bound): a box is refined while
         # the most posterior mass its template distance allows exceeds
         # mass_fraction of Z, until that distance is below the resolution
@@ -291,7 +306,8 @@ class AMRSampler(BaseSampler):
         self._peak_cube = None
         self._peak_logl = -numpy.inf
         # the evidence so far, for certifying new boxes before evaluating them
-        self._current_logz = -numpy.inf
+        self._current_logz = (-numpy.inf if self.reference_logz is None
+                              else self.reference_logz)
         # the coverage tree in the model's curvilinear coordinates (see
         # _chart_frame) rather than the prior cube
         # True: the model's curvilinear coordinates; a matrix A: the affine
@@ -838,13 +854,17 @@ class AMRSampler(BaseSampler):
             logmass = self._log_mass(leaves)
             logz = logsumexp(logmass)
             self.history.append((len(leaves), self.nevaluations, logz))
-            self._current_logz = logz
-            refine = self._logerr[leaves] - logz > threshold
-            refine |= self._neighbour_flags(leaves, logmass - logz > threshold,
-                                            logz + threshold)
+            # the thresholds' evidence: the tree's own, or a larger one known
+            # from elsewhere (reference_logz)
+            ref = (logz if self.reference_logz is None
+                   else max(logz, self.reference_logz))
+            self._current_logz = ref
+            refine = self._logerr[leaves] - ref > threshold
+            refine |= self._neighbour_flags(leaves, logmass - ref > threshold,
+                                            ref + threshold)
             bound = None
             if self._coverage:
-                bound, cover = self._coverage_flags(leaves, logz, threshold)
+                bound, cover = self._coverage_flags(leaves, ref, threshold)
                 refine |= cover
             refine &= self._level[leaves] < self.max_level
             if bound is not None:
