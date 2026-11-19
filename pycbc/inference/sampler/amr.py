@@ -674,6 +674,9 @@ class AMRSampler(BaseSampler):
             cube[has], logjac[has] = self._map(inner[has])
         logl = self._cube_loglikelihoods(cube, logjac)
         k = inside.shape[1]
+        # which boxes reach beyond the prior (some volume point outside it):
+        # their posterior draws are uniform, not linear (_draw_curved_posterior)
+        self._beyond[index] = inside.sum(axis=1) < k
         straddle = numpy.nonzero((inside.sum(axis=1) < k) & inside.any(axis=1))[0]
         if self.edge_points > 1 and len(straddle):
             # a box straddling the prior's edge, valued at one inner point, can hold a likelihood that falls by tens
@@ -936,6 +939,7 @@ class AMRSampler(BaseSampler):
         self._snr = numpy.full(len(self._lower), numpy.nan)
         self._axis_dist = numpy.full((len(self._lower), self.ndim), numpy.nan)
         self._certified = numpy.zeros(len(self._lower), dtype=bool)
+        self._beyond = numpy.zeros(len(self._lower), dtype=bool)
         self._nu = numpy.full(len(self._lower), numpy.nan)
         self._lncells = numpy.full(len(self._lower), numpy.nan)
         if evaluate:
@@ -2056,6 +2060,8 @@ class AMRSampler(BaseSampler):
             (2 * len(index), self.ndim), numpy.nan)])
         self._certified = numpy.concatenate([self._certified, numpy.zeros(
             2 * len(index), dtype=bool)])
+        self._beyond = numpy.concatenate([self._beyond, numpy.zeros(
+            2 * len(index), dtype=bool)])
         self._nu = numpy.concatenate([self._nu, numpy.full(2 * len(index),
                                                            numpy.nan)])
         self._lncells = numpy.concatenate([self._lncells, numpy.full(
@@ -2300,6 +2306,12 @@ class AMRSampler(BaseSampler):
             # first-order variation across a box)
             slopes = numpy.zeros((len(self._lower), self.ndim))
             slopes[leaves] = self._box_slopes(leaves)
+            # a box reaching beyond the prior is drawn uniformly: ln L rises
+            # towards a bound the posterior presses on, a slope there points
+            # out of the prior, and the rejection of the draws beyond it ran
+            # without end (2026-11-19, the eccentric PE's curvilinear frame,
+            # 30 minutes on one draw; Gemini review)
+            slopes[leaves[self._beyond[leaves]]] = 0.0
             logmass = logmass + self._linear_log_factor(
                 slopes[leaves] * self._width[leaves])
         tree_logz = float(logsumexp(logmass))
