@@ -295,6 +295,23 @@ class AMRSampler(BaseSampler):
         in the frame the previous one whitened. A thin ridge oblique to the
         cube's axes is resolved only coarsely by the first pilot; each round
         aligns the boxes with it better. Default 1.
+    flank_refinement : bool, optional
+        Also refine a box whose face neighbour's ln L exceeds its own by more
+        than ``loglikelihood_step``, by either of two bounds, along the axis
+        of that step: its mass at the neighbour's likelihood exceeds the mass
+        fraction of Z (the posterior it may hide), or, if one of the
+        posterior draws is expected from it, its share of the importance
+        weights' second moment, ``p e^(2 Delta)`` with ``p`` its mass over Z
+        and ``Delta`` the step, exceeds that fraction (the ESS it may cost).
+        Both end on their own: every halving halves ``p``. The box is halved
+        along its widest side, as every other: halved along the step instead,
+        boxes grew thin along it and the bisection's error estimate, which
+        sees the change along the halved axis only, missed the midpoint
+        error along the others (a normal toy's tree ln Z 0.0075 low against
+        0.0008-0.0016). Default True (2026-11-20: the heavy draws of the low-ESS
+        pp injections lay 3.5-3.9 above their box's value in boxes on the
+        flank of the posterior's sheet, never refined because a box is
+        judged by its centre's mass; Gemini review).
     loglikelihood_step : float, optional
         A box holding more than ``mass_fraction`` of the evidence is refined
         while its log likelihood differs from a face neighbour's by more
@@ -352,7 +369,7 @@ class AMRSampler(BaseSampler):
     _io = AMRFile
 
     def __init__(self, model, initial_divisions=4, max_level=30,
-                 pilot_evaluations=0, loglikelihood_step=1.0,
+                 pilot_evaluations=0, loglikelihood_step=1.0, flank_refinement=True,
                  mass_fraction=1e-4, max_evaluations=100000,
                  posterior_samples=10000, seed=0, nprocesses=1,
                  use_mpi=False, loglikelihood_function=None,
@@ -488,6 +505,7 @@ class AMRSampler(BaseSampler):
         self._batched = False
         self._next_share = 0
         self.loglikelihood_step = float(loglikelihood_step)
+        self.flank_refinement = bool(flank_refinement)
         self.mass_fraction = float(mass_fraction)
         self.max_evaluations = int(max_evaluations)
         if self.explore_basin > 0 and self._explore_points() >= \
@@ -986,7 +1004,7 @@ class AMRSampler(BaseSampler):
             self._current_logz = ref
             refine = self._logerr[leaves] - ref > threshold
             refine |= self._neighbour_flags(leaves, logmass - ref > threshold,
-                                            ref + threshold)
+                                            ref + threshold, logz=ref)
             bound = None
             if self._coverage:
                 bound, cover = self._coverage_flags(leaves, ref, threshold)
@@ -1977,13 +1995,16 @@ class AMRSampler(BaseSampler):
             upper = points[rows[inner], axis] >= self._lower[hi, axis]
             node[inner] = self._children[node[inner], upper.astype(int)]
 
-    def _neighbour_flags(self, leaves, significant, logbound):
+    def _neighbour_flags(self, leaves, significant, logbound, logz=None):
         """Leaves to refine because of their face neighbours: those more
         than twice as coarse as a neighbour whose likelihood, times their own
         volume, exceeds ``logbound``, and the significant ones whose log
         likelihood steps by more than ``loglikelihood_step`` to a neighbour
         (with the neighbour, unless it is the finer)."""
         flag = numpy.zeros(len(self._lower), dtype=bool)
+        flanks = self.flank_refinement and logz is not None
+        # a box from which one of the posterior draws is expected
+        log_drawable = -numpy.log(max(int(self.posterior_samples), 1))
         flag_significant = numpy.zeros(len(self._lower), dtype=bool)
         flag_significant[leaves[significant]] = True
         # a neighbour is at most as large as a box of the starting grid
@@ -1993,6 +2014,10 @@ class AMRSampler(BaseSampler):
                       else self._logdet))
         source = leaves[(self._logl[leaves] + largest > logbound)
                         | significant]
+        if flanks:
+            # a flank box's neighbour can be any box a draw may come from
+            drawable = self._logl[leaves] + jac - logz > log_drawable
+            source = numpy.union1d(source, leaves[drawable])
         if len(source) == 0:
             return numpy.zeros(len(leaves), dtype=bool)
         centre = self._lower[source] + 0.5 * self._width[source]
@@ -2028,6 +2053,22 @@ class AMRSampler(BaseSampler):
                 if cert is not None and len(cert) == len(self._lower):
                     step &= ~cert[found]
                 flag[origin[step]] = True
+                if flanks:
+                    with numpy.errstate(invalid='ignore'):
+                        delta = self._logl[origin] - self._logl[found]
+                        rise = numpy.isfinite(delta) & (
+                            delta > self.loglikelihood_step)
+                        mass = self._logl[found] + logvol
+                        # the posterior the box may hide, at its
+                        # neighbour's likelihood over its volume
+                        hide = rise & (self._logl[origin] + logvol > logbound)
+                        # the ESS a drawable box may cost
+                        cost = (rise & (mass - logz > log_drawable)
+                                & (mass + 2 * delta > logbound))
+                    hit = hide | cost
+                    if cert is not None and len(cert) == len(self._lower):
+                        hit &= ~cert[found]
+                    flag[found[hit]] = True
                 flag[found[step & (coarseness >= size[inside])]] = True
         return flag[leaves]
 

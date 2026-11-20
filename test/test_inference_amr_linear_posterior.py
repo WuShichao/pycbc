@@ -66,3 +66,34 @@ def test_linear_factor_and_draw():
         tt = AMRSampler._linear_unit_draw(numpy.full(len(u), ai), u)
         mean = numpy.trapz(t * numpy.exp(ai * t), t) / numpy.trapz(numpy.exp(ai * t), t)
         assert tt.mean() == pytest.approx(mean, abs=3e-3)
+
+
+SHEET_SD = 0.004
+
+
+def sheet_logl(x, y):
+    return -0.5 * ((numpy.asarray(y) - 0.5 - 0.3 * (numpy.asarray(x) - 0.5) ** 2) / SHEET_SD) ** 2
+
+
+class SheetModel(BaseModel):
+    name = 'test_flank_sheet'
+
+    def __init__(self):
+        super().__init__(['x', 'y'], prior=JointDistribution(['x', 'y'], Uniform(x=(0., 1.)), Uniform(y=(0., 1.))))
+
+    def _loglikelihood(self):
+        return float(sheet_logl(self.current_params['x'], self.current_params['y']))
+
+
+@pytest.mark.parametrize('flank', [False, True])
+def test_flank_refinement_keeps_a_thin_sheet_exact(flank):
+    # a curved sheet 0.004 thick: the draws' importance weights against their own ln L stay even with flank refinement
+    # on or off (in two dimensions the crest's boxes are significant, so the flank bound adds little: the six-dimensional
+    # trees it is for are tested on the eccentric PE)
+    s = AMRSampler(SheetModel(), initial_divisions=4, mass_fraction=1e-4, max_evaluations=20000,
+                   posterior_samples=5000, linear_posterior=True, flank_refinement=flank, seed=1)
+    s.run()
+    lw = sheet_logl(s.samples['x'], s.samples['y']) - numpy.asarray(s.samples['loglikelihood'])
+    w = numpy.exp(lw - lw.max())
+    assert w.sum() ** 2 / numpy.sum(w ** 2) > 0.9 * len(w)
+    assert s.logz == pytest.approx(numpy.log(numpy.sqrt(2 * numpy.pi) * SHEET_SD), abs=0.02)
