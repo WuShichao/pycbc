@@ -889,8 +889,14 @@ class AMRSampler(BaseSampler):
             stopped = ('check' if self._dlogz <= self.check_tolerance
                        else 'max-evaluations')
         else:
-            stopped = 'max-evaluations' if len(refine) else 'convergence'
+            capped = len(getattr(self, '_capped', ()))
+            stopped = ('max-evaluations' if len(refine) else
+                       'max-level' if capped else 'convergence')
+            if capped and not len(refine):
+                logging.warning("AMR stopped by max-level with %d boxes still "
+                                "flagged at level %d", capped, self.max_level)
         diag.update(stopped_by=stopped,
+                    boxes_at_max_level=len(getattr(self, '_capped', ())),
                     boxes_to_refine=len(refine), boxes=len(leaves),
                     evaluations=self.nevaluations, logz=float(self._logz),
                     dlogz=float(self._dlogz), seconds=seconds,
@@ -989,6 +995,13 @@ class AMRSampler(BaseSampler):
                 # a box the certificate holds is not refined, whatever flagged
                 # it
                 refine &= ~self._certified[leaves]
+            # boxes still flagged at max_level are not refined; counted, so that
+            # a refinement they stop is not reported as converged (2026-11-20:
+            # at max_level 60 the heavy-weight boxes of all seven low-ESS pp
+            # injections sat at levels 54-62, the run said 'convergence';
+            # Gemini review)
+            capped = refine & (self._level[leaves] >= self.max_level)
+            self._capped = leaves[capped]
             refine &= self._level[leaves] < self.max_level
             if bound is not None:
                 bound = bound[refine]
