@@ -2186,10 +2186,22 @@ class AMRSampler(BaseSampler):
 
     def _box_slopes(self, index):
         """Each box's slope of ln L along each axis of the box coordinates,
-        ``(len(index), ndim)``: the central difference of its two face
-        neighbours' centre values (probed across the middle of each face),
-        the one-sided difference where one neighbour is missing or outside
-        the likelihood's support, zero where both are."""
+        ``(len(index), ndim)``, limited by minmod (the monotone reconstruction
+        of finite-volume schemes): of the one-sided differences to its two
+        face neighbours' centre values (probed across the middle of each
+        face), the smaller in magnitude where they agree in sign, zero where
+        they disagree (a maximum or minimum of ln L inside the box) or where
+        either neighbour is missing or outside the likelihood's support. The
+        linear density then stays between the neighbours' values.
+
+        Until 2026-11-20 the central difference, or the one-sided one where a
+        neighbour was missing: across a ridge's crest it was not zero, and
+        towards a neighbour far below it was a cliff, not a slope. Up to
+        linear_cap (10) across a box per axis, it raised boxes' masses by up
+        to e^5.8 over their midpoint mass (posterior_geometry_logz above the
+        tree's ln Z by 2.8-5.8 on pp 1, 16 and 35 of 40), drew most samples
+        into them (median ln weight -11 to -31) and left an ESS of 19-36
+        (Gemini review)."""
         n = len(index)
         centre = self._lower[index] + 0.5 * self._width[index]
         value = self._logl[index]
@@ -2216,12 +2228,12 @@ class AMRSampler(BaseSampler):
             (vm, vp), (dm, dp) = vals, dist
             with numpy.errstate(invalid='ignore', divide='ignore'):
                 both = numpy.isfinite(vm) & numpy.isfinite(vp)
-                plus = ~both & numpy.isfinite(vp)
-                minus = ~both & numpy.isfinite(vm)
                 g = numpy.zeros(n)
-                g[both] = (vp[both] - vm[both]) / (dp[both] - dm[both])
-                g[plus] = (vp[plus] - value[plus]) / dp[plus]
-                g[minus] = (vm[minus] - value[minus]) / dm[minus]
+                gm = (value[both] - vm[both]) / (-dm[both])
+                gp = (vp[both] - value[both]) / dp[both]
+                agree = gm * gp > 0
+                g[both] = numpy.where(agree, numpy.sign(gp) * numpy.minimum(
+                    numpy.abs(gm), numpy.abs(gp)), 0.0)
             g[~numpy.isfinite(g) | ~numpy.isfinite(value)] = 0.0
             slope[:, axis] = g
         # at most linear_cap across a box per axis: a step to a neighbour
