@@ -20,11 +20,13 @@ e_k)`` over 16 + rank basis functions, and the mode's clock ``t_k = t_k0 + dpsi'
 mode: an eccentric harmonic's amplitude goes as e^|n-2|); what
 the linearisation and the fixed amplitude miss is measured against the direct engine, not assumed.
 """
+import time
+
 import numpy
 
 from pycbc.filter.nufft_correlation import (PhaseGrid, PhaseNUFFTCorrelation, SkyBasis, source_power_weights,
                                             _basis, _host)
-from pycbc.waveform.taylorf2_jets import taylorf2_basis_coefficients
+from pycbc.waveform.taylorf2_jets import taylorf2_basis_coefficients, taylorf2_basis_coefficients_many
 from pycbc.tdi.ssb_yearly_harmonics import GridSkyResponse
 
 
@@ -228,15 +230,13 @@ class EccentricModePhaseCorrelation(PhaseNUFFTCorrelation):
         amplitude ratios."""
         fam = self.family_cell
         thetas = numpy.atleast_2d(numpy.asarray(thetas, dtype=float))
-        dC = []
-        for theta in thetas:
-            A, B, la = taylorf2_basis_coefficients(*self._pn_params(theta))
-            dC.append(numpy.concatenate([A - self._A0, B - self._B0]))
+        A, B, _ = taylorf2_basis_coefficients_many(*self._pn_params(thetas.T))
+        dC = numpy.concatenate([A - self._A0[None], B - self._B0[None]], axis=1)
         X = self._offsets_many(fam, thetas)
         ecc = (self._corr_weights(X) - self._W0[None]) @ self._P
         slope = (self._222_weights(X) - self._W0_222[None]) @ self._S
         amp = self._amp_weights(X) @ self._Ra
-        cols = [self.r * numpy.array(dC), ecc]
+        cols = [self.r * dC, ecc]
         if self._nprec:
             # the precession main row: its shapes' coefficients (zero for an aligned template, 4 parameters)
             if thetas.shape[1] > 4:
@@ -263,9 +263,9 @@ class EccentricModePhaseCorrelation(PhaseNUFFTCorrelation):
         w = self.xp.asarray(D[16:-1])
         return x + w.T @ self._D, dx + w.T @ self._Dp
 
-    def project(self, thetas, frame):
+    def project(self, thetas, frame, coefficients=None):
         thetas = numpy.atleast_2d(numpy.asarray(thetas, dtype=float))
-        c, amp = self._coefficients(thetas)
+        c, amp = self._coefficients(thetas) if coefficients is None else coefficients
         s = (c @ frame['root']) @ frame['vs'].T
         remainder = c - s @ frame['directions'].T
         line = remainder @ frame['coef'].T
@@ -563,7 +563,10 @@ class EccentricSharedRegion(object):
 
     def _inside(self, points):
         import logging
+        t0 = time.time()
         thetas, skies = self._coordinates(points)
+        self.inside_times = getattr(self, 'inside_times', {})
+        self.inside_times['coordinates'] = self.inside_times.get('coordinates', 0.) + time.time() - t0
         ok = numpy.ones(len(points), dtype=bool)
         reasons = {}
         # the point's whole lags whose grid times every mode's grid holds, as _evaluate finds them: a point with none
@@ -572,8 +575,14 @@ class EccentricSharedRegion(object):
         L = len(self.lags)
         first = numpy.zeros(len(points), dtype=int)
         last = numpy.full(len(points), L - 1)
+        tick = time.time()
+        times = self.inside_times = getattr(self, 'inside_times', {})
         for k, grid in enumerate(self.grids):
-            s, shift, _ = grid.correlator.project(thetas, grid.frame)
+            t0 = time.time()
+            # the template's coefficients once for the projection and the phase residual (each took them itself)
+            coefficients = grid.correlator._coefficients(thetas)
+            times['coefficients'] = times.get('coefficients', 0.) + time.time() - t0
+            s, shift, _ = grid.correlator.project(thetas, grid.frame, coefficients=coefficients)
             t_lo, t_hi = grid.time_limits()
             first = numpy.maximum(first, numpy.ceil((t_lo - shift) / self.dt - self.lags[0]).astype(int))
             last = numpy.minimum(last, numpy.floor((t_hi - self.dt - shift) / self.dt - self.lags[0]).astype(int))
@@ -583,8 +592,11 @@ class EccentricSharedRegion(object):
                 lo = grid.start[d] + hw[d] * grid.step[d]
                 hi = grid.start[d] + (grid.size[d] - hw[d] - 1) * grid.step[d]
                 on &= (s[:, d] >= lo) & (s[:, d] <= hi)
+            t0 = time.time()
             taylor = grid.taylor_inside(s)
-            phase = grid.correlator.phase_residual(thetas, grid.frame) <= grid.phase_tolerance
+            times['taylor'] = times.get('taylor', 0.) + time.time() - t0
+            phase = grid.correlator.phase_residual(thetas, grid.frame,
+                                                   coefficients=coefficients) <= grid.phase_tolerance
             reasons['off_grid_%d' % k] = int((~on).sum())
             reasons['taylor_%d' % k] = int((~taylor).sum())
             reasons['phase_%d' % k] = int((~phase).sum())
@@ -600,13 +612,17 @@ class EccentricSharedRegion(object):
                              int(lost.sum()), numpy.percentile(first[lost], [0, 10, 50, 90, 100]).tolist(),
                              numpy.percentile(last[lost], [0, 10, 50, 90, 100]).tolist(), L)
         ok &= has_lags
+        times['grids'] = times.get('grids', 0.) + time.time() - tick
         if ok.any():
+            t0 = time.time()
             sky = self.correlators[0].sky_error(skies[ok]) <= self.sky_tolerance
+            times['sky'] = times.get('sky', 0.) + time.time() - t0
             reasons['sky'] = int((~sky).sum())
             ok[ok] = sky
         if len(points) >= 100 and not ok.all():
-            logging.info("EccentricSharedRegion.inside: %d of %d; outside by %s", ok.sum(), len(points),
-                         {k: v for k, v in reasons.items() if v})
+            logging.info("EccentricSharedRegion.inside: %d of %d; outside by %s; seconds so far %s", ok.sum(),
+                         len(points), {k: v for k, v in reasons.items() if v},
+                         {k: round(v, 1) for k, v in times.items()})
         return ok
 
     def _z(self, thetas, skies, delays):

@@ -321,6 +321,26 @@ def taylorf2_basis_coefficients(mchirp, q, spin1z, spin2z):
     return A, B, 5 / 6 * numpy.log(mchirp)
 
 
+def taylorf2_basis_coefficients_many(mchirp, q, spin1z, spin2z):
+    """:func:`taylorf2_basis_coefficients` for arrays of ``M`` points at once:
+    ``(A, B, logamp)`` with ``A``, ``B`` of shape ``(M, 8)``. The same
+    arithmetic, elementwise (a point at a time in Python was most of the
+    shared region's membership test, 2026-11-20)."""
+    mchirp, q, spin1z, spin2z = numpy.broadcast_arrays(
+        *(numpy.atleast_1d(numpy.asarray(x, dtype=float))
+          for x in (mchirp, q, spin1z, spin2z)))
+    m1 = mchirp * (1 + q) ** 0.2 * q ** 0.4
+    m2 = m1 / q
+    a, b = taylorf2_phasing(m1, m2, spin1z, spin2z)
+    a = numpy.column_stack(numpy.broadcast_arrays(*a))
+    b = numpy.column_stack(numpy.broadcast_arrays(*b))
+    scale = numpy.pi * (m1 + m2) * MTSUN_SI
+    power = scale[:, None] ** ((numpy.arange(8) - 5) / 3)
+    A = power * (a + b * numpy.log(scale)[:, None] / 3)
+    B = power * b / 3
+    return A, B, 5 / 6 * numpy.log(mchirp)
+
+
 def basis_phase_and_time(A, B, frequencies, f_lower):
     """``phase(f)`` and ``t(f)`` of the module docstring from basis
     coefficients (or their differences, which enter linearly)."""

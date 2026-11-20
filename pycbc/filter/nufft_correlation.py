@@ -501,11 +501,12 @@ class PhaseNUFFTCorrelation(object):
                     root=R.T, vs=vs[:nall], directions=directions,
                     line_dir=directions.T @ coef.T)
 
-    def project(self, thetas, frame):
+    def project(self, thetas, frame, coefficients=None):
         """Each template's phase coordinates ``s`` (M, nall), the arrival-time
-        shift and the constant factor, in ``frame``."""
+        shift and the constant factor, in ``frame`` (``coefficients``, the
+        templates' ``_coefficients`` if already at hand)."""
         thetas = numpy.atleast_2d(numpy.asarray(thetas, dtype=float))
-        dC, amp = self._coefficients(thetas)
+        dC, amp = self._coefficients(thetas) if coefficients is None else coefficients
         s = (dC @ frame['root']) @ frame['vs'].T
         remainder = dC - s @ frame['directions'].T
         line = remainder @ frame['coef'].T
@@ -517,13 +518,13 @@ class PhaseNUFFTCorrelation(object):
             * amp
         return s, shift, const
 
-    def phase_residual(self, thetas, frame):
+    def phase_residual(self, thetas, frame, coefficients=None):
         """The root-mean-square, weighted by the template power, of the
         phase each template keeps outside ``frame``'s directions, less its
         constant and linear parts, rad: by Cauchy-Schwarz it bounds the
         power-weighted mean phase error the frame makes."""
         thetas = numpy.atleast_2d(numpy.asarray(thetas, dtype=float))
-        dC, _ = self._coefficients(thetas)
+        dC, _ = self._coefficients(thetas) if coefficients is None else coefficients
         y = dC @ frame['root']
         r = y - (y @ frame['vs'].T) @ frame['vs']
         return numpy.sqrt(numpy.sum(r ** 2, axis=1))
