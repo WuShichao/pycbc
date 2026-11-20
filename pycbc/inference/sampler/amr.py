@@ -297,13 +297,14 @@ class AMRSampler(BaseSampler):
         aligns the boxes with it better. Default 1.
     flank_refinement : bool, optional
         Also refine a box whose face neighbour's ln L exceeds its own by more
-        than ``loglikelihood_step``, by either of two bounds, along the axis
-        of that step: its mass at the neighbour's likelihood exceeds the mass
-        fraction of Z (the posterior it may hide), or, if one of the
-        posterior draws is expected from it, its share of the importance
-        weights' second moment, ``p e^(2 Delta)`` with ``p`` its mass over Z
-        and ``Delta`` the step, exceeds that fraction (the ESS it may cost).
-        Both end on their own: every halving halves ``p``. The box is halved
+        than ``loglikelihood_step`` when its mass at the neighbour's
+        likelihood exceeds the mass fraction of Z: the posterior it may hide,
+        for a box of any size (the coarse-neighbour rule asks it to be more
+        than twice as coarse). It ends on its own: every halving halves the
+        box's volume. (A second bound, on a drawable box's share of the
+        weights' second moment, never held without this one at the PE's
+        settings: with one draw expected from a box and a step above 1, the
+        first bound already does. Removed, 2026-11-20.) The box is halved
         along its widest side, as every other: halved along the step instead,
         boxes grew thin along it and the bisection's error estimate, which
         sees the change along the halved axis only, missed the midpoint
@@ -1004,7 +1005,7 @@ class AMRSampler(BaseSampler):
             self._current_logz = ref
             refine = self._logerr[leaves] - ref > threshold
             refine |= self._neighbour_flags(leaves, logmass - ref > threshold,
-                                            ref + threshold, logz=ref)
+                                            ref + threshold)
             bound = None
             if self._coverage:
                 bound, cover = self._coverage_flags(leaves, ref, threshold)
@@ -1995,16 +1996,14 @@ class AMRSampler(BaseSampler):
             upper = points[rows[inner], axis] >= self._lower[hi, axis]
             node[inner] = self._children[node[inner], upper.astype(int)]
 
-    def _neighbour_flags(self, leaves, significant, logbound, logz=None):
+    def _neighbour_flags(self, leaves, significant, logbound):
         """Leaves to refine because of their face neighbours: those more
         than twice as coarse as a neighbour whose likelihood, times their own
         volume, exceeds ``logbound``, and the significant ones whose log
         likelihood steps by more than ``loglikelihood_step`` to a neighbour
         (with the neighbour, unless it is the finer)."""
         flag = numpy.zeros(len(self._lower), dtype=bool)
-        flanks = self.flank_refinement and logz is not None
-        # a box from which one of the posterior draws is expected
-        log_drawable = -numpy.log(max(int(self.posterior_samples), 1))
+        flanks = self.flank_refinement
         flag_significant = numpy.zeros(len(self._lower), dtype=bool)
         flag_significant[leaves[significant]] = True
         # a neighbour is at most as large as a box of the starting grid
@@ -2014,10 +2013,6 @@ class AMRSampler(BaseSampler):
                       else self._logdet))
         source = leaves[(self._logl[leaves] + largest > logbound)
                         | significant]
-        if flanks:
-            # a flank box's neighbour can be any box a draw may come from
-            drawable = self._logl[leaves] + jac - logz > log_drawable
-            source = numpy.union1d(source, leaves[drawable])
         if len(source) == 0:
             return numpy.zeros(len(leaves), dtype=bool)
         centre = self._lower[source] + 0.5 * self._width[source]
@@ -2056,16 +2051,11 @@ class AMRSampler(BaseSampler):
                 if flanks:
                     with numpy.errstate(invalid='ignore'):
                         delta = self._logl[origin] - self._logl[found]
-                        rise = numpy.isfinite(delta) & (
-                            delta > self.loglikelihood_step)
-                        mass = self._logl[found] + logvol
-                        # the posterior the box may hide, at its
-                        # neighbour's likelihood over its volume
-                        hide = rise & (self._logl[origin] + logvol > logbound)
-                        # the ESS a drawable box may cost
-                        cost = (rise & (mass - logz > log_drawable)
-                                & (mass + 2 * delta > logbound))
-                    hit = hide | cost
+                        # the posterior the box may hide: at its neighbour's
+                        # likelihood over its own volume
+                        hit = (numpy.isfinite(delta)
+                               & (delta > self.loglikelihood_step)
+                               & (self._logl[origin] + logvol > logbound))
                     if cert is not None and len(cert) == len(self._lower):
                         hit &= ~cert[found]
                     flag[found[hit]] = True
