@@ -220,17 +220,23 @@ class EccentricCellPE(BaseModel):
                  n_l0=64, orientation_nodes=(16, 8), amplitude_order=64, oversampling=4,
                  screen_margin=40.0, bayes_margin=30.0, noise_variance=1.0, amplitude_table=None,
                  screen_anomalies=None, shared_options=None, template_convention='face-on', mode_keys=None,
-                 precession=False, spin_log_prior=None, **kwargs):
+                 precession=False, spin_log_prior=None, spin_perp_sqrt=False, **kwargs):
         super().__init__(variable_params, **kwargs)
         self.block = block_model
         # precession=True: the block's family carries a main-row model (family.precession, a
         # pycbc.waveform.precession_main_row.PrecessionMainRow) and the intrinsic parameters gain the in-plane spins
         # and their azimuth difference at f_ref (theta of 7). spin_log_prior(points) -> ln of the spins' prior
         # density over the sampler's uniform box, added by loglikelihoods() and _loglikelihood() (the sampler's
-        # target; evaluate() and the reconstruction stay the likelihood alone)
+        # target; evaluate() and the reconstruction stay the likelihood alone).
+        # spin_perp_sqrt=True: sampler parameters are spin1_perp_sqrt = sqrt(spin1_perp), spin2_perp_sqrt =
+        # sqrt(spin2_perp), mapped to physical in-plane spins inside _theta_sky().
         self.precession = bool(precession)
+        self.spin_perp_sqrt = bool(spin_perp_sqrt) and self.precession
         if self.precession:
-            self.intrinsic = self.intrinsic + ('spin1_perp', 'spin2_perp', 'spin_dphi')
+            if self.spin_perp_sqrt:
+                self.intrinsic = self.intrinsic + ('spin1_perp_sqrt', 'spin2_perp_sqrt', 'spin_dphi')
+            else:
+                self.intrinsic = self.intrinsic + ('spin1_perp', 'spin2_perp', 'spin_dphi')
         self.spin_log_prior = spin_log_prior
         self.patterns = None
         if template_convention == 'hlm':
@@ -464,6 +470,9 @@ class EccentricCellPE(BaseModel):
 
     def _theta_sky(self, params):
         theta = numpy.array([params[k] for k in self.intrinsic], float)
+        if self.spin_perp_sqrt:
+            theta[4] = theta[4] ** 2
+            theta[5] = theta[5] ** 2
         lon0, lat0, slon, slat = self.sky_reference
         dlon = numpy.mod(params['eclipticlongitude'] - lon0 + numpy.pi, 2 * numpy.pi) - numpy.pi
         sky = numpy.array([dlon / slon, (params['eclipticlatitude'] - lat0) / slat])
@@ -610,7 +619,12 @@ class EccentricCellPE(BaseModel):
                  eclipticlongitude=float(numpy.mod(lon0 + sky[0] * slon, 2 * numpy.pi)),
                  eclipticlatitude=float(lat0 + sky[1] * slat))
         if len(theta) > 4:
-            q.update(spin1_perp=float(theta[4]), spin2_perp=float(theta[5]), spin_dphi=float(theta[6]))
+            if self.spin_perp_sqrt:
+                q.update(spin1_perp_sqrt=float(numpy.sqrt(max(theta[4], 0.))),
+                         spin2_perp_sqrt=float(numpy.sqrt(max(theta[5], 0.))),
+                         spin_dphi=float(theta[6]))
+            else:
+                q.update(spin1_perp=float(theta[4]), spin2_perp=float(theta[5]), spin_dphi=float(theta[6]))
         return q
 
     def _full_at(self, params, delays):

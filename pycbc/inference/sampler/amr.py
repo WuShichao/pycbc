@@ -1958,16 +1958,30 @@ class AMRSampler(BaseSampler):
         of the origin, unless that would take more than ``_layout`` (a
         tenth by default) of the budget."""
         self._grid(evaluate=False)
-        target = max(1.0, 2 * radius / (self._layout * self.max_evaluations)
-                     ** (1.0 / self.ndim))
+        cap = max(1, int(self._layout * self.max_evaluations))
+        target = max(1.0, 2 * radius / cap ** (1.0 / self.ndim))
         while True:
             leaves = self._leaves()
             zlow = low + span * self._lower[leaves]
             zwidth = span * self._width[leaves]
             nearest = numpy.clip(0, zlow, zlow + zwidth)
             near = numpy.linalg.norm(nearest, axis=1) <= radius
-            split = leaves[near & (zwidth.max(axis=1) > target)]
+            wide = zwidth.max(axis=1)
+            mask = near & (wide > target)
+            split = leaves[mask]
             if len(split) == 0:
+                break
+            # Power-of-two bisection across many dimensions (e.g. 9-D
+            # precessing PE) can overshoot ``cap`` by 5-25x in a single wave.
+            # Stop once the near-ball leaves reach ``cap``, splitting only the
+            # widest boxes on the final wave.
+            near_count = int(near.sum())
+            if near_count >= cap:
+                break
+            if near_count + len(split) > cap:
+                order = numpy.argsort(-wide[mask])
+                split = split[order[:cap - near_count]]
+                self._split(split)
                 break
             self._split(split)
         self._evaluate_leaves()

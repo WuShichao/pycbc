@@ -41,7 +41,7 @@ from itertools import combinations_with_replacement
 import numpy
 
 __all__ = ['PrecessionMainRow', 'build_precession_main_row', 'features',
-           'isotropic_log_prior']
+           'isotropic_log_prior', 'isotropic_log_prior_sqrt']
 
 
 def features(lam):
@@ -269,26 +269,111 @@ def isotropic_log_prior(chi_eff, chi1_perp, chi2_perp, q, a_max=0.99,
     uniform, so their difference too), the antisymmetric aligned part
     integrated out: with ``chi_i = (chi_i_perp, chi_iz)`` each of density
     ``chi_perp / (2 a_max (chi_perp^2 + chi_z^2))`` inside the ball, and
-    ``chi_eff = (m1 chi_1z + m2 chi_2z) / M``, the integral over ``chi_1z`` by
-    the midpoint rule on ``n`` points (normalised over chi_eff, chi1_perp,
-    chi2_perp; ``q = m1 / m2``)."""
+    ``chi_eff = (m1 chi_1z + m2 chi_2z) / M``, evaluated by its exact closed-form
+    antiderivative (partial fractions into ``arctan`` and ``log``, with 32-pt
+    Gauss-Legendre in ``arctan(z / s1)`` on the near-degenerate strip
+    ``mu ~ 0, s1 ~ (w2 / w1) s2``). Normalised over chi_eff, chi1_perp,
+    chi2_perp; ``q = m1 / m2``. ``n`` is retained only for API compatibility."""
+    del n
     chi_eff, s1, s2, q = (numpy.atleast_1d(numpy.asarray(v, dtype=float))
                           for v in (chi_eff, chi1_perp, chi2_perp, q))
-    w1 = q / (1 + q)
-    w2 = 1 / (1 + q)
-    out = numpy.full(numpy.broadcast(chi_eff, s1, s2, q).shape, -numpy.inf)
-    chi_eff, s1, s2, w1, w2 = numpy.broadcast_arrays(chi_eff, s1, s2, w1, w2)
-    zmax1 = numpy.sqrt(numpy.maximum(a_max ** 2 - s1 ** 2, 0.))
-    zmax2 = numpy.sqrt(numpy.maximum(a_max ** 2 - s2 ** 2, 0.))
-    u = (numpy.arange(n) + 0.5) / n
-    z1 = -zmax1[..., None] + 2 * zmax1[..., None] * u
-    z2 = (chi_eff[..., None] - w1[..., None] * z1) / w2[..., None]
-    inside = numpy.abs(z2) <= zmax2[..., None]
-    d1 = s1[..., None] / (2 * a_max * (s1[..., None] ** 2 + z1 ** 2))
-    d2 = s2[..., None] / (2 * a_max * (s2[..., None] ** 2 + z2 ** 2))
-    # p(chi_eff) = int p1(z1) p2((chi_eff - w1 z1) / w2) / w2 dz1
-    integrand = numpy.where(inside, d1 * d2 / w2[..., None], 0.)
-    total = integrand.sum(axis=-1) * 2 * zmax1 / n
-    with numpy.errstate(divide='ignore'):
-        out = numpy.where(total > 0, numpy.log(total), -numpy.inf)
+    chi_eff, s1, s2, q = numpy.broadcast_arrays(chi_eff, s1, s2, q)
+    w1 = q / (1.0 + q)
+    w2 = 1.0 / (1.0 + q)
+    out = numpy.full(chi_eff.shape, -numpy.inf, dtype=float)
+    zmax1 = numpy.sqrt(numpy.maximum(a_max ** 2 - s1 ** 2, 0.0))
+    zmax2 = numpy.sqrt(numpy.maximum(a_max ** 2 - s2 ** 2, 0.0))
+    zlo = numpy.maximum(-zmax1, (chi_eff - w2 * zmax2) / w1)
+    zhi = numpy.minimum(zmax1, (chi_eff + w2 * zmax2) / w1)
+    in_box = (zhi > zlo) & (s1 >= 0.0) & (s2 >= 0.0) & (s1 < a_max) & (s2 < a_max)
+    if not numpy.any(in_box):
+        return out
+
+    # Exact s1 > 0, s2 > 0 interior (generic case)
+    both_pos = in_box & (s1 > 0.0) & (s2 > 0.0)
+    if numpy.any(both_pos):
+        a = s1[both_pos]
+        w1v = w1[both_pos]
+        mu = chi_eff[both_pos] / w1v
+        b = (w2[both_pos] / w1v) * s2[both_pos]
+        zl = zlo[both_pos]
+        zh = zhi[both_pos]
+        # D = (mu^2 + (a - b)^2) (mu^2 + (a + b)^2)
+        D = (mu ** 2 + (a - b) ** 2) * (mu ** 2 + (a + b) ** 2)
+        scale4 = numpy.maximum((a + b) ** 4, 1e-300)
+        near_deg = D < 1e-6 * scale4
+        val = numpy.empty_like(a)
+        g = ~near_deg
+        if numpy.any(g):
+            ag, bg, mg, zlg, zhg, Dg = a[g], b[g], mu[g], zl[g], zh[g], D[g]
+            dt1 = numpy.arctan2(zhg, ag) - numpy.arctan2(zlg, ag)
+            dt2 = numpy.arctan2(zhg - mg, bg) - numpy.arctan2(zlg - mg, bg)
+            lterm = (numpy.log(zhg ** 2 + ag ** 2)
+                     - numpy.log(zlg ** 2 + ag ** 2)
+                     + numpy.log((zlg - mg) ** 2 + bg ** 2)
+                     - numpy.log((zhg - mg) ** 2 + bg ** 2))
+            val[g] = (mg * ag * bg * lterm
+                      + bg * (mg ** 2 + bg ** 2 - ag ** 2) * dt1
+                      + ag * (mg ** 2 + ag ** 2 - bg ** 2) * dt2) / Dg
+        if numpy.any(near_deg):
+            an, bn, mn = a[near_deg], b[near_deg], mu[near_deg]
+            zln, zhn = zl[near_deg], zh[near_deg]
+            tlo = numpy.arctan2(zln, an)
+            thi = numpy.arctan2(zhn, an)
+            xgl, wgl = numpy.polynomial.legendre.leggauss(32)
+            t = 0.5 * (thi - tlo)[:, None] * xgl[None, :] + 0.5 * (thi + tlo)[:, None]
+            z = an[:, None] * numpy.tan(t)
+            integrand = bn[:, None] / ((z - mn[:, None]) ** 2 + bn[:, None] ** 2)
+            val[near_deg] = numpy.sum(integrand * wgl[None, :], axis=1) * 0.5 * (thi - tlo)
+        total = val / (4.0 * a_max ** 2 * w1v)
+        with numpy.errstate(divide='ignore', invalid='ignore'):
+            out[both_pos] = numpy.where(total > 0.0, numpy.log(total), -numpy.inf)
+
+    # Exact boundary limits s1 == 0, s2 > 0 or s2 == 0, s1 > 0 (Dirac delta of Lorentzian)
+    only_s2 = in_box & (s1 == 0.0) & (s2 > 0.0) & (zlo <= 0.0) & (zhi >= 0.0)
+    if numpy.any(only_s2):
+        w1v = w1[only_s2]
+        mu = chi_eff[only_s2] / w1v
+        b = (w2[only_s2] / w1v) * s2[only_s2]
+        # endpoint weight: pi if strictly inside, pi/2 at an endpoint
+        wt = numpy.where((zlo[only_s2] < 0.0) & (zhi[only_s2] > 0.0), numpy.pi, 0.5 * numpy.pi)
+        total = wt * b / (4.0 * a_max ** 2 * w1v * (b ** 2 + mu ** 2))
+        with numpy.errstate(divide='ignore'):
+            out[only_s2] = numpy.where(total > 0.0, numpy.log(total), -numpy.inf)
+
+    only_s1 = in_box & (s2 == 0.0) & (s1 > 0.0)
+    if numpy.any(only_s1):
+        w1v = w1[only_s1]
+        mu = chi_eff[only_s1] / w1v
+        a = s1[only_s1]
+        in_z = (zlo[only_s1] <= mu) & (zhi[only_s1] >= mu)
+        if numpy.any(in_z):
+            wt = numpy.where((zlo[only_s1] < mu) & (zhi[only_s1] > mu), numpy.pi, 0.5 * numpy.pi)
+            total = numpy.where(in_z, wt * a / (4.0 * a_max ** 2 * w1v * (a ** 2 + mu ** 2)), 0.0)
+            with numpy.errstate(divide='ignore'):
+                out[only_s1] = numpy.where(total > 0.0, numpy.log(total), -numpy.inf)
+
+    return out
+
+
+def isotropic_log_prior_sqrt(chi_eff, u1, u2, q, a_max=0.99):
+    """ln of the isotropic spin prior density in quadratic in-plane coordinates
+    ``(chi_eff, u1, u2)`` where ``chi1_perp = u1^2``, ``chi2_perp = u2^2`` on
+    ``u_i in [0, sqrt(a_max)]``.
+
+    Multiplying ``p(chi_eff, s1, s2)`` by the Jacobian ``4 u1 u2`` removes the
+    ``1 / (w1 s1 + w2 s2)`` integrable pole at ``(chi_eff, s1, s2) = (0, 0, 0)``
+    completely (bounded above everywhere by AM-GM), making climbs and AMR boxes
+    well-conditioned across the entire prior box."""
+    chi_eff, u1, u2, q = (numpy.atleast_1d(numpy.asarray(v, dtype=float))
+                          for v in (chi_eff, u1, u2, q))
+    chi_eff, u1, u2, q = numpy.broadcast_arrays(chi_eff, u1, u2, q)
+    out = numpy.full(chi_eff.shape, -numpy.inf, dtype=float)
+    pos = (u1 > 0.0) & (u2 > 0.0) & (u1 * u1 < a_max) & (u2 * u2 < a_max)
+    if not numpy.any(pos):
+        return out
+    lp = isotropic_log_prior(chi_eff[pos], u1[pos] ** 2, u2[pos] ** 2, q[pos], a_max=a_max)
+    with numpy.errstate(divide='ignore', invalid='ignore'):
+        val = lp + numpy.log(4.0 * u1[pos] * u2[pos])
+    out[pos] = numpy.where(numpy.isfinite(val), val, -numpy.inf)
     return out
