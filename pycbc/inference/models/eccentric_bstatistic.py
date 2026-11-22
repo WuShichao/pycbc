@@ -793,34 +793,51 @@ class EccentricCellPE(BaseModel):
             parts.append(host(ba).reshape(len(angles), -1))
         angles = numpy.asarray(host(angles), dtype=float)
         by_angle = numpy.concatenate(parts, axis=1)
-        a = flat_choice(by_angle.T, rng.random((M, 1)))[:, 0]
         step = 2 * numpy.pi / len(angles)
-        anomaly = numpy.mod(angles[a] + (rng.random(M) - 0.5) * step, 2 * numpy.pi)
         zs, gs, off = self._sub22(z22 / var, g22 / var)
         zl, gl, _ = mean_anomaly_components(zs, gs, off, self.n_l0)
         r = numpy.arange(M)
-        zz = zl[a, :, r]                                                  # (M, 2)
-        gg = gl[a, :, :, r]                                               # (M, 2, 2)
-        g00, g11, g01 = gg[:, 0, 0].real, gg[:, 1, 1].real, gg[:, 0, 1]
-        ci, ps = draw_orientation_batch(zz.T, g00, g11, g01, self.distance_prior, self.nodes, rng,
-                                        table=self.table, xp=xp)
-        ci, ps = host(ci), host(ps)
-        wv = host(_orientation_vectors(xp.asarray(ci), xp.asarray(ps), xp))   # (M, 2)
-        X = numpy.sum(numpy.conj(wv) * zz, axis=1)
-        gx = (numpy.abs(wv[:, 0]) ** 2 * g00 + numpy.abs(wv[:, 1]) ** 2 * g11
-              + 2 * numpy.real(numpy.conj(wv[:, 0]) * wv[:, 1] * g01))
-        h = numpy.concatenate([host(draw_amplitude_batch(xp.asarray(numpy.abs(X[c:c + 4096])),
-                                                         xp.asarray(gx[c:c + 4096]), self.distance_prior, rng,
-                                                         xp=xp)) for c in range(0, M, 4096)])
-        phase = numpy.mod(rng.vonmises(numpy.angle(X), h * numpy.abs(X)), 2 * numpy.pi)
-        quarter = rng.integers(4, size=M)
-        branch = rng.integers(2, size=M)
-        pol = numpy.mod(ps + quarter * numpy.pi / 2, numpy.pi)
-        phi = numpy.mod(0.5 * (phase + quarter * numpy.pi) + branch * numpy.pi, 2 * numpy.pi)
-        iota = numpy.arccos(ci)
-        lnl = log_likelihood_batch(z / var, g / var, self.full_model.patterns.keys, h, anomaly, iota, pol, phi)
-        lnl22 = log_likelihood_batch(z22 / var, g22 / var, self.patterns.keys, h, anomaly, iota, pol, phi)
-        delta = lnl - lnl22
+        # K independent draws of the angles and amplitude at each point's one time sample: hm_delta = ln of the
+        # mean of exp(ln L_full - ln L_22) over them, still unbiased for B_full / B_22 in e^lnB, its variance about
+        # 1/K of one draw's (2026-11-22: the time sample's own noise is 0.0004-0.004 in sd against 0.16-0.44 for one
+        # draw of the angles, so the angles are the noise); the returned extrinsics one of the K by weight
+        K = max(1, int(getattr(self, 'hm_draw_count', 1)))
+        draws = []
+        for _k in range(K):
+            a = flat_choice(by_angle.T, rng.random((M, 1)))[:, 0]
+            anomaly = numpy.mod(angles[a] + (rng.random(M) - 0.5) * step, 2 * numpy.pi)
+            zz = zl[a, :, r]                                                  # (M, 2)
+            gg = gl[a, :, :, r]                                               # (M, 2, 2)
+            g00, g11, g01 = gg[:, 0, 0].real, gg[:, 1, 1].real, gg[:, 0, 1]
+            ci, ps = draw_orientation_batch(zz.T, g00, g11, g01, self.distance_prior, self.nodes, rng,
+                                            table=self.table, xp=xp)
+            ci, ps = host(ci), host(ps)
+            wv = host(_orientation_vectors(xp.asarray(ci), xp.asarray(ps), xp))   # (M, 2)
+            X = numpy.sum(numpy.conj(wv) * zz, axis=1)
+            gx = (numpy.abs(wv[:, 0]) ** 2 * g00 + numpy.abs(wv[:, 1]) ** 2 * g11
+                  + 2 * numpy.real(numpy.conj(wv[:, 0]) * wv[:, 1] * g01))
+            h = numpy.concatenate([host(draw_amplitude_batch(xp.asarray(numpy.abs(X[c:c + 4096])),
+                                                             xp.asarray(gx[c:c + 4096]), self.distance_prior, rng,
+                                                             xp=xp)) for c in range(0, M, 4096)])
+            phase = numpy.mod(rng.vonmises(numpy.angle(X), h * numpy.abs(X)), 2 * numpy.pi)
+            quarter = rng.integers(4, size=M)
+            branch = rng.integers(2, size=M)
+            pol = numpy.mod(ps + quarter * numpy.pi / 2, numpy.pi)
+            phi = numpy.mod(0.5 * (phase + quarter * numpy.pi) + branch * numpy.pi, 2 * numpy.pi)
+            iota = numpy.arccos(ci)
+            lnl = log_likelihood_batch(z / var, g / var, self.full_model.patterns.keys, h, anomaly, iota, pol, phi)
+            lnl22 = log_likelihood_batch(z22 / var, g22 / var, self.patterns.keys, h, anomaly, iota, pol, phi)
+            draws.append((lnl - lnl22, lnl, h, anomaly, iota, pol, phi))
+        dk = numpy.array([d_[0] for d_ in draws])                            # (K, M)
+        delta = numpy.logaddexp.reduce(dk, axis=0) - numpy.log(K)
+        if K > 1:
+            wk = numpy.exp(dk - dk.max(axis=0))
+            pick = (wk.cumsum(axis=0) / wk.sum(axis=0) < rng.random(M)).sum(axis=0)
+            pick = numpy.minimum(pick, K - 1)
+        else:
+            pick = numpy.zeros(M, dtype=int)
+        lnl, h, anomaly, iota, pol, phi = [numpy.array([draws[pick[i]][j][i] for i in range(M)])
+                                           for j in range(1, 7)]
         # the delay is drawn within its sample's width (delays) while the angles belong to the sample's own time:
         # moved by dt, the orbital phase and the mean anomaly advance by pi f dt at the frequency the data fix
         # best (phase_reference_frequency; every harmonic's phase at its own frequency is then kept, 2 dphi + (n - 2)
