@@ -295,6 +295,40 @@ class AMRSampler(BaseSampler):
         in the frame the previous one whitened. A thin ridge oblique to the
         cube's axes is resolved only coarsely by the first pilot; each round
         aligns the boxes with it better. Default 1.
+    box_nonlinearity : callable, optional
+        ``box_nonlinearity(lower, width, loglikelihood, loglikelihood_max)``
+        for boxes ``(n, ndim)`` in the box coordinates: ``(n, ndim)``, a bound
+        on how far the box's ln L departs from its linear surrogate along each
+        axis, in nats. A box whose posterior mass exceeds ``mass_fraction`` of
+        Z is refined while the largest exceeds ``nonlinearity_tolerance``, and
+        halved along that axis. The likelihood's resolution is then set by
+        the curvature of the templates, harmonic by harmonic, not by the
+        posterior's widths (card 2026-11-22-amr-coverage-noise-bound: the
+        noise term changes across a box by at most the template distance
+        times the data's norm in the directions the template space gains).
+    nonlinearity_tolerance : float, optional
+        Nats; default 1.
+    nonlinearity_reach : float, optional
+        Boxes whose midpoint mass is within this many nats below the
+        refinement threshold get ``box_nonlinearity`` evaluated, and are
+        refined when their mass with the departure (the sum over the axes)
+        crosses the threshold: a box whose surrogate is wrong may hide mass.
+        Default 10.
+    target_efficiency : float, optional
+        With ``box_nonlinearity``: refine, largest first, the boxes whose
+        mass times their predicted log-weight variance (4/45 of the sum of
+        their squared departures) makes the proposal's exceed
+        ``-ln(target_efficiency)``, the ESS / N the draws' importance weights
+        are to reach. Default None (only the per-box tolerance).
+    parabolic_slopes : bool, optional
+        With ``linear_posterior``: a box's slope along an axis from the
+        parabola through its own and its two neighbours' centre values
+        (exact for a quadratic ln L) wherever that parabola departs from its
+        tangent across the box by at most ``nonlinearity_tolerance``; minmod
+        elsewhere. Minmod's one-sided slope errs by the curvature times the
+        box's width, which spreads the log weights 15 times more than the
+        curvature itself (4/3 against 4/45 of the departure squared). Default
+        False.
     flank_refinement : bool, optional
         Also refine a box whose face neighbour's ln L exceeds its own by more
         than ``loglikelihood_step`` when its mass at the neighbour's
@@ -389,8 +423,16 @@ class AMRSampler(BaseSampler):
                  box_snr_bound=None, coverage_chart=False,
                  reference_logz=None, certificate_delta=1e-3,
                  certificate_shells=(0.5, 1., 1.5, 2., 3., 4., 5., 6., 8.,
-                                     10.)):
+                                     10.), box_nonlinearity=None,
+                 nonlinearity_tolerance=1.0, nonlinearity_reach=10.0,
+                 target_efficiency=None, parabolic_slopes=False):
         super().__init__(model)
+        self.box_nonlinearity = box_nonlinearity
+        self.nonlinearity_tolerance = float(nonlinearity_tolerance)
+        self.nonlinearity_reach = float(nonlinearity_reach)
+        self.target_efficiency = (None if target_efficiency is None
+                                  else float(target_efficiency))
+        self.parabolic_slopes = bool(parabolic_slopes)
         self.reference_logz = (None if reference_logz is None
                                else float(reference_logz))
         # the coverage bound (see _coverage_bound): a box is refined while
@@ -963,6 +1005,7 @@ class AMRSampler(BaseSampler):
         self._dist = numpy.full(len(self._lower), numpy.nan)
         self._snr = numpy.full(len(self._lower), numpy.nan)
         self._axis_dist = numpy.full((len(self._lower), self.ndim), numpy.nan)
+        self._nonlin = numpy.full((len(self._lower), self.ndim), numpy.nan)
         self._certified = numpy.zeros(len(self._lower), dtype=bool)
         self._beyond = numpy.zeros(len(self._lower), dtype=bool)
         self._nu = numpy.full(len(self._lower), numpy.nan)
@@ -1006,6 +1049,9 @@ class AMRSampler(BaseSampler):
             refine = self._logerr[leaves] - ref > threshold
             refine |= self._neighbour_flags(leaves, logmass - ref > threshold,
                                             ref + threshold)
+            if self.box_nonlinearity is not None:
+                refine |= self._nonlinearity_flags(leaves, logmass - ref,
+                                                   threshold)
             bound = None
             if self._coverage:
                 bound, cover = self._coverage_flags(leaves, ref, threshold)
@@ -2062,6 +2108,54 @@ class AMRSampler(BaseSampler):
                 flag[found[step & (coarseness >= size[inside])]] = True
         return flag[leaves]
 
+    def _nonlinearity_flags(self, leaves, logshare, threshold):
+        """Leaves whose ln L may depart from their linear surrogate by more
+        than ``nonlinearity_tolerance`` along some axis and whose mass, with
+        that departure (the sum over the axes bounds it: the box's ln L
+        exceeds its surrogate by at most that much), may exceed
+        ``mass_fraction`` of Z. ``box_nonlinearity`` is computed once per box,
+        for boxes within ``nonlinearity_reach`` nats of the threshold."""
+        near = logshare > threshold - self.nonlinearity_reach
+        cand = leaves[near]
+        need = cand[~numpy.all(numpy.isfinite(self._nonlin[cand]), axis=1)]
+        if len(need):
+            top = float(numpy.nanmax(self._logl[leaves]))
+            self._nonlin[need] = numpy.asarray(self.box_nonlinearity(
+                self._lower[need], self._width[need], self._logl[need], top),
+                dtype=float)
+        flag = numpy.zeros(len(leaves), dtype=bool)
+        nl = numpy.where(numpy.isfinite(self._nonlin[cand]),
+                         self._nonlin[cand], 0.0)
+        # hidden mass: the box's ln L may exceed its surrogate by the sum
+        with numpy.errstate(invalid='ignore'):
+            flag[near] = ((nl.max(axis=1) > self.nonlinearity_tolerance)
+                          & (logshare[near] + nl.sum(axis=1) > threshold))
+        # the importance weights: a departure from the linear surrogate that
+        # is quadratic, at most nl along an axis, spreads the log weights of
+        # the box's draws by a variance 4/45 nl^2 per axis; the proposal's is
+        # their mean over the boxes by mass, and ESS / N ~ exp(-variance).
+        # Boxes are refined, largest share first, until the rest is below
+        # -ln(target_efficiency)
+        if self.target_efficiency is not None:
+            var = 4.0 / 45.0 * numpy.sum(nl ** 2, axis=1)
+            share = numpy.exp(logshare[near] - numpy.max(logshare))
+            share = share / numpy.sum(numpy.exp(logshare - numpy.max(logshare)))
+            contrib = share * var
+            budget = -numpy.log(self.target_efficiency)
+            total = float(contrib.sum())
+            self._diagnostics['predicted_logweight_variance'] = total
+            if total > budget:
+                order = numpy.argsort(-contrib)
+                excess = numpy.cumsum(contrib[order])
+                k = int(numpy.searchsorted(excess, total - budget)) + 1
+                pick = numpy.zeros(len(cand), dtype=bool)
+                pick[order[:k]] = True
+                flag[near] |= pick
+        self._diagnostics['nonlinearity_flagged'] = int(flag.sum())
+        self._diagnostics['nonlinearity_computed'] = (
+            self._diagnostics.get('nonlinearity_computed', 0) + int(len(need)))
+        return flag
+
     def _split(self, index):
         """Halves boxes along their widest side, without evaluating them;
         returns the indices of the lower and the upper halves."""
@@ -2075,6 +2169,14 @@ class AMRSampler(BaseSampler):
             dist = self._axis_dist[index]
             known = numpy.all(numpy.isfinite(dist), axis=1)
             axis[known] = numpy.argmax(dist[known], axis=1)
+        if self.box_nonlinearity is not None:
+            # a box too curved for its linear surrogate: along its most
+            # curved axis
+            nl = self._nonlin[index]
+            known = numpy.all(numpy.isfinite(nl), axis=1)
+            known[known] &= (nl[known].max(axis=1)
+                             > self.nonlinearity_tolerance)
+            axis[known] = numpy.argmax(nl[known], axis=1)
         rows = numpy.arange(len(index))
         half = width.copy()
         half[rows, axis] /= 2
@@ -2101,6 +2203,8 @@ class AMRSampler(BaseSampler):
         self._snr = numpy.concatenate([self._snr,
                                        numpy.full(2 * len(index), numpy.nan)])
         self._axis_dist = numpy.vstack([self._axis_dist, numpy.full(
+            (2 * len(index), self.ndim), numpy.nan)])
+        self._nonlin = numpy.vstack([self._nonlin, numpy.full(
             (2 * len(index), self.ndim), numpy.nan)])
         self._certified = numpy.concatenate([self._certified, numpy.zeros(
             2 * len(index), dtype=bool)])
@@ -2278,6 +2382,20 @@ class AMRSampler(BaseSampler):
                 agree = gm * gp > 0
                 g[both] = numpy.where(agree, numpy.sign(gp) * numpy.minimum(
                     numpy.abs(gm), numpy.abs(gp)), 0.0)
+                if self.parabolic_slopes:
+                    # the parabola's slope through the three centres, exact
+                    # for a quadratic ln L, where that parabola departs from
+                    # its tangent across the box by at most
+                    # nonlinearity_tolerance (the box is resolved, its
+                    # neighbours are on the same smooth piece); minmod
+                    # elsewhere (a cliff, a crest under-resolved)
+                    am, ap = -dm[both], dp[both]
+                    gpar = (gm * ap + gp * am) / (am + ap)
+                    curv = 2 * (gp - gm) / (am + ap)
+                    half = 0.5 * self._width[index[both], axis]
+                    resolved = (numpy.abs(curv) * half ** 2 / 2
+                                <= self.nonlinearity_tolerance)
+                    g[both] = numpy.where(resolved, gpar, g[both])
             g[~numpy.isfinite(g) | ~numpy.isfinite(value)] = 0.0
             slope[:, axis] = g
         # at most linear_cap across a box per axis: a step to a neighbour
