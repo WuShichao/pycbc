@@ -1235,6 +1235,12 @@ class _LILA_detector(AbsSpaceDet):
     curve. A frequency-domain response covering either or both is
     provided by `pycbc.waveform.lila.lila_fd_response`.
 
+    Beware a name collision: `_LDC_detector` elsewhere in this module is
+    the LISA Data Challenge backend and has nothing to do with the Lunar
+    Deformation Channel. Every `ldc_*` attribute on this class -- and
+    every 'LDC' in a LILA channel name, PSD file or parameter -- means
+    the Lunar Deformation Channel.
+
     Unlike `_LGWA_detector`, this backend needs no external package: the
     lunar orientation comes from `lunarsky` (already an optional
     dependency of `pycbc.coordinates.moon`) via the Moon-centred
@@ -1293,9 +1299,10 @@ class _LILA_detector(AbsSpaceDet):
         evaluate every sample exactly (much slower).
     """
     # Orthogonal recombination of the three vertex channels, in the same
-    # convention `_LDC_detector` uses for LISA's TDI variables (see its
-    # `project_wave`), with the vertex channels 1/2/3 playing the role of
-    # X/Y/Z there:
+    # convention LISA's `_LDC_detector` backend uses for its TDI
+    # variables (see its `project_wave`) -- that 'LDC' is the LISA Data
+    # Challenge, not LILA's Lunar Deformation Channel -- with the vertex
+    # channels 1/2/3 playing the role of X/Y/Z there:
     #     A = (Z - X)/sqrt(2), E = (X - 2Y + Z)/sqrt(6),
     #     T = (X + Y + Z)/sqrt(3).
     # Any orthonormal basis of the two-dimensional signal subspace would
@@ -1356,6 +1363,9 @@ class _LILA_detector(AbsSpaceDet):
 
         # Lunar Deformation Channel: the triangle sides read as
         # long-baseline strainmeters with optics anchored to the surface.
+        # 'LDC' here and in every `ldc_*` name below is the Lunar
+        # Deformation Channel, never this module's `_LDC_detector`
+        # (LISA Data Challenge).
         # Baseline i runs from vertex i to vertex i+1, and its direction is
         # the straight-line chord the laser actually traverses, not the
         # local great-circle tangent -- the two differ by half the subtended
