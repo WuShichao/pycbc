@@ -1222,13 +1222,18 @@ class _LILA_detector(AbsSpaceDet):
     layout, and handled here with exactly ET's geometric conventions
     (see `pycbc.coordinates.moon.moon_triangle_sites`).
 
-    Only the Geodesic Displacement Channel (GDC) is modeled: each vertex
-    has suspended test masses, so it is an ordinary long-wavelength
-    Michelson interferometer with a 60 degree opening angle and its
-    response is the usual two-arm difference tensor. The Lunar
-    Deformation Channel (LDC), in which the Moon's own elastic normal
-    modes are part of the instrument, is a genuinely different response
-    function and is not modeled here.
+    Two channel sets are modeled, with different response functions.
+    The Geodesic Displacement Channel (GDC) is the suspended-test-mass
+    interferometer at each vertex: an ordinary long-wavelength Michelson
+    with a 60 degree opening angle, whose response is the usual two-arm
+    difference tensor (`antenna_pattern`, and the only channel set
+    `project_wave` emits). The Lunar Deformation Channel (LDC) treats
+    the Moon's own elastic normal modes as part of the instrument,
+    sensing the strain along each unsuspended vertex-to-vertex baseline;
+    it is a genuinely different response (`ldc_antenna_pattern`), not a
+    rotation or rescaling of the GDC one, and it carries its own noise
+    curve. A frequency-domain response covering either or both is
+    provided by `pycbc.waveform.lila.lila_fd_response`.
 
     Unlike `_LGWA_detector`, this backend needs no external package: the
     lunar orientation comes from `lunarsky` (already an optional
