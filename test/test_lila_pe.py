@@ -82,6 +82,105 @@ class TestLDCResponse(unittest.TestCase):
         ratio = gdc / ldc
         self.assertGreater(ratio.std() / numpy.abs(ratio).mean(), 1e-3)
 
+    def test_response_sum_is_the_in_plane_projector(self):
+        """The three baselines together see the triangle's plane.
+
+        Three unit chords at 120 degrees in a plane satisfy
+        sum_k e_k e_k = (3/2) P, with P the projector onto that plane,
+        so the LDC responses (which carry an extra 1/2) must sum to
+        (3/4) P. This ties all three baselines together with no
+        reference to the implementation, and it is the LDC counterpart
+        of the GDC null-stream identity -- note it is *not* zero, so
+        unlike the GDC the LDC has no null stream.
+        """
+        total = sum(self.det.ldc_responses[c] for c in self.det.ldc_channels)
+        evecs = numpy.array([self.det.ldc_baselines[c]
+                             for c in self.det.ldc_channels])
+        normal = numpy.cross(evecs[0], evecs[1])
+        normal /= numpy.linalg.norm(normal)
+        proj = numpy.eye(3) - numpy.outer(normal, normal)
+        numpy.testing.assert_allclose(total, 0.75 * proj, atol=1e-12)
+
+    def test_matches_the_closed_form_single_arm_response(self):
+        """Independent analytic cross-check of `ldc_antenna_pattern`.
+
+        For D = (1/2) e e the contraction against the polarization basis
+        collapses to a closed form,
+
+            F+ = (1/2)[(e.x)^2 - (e.y)^2]      Fx = (e.x)(e.y)
+
+        which is derived from the single-arm tensor rather than read off
+        the implementation. The residual tolerance is set by the cubic
+        spline over the coarse orientation grid, not by the algebra.
+        """
+        times = 1.4e9 + numpy.linspace(0.0, 20 * 86400.0, 9)
+        ra, dec, psi = 1.7, -0.4, 0.6
+        x_pol, y_pol = self.det._source_basis_mcmf(ra, dec, psi, times)
+        pats = self.det.ldc_antenna_pattern(ra, dec, psi, times)
+        for chan in self.det.ldc_channels:
+            ehat = self.det.ldc_baselines[chan]
+            a, b = ehat @ x_pol, ehat @ y_pol
+            fplus, fcross = pats[chan]
+            numpy.testing.assert_allclose(fplus, 0.5 * (a ** 2 - b ** 2),
+                                          atol=1e-8)
+            numpy.testing.assert_allclose(fcross, a * b, atol=1e-8)
+
+    def test_polarization_rotation_is_spin_two(self):
+        """A quadrupolar response must transform with 2*psi.
+
+        Rotating psi by pi/2 flips the sign of both patterns; rotating
+        by pi/4 sends (F+, Fx) -> (Fx, -F+). Both follow from
+        F+ + i Fx picking up exp(-2 i dpsi), so they fail for any
+        response that is not spin-2 in the transverse plane.
+        """
+        times = 1.4e9 + numpy.linspace(0.0, 20 * 86400.0, 9)
+        ra, dec, psi = 1.7, -0.4, 0.6
+        base = self.det.ldc_antenna_pattern(ra, dec, psi, times)
+        half = self.det.ldc_antenna_pattern(ra, dec, psi + numpy.pi / 2,
+                                            times)
+        quarter = self.det.ldc_antenna_pattern(ra, dec, psi + numpy.pi / 4,
+                                               times)
+        for chan in self.det.ldc_channels:
+            fp0, fc0 = base[chan]
+            numpy.testing.assert_allclose(half[chan][0], -fp0, atol=1e-12)
+            numpy.testing.assert_allclose(half[chan][1], -fc0, atol=1e-12)
+            numpy.testing.assert_allclose(quarter[chan][0], fc0, atol=1e-12)
+            numpy.testing.assert_allclose(quarter[chan][1], -fp0, atol=1e-12)
+
+    def test_pattern_is_bounded_by_one_half(self):
+        """|F| <= 1/2, since (e.x)^2 + (e.y)^2 <= 1 for a unit chord."""
+        times = 1.4e9 + numpy.linspace(0.0, 27.3 * 86400.0, 128)
+        pats = self.det.ldc_antenna_pattern(1.7, -0.4, 0.6, times)
+        for chan in self.det.ldc_channels:
+            for arr in pats[chan]:
+                self.assertLessEqual(numpy.abs(arr).max(), 0.5 + 1e-12)
+
+    def test_gdc_vertex_is_the_difference_of_two_ldc_baselines(self):
+        """The two instruments share one geometry.
+
+        A Michelson vertex is the difference of its two arms, and those
+        arms run to the other two vertices -- the same pairs of points
+        the LDC baselines join. So each GDC response must be the
+        difference of two LDC responses, up to one deliberate
+        difference: the GDC arms are local great-circle tangents while
+        the LDC baselines are the straight chords the laser actually
+        traverses. Those differ by half the subtended arc, L/(2R) =
+        0.0115 rad at 40 km on a 1737 km sphere, which is exactly the
+        scale of the residual asserted here. A zero residual would mean
+        the chord/tangent distinction had been lost.
+        """
+        ldc = self.det.ldc_responses
+        chans = self.det.ldc_channels
+        half_arc = self.det.arm_length / (2.0 * 1737400.0)
+        for i, gdc_chan in enumerate(self.det.channels):
+            diff = ldc[chans[i]] - ldc[chans[(i - 1) % 3]]
+            resid = numpy.abs(self.det.responses[gdc_chan] - diff).max()
+            self.assertLess(resid, 2.0 * half_arc)
+            self.assertGreater(
+                resid, 1e-4,
+                'residual vanished: the LDC baselines are no longer '
+                'chords, or the GDC arms are no longer tangents')
+
     def test_transfer_function_hook(self):
         """T(f) defaults to unity, which is the correct pairing for the
         supplied sensitivity curves since those already have it divided
