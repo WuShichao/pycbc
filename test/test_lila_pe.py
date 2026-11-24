@@ -111,6 +111,52 @@ class TestFDResponse(unittest.TestCase):
             self.assertEqual(len(series), len(self.fpts))
             self.assertTrue(numpy.all(numpy.isfinite(series.numpy())))
 
+    def test_dispatch_matches_a_direct_call(self):
+        """The two entry points must return the same waveform.
+
+        `get_fd_det_waveform_sequence` runs its arguments through
+        `props`, which supplies `f_ref=0` as a library default. A
+        `setdefault("f_ref", f_lower)` in `lila_fd_response` never fires
+        against that, so the dispatch path silently used `f_ref=0` while
+        a direct call used `f_lower` -- a constant ~0.065 rad phase
+        offset between an injection built one way and a relbin model
+        built the other.
+        """
+        from pycbc.types import Array
+        from pycbc.waveform.waveform import get_fd_det_waveform_sequence
+
+        direct = self.fd(sample_points=self.fpts, **self.kw)
+        for name, series in direct.items():
+            viaprops = get_fd_det_waveform_sequence(
+                ifos=name, sample_points=Array(self.fpts), **self.kw)[name]
+            numpy.testing.assert_array_equal(
+                numpy.asarray(series), numpy.asarray(viaprops),
+                err_msg='%s differs between the direct and dispatch '
+                        'entry points' % name)
+
+    def test_explicit_f_ref_is_respected(self):
+        """A caller-supplied, non-zero f_ref must not be overridden."""
+        a = self.fd(sample_points=self.fpts, f_ref=1.5,
+                    **self.kw)['LILA_1']
+        b = self.fd(sample_points=self.fpts, f_ref=self.kw['f_lower'],
+                    **self.kw)['LILA_1']
+        # Exact inequality, not `allclose`: strain amplitudes here are
+        # ~1e-21, far below `allclose`'s default atol of 1e-8, so it
+        # would call any two of these arrays equal.
+        self.assertFalse(
+            numpy.array_equal(numpy.asarray(a), numpy.asarray(b)),
+            'f_ref=1.5 produced the same waveform as f_ref=f_lower, so '
+            'the explicit value was ignored')
+
+    def test_zero_f_ref_falls_back_to_f_lower(self):
+        """f_ref=0 is LAL's "unset" sentinel, not a real reference."""
+        zero = self.fd(sample_points=self.fpts, f_ref=0.0,
+                       **self.kw)['LILA_1']
+        flow = self.fd(sample_points=self.fpts,
+                       f_ref=self.kw['f_lower'], **self.kw)['LILA_1']
+        numpy.testing.assert_array_equal(
+            numpy.asarray(zero), numpy.asarray(flow))
+
     def test_ldc_channel_set(self):
         out = self.fd(sample_points=self.fpts, channel_set='LDC', **self.kw)
         self.assertEqual(sorted(out),

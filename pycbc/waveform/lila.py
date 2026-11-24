@@ -296,10 +296,19 @@ def lila_fd_response(ifos=None, sample_points=None, delta_f=None,
             channel_set = 'LDC'
         elif has_gdc:
             channel_set = 'GDC'
-    # f_lower/f_ref are named arguments here, so they never reach
-    # **params; the intrinsic waveform still needs them.
+    # f_lower is a named argument here, so it never reaches **params;
+    # the intrinsic waveform still needs it. f_ref is *not* named, and
+    # does arrive via **params -- see below.
     cbc_params["f_lower"] = f_lower
-    cbc_params.setdefault("f_ref", f_lower)
+    # Not `setdefault`: `get_fd_det_waveform_sequence` runs the parameters
+    # through `props`, which supplies `f_ref=0` as a library default, so
+    # the key is always present by the time it reaches here and
+    # `setdefault` would silently never fire. Zero is LAL's "unset"
+    # sentinel, so treat it as absent -- otherwise a direct call (f_ref =
+    # f_lower) and a call through the relbin dispatch (f_ref = 0) return
+    # waveforms differing by a constant phase.
+    if not cbc_params.get("f_ref"):
+        cbc_params["f_ref"] = f_lower
 
     if sample_points is not None:
         fm = np.asarray(sample_points, dtype=float)
