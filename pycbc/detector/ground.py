@@ -72,6 +72,70 @@ def get_available_lal_detectors():
 
 _ground_detectors = {}
 
+def body_fixed_detector_tensor(longitude, latitude, yangle=0, xangle=None,
+                               xaltitude=0, yaltitude=0):
+    """Build the two single-arm response tensors and arm unit vectors of a
+    two-arm interferometer, in the body-fixed frame of whatever spherical
+    body it sits on.
+
+    This is the body-agnostic core of `add_detector_on_earth`: the
+    construction is pure geometry in a body-fixed Cartesian frame whose
+    z-axis is the rotation pole and whose x-axis is the prime meridian, so
+    it applies unchanged to a lunar-surface site expressed in `lunarsky`'s
+    MCMF frame (see `pycbc.detector.space._LILA_detector`). Only the
+    conversion of (longitude, latitude, height) into a Cartesian site
+    position is body-specific, and that stays in the callers.
+
+    Parameters
+    ----------
+    longitude : float
+        Longitude in radians, body-fixed.
+    latitude : float
+        Latitude in radians, body-fixed.
+    yangle : float
+        Azimuthal angle of the y-arm, drawn from local north toward east.
+    xangle : float or None
+        Azimuthal angle of the x-arm. If None, a right-angle detector is
+        assumed, following the right-hand rule.
+    xaltitude, yaltitude : float
+        Altitude angles of the arms, measured from the local horizon.
+
+    Returns
+    -------
+    resps : list of numpy.ndarray
+        `[yresp, xresp]`, the two single-arm response tensors. The full
+        detector response is `resps[0] - resps[1]`.
+    vecs : list of numpy.ndarray
+        `[yvec, xvec]`, the two arm unit vectors in the body-fixed frame.
+    xangle : float
+        The x-arm azimuth actually used, so callers that passed None can
+        record the resolved value.
+    """
+    if xangle is None:
+        # assume right angle detector if no separate xarm direction given
+        xangle = yangle + np.pi / 2.0
+
+    # baseline response of a single arm pointed in the -X direction
+    resp = np.array([[-1, 0, 0], [0, 0, 0], [0, 0, 0]])
+    rm2 = rotation_matrix(-longitude * units.rad, 'z')
+    rm1 = rotation_matrix(-1.0 * (np.pi / 2.0 - latitude) * units.rad, 'y')
+
+    # Calculate response in body centered coordinates
+    # by rotation of response in coordinates aligned
+    # with the detector arms
+    resps = []
+    vecs = []
+    for angle, azi in [(yangle, yaltitude), (xangle, xaltitude)]:
+        rm0 = rotation_matrix(angle * units.rad, 'z')
+        rmN = rotation_matrix(-azi *  units.rad, 'y')
+        rm = rm2 @ rm1 @ rm0 @ rmN
+        # apply rotation
+        resps.append(rm @ resp @ rm.T / 2.0)
+        vecs.append(rm @ np.array([-1, 0, 0]))
+
+    return resps, vecs, xangle
+
+
 def add_detector_on_earth(name, longitude, latitude,
                           yangle=0, xangle=None, height=0,
                           xlength=4000, ylength=4000,
@@ -100,27 +164,9 @@ def add_detector_on_earth(name, longitude, latitude,
         The height in meters of the detector above the standard
         reference ellipsoidal earth
     """
-    if xangle is None:
-        # assume right angle detector if no separate xarm direction given
-        xangle = yangle + np.pi / 2.0
-
-    # baseline response of a single arm pointed in the -X direction
-    resp = np.array([[-1, 0, 0], [0, 0, 0], [0, 0, 0]])
-    rm2 = rotation_matrix(-longitude * units.rad, 'z')
-    rm1 = rotation_matrix(-1.0 * (np.pi / 2.0 - latitude) * units.rad, 'y')
-    
-    # Calculate response in earth centered coordinates
-    # by rotation of response in coordinates aligned
-    # with the detector arms
-    resps = []
-    vecs = []
-    for angle, azi in [(yangle, yaltitude), (xangle, xaltitude)]:
-        rm0 = rotation_matrix(angle * units.rad, 'z')
-        rmN = rotation_matrix(-azi *  units.rad, 'y')
-        rm = rm2 @ rm1 @ rm0 @ rmN
-        # apply rotation
-        resps.append(rm @ resp @ rm.T / 2.0)
-        vecs.append(rm @ np.array([-1, 0, 0]))
+    resps, vecs, xangle = body_fixed_detector_tensor(
+        longitude, latitude, yangle=yangle, xangle=xangle,
+        xaltitude=xaltitude, yaltitude=yaltitude)
 
     full_resp = (resps[0] - resps[1])
     loc = coordinates.EarthLocation.from_geodetic(longitude * units.rad,
@@ -702,6 +748,7 @@ __all__ = [
     'get_available_detectors',
     'get_available_lal_detectors',
     'add_detector_on_earth',
+    'body_fixed_detector_tensor',
     'single_arm_frequency_response',
     'ppdets',
     'overhead_antenna_pattern',

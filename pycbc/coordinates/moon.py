@@ -66,7 +66,9 @@ from pycbc.coordinates.space import (
 )
 
 __all__ = [
+    "LUNAR_RADIUS",
     "rotation_matrix_ssb_to_moon",
+    "moon_triangle_sites",
     "moon_site_position_ssb",
     "t_moon_from_ssb",
     "t_ssb_from_t_moon",
@@ -77,6 +79,128 @@ __all__ = [
     "moon_to_lisa",
     "lisa_to_moon",
 ]
+
+
+# `lunarsky`'s MoonLocation uses a perfect sphere (its `ellipsoid` is
+# literally "SPHERE") of this radius, so the spherical trigonometry in
+# `moon_triangle_sites` is exact rather than a first-order approximation --
+# unlike the equivalent construction on Earth's reference ellipsoid.
+LUNAR_RADIUS = 1737100.0
+
+
+def _unit_from_lonlat(longitude, latitude):
+    """Selenodetic longitude/latitude (radians) -> body-fixed unit vector."""
+    return np.array([
+        np.cos(latitude) * np.cos(longitude),
+        np.cos(latitude) * np.sin(longitude),
+        np.sin(latitude),
+    ])
+
+
+def _enu_basis(longitude, latitude):
+    """Local East/North/Up unit vectors at a selenodetic site."""
+    east = np.array([-np.sin(longitude), np.cos(longitude), 0.0])
+    north = np.array([
+        -np.sin(latitude) * np.cos(longitude),
+        -np.sin(latitude) * np.sin(longitude),
+        np.cos(latitude),
+    ])
+    return east, north, _unit_from_lonlat(longitude, latitude)
+
+
+def _bearing(lon1, lat1, lon2, lat2):
+    """Initial great-circle bearing from site 1 to site 2, in radians
+    measured from local north toward east -- the same azimuth convention
+    as `pycbc.detector.add_detector_on_earth`."""
+    east, north, up = _enu_basis(lon1, lat1)
+    target = _unit_from_lonlat(lon2, lat2)
+    tangent = target - up * np.dot(up, target)
+    return np.arctan2(np.dot(tangent, east),
+                      np.dot(tangent, north)) % (2 * np.pi)
+
+
+def moon_triangle_sites(longitude_center, latitude_center, arm_length,
+                        orientation=0.0, height=0.0):
+    """Place the three vertices of an equilateral triangular observatory
+    on the lunar surface, and give each vertex's arm azimuths.
+
+    This is the lunar analogue of the Einstein Telescope's layout, and
+    follows exactly the same conventions, which are implicit in LAL's
+    hardcoded E1/E2/E3 constants rather than written down anywhere:
+
+      * The vertices run counter-clockwise as seen from outside the body.
+      * At each vertex the x-arm points along the triangle side toward the
+        next vertex and the y-arm toward the previous one, so the two arms
+        subtend 60 degrees and `(yangle - xangle) mod 2*pi` is 300 degrees.
+      * Azimuths are measured from local north toward east.
+
+    Feeding this function Earth's radius and ET's centroid reproduces
+    LAL's E1/E2/E3 vertex coordinates to sub-arcsecond accuracy (the
+    residual being LAL's ellipsoidal-Earth site offsets); see
+    `test/test_detector_lila.py`.
+
+    Parameters
+    ----------
+    longitude_center, latitude_center : float
+        Selenodetic longitude/latitude of the triangle centroid, in the
+        unit of 'radian'.
+    arm_length : float
+        Triangle side length, i.e. the arm length of each vertex
+        interferometer, in the unit of 'm'.
+    orientation : float, optional
+        Bearing of the first vertex as seen from the centroid, in the unit
+        of 'radian'. Rotates the whole triangle in the surface plane.
+        Default 0.
+    height : float, optional
+        Height of the vertices above the reference selenoid, in the unit
+        of 'm'. Default 0.
+
+    Returns
+    -------
+    sites : list of dict
+        Three entries, each with keys 'longitude', 'latitude', 'height',
+        'xangle', 'yangle' (radians and metres), ready to pass to
+        `pycbc.detector.body_fixed_detector_tensor`.
+    """
+    if arm_length <= 0:
+        raise ValueError("arm_length must be positive")
+
+    # Circumradius, as an angle subtended at the Moon's centre, of a
+    # *spherical* equilateral triangle of side arc `a`. Writing each vertex
+    # as cos(theta) u + sin(theta)(...) about the centroid axis u, with the
+    # three azimuths 120 degrees apart, the vertex-vertex dot product is
+    #     cos(a) = cos^2(theta) + sin^2(theta) cos(120 deg)
+    #            = 1 - 1.5 sin^2(theta),
+    # whose cancellation-free solution is sin(theta) = 2 sin(a/2)/sqrt(3).
+    # The familiar flat-space circumradius arm_length/sqrt(3) is the
+    # small-angle limit of this.
+    a = arm_length / LUNAR_RADIUS
+    theta = np.arcsin(2.0 / np.sqrt(3.0) * np.sin(a / 2.0))
+
+    # Decreasing bearing from the centroid puts the vertices in
+    # counter-clockwise order, matching LAL's E1 -> E2 -> E3 handedness.
+    # The opposite handedness flips the sign of the opening angle, and
+    # with it the sign of Fx.
+    lonlats = []
+    for k in range(3):
+        bearing = orientation - k * (2 * np.pi / 3)
+        east, north, up = _enu_basis(longitude_center, latitude_center)
+        tangent = np.cos(bearing) * north + np.sin(bearing) * east
+        vec = np.cos(theta) * up + np.sin(theta) * tangent
+        lonlats.append((np.arctan2(vec[1], vec[0]),
+                        np.arcsin(np.clip(vec[2], -1.0, 1.0))))
+
+    sites = []
+    for i in range(3):
+        longitude, latitude = lonlats[i]
+        sites.append({
+            "longitude": longitude,
+            "latitude": latitude,
+            "height": height,
+            "xangle": _bearing(longitude, latitude, *lonlats[(i + 1) % 3]),
+            "yangle": _bearing(longitude, latitude, *lonlats[(i - 1) % 3]),
+        })
+    return sites
 
 
 def rotation_matrix_ssb_to_moon():
