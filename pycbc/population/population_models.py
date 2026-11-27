@@ -475,17 +475,20 @@ def coalescence_rate(rate_den, maxz=10.0, npoints=10000, z_array=None, **kwargs)
 
     """
     if z_array is None:
-        z_array = np.linspace(0, maxz, npoints)
+        z_array = np.linspace(0.0, maxz, npoints)
+    else:
+        z_array = np.asarray(z_array, dtype=float)
 
-    dr_dz = []
     cosmology = get_cosmology(**kwargs)
+    dvc_dz = cosmology.differential_comoving_volume(z_array).to_value(
+        units.Mpc**3 / units.sr
+    )
+    try:
+        rate_vals = np.asarray(rate_den(z_array), dtype=float)
+    except (TypeError, ValueError):
+        rate_vals = np.array([rate_den(z) for z in z_array], dtype=float)
 
-    for z in z_array:
-        dr = cosmology.differential_comoving_volume(z) / (1 + z)
-        dr_dz.append(
-            (dr * 4 * np.pi * units.sr * rate_den(z) * (units.Mpc) ** (-3)).value
-        )
-
+    dr_dz = 4.0 * np.pi * dvc_dz / (1.0 + z_array) * rate_vals
     return scipy_interpolate.interp1d(z_array, dr_dz, fill_value="extrapolate")
 
 
@@ -625,15 +628,17 @@ def distance_from_rate(total_rate, merger_rate, maxz=10, npoints=10000, **kwargs
     if (cosmology.name not in merger_rate.dist_interp) or (
         len(merger_rate.dist_interp[cosmology.name].x) != npoints
     ):
-
-        def rate_func(redshift):
-            return total_rate_upto_redshift(redshift, merger_rate)
-
-        z_array = np.linspace(0, maxz, npoints)
+        z_array = np.linspace(0.0, maxz, npoints)
         dists = cosmological_quantity_from_redshift(
             z_array, "luminosity_distance", **kwargs
         )
-        total_rates = rate_func(z_array)
+        try:
+            rate_vals = np.asarray(merger_rate(z_array), dtype=float)
+        except (TypeError, ValueError):
+            rate_vals = np.array([merger_rate(z) for z in z_array], dtype=float)
+        total_rates = scipy_integrate.cumulative_trapezoid(
+            rate_vals, z_array, initial=0.0
+        )
         interp = scipy_interpolate.interp1d(total_rates, dists)
         merger_rate.dist_interp[cosmology.name] = interp
 

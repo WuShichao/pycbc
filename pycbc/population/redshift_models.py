@@ -33,13 +33,44 @@ import astropy.units as u
 import numpy as np
 from scipy.integrate import cumulative_trapezoid
 from scipy.interpolate import PchipInterpolator
-from scipy.special import erf, erfinv
+from scipy.special import ndtr, ndtri
 
 from pycbc.cosmology import get_cosmology
 
-_SQRT_2 = np.sqrt(2.0)
 _SQRT_2PI = np.sqrt(2.0 * np.pi)
 _DEFAULT_MAX_CACHE_SIZE = 64
+_FLOAT_TINY = np.finfo(float).tiny
+_FLOAT_EPS = np.finfo(float).eps
+
+
+def _truncnorm_bounds(z_min, z_max):
+    """Compute tail-safe truncated-normal CDF/survival parameters via ``ndtr``."""
+    use_right_tail = z_min > 0.0
+    if use_right_tail:
+        sf_min = float(ndtr(-z_min))
+        sf_max = float(ndtr(-z_max))
+        norm = sf_min - sf_max
+        return use_right_tail, sf_min, norm
+    cdf_min = float(ndtr(z_min))
+    cdf_max = float(ndtr(z_max))
+    norm = cdf_max - cdf_min
+    return use_right_tail, cdf_min, norm
+
+
+def _truncnorm_cdf_z(z_vals, use_right_tail, edge_prob, norm):
+    """Evaluate truncated standard-normal CDF at standardized values ``z_vals``."""
+    if use_right_tail:
+        return np.clip((edge_prob - ndtr(-z_vals)) / norm, 0.0, 1.0)
+    return np.clip((ndtr(z_vals) - edge_prob) / norm, 0.0, 1.0)
+
+
+def _truncnorm_ppf_z(q_vals, use_right_tail, edge_prob, norm):
+    """Evaluate truncated standard-normal inverse CDF at quantiles ``q_vals``."""
+    if use_right_tail:
+        surv = np.clip(edge_prob - q_vals * norm, _FLOAT_TINY, 1.0 - _FLOAT_EPS)
+        return -ndtri(surv)
+    prob = np.clip(edge_prob + q_vals * norm, _FLOAT_TINY, 1.0 - _FLOAT_EPS)
+    return ndtri(prob)
 
 
 def _validate_positive_finite(value, name):
@@ -628,17 +659,16 @@ class BaseRedshiftEvolution(ABC):
 
         valid = z <= self.z_max
         if np.any(valid):
-            norm = self.normalize(**parameters)
-            if norm.value <= 0:
+            norm_val = self.normalize(**parameters).to_value(u.Gpc**3)
+            if norm_val <= 0:
                 warnings.warn(
                     "Normalization integral is non-positive; returning zero PDF.",
                     RuntimeWarning,
                     stacklevel=2,
                 )
             else:
-                pdf[valid] = (
-                    (self.dVT_dz(z[valid], **parameters) / norm).decompose().value
-                )
+                dvt_val = self.dVT_dz(z[valid], **parameters).to_value(u.Gpc**3)
+                pdf[valid] = dvt_val / norm_val
 
         return float(pdf[0]) if is_scalar else pdf.reshape(orig_shape)
 
@@ -1069,11 +1099,11 @@ class LogNormalDelayDistribution(BaseDelayTimeDistribution):
         self._sigma = _validate_positive_finite(sigma, "sigma")
 
         self._ln_t_peak = np.log(self._t_peak)
-        x_min = (np.log(self._td_min) - self._ln_t_peak) / (_SQRT_2 * self._sigma)
-        x_max = (np.log(self._td_max) - self._ln_t_peak) / (_SQRT_2 * self._sigma)
-        self._cdf_min = 0.5 * (1.0 + float(erf(x_min)))
-        self._cdf_max = 0.5 * (1.0 + float(erf(x_max)))
-        self._norm = self._cdf_max - self._cdf_min
+        z_min = (np.log(self._td_min) - self._ln_t_peak) / self._sigma
+        z_max = (np.log(self._td_max) - self._ln_t_peak) / self._sigma
+        self._use_right_tail, self._edge_prob, self._norm = _truncnorm_bounds(
+            z_min, z_max
+        )
         if self._norm <= 0.0:
             raise ValueError(
                 "LogNormalDelayDistribution has negligible probability mass "
@@ -1108,9 +1138,10 @@ class LogNormalDelayDistribution(BaseDelayTimeDistribution):
         result[tau_arr >= self._td_max] = 1.0
         valid = (tau_arr > self._td_min) & (tau_arr < self._td_max)
         if np.any(valid):
-            x = (np.log(tau_arr[valid]) - self._ln_t_peak) / (_SQRT_2 * self._sigma)
-            raw_cdf = 0.5 * (1.0 + erf(x))
-            result[valid] = np.clip((raw_cdf - self._cdf_min) / self._norm, 0.0, 1.0)
+            z = (np.log(tau_arr[valid]) - self._ln_t_peak) / self._sigma
+            result[valid] = _truncnorm_cdf_z(
+                z, self._use_right_tail, self._edge_prob, self._norm
+            )
         return result
 
     def ppf(self, quantile: np.ndarray) -> np.ndarray:
@@ -1118,11 +1149,8 @@ class LogNormalDelayDistribution(BaseDelayTimeDistribution):
         q = np.asarray(quantile, dtype=float)
         if np.any((q < 0.0) | (q > 1.0)):
             raise ValueError("quantile values must lie in [0, 1]")
-        p = self._cdf_min + q * self._norm
-        # Clip away from exact 0/1 to avoid +/-inf in erfinv at boundary quantiles
-        eps = np.finfo(float).eps
-        arg = np.clip(2.0 * p - 1.0, -1.0 + eps, 1.0 - eps)
-        tau = np.exp(self._ln_t_peak + _SQRT_2 * self._sigma * erfinv(arg))
+        z = _truncnorm_ppf_z(q, self._use_right_tail, self._edge_prob, self._norm)
+        tau = np.exp(self._ln_t_peak + self._sigma * z)
         return np.clip(tau, self._td_min, self._td_max)
 
 
@@ -1161,11 +1189,11 @@ class GaussianDelayDistribution(BaseDelayTimeDistribution):
         self._t_mean = _validate_positive_finite(t_mean, "t_mean")
         self._sigma = _validate_positive_finite(sigma, "sigma")
 
-        x_min = (self._td_min - self._t_mean) / (_SQRT_2 * self._sigma)
-        x_max = (self._td_max - self._t_mean) / (_SQRT_2 * self._sigma)
-        self._cdf_min = 0.5 * (1.0 + float(erf(x_min)))
-        self._cdf_max = 0.5 * (1.0 + float(erf(x_max)))
-        self._norm = self._cdf_max - self._cdf_min
+        z_min = (self._td_min - self._t_mean) / self._sigma
+        z_max = (self._td_max - self._t_mean) / self._sigma
+        self._use_right_tail, self._edge_prob, self._norm = _truncnorm_bounds(
+            z_min, z_max
+        )
         if self._norm <= 0.0:
             raise ValueError(
                 "GaussianDelayDistribution has negligible probability mass "
@@ -1201,9 +1229,10 @@ class GaussianDelayDistribution(BaseDelayTimeDistribution):
         result[tau_arr >= self._td_max] = 1.0
         valid = (tau_arr > self._td_min) & (tau_arr < self._td_max)
         if np.any(valid):
-            x = (tau_arr[valid] - self._t_mean) / (_SQRT_2 * self._sigma)
-            raw_cdf = 0.5 * (1.0 + erf(x))
-            result[valid] = np.clip((raw_cdf - self._cdf_min) / self._norm, 0.0, 1.0)
+            z = (tau_arr[valid] - self._t_mean) / self._sigma
+            result[valid] = _truncnorm_cdf_z(
+                z, self._use_right_tail, self._edge_prob, self._norm
+            )
         return result
 
     def ppf(self, quantile: np.ndarray) -> np.ndarray:
@@ -1211,10 +1240,8 @@ class GaussianDelayDistribution(BaseDelayTimeDistribution):
         q = np.asarray(quantile, dtype=float)
         if np.any((q < 0.0) | (q > 1.0)):
             raise ValueError("quantile values must lie in [0, 1]")
-        p = self._cdf_min + q * self._norm
-        eps = np.finfo(float).eps
-        arg = np.clip(2.0 * p - 1.0, -1.0 + eps, 1.0 - eps)
-        tau = self._t_mean + _SQRT_2 * self._sigma * erfinv(arg)
+        z = _truncnorm_ppf_z(q, self._use_right_tail, self._edge_prob, self._norm)
+        tau = self._t_mean + self._sigma * z
         return np.clip(tau, self._td_min, self._td_max)
 
 
@@ -1304,10 +1331,13 @@ class SFRTimeDelayRedshift(BaseRedshiftEvolution):
         ):
             raise ValueError("n_quad must be an integer >= 8")
 
+        resolved_cosmology = (
+            sfr_model.cosmology if cosmology is None else cosmology
+        )
         super().__init__(
             z_max=z_max,
             num_zbins=num_zbins,
-            cosmology=cosmology,
+            cosmology=resolved_cosmology,
             z_grid=z_grid,
             z_max_cosmo=max(float(z_max_cosmo), float(z_max)),
             z_grid_cosmo=z_grid_cosmo,
@@ -1336,11 +1366,19 @@ class SFRTimeDelayRedshift(BaseRedshiftEvolution):
             self._tf_grid, np.log1p(self._zf_grid), extrapolate=False
         )
 
-        # Precompute merger lookback times on self._z_grid and quadrature rule
-        self._tm_grid = self.cosmology.lookback_time(self._z_grid).to_value(u.Gyr)
+        # Interpolate merger lookback times from _zf_grid (avoids second astropy pass)
+        tf_of_z = PchipInterpolator(self._zf_grid, self._tf_grid, extrapolate=False)
+        self._tm_grid = tf_of_z(self._z_grid)
         self._gl_nodes, self._gl_weights = np.polynomial.legendre.leggauss(
             self._n_quad
         )
+
+        # Lazily precomputed SFR-independent quadrature nodes and weights
+        self._quad_plan_ready = False
+        self._quad_active_indices = None
+        self._quad_zf_grid = None
+        self._quad_half_scale = None
+        self._quad_weights_2d = None
 
         # Extract parameter names from sub-models
         self._sfr_param_names = tuple(getattr(sfr_model, "param_names", ()))
@@ -1352,19 +1390,19 @@ class SFRTimeDelayRedshift(BaseRedshiftEvolution):
         self._last_sfr_params = None
         self._psi_z_grid = None
 
-    def _compute_convolution_grid(self, sfr_params):
-        """Evaluate the delay-time convolution across ``self._z_grid``."""
+    def _prepare_quadrature_plan(self):
+        """Precompute SFR-independent formation-redshift nodes and weights once."""
         td_model = self.time_delay_model
         tau_min = td_model.min_delay
         tau_max = td_model.max_delay
 
-        # Available lookback time window [tau_min, tau_hi] for each merger z_m
         tau_hi = np.minimum(tau_max, self._t_formation_max - self._tm_grid)
         active = tau_hi > tau_min
+        self._quad_plan_ready = True
 
-        psi_grid = np.zeros(self._z_grid.size, dtype=float)
         if not np.any(active):
-            return psi_grid
+            self._quad_active_indices = np.empty(0, dtype=int)
+            return
 
         tm_active = self._tm_grid[active]
         tau_hi_active = tau_hi[active]
@@ -1374,39 +1412,60 @@ class SFRTimeDelayRedshift(BaseRedshiftEvolution):
             u_hi = td_model.cdf(tau_hi_active)
             has_mass = u_hi > 0.0
             if not np.any(has_mass):
-                return psi_grid
+                self._quad_active_indices = np.empty(0, dtype=int)
+                return
 
-            active_indices = np.flatnonzero(active)[has_mass]
+            self._quad_active_indices = np.flatnonzero(active)[has_mass]
             tm_eff = tm_active[has_mass]
             u_eff = u_hi[has_mass]
 
-            # Map Gauss-Legendre nodes from [-1, 1] to [0, u_eff]
-            half_u = 0.5 * u_eff[:, None]
-            u_grid = half_u * (self._gl_nodes[None, :] + 1.0)
+            half_u = 0.5 * u_eff
+            u_grid = half_u[:, None] * (self._gl_nodes[None, :] + 1.0)
             tau_grid = td_model.ppf(u_grid)
             tf_grid = np.clip(
                 tm_eff[:, None] + tau_grid, 0.0, self._t_formation_max
             )
-            zf_grid = np.expm1(self._ln1p_zf_of_t(tf_grid))
-            sfr_vals = self.sfr_model.psi_z(zf_grid, **sfr_params)
-            psi_grid[active_indices] = half_u[:, 0] * (sfr_vals @ self._gl_weights)
+            self._quad_zf_grid = np.expm1(self._ln1p_zf_of_t(tf_grid))
+            self._quad_half_scale = half_u
+            self._quad_weights_2d = None
         else:
             # General fallback for custom distributions: quadrature in ln(tau)
+            self._quad_active_indices = np.flatnonzero(active)
             ln_lo = np.log(tau_min)
             ln_hi = np.log(tau_hi_active)
             half_span = 0.5 * (ln_hi - ln_lo)[:, None]
             mid = 0.5 * (ln_hi + ln_lo)[:, None]
-            ln_tau_grid = mid + half_span * self._gl_nodes[None, :]
-            tau_grid = np.exp(ln_tau_grid)
+            tau_grid = np.exp(mid + half_span * self._gl_nodes[None, :])
             tf_grid = np.clip(
                 tm_active[:, None] + tau_grid, 0.0, self._t_formation_max
             )
-            zf_grid = np.expm1(self._ln1p_zf_of_t(tf_grid))
-            sfr_vals = self.sfr_model.psi_z(zf_grid, **sfr_params)
-            pdf_vals = td_model.pdf(tau_grid)
-            integrand = sfr_vals * pdf_vals * tau_grid
-            psi_grid[active] = half_span[:, 0] * (integrand @ self._gl_weights)
+            self._quad_zf_grid = np.expm1(self._ln1p_zf_of_t(tf_grid))
+            self._quad_half_scale = None
+            self._quad_weights_2d = (
+                half_span
+                * td_model.pdf(tau_grid)
+                * tau_grid
+                * self._gl_weights[None, :]
+            )
 
+    def _compute_convolution_grid(self, sfr_params):
+        """Evaluate the delay-time convolution across ``self._z_grid``."""
+        if not self._quad_plan_ready:
+            self._prepare_quadrature_plan()
+
+        psi_grid = np.zeros(self._z_grid.size, dtype=float)
+        if self._quad_active_indices.size == 0:
+            return psi_grid
+
+        sfr_vals = self.sfr_model.psi_z(self._quad_zf_grid, **sfr_params)
+        if self._quad_half_scale is not None:
+            psi_grid[self._quad_active_indices] = self._quad_half_scale * (
+                sfr_vals @ self._gl_weights
+            )
+        else:
+            psi_grid[self._quad_active_indices] = np.einsum(
+                "ij,ij->i", sfr_vals, self._quad_weights_2d
+            )
         return psi_grid
 
     def _update_psi_z_grid(self, sfr_params=None):

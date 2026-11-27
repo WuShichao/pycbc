@@ -286,6 +286,33 @@ class TestDelayTimeDistributions(unittest.TestCase):
         with self.assertRaises(ValueError):
             rm.LogNormalDelayDistribution(td_min=0.02, td_max=13.0, t_peak=-1.0)
 
+    def test_extreme_tail_stability_ndtr(self):
+        # 12-sigma right tail (previously underflowed with erf)
+        g_right = rm.GaussianDelayDistribution(
+            td_min=2.5, td_max=13.0, t_mean=0.1, sigma=0.2
+        )
+        # 10-sigma left tail
+        g_left = rm.GaussianDelayDistribution(
+            td_min=0.02, td_max=1.0, t_mean=3.0, sigma=0.2
+        )
+        # Far right tail for LogNormal
+        ln_right = rm.LogNormalDelayDistribution(
+            td_min=5.0, td_max=13.0, t_peak=0.2, sigma=0.3
+        )
+        for dist in (g_right, g_left, ln_right):
+            with self.subTest(dist=type(dist).__name__):
+                q = np.array([0.05, 0.5, 0.95])
+                taus = dist.ppf(q)
+                self.assertTrue(np.all(np.isfinite(taus)))
+                np.testing.assert_allclose(dist.cdf(taus), q, atol=1e-6)
+                integral, _ = scipy_integrate.quad(
+                    lambda t, d=dist: float(d.pdf(t)),
+                    dist.min_delay,
+                    dist.max_delay,
+                    limit=200,
+                )
+                self.assertAlmostEqual(integral, 1.0, places=5)
+
 
 class TestSFRTimeDelayRedshift(unittest.TestCase):
     """Tests for SFRTimeDelayRedshift convolution accuracy, caching, and API."""
@@ -394,6 +421,18 @@ class TestSFRTimeDelayRedshift(unittest.TestCase):
         for g in (1.0, 1.5, 2.0, 2.5, 3.0):
             model.psi_z(1.0, gamma=g)
         self.assertLessEqual(len(model._psi_z_cache), 3)
+
+    def test_inherits_sfr_model_cosmology(self):
+        custom_cosmo = get_cosmology(cosmology="Planck15")
+        sfr_custom = rm.MadauDickinson2014SFR(z_max=5.0, cosmology=custom_cosmo)
+        model = rm.SFRTimeDelayRedshift(
+            sfr_model=sfr_custom,
+            time_delay_model=rm.InverseDelayDistribution(),
+            z_max=5.0,
+            num_zbins=50,
+            z_formation_max=10.0,
+        )
+        self.assertIs(model.cosmology, custom_cosmo)
 
 
 class TestPopulationModelsBackwardCompatibility(unittest.TestCase):
