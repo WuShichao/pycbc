@@ -197,10 +197,39 @@ def diff_lookback_time(z, **kwargs):
     )
 
 
+_DELAY_MODEL_CLASSES = {
+    "inverse": InverseDelayDistribution,
+    "power_law": PowerLawDelayDistribution,
+    "log_normal": LogNormalDelayDistribution,
+    "gaussian": GaussianDelayDistribution,
+}
+
+_SFR_MODEL_CLASSES = {
+    sfr_grb_2008: GRB2008SFR,
+    sfr_madau_dickinson_2014: MadauDickinson2014SFR,
+    sfr_madau_fragos_2017: MadauFragos2017SFR,
+}
+
+
+def _eval_on_grid(func, z_array):
+    """Evaluate ``func`` on ``z_array``, falling back to scalar loop if needed."""
+    try:
+        return np.asarray(func(z_array), dtype=float)
+    except (TypeError, ValueError):
+        return np.array([func(z) for z in z_array], dtype=float)
+
+
 def _build_delay_distribution(td_model, cosmology=None, **td_kwargs):
     """Map a legacy string name or distribution instance to a delay model."""
     if isinstance(td_model, BaseDelayTimeDistribution):
         return td_model
+
+    cls = _DELAY_MODEL_CLASSES.get(td_model)
+    if cls is None:
+        raise ValueError(
+            "'td_model' must be a BaseDelayTimeDistribution or choose from "
+            "['log_normal', 'gaussian', 'power_law', 'inverse']."
+        )
 
     if cosmology is None:
         cosmology = get_cosmology()
@@ -208,34 +237,21 @@ def _build_delay_distribution(td_model, cosmology=None, **td_kwargs):
     default_td_max = float(cosmology.age(0).to_value(units.Gyr))
     td_min = td_kwargs.pop("td_min", 0.02)
     td_max = td_kwargs.pop("td_max", default_td_max)
-
-    if td_model == "inverse":
-        return InverseDelayDistribution(td_min=td_min, td_max=td_max)
-    if td_model == "power_law":
-        return PowerLawDelayDistribution(td_min=td_min, td_max=td_max, **td_kwargs)
-    if td_model == "log_normal":
-        return LogNormalDelayDistribution(td_min=td_min, td_max=td_max, **td_kwargs)
-    if td_model == "gaussian":
-        return GaussianDelayDistribution(td_min=td_min, td_max=td_max, **td_kwargs)
-
-    raise ValueError(
-        "'td_model' must be a BaseDelayTimeDistribution or choose from "
-        "['log_normal', 'gaussian', 'power_law', 'inverse']."
-    )
+    return cls(td_min=td_min, td_max=td_max, **td_kwargs)
 
 
 def _build_sfr_model(sfr_func, maxz, cosmology):
     """Map a legacy SFR callable or redshift model to a BaseRedshiftEvolution."""
     if isinstance(sfr_func, BaseRedshiftEvolution):
         return sfr_func
-    if sfr_func is sfr_grb_2008:
-        return GRB2008SFR(z_max=maxz, cosmology=cosmology)
-    if sfr_func is sfr_madau_dickinson_2014:
-        return MadauDickinson2014SFR(z_max=maxz, cosmology=cosmology)
-    if sfr_func is sfr_madau_fragos_2017:
-        return MadauFragos2017SFR(z_max=maxz, cosmology=cosmology)
+
+    cls = _SFR_MODEL_CLASSES.get(sfr_func)
+    if cls is not None:
+        return cls(z_max=maxz, cosmology=cosmology)
+
     if callable(sfr_func):
         return _CallableSFR(sfr_func, z_max=maxz, cosmology=cosmology)
+
     raise TypeError(
         "sfr_func must be a callable or an instance of BaseRedshiftEvolution."
     )
@@ -273,8 +289,7 @@ def p_tau(tau, td_model="inverse"):
         DeprecationWarning,
         stacklevel=2,
     )
-    valid_models = ("log_normal", "gaussian", "power_law", "inverse")
-    if td_model not in valid_models:
+    if td_model not in _DELAY_MODEL_CLASSES:
         raise ValueError(
             "'td_model' must choose from "
             "['log_normal', 'gaussian', 'power_law', 'inverse']."
@@ -289,29 +304,27 @@ def p_tau(tau, td_model="inverse"):
     from sympy import Piecewise, exp, log, sqrt
 
     if td_model == "log_normal":
-        t_ln = 2.9
-        sigma_ln = 0.2
-        return exp(-((log(tau) - log(t_ln)) ** 2) / (2 * sigma_ln**2)) / (
+        t_ln, sigma_ln = 2.9, 0.2
+        p_t = exp(-((log(tau) - log(t_ln)) ** 2) / (2 * sigma_ln**2)) / (
             sqrt(2 * np.pi) * sigma_ln * tau
         )
-    if td_model == "gaussian":
-        t_g = 2.0
-        sigma_g = 0.3
-        return exp(-((tau - t_g) ** 2) / (2 * sigma_g**2)) / (
+    elif td_model == "gaussian":
+        t_g, sigma_g = 2.0, 0.3
+        p_t = exp(-((tau - t_g) ** 2) / (2 * sigma_g**2)) / (
             sqrt(2 * np.pi) * sigma_g
         )
-    if td_model == "power_law":
-        alpha_t = 0.81
-        return tau ** (-alpha_t)
-
-    td_min = 0.02
-    td_max = cosmological_quantity_from_redshift(0, "age")
-    norm_const = 1.0 / np.log(td_max / td_min)
-    return Piecewise(
-        (0, tau < td_min),
-        (0, tau > td_max),
-        (norm_const / tau, True),
-    )
+    elif td_model == "power_law":
+        p_t = tau ** (-0.81)
+    else:
+        td_min = 0.02
+        td_max = cosmological_quantity_from_redshift(0, "age")
+        norm_const = 1.0 / np.log(td_max / td_min)
+        p_t = Piecewise(
+            (0, tau < td_min),
+            (0, tau > td_max),
+            (norm_const / tau, True),
+        )
+    return p_t
 
 
 def convolution_trans(sfr, diff_lookback_t, model_td, **kwargs):
@@ -483,11 +496,7 @@ def coalescence_rate(rate_den, maxz=10.0, npoints=10000, z_array=None, **kwargs)
     dvc_dz = cosmology.differential_comoving_volume(z_array).to_value(
         units.Mpc**3 / units.sr
     )
-    try:
-        rate_vals = np.asarray(rate_den(z_array), dtype=float)
-    except (TypeError, ValueError):
-        rate_vals = np.array([rate_den(z) for z in z_array], dtype=float)
-
+    rate_vals = _eval_on_grid(rate_den, z_array)
     dr_dz = 4.0 * np.pi * dvc_dz / (1.0 + z_array) * rate_vals
     return scipy_interpolate.interp1d(z_array, dr_dz, fill_value="extrapolate")
 
@@ -632,10 +641,7 @@ def distance_from_rate(total_rate, merger_rate, maxz=10, npoints=10000, **kwargs
         dists = cosmological_quantity_from_redshift(
             z_array, "luminosity_distance", **kwargs
         )
-        try:
-            rate_vals = np.asarray(merger_rate(z_array), dtype=float)
-        except (TypeError, ValueError):
-            rate_vals = np.array([merger_rate(z) for z in z_array], dtype=float)
+        rate_vals = _eval_on_grid(merger_rate, z_array)
         total_rates = scipy_integrate.cumulative_trapezoid(
             rate_vals, z_array, initial=0.0
         )

@@ -80,6 +80,32 @@ def _validate_positive_finite(value, name):
     return float(value)
 
 
+def _validate_int_at_least(value, minimum, name):
+    """Validate that ``value`` is a non-boolean integer >= ``minimum``."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, np.integer))
+        or value < minimum
+    ):
+        raise ValueError(f"{name} must be an integer >= {minimum}")
+    return int(value)
+
+
+def _validate_quantiles(quantile):
+    """Convert and validate cumulative probability quantiles in ``[0, 1]``."""
+    q = np.asarray(quantile, dtype=float)
+    if np.any((q < 0.0) | (q > 1.0)):
+        raise ValueError("quantile values must lie in [0, 1]")
+    return q
+
+
+def _as_float_or_symbolic(redshift):
+    """Return a float ndarray unless ``redshift`` is a symbolic expression."""
+    if hasattr(redshift, "free_symbols"):
+        return redshift
+    return np.asarray(redshift, dtype=float)
+
+
 def _validate_delay_bounds(td_min, td_max):
     """Validate minimum and maximum delay-time bounds in Gyr."""
     td_min = _validate_positive_finite(td_min, "td_min")
@@ -192,19 +218,12 @@ class BaseRedshiftEvolution(ABC):
     ):
         """Initialize the redshift evolution model."""
         self.z_max = _validate_positive_finite(z_max, "z_max")
-
-        if (
-            isinstance(num_zbins, bool)
-            or not isinstance(num_zbins, (int, np.integer))
-            or num_zbins < 2
-        ):
-            raise ValueError("num_zbins must be an integer >= 2")
+        self.num_zbins = _validate_int_at_least(num_zbins, 2, "num_zbins")
 
         self.z_max_cosmo = _validate_positive_finite(z_max_cosmo, "z_max_cosmo")
         if self.z_max_cosmo < self.z_max:
             raise ValueError("z_max_cosmo must be >= z_max")
 
-        self.num_zbins = int(num_zbins)
         self.cosmology = cosmology if cosmology is not None else get_cosmology()
 
         # Redshift grid (dimensionless) validation
@@ -239,18 +258,35 @@ class BaseRedshiftEvolution(ABC):
     # Lazy cosmological grids
     # ------------------------------------------------------------------
 
+    def _compute_fullsky_dvc_dz(self, redshift_array):
+        """Evaluate full-sky ``dVc/dz`` in ``Gpc^3`` on ``redshift_array``."""
+        return (
+            4.0
+            * np.pi
+            * self.cosmology.differential_comoving_volume(redshift_array).to(
+                u.Gpc**3 / u.sr
+            )
+            * u.sr
+        )
+
+    def _interp_dvc_dz(self, redshift_array):
+        """Interpolate full-sky ``dVc/dz`` from ``_z_grid`` with zero padding."""
+        return (
+            np.interp(
+                redshift_array,
+                self._z_grid,
+                self._dvc_dz_grid.value,
+                left=0.0,
+                right=0.0,
+            )
+            * u.Gpc**3
+        )
+
     @property
     def _dvc_dz_grid(self):
         """Full-sky differential comoving volume on ``_z_grid`` (in Gpc^3)."""
         if self._dvc_dz_grid_cache is None:
-            self._dvc_dz_grid_cache = (
-                4.0
-                * np.pi
-                * self.cosmology.differential_comoving_volume(self._z_grid).to(
-                    u.Gpc**3 / u.sr
-                )
-                * u.sr
-            )
+            self._dvc_dz_grid_cache = self._compute_fullsky_dvc_dz(self._z_grid)
         return self._dvc_dz_grid_cache
 
     @property
@@ -268,13 +304,8 @@ class BaseRedshiftEvolution(ABC):
     def _dvc_dz_grid_cosmo(self):
         """Full-sky differential comoving volume on ``_z_grid_cosmo`` (Gpc^3)."""
         if self._dvc_dz_grid_cosmo_cache is None:
-            self._dvc_dz_grid_cosmo_cache = (
-                4.0
-                * np.pi
-                * self.cosmology.differential_comoving_volume(
-                    self._z_grid_cosmo
-                ).to(u.Gpc**3 / u.sr)
-                * u.sr
+            self._dvc_dz_grid_cosmo_cache = self._compute_fullsky_dvc_dz(
+                self._z_grid_cosmo
             )
         return self._dvc_dz_grid_cosmo_cache
 
@@ -361,14 +392,7 @@ class BaseRedshiftEvolution(ABC):
             Differential comoving volume in ``Gpc^3``.
         """
         zz, orig_shape, is_scalar = self._prepare_redshift(redshift)
-
-        dvc = (
-            4.0
-            * np.pi
-            * self.cosmology.differential_comoving_volume(zz).to(u.Gpc**3 / u.sr)
-            * u.sr
-        )
-
+        dvc = self._compute_fullsky_dvc_dz(zz)
         return dvc[0] if is_scalar else dvc.reshape(orig_shape)
 
     def fullsky_differential_spacetime_volume(self, redshift):
@@ -389,15 +413,7 @@ class BaseRedshiftEvolution(ABC):
             Time-dilated differential comoving volume in ``Gpc^3``.
         """
         zz, orig_shape, is_scalar = self._prepare_redshift(redshift)
-
-        dvt = (
-            4.0
-            * np.pi
-            / (1.0 + zz)
-            * self.cosmology.differential_comoving_volume(zz).to(u.Gpc**3 / u.sr)
-            * u.sr
-        )
-
+        dvt = self._compute_fullsky_dvc_dz(zz) / (1.0 + zz)
         return dvt[0] if is_scalar else dvt.reshape(orig_shape)
 
     def comoving_volume(self, redshift):
@@ -509,16 +525,7 @@ class BaseRedshiftEvolution(ABC):
         """
         redshift = np.asarray(redshift, dtype=float)
         self._cached_z = redshift.copy()
-        self._cached_dvc_dz = (
-            np.interp(
-                redshift,
-                self._z_grid,
-                self._dvc_dz_grid.value,
-                left=0.0,
-                right=0.0,
-            )
-            * u.Gpc**3
-        )
+        self._cached_dvc_dz = self._interp_dvc_dz(redshift)
         return self._cached_dvc_dz
 
     # ------------------------------------------------------------------
@@ -562,16 +569,7 @@ class BaseRedshiftEvolution(ABC):
             else:
                 dvc_dz = self._cached_dvc_dz
         else:
-            dvc_dz = (
-                np.interp(
-                    z,
-                    self._z_grid,
-                    self._dvc_dz_grid.value,
-                    left=0.0,
-                    right=0.0,
-                )
-                * u.Gpc**3
-            )
+            dvc_dz = self._interp_dvc_dz(z)
 
         result = psi * dvc_dz / (1.0 + z)
         return result[0] if is_scalar else result.reshape(orig_shape)
@@ -743,11 +741,7 @@ class GRB2008SFR(BaseRedshiftEvolution):
     def psi_z(self, redshift, **parameters):
         """Evaluate the GRB 2008 star formation rate in ``Msun/yr/Mpc^3``."""
         del parameters
-        z = (
-            redshift
-            if hasattr(redshift, "free_symbols")
-            else np.asarray(redshift, dtype=float)
-        )
+        z = _as_float_or_symbolic(redshift)
         rho_local = 0.02  # Msolar/yr/Mpc^3
         eta = -10.0
         psiz = (
@@ -774,11 +768,7 @@ class MadauDickinson2014SFR(BaseRedshiftEvolution):
 
     def psi_z(self, redshift, *, gamma=2.7, kappa=5.6, z_peak=1.9):
         """Evaluate the Madau & Dickinson (2014) SFR in ``Msun/yr/Mpc^3``."""
-        z = (
-            redshift
-            if hasattr(redshift, "free_symbols")
-            else np.asarray(redshift, dtype=float)
-        )
+        z = _as_float_or_symbolic(redshift)
         return (
             0.015
             * (1.0 + z) ** gamma
@@ -809,11 +799,7 @@ class MadauFragos2017SFR(BaseRedshiftEvolution):
 
     def psi_z(self, redshift, *, k_imf=0.66, mode="high"):
         """Evaluate the Madau & Fragos (2017) SFR in ``Msun/yr/Mpc^3``."""
-        z = (
-            redshift
-            if hasattr(redshift, "free_symbols")
-            else np.asarray(redshift, dtype=float)
-        )
+        z = _as_float_or_symbolic(redshift)
 
         if mode in self._MODE_PARAMETERS:
             factor_a, factor_b, factor_c = self._MODE_PARAMETERS[mode]
@@ -913,9 +899,7 @@ class BaseDelayTimeDistribution(ABC):
         numpy.ndarray
             Delay times in Gyr corresponding to ``quantile``.
         """
-        q = np.asarray(quantile, dtype=float)
-        if np.any((q < 0.0) | (q > 1.0)):
-            raise ValueError("quantile values must lie in [0, 1]")
+        q = _validate_quantiles(quantile)
         tau_vals = np.geomspace(self.min_delay, self.max_delay, 2000)
         cdf_vals = self.cdf(tau_vals)
         return np.interp(q, cdf_vals, tau_vals)
@@ -1025,9 +1009,7 @@ class PowerLawDelayDistribution(BaseDelayTimeDistribution):
 
     def ppf(self, quantile: np.ndarray) -> np.ndarray:
         """Evaluate the exact analytic inverse CDF (percent-point function)."""
-        q = np.asarray(quantile, dtype=float)
-        if np.any((q < 0.0) | (q > 1.0)):
-            raise ValueError("quantile values must lie in [0, 1]")
+        q = _validate_quantiles(quantile)
         if self._is_inverse:
             return self._td_min * (self._td_max / self._td_min) ** q
         one_minus_alpha = 1.0 - self._alpha
@@ -1056,7 +1038,70 @@ class InverseDelayDistribution(PowerLawDelayDistribution):
         super().__init__(td_min=td_min, td_max=td_max, alpha=1.0)
 
 
-class LogNormalDelayDistribution(BaseDelayTimeDistribution):
+class _TruncatedNormalDelayBase(BaseDelayTimeDistribution):
+    """Shared base for delay distributions normal in ``tau`` or ``ln(tau)``."""
+
+    _has_analytic_ppf = True
+
+    def __init__(self, td_min: float, td_max: float, sigma: float):
+        self._td_min, self._td_max = _validate_delay_bounds(td_min, td_max)
+        self._sigma = _validate_positive_finite(sigma, "sigma")
+
+    def _init_truncation(self):
+        """Compute tail-safe normalization constants after subclass setup."""
+        z_min = float(self._to_z(self._td_min))
+        z_max = float(self._to_z(self._td_max))
+        self._use_right_tail, self._edge_prob, self._norm = _truncnorm_bounds(
+            z_min, z_max
+        )
+        if self._norm <= 0.0:
+            raise ValueError(
+                f"{type(self).__name__} has negligible probability mass "
+                "within [td_min, td_max]"
+            )
+
+    @abstractmethod
+    def _to_z(self, tau):
+        """Map delay time ``tau`` to standardized normal coordinate ``z``."""
+
+    @abstractmethod
+    def _from_z(self, z):
+        """Map standardized normal coordinate ``z`` back to delay time ``tau``."""
+
+    @property
+    def min_delay(self) -> float:
+        return self._td_min
+
+    @property
+    def max_delay(self) -> float:
+        return self._td_max
+
+    @property
+    def sigma(self) -> float:
+        """Standard deviation parameter."""
+        return self._sigma
+
+    def cdf(self, tau: np.ndarray) -> np.ndarray:
+        """Evaluate the exact analytic CDF."""
+        tau_arr = np.asarray(tau, dtype=float)
+        result = np.zeros_like(tau_arr, dtype=float)
+        result[tau_arr >= self._td_max] = 1.0
+        valid = (tau_arr > self._td_min) & (tau_arr < self._td_max)
+        if np.any(valid):
+            z = self._to_z(tau_arr[valid])
+            result[valid] = _truncnorm_cdf_z(
+                z, self._use_right_tail, self._edge_prob, self._norm
+            )
+        return result
+
+    def ppf(self, quantile: np.ndarray) -> np.ndarray:
+        """Evaluate the exact analytic inverse CDF (percent-point function)."""
+        q = _validate_quantiles(quantile)
+        z = _truncnorm_ppf_z(q, self._use_right_tail, self._edge_prob, self._norm)
+        return np.clip(self._from_z(z), self._td_min, self._td_max)
+
+
+class LogNormalDelayDistribution(_TruncatedNormalDelayBase):
     """
     Truncated log-normal delay-time distribution.
 
@@ -1084,8 +1129,6 @@ class LogNormalDelayDistribution(BaseDelayTimeDistribution):
         Standard deviation of ``ln(tau)``. Default is 0.2.
     """
 
-    _has_analytic_ppf = True
-
     def __init__(
         self,
         td_min: float = 0.02,
@@ -1094,29 +1137,21 @@ class LogNormalDelayDistribution(BaseDelayTimeDistribution):
         sigma: float = 0.2,
     ):
         """Initialize the truncated log-normal delay-time distribution."""
-        self._td_min, self._td_max = _validate_delay_bounds(td_min, td_max)
+        super().__init__(td_min=td_min, td_max=td_max, sigma=sigma)
         self._t_peak = _validate_positive_finite(t_peak, "t_peak")
-        self._sigma = _validate_positive_finite(sigma, "sigma")
-
         self._ln_t_peak = np.log(self._t_peak)
-        z_min = (np.log(self._td_min) - self._ln_t_peak) / self._sigma
-        z_max = (np.log(self._td_max) - self._ln_t_peak) / self._sigma
-        self._use_right_tail, self._edge_prob, self._norm = _truncnorm_bounds(
-            z_min, z_max
-        )
-        if self._norm <= 0.0:
-            raise ValueError(
-                "LogNormalDelayDistribution has negligible probability mass "
-                "within [td_min, td_max]"
-            )
+        self._init_truncation()
 
     @property
-    def min_delay(self) -> float:
-        return self._td_min
+    def t_peak(self) -> float:
+        """Scale/median delay-time parameter in Gyr."""
+        return self._t_peak
 
-    @property
-    def max_delay(self) -> float:
-        return self._td_max
+    def _to_z(self, tau):
+        return (np.log(tau) - self._ln_t_peak) / self._sigma
+
+    def _from_z(self, z):
+        return np.exp(self._ln_t_peak + self._sigma * z)
 
     def pdf(self, tau: np.ndarray) -> np.ndarray:
         """Evaluate the normalized truncated log-normal PDF in ``Gyr^-1``."""
@@ -1125,36 +1160,14 @@ class LogNormalDelayDistribution(BaseDelayTimeDistribution):
         valid = (tau_arr >= self._td_min) & (tau_arr <= self._td_max)
         if np.any(valid):
             tv = tau_arr[valid]
-            result[valid] = (
-                np.exp(-((np.log(tv) - self._ln_t_peak) ** 2) / (2.0 * self._sigma**2))
-                / (tv * self._sigma * _SQRT_2PI * self._norm)
+            z = self._to_z(tv)
+            result[valid] = np.exp(-0.5 * z**2) / (
+                tv * self._sigma * _SQRT_2PI * self._norm
             )
         return result
 
-    def cdf(self, tau: np.ndarray) -> np.ndarray:
-        """Evaluate the exact analytic CDF."""
-        tau_arr = np.asarray(tau, dtype=float)
-        result = np.zeros_like(tau_arr, dtype=float)
-        result[tau_arr >= self._td_max] = 1.0
-        valid = (tau_arr > self._td_min) & (tau_arr < self._td_max)
-        if np.any(valid):
-            z = (np.log(tau_arr[valid]) - self._ln_t_peak) / self._sigma
-            result[valid] = _truncnorm_cdf_z(
-                z, self._use_right_tail, self._edge_prob, self._norm
-            )
-        return result
 
-    def ppf(self, quantile: np.ndarray) -> np.ndarray:
-        """Evaluate the exact analytic inverse CDF (percent-point function)."""
-        q = np.asarray(quantile, dtype=float)
-        if np.any((q < 0.0) | (q > 1.0)):
-            raise ValueError("quantile values must lie in [0, 1]")
-        z = _truncnorm_ppf_z(q, self._use_right_tail, self._edge_prob, self._norm)
-        tau = np.exp(self._ln_t_peak + self._sigma * z)
-        return np.clip(tau, self._td_min, self._td_max)
-
-
-class GaussianDelayDistribution(BaseDelayTimeDistribution):
+class GaussianDelayDistribution(_TruncatedNormalDelayBase):
     """
     Truncated Gaussian delay-time distribution.
 
@@ -1175,8 +1188,6 @@ class GaussianDelayDistribution(BaseDelayTimeDistribution):
         Standard deviation of the untruncated Gaussian in Gyr. Default is 0.3.
     """
 
-    _has_analytic_ppf = True
-
     def __init__(
         self,
         td_min: float = 0.02,
@@ -1185,28 +1196,20 @@ class GaussianDelayDistribution(BaseDelayTimeDistribution):
         sigma: float = 0.3,
     ):
         """Initialize the truncated Gaussian delay-time distribution."""
-        self._td_min, self._td_max = _validate_delay_bounds(td_min, td_max)
+        super().__init__(td_min=td_min, td_max=td_max, sigma=sigma)
         self._t_mean = _validate_positive_finite(t_mean, "t_mean")
-        self._sigma = _validate_positive_finite(sigma, "sigma")
-
-        z_min = (self._td_min - self._t_mean) / self._sigma
-        z_max = (self._td_max - self._t_mean) / self._sigma
-        self._use_right_tail, self._edge_prob, self._norm = _truncnorm_bounds(
-            z_min, z_max
-        )
-        if self._norm <= 0.0:
-            raise ValueError(
-                "GaussianDelayDistribution has negligible probability mass "
-                "within [td_min, td_max]"
-            )
+        self._init_truncation()
 
     @property
-    def min_delay(self) -> float:
-        return self._td_min
+    def t_mean(self) -> float:
+        """Mean of the untruncated Gaussian distribution in Gyr."""
+        return self._t_mean
 
-    @property
-    def max_delay(self) -> float:
-        return self._td_max
+    def _to_z(self, tau):
+        return (tau - self._t_mean) / self._sigma
+
+    def _from_z(self, z):
+        return self._t_mean + self._sigma * z
 
     def pdf(self, tau: np.ndarray) -> np.ndarray:
         """Evaluate the normalized truncated Gaussian PDF in ``Gyr^-1``."""
@@ -1214,35 +1217,11 @@ class GaussianDelayDistribution(BaseDelayTimeDistribution):
         result = np.zeros_like(tau_arr, dtype=float)
         valid = (tau_arr >= self._td_min) & (tau_arr <= self._td_max)
         if np.any(valid):
-            result[valid] = (
-                np.exp(
-                    -((tau_arr[valid] - self._t_mean) ** 2) / (2.0 * self._sigma**2)
-                )
-                / (self._sigma * _SQRT_2PI * self._norm)
+            z = self._to_z(tau_arr[valid])
+            result[valid] = np.exp(-0.5 * z**2) / (
+                self._sigma * _SQRT_2PI * self._norm
             )
         return result
-
-    def cdf(self, tau: np.ndarray) -> np.ndarray:
-        """Evaluate the exact analytic CDF."""
-        tau_arr = np.asarray(tau, dtype=float)
-        result = np.zeros_like(tau_arr, dtype=float)
-        result[tau_arr >= self._td_max] = 1.0
-        valid = (tau_arr > self._td_min) & (tau_arr < self._td_max)
-        if np.any(valid):
-            z = (tau_arr[valid] - self._t_mean) / self._sigma
-            result[valid] = _truncnorm_cdf_z(
-                z, self._use_right_tail, self._edge_prob, self._norm
-            )
-        return result
-
-    def ppf(self, quantile: np.ndarray) -> np.ndarray:
-        """Evaluate the exact analytic inverse CDF (percent-point function)."""
-        q = np.asarray(quantile, dtype=float)
-        if np.any((q < 0.0) | (q > 1.0)):
-            raise ValueError("quantile values must lie in [0, 1]")
-        z = _truncnorm_ppf_z(q, self._use_right_tail, self._edge_prob, self._norm)
-        tau = self._t_mean + self._sigma * z
-        return np.clip(tau, self._td_min, self._td_max)
 
 
 # =============================================================================
@@ -1324,12 +1303,7 @@ class SFRTimeDelayRedshift(BaseRedshiftEvolution):
             raise TypeError(
                 "time_delay_model must be an instance of BaseDelayTimeDistribution"
             )
-        if (
-            isinstance(n_quad, bool)
-            or not isinstance(n_quad, (int, np.integer))
-            or n_quad < 8
-        ):
-            raise ValueError("n_quad must be an integer >= 8")
+        n_quad = _validate_int_at_least(n_quad, 8, "n_quad")
 
         resolved_cosmology = (
             sfr_model.cosmology if cosmology is None else cosmology
@@ -1344,7 +1318,7 @@ class SFRTimeDelayRedshift(BaseRedshiftEvolution):
         )
         self.sfr_model = sfr_model
         self.time_delay_model = time_delay_model
-        self._n_quad = int(n_quad)
+        self._n_quad = n_quad
 
         z_formation_max = _validate_positive_finite(
             z_formation_max, "z_formation_max"

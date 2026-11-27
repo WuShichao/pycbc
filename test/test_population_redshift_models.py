@@ -247,10 +247,10 @@ class TestDelayTimeDistributions(unittest.TestCase):
 
                 # PDF integrates to 1.0 (use quad with midpoint near peak for narrow)
                 points = []
-                if hasattr(dist, "_t_mean"):
-                    points = [dist._t_mean]
-                elif hasattr(dist, "_t_peak"):
-                    points = [dist._t_peak]
+                if hasattr(dist, "t_mean"):
+                    points = [dist.t_mean]
+                elif hasattr(dist, "t_peak"):
+                    points = [dist.t_peak]
                 integral, _ = scipy_integrate.quad(
                     lambda t, d=dist: float(d.pdf(t)),
                     dist.min_delay,
@@ -337,15 +337,15 @@ class TestSFRTimeDelayRedshift(unittest.TestCase):
                 continue
             pts = []
             if (
-                hasattr(td_model, "_t_mean")
-                and td_model.min_delay < td_model._t_mean < tau_hi
+                hasattr(td_model, "t_mean")
+                and td_model.min_delay < td_model.t_mean < tau_hi
             ):
-                pts = [td_model._t_mean]
+                pts = [td_model.t_mean]
             elif (
-                hasattr(td_model, "_t_peak")
-                and td_model.min_delay < td_model._t_peak < tau_hi
+                hasattr(td_model, "t_peak")
+                and td_model.min_delay < td_model.t_peak < tau_hi
             ):
-                pts = [td_model._t_peak]
+                pts = [td_model.t_peak]
             val, _ = scipy_integrate.quad(
                 lambda tau, t_m=tm: float(
                     sfr_model.psi_z(np.expm1(ln1p_zf(t_m + tau))) * td_model.pdf(tau)
