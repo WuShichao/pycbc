@@ -26,12 +26,45 @@ This module provides functions for star formation rate models, time delay
 models, merger rate density, and population models of BBH/BNS/NSBH.
 """
 
+import warnings
+from functools import partial
+
 import numpy as np
 import scipy.integrate as scipy_integrate
 import scipy.interpolate as scipy_interpolate
 from astropy import units
 
 from pycbc.cosmology import cosmological_quantity_from_redshift, get_cosmology
+from pycbc.population.redshift_models import (
+    BaseDelayTimeDistribution,
+    BaseRedshiftEvolution,
+    GaussianDelayDistribution,
+    GRB2008SFR,
+    InverseDelayDistribution,
+    LogNormalDelayDistribution,
+    MadauDickinson2014SFR,
+    MadauFragos2017SFR,
+    PowerLawDelayDistribution,
+    SFRTimeDelayRedshift,
+    sfr_grb_2008_redshift,
+    sfr_madau_dickinson_2014_redshift,
+    sfr_madau_fragos_2017_redshift,
+)
+
+
+class _CallableSFR(BaseRedshiftEvolution):
+    """Adapter wrapping a plain callable ``sfr_func(z)`` as a redshift model."""
+
+    name = "callable_sfr"
+    param_names = ()
+
+    def __init__(self, sfr_func, z_max=10.0, num_zbins=1000, cosmology=None):
+        super().__init__(z_max=z_max, num_zbins=num_zbins, cosmology=cosmology)
+        self._sfr_func = sfr_func
+
+    def psi_z(self, redshift, **parameters):
+        del parameters
+        return np.asarray(self._sfr_func(redshift), dtype=float)
 
 
 def sfr_grb_2008(z):
@@ -40,12 +73,12 @@ def sfr_grb_2008(z):
 
     Parameters
     ----------
-    z : float
+    z : float or numpy.ndarray
         The redshift.
 
     Returns
     -------
-    rho_z : float
+    rho_z : float or numpy.ndarray
             The SFR at redshift z, in unit of "Msolar/Mpc^3/yr".
 
     Note
@@ -53,8 +86,6 @@ def sfr_grb_2008(z):
         Please see Eq.(5) in <arXiv:0804.4008> for more details.
 
     """
-
-    from .redshift_models import sfr_grb_2008_redshift
     return sfr_grb_2008_redshift.psi_z(z)
 
 
@@ -64,21 +95,25 @@ def sfr_madau_dickinson_2014(z, gamma=2.7, kappa=5.6, z_peak=1.9):
 
     Parameters
     ----------
-    z : float
+    z : float or numpy.ndarray
         The redshift.
+    gamma : float, optional
+        Low-redshift power-law index. Default is 2.7.
+    kappa : float, optional
+        High-redshift decline index. Default is 5.6.
+    z_peak : float, optional
+        Turnover redshift. Default is 1.9.
 
     Returns
     -------
-    rho_z : float
+    rho_z : float or numpy.ndarray
             The SFR at redshift z, in unit of "Msolar/Mpc^3/yr".
 
     Notes
     -----
-         Pease see Eq.(15) in <arXiv:1403.0007> for more details.
+         Please see Eq.(15) in <arXiv:1403.0007> for more details.
 
     """
-
-    from .redshift_models import sfr_madau_dickinson_2014_redshift
     return sfr_madau_dickinson_2014_redshift.psi_z(
         z, gamma=gamma, kappa=kappa, z_peak=z_peak
     )
@@ -92,56 +127,40 @@ def sfr_madau_fragos_2017(z, k_imf=0.66, mode="high"):
 
     Parameters
     ----------
-    z : float
+    z : float or numpy.ndarray
         The redshift.
     k_imf : float
         The correction factor KIMF adjusts the SFR for the assumed IMF,
-        for the Salpeter IMF, k_imf=1.0, for the  three component broken
+        for the Salpeter IMF, k_imf=1.0, for the three component broken
         power-law Kroupa IMF, k_imf=0.66, here we choose Kroupa IMF as default.
-    model : string
+    mode : str
         The model of SFR, choose from 'high' and 'low'. Default to 'high'.
 
     Returns
     -------
-    rho_z : float
+    rho_z : float or numpy.ndarray
             The SFR at redshift z, in unit of "Msolar/Mpc^3/yr".
 
     Notes
     -----
-         Pease see <arXiv:1606.07887> and <arXiv:1706.07053> for more details.
+         Please see <arXiv:1606.07887> and <arXiv:1706.07053> for more details.
 
     """
-
-    from .redshift_models import sfr_madau_fragos_2017_redshift
-    return sfr_madau_fragos_2017_redshift.psi_z(
-        z, k_imf=k_imf, mode=mode
-    )
+    return sfr_madau_fragos_2017_redshift.psi_z(z, k_imf=k_imf, mode=mode)
 
 
-def merger_rate_density(sfr_func, td_model, rho_local, maxz=10.0,
-                        npoints=10000, z_array=None, **kwargs):
-    r""" This function uses the numerical integral to calculate
-        the merger rate density of CBC sources. This function calculates the
-        convolution of the star formation rate SFR(tau) and the time delay
-        probability P(tau) on the time delay 'tau' into the convolution on
-        the redshift 'z'.
+def diff_lookback_time(z, **kwargs):
+    r"""
+    The derivative of lookback time ``t(z)`` with respect to redshift ``z``.
+
+    .. deprecated::
+        Use ``cosmology.H(z)`` from :py:func:`get_cosmology` or the classes
+        in :py:mod:`pycbc.population.redshift_models` instead.
 
     Parameters
     ----------
-    sfr_func : function
-            The star formation rate function used in the convolution.
-    td_model : str
-            The name of time delay model.
-    rho_local : float
-            The local merger rate of a certain type of CBC source.
-            In the unit of "Mpc^-3yr^-1".
-    maxz : float
-            The max redshift. The default value is 10.
-    npoints : int
-            The number of points used in the interpolation. The default
-            value is 10000.
-    z_array : numpy.array
-            The array of redshift. The default value is None.
+    z : float, numpy.ndarray, or sympy.Basic
+        The redshift.
     \**kwargs :
         All other keyword args are passed to :py:func:`get_cosmology` to
         select a cosmology. If none provided, will use
@@ -149,45 +168,279 @@ def merger_rate_density(sfr_func, td_model, rho_local, maxz=10.0,
 
     Returns
     -------
-    rho_z : scipy.interpolate.interp1d
-          The merger rate density.
+    dt_dz : float, numpy.ndarray, or sympy.Expr
+        The value of ``dt/dz`` at redshift ``z`` in ``Gyr``.
 
     Notes
     -----
-         Pease see Eq.(A1), Eq.(A2) in <arXiv:2011.02717v3> for more details.
+        Please see Eq.(A3) in <arXiv:2011.02717v3> for more details.
 
     """
+    warnings.warn(
+        "diff_lookback_time is deprecated; use astropy cosmology.H(z) or "
+        "pycbc.population.redshift_models instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    cosmology = get_cosmology(**kwargs)
 
-    if z_array is None:
-        z_array = np.linspace(0, maxz, npoints)
-    else:
-        maxz = max(maxz, np.max(z_array))
+    if isinstance(z, (int, float, np.number, np.ndarray)):
+        h_z = cosmology.H(z).to_value(1.0 / units.Gyr)
+        return 1.0 / (h_z * (1.0 + z))
 
-    if td_model not in ["log_normal", "gaussian", "power_law", "inverse"]:
+    # Symbolic fallback for legacy callers (e.g. convolution_trans)
+    from sympy import sqrt
+
+    h0_gyr = cosmology.H0.to_value(1.0 / units.Gyr)
+    return 1.0 / h0_gyr / (1.0 + z) / sqrt(
+        cosmology.Ode0 + cosmology.Om0 * (1.0 + z) ** 3
+    )
+
+
+def _build_delay_distribution(td_model, cosmology=None, **td_kwargs):
+    """Map a legacy string name or distribution instance to a delay model."""
+    if isinstance(td_model, BaseDelayTimeDistribution):
+        return td_model
+
+    if cosmology is None:
+        cosmology = get_cosmology()
+
+    default_td_max = float(cosmology.age(0).to_value(units.Gyr))
+    td_min = td_kwargs.pop("td_min", 0.02)
+    td_max = td_kwargs.pop("td_max", default_td_max)
+
+    if td_model == "inverse":
+        return InverseDelayDistribution(td_min=td_min, td_max=td_max)
+    if td_model == "power_law":
+        return PowerLawDelayDistribution(td_min=td_min, td_max=td_max, **td_kwargs)
+    if td_model == "log_normal":
+        return LogNormalDelayDistribution(td_min=td_min, td_max=td_max, **td_kwargs)
+    if td_model == "gaussian":
+        return GaussianDelayDistribution(td_min=td_min, td_max=td_max, **td_kwargs)
+
+    raise ValueError(
+        "'td_model' must be a BaseDelayTimeDistribution or choose from "
+        "['log_normal', 'gaussian', 'power_law', 'inverse']."
+    )
+
+
+def _build_sfr_model(sfr_func, maxz, cosmology):
+    """Map a legacy SFR callable or redshift model to a BaseRedshiftEvolution."""
+    if isinstance(sfr_func, BaseRedshiftEvolution):
+        return sfr_func
+    if sfr_func is sfr_grb_2008:
+        return GRB2008SFR(z_max=maxz, cosmology=cosmology)
+    if sfr_func is sfr_madau_dickinson_2014:
+        return MadauDickinson2014SFR(z_max=maxz, cosmology=cosmology)
+    if sfr_func is sfr_madau_fragos_2017:
+        return MadauFragos2017SFR(z_max=maxz, cosmology=cosmology)
+    if callable(sfr_func):
+        return _CallableSFR(sfr_func, z_max=maxz, cosmology=cosmology)
+    raise TypeError(
+        "sfr_func must be a callable or an instance of BaseRedshiftEvolution."
+    )
+
+
+def p_tau(tau, td_model="inverse"):
+    r"""
+    The probability distribution of the time delay.
+
+    .. deprecated::
+        Use the :py:class:`BaseDelayTimeDistribution` subclasses in
+        :py:mod:`pycbc.population.redshift_models` instead.
+
+    Parameters
+    ----------
+    tau : float, numpy.ndarray, or sympy.Basic
+        The merger delay time in Gyr.
+    td_model : str
+        The time delay model: ``'log_normal'``, ``'gaussian'``,
+        ``'power_law'``, or ``'inverse'``.
+
+    Returns
+    -------
+    p_t : float, numpy.ndarray, or sympy.Expr
+        The probability density at time delay ``tau``.
+
+    Notes
+    -----
+        Please see the Appendix in <arXiv:2011.02717v3> for more details.
+
+    """
+    warnings.warn(
+        "p_tau is deprecated; use BaseDelayTimeDistribution subclasses in "
+        "pycbc.population.redshift_models instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    valid_models = ("log_normal", "gaussian", "power_law", "inverse")
+    if td_model not in valid_models:
         raise ValueError(
-            "'td_model' must choose from \
-        ['log_normal', 'gaussian', 'power_law', 'inverse']."
+            "'td_model' must choose from "
+            "['log_normal', 'gaussian', 'power_law', 'inverse']."
         )
 
+    if isinstance(tau, (int, float, np.number, np.ndarray)):
+        dist = _build_delay_distribution(td_model)
+        val = dist.pdf(tau)
+        return float(val) if np.isscalar(tau) else val
+
+    # Symbolic fallback for legacy callers (e.g. convolution_trans)
+    from sympy import Piecewise, exp, log, sqrt
+
+    if td_model == "log_normal":
+        t_ln = 2.9
+        sigma_ln = 0.2
+        return exp(-((log(tau) - log(t_ln)) ** 2) / (2 * sigma_ln**2)) / (
+            sqrt(2 * np.pi) * sigma_ln * tau
+        )
+    if td_model == "gaussian":
+        t_g = 2.0
+        sigma_g = 0.3
+        return exp(-((tau - t_g) ** 2) / (2 * sigma_g**2)) / (
+            sqrt(2 * np.pi) * sigma_g
+        )
+    if td_model == "power_law":
+        alpha_t = 0.81
+        return tau ** (-alpha_t)
+
+    td_min = 0.02
+    td_max = cosmological_quantity_from_redshift(0, "age")
+    norm_const = 1.0 / np.log(td_max / td_min)
+    return Piecewise(
+        (0, tau < td_min),
+        (0, tau > td_max),
+        (norm_const / tau, True),
+    )
+
+
+def convolution_trans(sfr, diff_lookback_t, model_td, **kwargs):
+    r"""
+    Legacy symbolic integrand helper for CBC merger rate convolution.
+
+    .. deprecated::
+        Use :py:class:`pycbc.population.redshift_models.SFRTimeDelayRedshift`
+        or :py:func:`merger_rate_density` instead.
+
+    Parameters
+    ----------
+    sfr : callable
+        The star formation rate function used in the convolution.
+    diff_lookback_t : callable
+        The derivative of lookback time ``t(z)`` with respect to redshift ``z``.
+    model_td : str
+        The name of the time-delay model.
+    \**kwargs :
+        Keyword arguments forwarded to ``diff_lookback_t``.
+
+    Returns
+    -------
+    func : sympy.Expr
+        The product of ``sfr(z)``, ``p_tau(tau(z))``, and ``dt(z)/dz``.
+    """
+    warnings.warn(
+        "convolution_trans is deprecated; use SFRTimeDelayRedshift in "
+        "pycbc.population.redshift_models instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    from sympy import integrate, symbols
+
+    if model_td not in ("log_normal", "gaussian", "power_law", "inverse"):
+        raise ValueError(
+            "'model_td' must choose from "
+            "['log_normal', 'gaussian', 'power_law', 'inverse']."
+        )
+
+    diff_lookback_time_z = partial(diff_lookback_t, **kwargs)
+    z = symbols("z")
+    z_0 = symbols("z_0")
+    tau = integrate(diff_lookback_time_z(z), (z, z_0, z))
+    return sfr(z) * p_tau(tau, model_td) * diff_lookback_time_z(z)
+
+
+def merger_rate_density(
+    sfr_func, td_model, rho_local, maxz=10.0, npoints=10000, z_array=None, **kwargs
+):
+    r"""
+    Calculate the merger rate density of CBC sources via numerical convolution.
+
+    Computes the convolution of the star formation rate ``SFR(z_f)`` and the
+    time-delay probability density ``P(tau)``, normalized to ``rho_local`` at
+    ``z = 0``.
+
+    Parameters
+    ----------
+    sfr_func : callable or BaseRedshiftEvolution
+        The star formation rate function (e.g. ``sfr_madau_dickinson_2014``)
+        or a :py:class:`BaseRedshiftEvolution` instance.
+    td_model : str or BaseDelayTimeDistribution
+        Name of the time-delay model (``'log_normal'``, ``'gaussian'``,
+        ``'power_law'``, or ``'inverse'``) or a
+        :py:class:`BaseDelayTimeDistribution` instance.
+    rho_local : float
+        The local merger rate density at ``z = 0``, in ``Mpc^-3 yr^-1``.
+    maxz : float, optional
+        The maximum redshift. Default is 10.0.
+    npoints : int, optional
+        The number of points used in the output interpolation when ``z_array``
+        is None. Default is 10000.
+    z_array : numpy.ndarray, optional
+        Custom redshift grid for the output interpolator. Default is None.
+    \**kwargs :
+        Optional delay-time parameters (``td_min``, ``td_max``, ``alpha``,
+        ``t_peak``, ``t_mean``, ``sigma``, ``z_formation_max``) and cosmology
+        keyword arguments forwarded to :py:func:`get_cosmology`.
+
+    Returns
+    -------
+    rho_z : scipy.interpolate.interp1d
+        Interpolator returning the merger rate density as a function of
+        redshift.
+
+    Notes
+    -----
+        Please see Eq.(A1), Eq.(A2) in <arXiv:2011.02717v3> for more details.
+
+    """
+    if z_array is None:
+        z_array = np.linspace(0.0, maxz, npoints)
+    else:
+        z_array = np.asarray(z_array, dtype=float)
+        maxz = float(max(maxz, np.max(z_array)))
+
+    td_param_keys = ("td_min", "td_max", "alpha", "t_peak", "t_mean", "sigma")
     td_kwargs = {}
-    for key in ['td_min', 'td_max']:
+    for key in td_param_keys:
         if key in kwargs:
             td_kwargs[key] = kwargs.pop(key)
 
-    cosmology = get_cosmology(**kwargs)
+    z_formation_max = kwargs.pop("z_formation_max", max(20.0, maxz * 2.0))
+    if z_formation_max <= maxz:
+        raise ValueError("z_formation_max must be greater than maxz")
 
-    from .redshift_models import SFRTimeDelayRedshift
+    cosmology = get_cosmology(**kwargs)
+    sfr_model = _build_sfr_model(sfr_func, maxz=maxz, cosmology=cosmology)
+    delay_model = _build_delay_distribution(
+        td_model, cosmology=cosmology, **td_kwargs
+    )
+
+    num_zbins = min(max(int(npoints), 200), 1000)
     model = SFRTimeDelayRedshift(
-        sfr_model=sfr_func, td_model=td_model,
-        zmax=maxz, num_zbins=1000, cosmology=cosmology, **td_kwargs
+        sfr_model=sfr_model,
+        time_delay_model=delay_model,
+        z_max=maxz,
+        num_zbins=num_zbins,
+        cosmology=cosmology,
+        z_formation_max=z_formation_max,
     )
 
     f_z = model.psi_z(z_array)
-    if f_z[0] != 0:
-        f_z = f_z / f_z[0] * rho_local  # Normalize & Rescale
+    f_0 = float(model.psi_z(0.0))
+    if f_0 != 0.0:
+        f_z = f_z / f_0 * rho_local
 
-    rho_z = scipy_interpolate.interp1d(z_array, f_z)
-    return rho_z
+    return scipy_interpolate.interp1d(z_array, f_z)
 
 
 def coalescence_rate(rate_den, maxz=10.0, npoints=10000, z_array=None, **kwargs):
@@ -218,7 +471,7 @@ def coalescence_rate(rate_den, maxz=10.0, npoints=10000, z_array=None, **kwargs)
 
     Notes
     -----
-         Pease see Eq.(1) in <arXiv:2011.02717v3> for more details.
+         Please see Eq.(1) in <arXiv:2011.02717v3> for more details.
 
     """
     if z_array is None:
@@ -261,17 +514,15 @@ def total_rate_upto_redshift(z, merger_rate):
             merger_rate, 0, z, epsabs=2.00e-4, epsrel=2.00e-4, limit=1000
         )[0]
     elif isinstance(z, (tuple, np.ndarray, list)):
-        total_rate = []
-        for redshift in z:
-            total_rate.append(
-                scipy_integrate.quad(
-                    merger_rate, 0, redshift, epsabs=2.00e-4, epsrel=2.00e-4, limit=1000
-                )[0]
-            )
+        total_rate = [
+            scipy_integrate.quad(
+                merger_rate, 0, redshift, epsabs=2.00e-4, epsrel=2.00e-4, limit=1000
+            )[0]
+            for redshift in z
+        ]
     else:
         raise ValueError(
-            "'z' must be 'int', 'float', 'tuple', \
-                            'numpy.ndarray' or 'list'."
+            "'z' must be 'int', 'float', 'tuple', 'numpy.ndarray' or 'list'."
         )
 
     return total_rate
@@ -320,7 +571,7 @@ def norm_redshift_distribution(z_array, merger_rate):
 
     Notes
     -----
-         The can be used as a population-informed prior for redshift
+         This can be used as a population-informed prior for redshift
          and luminosity distance of CBC sources.
 
     """
@@ -392,7 +643,17 @@ def distance_from_rate(total_rate, merger_rate, maxz=10, npoints=10000, **kwargs
     return dl
 
 
-__all__ = ['sfr_grb_2008', 'sfr_madau_dickinson_2014',
-           'sfr_madau_fragos_2017', 'merger_rate_density', 'coalescence_rate',
-           'norm_redshift_distribution', 'total_rate_upto_redshift',
-           'distance_from_rate', 'average_time_between_signals']
+__all__ = [
+    "average_time_between_signals",
+    "coalescence_rate",
+    "convolution_trans",
+    "diff_lookback_time",
+    "distance_from_rate",
+    "merger_rate_density",
+    "norm_redshift_distribution",
+    "p_tau",
+    "sfr_grb_2008",
+    "sfr_madau_dickinson_2014",
+    "sfr_madau_fragos_2017",
+    "total_rate_upto_redshift",
+]
